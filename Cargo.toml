@@ -1,0 +1,56 @@
+[workspace]
+members = [
+    "crates/imparo-backend",
+    "crates/imparo-cpu",
+    "crates/imparo-cuda",
+    "crates/imparo-host",
+    "crates/imparo-metal",
+    "crates/imparo-model",
+    "crates/imparo-kv",
+    "crates/imparo-server",
+    "crates/imparo-tokenize",
+    "crates/imparo-tune",
+    "crates/imparo-gguf",
+]
+resolver = "2"
+
+# Everything is a default member so a bare `cargo build --release` builds the whole
+# engine. The engine crates once were not, and every bare build was a silent no-op that
+# left stale binaries which then measured exactly like real results -- three sessions
+# hit this. dev_harness/build.sh additionally asserts binary freshness after building.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Zeraix"]
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pedantic classes this codebase deliberately violates, allowed once here rather than
+# per-site: GPU wire types make usize->u32/i32 casts the normal case (sizes are bounded
+# by tensor shapes, not pointer width), and docs are written as prose, not rustdoc
+# reference style. Everything else in pedantic stays on.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+doc_markdown = "allow"
+doc_lazy_continuation = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+format_push_string = "allow"
+# Kernel-adjacent style this codebase is deliberate about: math code uses i/n/k/o
+# bindings, the Backend trait mirrors the real op surface (wide argument lists), and
+# dispatch tables produce types clippy calls complex.
+many_single_char_names = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+items_after_statements = "allow"
+# A model workflow is DELIBERATELY one hand-scheduled function (the design rejects a
+# graph IR); line-count lints fight the architecture.
+too_many_lines = "allow"

@@ -1,0 +1,18 @@
+[package]
+name = "imparo-gguf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2 = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.177"
+
+[target.'cfg(windows)'.dependencies]
+
+# scan.rs mmaps the GGUF (the tokenizer borrows token bytes from clean file pages);
+[lints]
+workspace = true

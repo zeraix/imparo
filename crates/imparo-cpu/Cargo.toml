@@ -1,0 +1,19 @@
+[package]
+name = "imparo-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+imparo-backend = { path = "../imparo-backend" }
+imparo-gguf = { path = "../imparo-gguf" }
+libc = "0.2.177"
+
+
+
+
+# mmap requires unsafe, and the workspace sets unsafe_code = "forbid", which `allow`
+# cannot override. Crates needing unsafe (the Metal backend) opt out
+[lints]
+workspace = true

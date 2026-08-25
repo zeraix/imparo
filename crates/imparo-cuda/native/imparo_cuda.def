@@ -1,0 +1,39 @@
+; Windows DLL export list (the salvaged cuda-expert pattern: explicit .def, no
+; declspec scatter). Every extern "C" in imparo_cuda.cu that the Rust side calls.
+LIBRARY imparo_cuda
+EXPORTS
+    imparo_cuda_init
+    imparo_cuda_begin
+    imparo_cuda_flush
+    imparo_cuda_end
+    imparo_cuda_alloc
+    imparo_cuda_arena
+    imparo_cuda_place
+    imparo_cuda_page_round
+    imparo_cuda_alloc_kv
+    imparo_cuda_grow_kv
+    imparo_cuda_write
+    imparo_cuda_write_u32
+    imparo_cuda_read
+    imparo_cuda_read_kv
+    imparo_cuda_set_epilogue
+    imparo_cuda_set_knob
+    imparo_cuda_knob
+    imparo_cuda_set_kv_types
+    imparo_cuda_matmat
+    imparo_cuda_rms_norm
+    imparo_cuda_rope
+    imparo_cuda_hadamard
+    imparo_cuda_kv_store
+    imparo_cuda_kv_dequant
+    imparo_cuda_attention
+    imparo_cuda_gelu
+    imparo_cuda_gelu_mul
+    imparo_cuda_add
+    imparo_cuda_add_scale
+    imparo_cuda_scale
+    imparo_cuda_copy
+    imparo_cuda_mul_strided
+    imparo_cuda_softcap
+    imparo_cuda_argmax
+    imparo_cuda_row

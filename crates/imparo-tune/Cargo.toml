@@ -1,0 +1,24 @@
+[package]
+name = "imparo-tune"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+cuda = ["imparo-model/cuda", "dep:imparo-cuda"]
+
+[dependencies]
+imparo-cuda = { path = "../imparo-cuda", optional = true }
+imparo-gguf = { path = "../imparo-gguf" }
+imparo-model = { path = "../imparo-model" }
+imparo-backend = { path = "../imparo-backend" }
+imparo-host = { path = "../imparo-host" }
+imparo-cpu = { path = "../imparo-cpu" }
+
+[[bin]]
+name = "imparo-tune"
+path = "src/main.rs"
+
+[lints]
+workspace = true

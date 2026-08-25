@@ -1,0 +1,46 @@
+name: release-linux
+
+# Manual: builds the linux-x64 server and tuner with the CUDA backend compiled in (newest 12.x
+# for hardware reach -- CUDA 13 dropped Maxwell/Pascal/Volta; cudart linked
+# statically so no toolkit is needed at runtime, only the NVIDIA driver to use the
+# GPU; without one the server runs its CPU path). Attaches to the tag's DRAFT
+# release, created if missing.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v2.0.0-alpha.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+          use-github-cache: true
+      - name: Build
+        run: cargo build --release --locked --bin imparo-server --bin imparo-tune --features cuda
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="imparo-${{ inputs.tag }}-linux-x64"
+          mkdir -p "dist/$name"
+          cp target/release/imparo-server target/release/imparo-tune \
+             README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - name: Attach to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ inputs.tag }}" >/dev/null 2>&1 || \
+            gh release create "${{ inputs.tag }}" --target "$GITHUB_SHA" --draft \
+              --title "Imparo ${{ inputs.tag }}" --generate-notes
+          gh release upload "${{ inputs.tag }}" dist/*.tar.gz --clobber

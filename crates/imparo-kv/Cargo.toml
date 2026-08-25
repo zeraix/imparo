@@ -1,0 +1,17 @@
+[package]
+name = "imparo-kv"
+description = "Unified KV pool: content-addressed units, refcounted sharing, tier ladder, disk store (docs/unified-kv-pool.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2.177"
+# Already in the tree via imparo-gguf; SHA-256 truncated to 128 bits is the wide
+# hash the design requires (collision is not a case the code handles).
+sha2 = "0.11"
+imparo-backend = { path = "../imparo-backend" }
+
+[lints]
+workspace = true

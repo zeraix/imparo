@@ -1,0 +1,104 @@
+name: CI
+
+# CI is automatic -- every push to v2 and every PR is checked without anyone
+# remembering to run it; workflow_dispatch stays for ad-hoc runs on other refs.
+# Releases are the opposite (release.yml): shipping is a decision, so manual only.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One job per user profile, each building what that user actually runs:
+#   apple-silicon -- the mac user: full workspace incl. the Metal backend
+#   linux-nvidia  -- linux amd64 + NV GPU: portable crates + nvcc kernel compile
+#   windows       -- windows amd64: portable crates on the MSVC toolchain
+# No hosted runner has a GPU, so this is build + lint + host-side tests only; the
+# correctness gates (pinned logits, determinism, mode gates) need the reference GGUF
+# and a real GPU and run on a dev machine via dev_harness. CUDA coverage is
+# compile-only until a CUDA box runs the gates.
+jobs:
+  apple-silicon:
+    # macos-14+ hosted runners are Apple arm64 (M series) -- required: this job
+    # compiles the Metal backend for the machine the mac user actually has.
+    # macos-13 and earlier were Intel; never move this job there.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      # Caches ~/.cargo and target/ keyed by lockfile + toolchain; saves after the
+      # first green run and cuts later runs to incremental-build time.
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --release --locked
+      - name: Tests (no GPU, no model)
+        run: cargo test --release --locked
+      - name: Clippy
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+
+  linux-nvidia:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Caches ~/.cargo and target/ keyed by lockfile + toolchain; saves after the
+      # first green run and cuts later runs to incremental-build time.
+      - uses: Swatinem/rust-cache@v2
+      # Installs ONLY nvcc (network method; no GPU on runners -- compile coverage).
+      # The version is pinned so the compiler and the cache key are stable, and the
+      # installer download is cached on GitHub's cache (use-github-cache, explicit
+      # here though it is the action's default).
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+          use-github-cache: true
+      - name: Build portable crates
+        run: cargo build --release --locked
+             -p imparo-gguf -p imparo-tokenize -p imparo-cpu -p imparo-backend -p imparo-kv
+             -p imparo-host -p imparo-model -p imparo-server -p imparo-tune
+      - name: Tests
+        run: cargo test --release --locked
+             -p imparo-gguf -p imparo-tokenize -p imparo-cpu -p imparo-backend -p imparo-kv
+             -p imparo-host -p imparo-model -p imparo-server
+      - name: Build CUDA-enabled server + tuner (nvcc compiles + links, no GPU to run)
+        run: cargo build --release --locked -p imparo-server -p imparo-tune --features cuda
+
+  # Compile-only check against CUDA 13 (the newest major): 13 DROPPED
+  # Maxwell/Pascal/Volta, so releases build with 12.x for hardware reach, while
+  # this job keeps the kernels valid for the toolkit developers increasingly have.
+  cuda-13-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.0.2'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+          use-github-cache: true
+      - name: Compile CUDA kernels under CUDA 13
+        run: cargo build --release --locked -p imparo-cuda --features cuda
+
+  # No nvcc here: it would repeat the linux job's compile with MSVC as host
+  # compiler at ~10 min of toolkit install; that pairing gets verified when a
+  # real Windows GPU box runs the gates. This job covers what is unique to
+  # Windows -- the portable crates on the MSVC toolchain.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Caches ~/.cargo and target/ keyed by lockfile + toolchain; saves after the
+      # first green run and cuts later runs to incremental-build time.
+      - uses: Swatinem/rust-cache@v2
+      - name: Build portable crates
+        run: cargo build --release --locked
+             -p imparo-gguf -p imparo-tokenize -p imparo-cpu -p imparo-backend -p imparo-kv
+             -p imparo-host -p imparo-model -p imparo-server -p imparo-tune
+      - name: Tests
+        run: cargo test --release --locked
+             -p imparo-gguf -p imparo-tokenize -p imparo-cpu -p imparo-backend -p imparo-kv
+             -p imparo-host -p imparo-model -p imparo-server

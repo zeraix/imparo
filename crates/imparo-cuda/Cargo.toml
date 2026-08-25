@@ -1,0 +1,21 @@
+[package]
+name = "imparo-cuda"
+description = "CUDA backend skeleton: the Backend trait as stubs a Windows/CUDA developer fills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Everything real sits behind this feature: with it OFF (the default) the crate
+# compiles everywhere -- including this macOS dev machine -- to nothing but the
+# module skeleton, so shared-code changes cannot rot it unnoticed.
+cuda = []
+
+[dependencies]
+imparo-backend = { path = "../imparo-backend" }
+imparo-host = { path = "../imparo-host" }
+
+# FFI onto the .cu surface is unsafe by nature -- the same exception imparo-metal
+[lints]
+workspace = true

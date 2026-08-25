@@ -1,0 +1,50 @@
+name: release-windows
+
+# Manual: builds the windows-x64 server and tuner with the CUDA backend compiled in (see
+# release-linux for the version/static-cudart reasoning). Attaches to the tag's
+# DRAFT release, created if missing.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v2.0.0-alpha.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # nvcc needs MSVC's cl as its host compiler; VS is installed but not on PATH
+      # until this sets the environment.
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+          use-github-cache: true
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --bin imparo-server --bin imparo-tune --features cuda
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="imparo-${{ inputs.tag }}-windows-x64"
+          mkdir -p "dist/$name"
+          cp target/release/imparo-server.exe target/release/imparo-tune.exe \
+             README.md LICENSE "dist/$name/"
+          cd dist && 7z a "$name.zip" "$name" > /dev/null
+      - name: Attach to draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ inputs.tag }}" >/dev/null 2>&1 || \
+            gh release create "${{ inputs.tag }}" --target "$GITHUB_SHA" --draft \
+              --title "Imparo ${{ inputs.tag }}" --generate-notes
+          gh release upload "${{ inputs.tag }}" dist/*.zip --clobber

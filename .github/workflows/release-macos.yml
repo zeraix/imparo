@@ -1,0 +1,39 @@
+name: release-macos
+
+# Manual: builds the measured Metal engine for Apple arm64 (M series) and attaches
+# it to the DRAFT release for the given tag (created if missing -- run the three
+# release-* workflows in any order against the same tag, then publish the draft).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v2.0.0-alpha.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14   # Apple arm64; macos-13 and earlier were Intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release --locked
+             --bin imparo-server --bin imparo-tune --bin imparo-metalbench
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="imparo-${{ inputs.tag }}-macos-arm64"
+          mkdir -p "dist/$name"
+          cp target/release/imparo-server target/release/imparo-tune \
+             target/release/imparo-metalbench README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - name: Attach to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ inputs.tag }}" >/dev/null 2>&1 || \
+            gh release create "${{ inputs.tag }}" --target "$GITHUB_SHA" --draft \
+              --title "Imparo ${{ inputs.tag }}" --generate-notes
+          gh release upload "${{ inputs.tag }}" dist/*.tar.gz --clobber

@@ -1,0 +1,16 @@
+[package]
+name = "imparo-tokenize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+imparo-gguf = { path = "../imparo-gguf" }
+
+[[bin]]
+name = "imparo-tok"
+path = "src/bin/imparo-tok.rs"
+
+[lints]
+workspace = true

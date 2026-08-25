@@ -1,0 +1,10 @@
+[package]
+name = "imparo-backend"
+description = "The backend seam: the Backend trait, named buffer slots, the weight-kind wire, and the backend registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
