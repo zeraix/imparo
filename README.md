@@ -19,7 +19,7 @@ dependencies — not a fork of llama.cpp and free of GGML. Measured against llam
 the same hardware and models: at or ahead on speed and memory at the shipped
 configuration, with byte-stable, run-to-run deterministic output.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-38D6B4?style=flat-square)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-38D6B4?style=flat-square)](LICENSE)
 
 </div>
 
