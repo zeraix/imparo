@@ -4,7 +4,7 @@
 
 ### LLM inference, fitted to your hardware.
 
-**An independent, hardware-adaptive LLM inference engine.**
+**A hardware-adaptive LLM inference engine.**
 
 [Why Imparo](#why-imparo) ·
 [Quick Start](#quick-start) ·
@@ -17,15 +17,18 @@
 
 ## About
 
-Imparo is an independent LLM inference engine built around a Rust runtime and
-direct Metal, CUDA, and CPU backends. It fits model execution to the hardware,
-model architecture, and shape of the workload instead of assuming one fixed
-deployment environment.
+Imparo is built in Rust with native Metal, CUDA, and CPU backends. It brings
+model execution, per-machine tuning, and persistent state management together
+in one inference runtime.
 
-GGUF is an input format; model execution is implemented by Imparo rather than
-delegated to llama.cpp, GGML, or a general-purpose machine-learning framework.
+Execution adapts to the model architecture, hardware topology, and live workload
+shape—from short decode steps to long prefills and repeated-prefix workloads.
 
 ## Why Imparo
+
+- **Lean native execution.** Model workflows call backend kernels directly,
+  keeping the hot path compact and giving each architecture an execution path
+  designed around its actual operators and state.
 
 - **Fitted to the machine.** Imparo reads the model and device geometry, then
   measures only the execution choices that cannot be safely derived. Tuning is
@@ -43,6 +46,10 @@ delegated to llama.cpp, GGML, or a general-purpose machine-learning framework.
 - **Memory-efficient model-native acceleration.** Imparo's native MTP research
   reuses target-model components and keeps only the architecture-specific
   auxiliary state, rather than loading a complete second draft model.
+
+- **Correctness-gated optimization.** Candidate optimizations must preserve
+  model outputs and state transitions before they can be selected. Performance
+  results remain bound to the configuration and machine that produced them.
 
 ## Quick Start
 
