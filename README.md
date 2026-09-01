@@ -2,9 +2,9 @@
 
 <img src="assets/imparo-wordmark-black.png" alt="Imparo by Zeraix" width="560" />
 
-### LLM inference, fitted to your hardware.
+### LLM inference that adapts to your hardware and workload.
 
-**A hardware-adaptive LLM inference engine.**
+**Native model execution, measurement-driven tuning, and persistent inference state—unified in a Rust runtime.**
 
 [Why Imparo](#why-imparo) ·
 [Quick Start](#quick-start) ·
@@ -17,9 +17,9 @@
 
 ## About
 
-Imparo is built in Rust with native Metal, CUDA, and CPU backends. It brings
-model execution, per-machine tuning, and persistent state management together
-in one inference runtime.
+Imparo is a hardware- and workload-adaptive LLM inference engine built in Rust
+with native Metal, CUDA, and CPU backends. It brings model execution,
+measurement-driven hardware tuning, and persistent inference state into one runtime.
 
 Execution adapts to the model architecture, hardware topology, and live workload
 shape—from short decode steps to long prefills and repeated-prefix workloads.
@@ -30,7 +30,7 @@ shape—from short decode steps to long prefills and repeated-prefix workloads.
   keeping the hot path compact and giving each architecture an execution path
   designed around its actual operators and state.
 
-- **Fitted to the machine.** Imparo reads the model and device geometry, then
+- **Fitted to your hardware.** Imparo reads the model and device geometry, then
   measures only the execution choices that cannot be safely derived. Tuning is
   tied to the exact model, hardware, backend, and engine version that produced it.
 
@@ -49,7 +49,7 @@ shape—from short decode steps to long prefills and repeated-prefix workloads.
 
 - **Correctness-gated optimization.** Candidate optimizations must preserve
   model outputs and state transitions before they can be selected. Performance
-  results remain bound to the configuration and machine that produced them.
+  results remain bound to the configuration and hardware that produced them.
 
 ## Quick Start
 
@@ -93,7 +93,7 @@ should be treated as experimental until explicitly validated.
 ## Contributing
 
 Contributions are welcome across model support, Metal and CUDA kernels, hardware
-validation, per-machine tuning, KV and state management, correctness testing,
+validation, hardware-specific tuning, KV and state management, correctness testing,
 benchmarks, tooling, and documentation.
 
 Performance contributions should include a reproducible baseline and the
