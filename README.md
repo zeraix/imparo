@@ -2,12 +2,12 @@
 
 <img src="assets/imparo-wordmark-black.png" alt="Imparo by Zeraix" width="560" />
 
-### Local inference, fitted to your hardware.
+### LLM inference, fitted to your hardware.
 
-**An independent, hardware-adaptive inference engine for local models.**
+**An independent, hardware-adaptive LLM inference engine.**
 
-[Features](#why-imparo) ·
-[Status](#current-status) ·
+[Why Imparo](#why-imparo) ·
+[Quick Start](#quick-start) ·
 [Contributing](#contributing) ·
 [Issues](https://github.com/zeraix/imparo/issues)
 
@@ -17,51 +17,76 @@
 
 ## About
 
-Imparo is built around a Rust runtime with direct Metal, CUDA, and CPU backends.
-It adapts model execution to the hardware, model architecture, and request shape
-it runs with.
+Imparo is an independent LLM inference engine built around a Rust runtime and
+direct Metal, CUDA, and CPU backends. It fits model execution to the hardware,
+model architecture, and shape of the workload instead of assuming one fixed
+deployment environment.
 
 GGUF is an input format; model execution is implemented by Imparo rather than
 delegated to llama.cpp, GGML, or a general-purpose machine-learning framework.
 
 ## Why Imparo
 
-- **Lean, direct execution.** Model workflows call backend kernels directly,
-  without a general graph runtime, heavyweight scheduler, or runtime-fusion layer.
+- **Fitted to the machine.** Imparo reads the model and device geometry, then
+  measures only the execution choices that cannot be safely derived. Tuning is
+  tied to the exact model, hardware, backend, and engine version that produced it.
 
-- **Tuned to the machine.** Imparo profiles the device, reads model geometry from
-  GGUF, and benchmarks only the execution choices that cannot be safely derived.
+- **Shaped by the workload.** Prefill, decode, attention, KV, and narrow-batch
+  paths can be selected from the current token width, context depth, cache
+  format, prefix reuse, and per-layer model structure.
 
-- **Shaped by the request.** Decode, narrow-batch, prefill, attention, and KV
-  paths are selected from the current token width, context depth, KV format,
-  prefix reuse, and per-layer model structure.
+- **Persistent, paged state.** Content-addressed state allows matching prefixes
+  to be reused across conversations, while inactive KV and recurrent state can
+  move between memory and disk under explicit resource limits. This is designed
+  for multi-turn conversations, repeated tool use, and long-running workloads.
 
-- **State built for repeated work.** Content-addressed paged state allows
-  matching prefixes to be reused across conversations. Inactive state can be
-  managed across memory and disk under explicit resource limits.
+- **Memory-efficient model-native acceleration.** Imparo's native MTP research
+  reuses target-model components and keeps only the architecture-specific
+  auxiliary state, rather than loading a complete second draft model.
 
-- **Evidence before claims.** Optimizations are checked for correctness and
-  determinism before adoption. Performance results remain tied to the exact
-  model, hardware, configuration, and engine version that produced them.
+## Quick Start
 
-## Current Status
+Build Imparo from source with Rust 1.85 or later:
 
-Apple Silicon with Metal is the primary development and validation platform
-today. The CUDA backend is under active hardware-specific validation, and the
-CPU backend provides a reference and fallback path.
+```sh
+git clone https://github.com/zeraix/imparo.git
+cd imparo
+cargo build --release --locked --bin imparo-server
+```
 
-Current model work focuses on Gemma4 E4B and LFM2.5. Broader model coverage,
-sampling, continuous batching, and additional hardware validation are in
-progress.
+Start the server with a supported GGUF model. On Apple Silicon, enable the Metal
+backend with `IMPARO_GPU=1`:
 
-Imparo is under active development. Support claims apply only to the model,
-weight format, KV format, backend, and hardware combinations that have been
-explicitly validated.
+```sh
+IMPARO_GPU=1 ./target/release/imparo-server \
+  --model /path/to/model.gguf \
+  --port 8420 \
+  --ctx 4096
+```
+
+Send an OpenAI-compatible chat-completion request:
+
+```sh
+curl http://127.0.0.1:8420/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "imparo",
+    "messages": [
+      {"role": "user", "content": "Explain why low-latency inference matters."}
+    ],
+    "max_tokens": 128,
+    "stream": false
+  }'
+```
+
+Backend and model support is qualification-specific. Apple Silicon with Metal is
+the primary development and validation path today; other backend combinations
+should be treated as experimental until explicitly validated.
 
 ## Contributing
 
-Contributions are welcome across model support, Metal and CUDA kernels,
-hardware validation, tuning, KV and state management, correctness testing,
+Contributions are welcome across model support, Metal and CUDA kernels, hardware
+validation, per-machine tuning, KV and state management, correctness testing,
 benchmarks, tooling, and documentation.
 
 Performance contributions should include a reproducible baseline and the
