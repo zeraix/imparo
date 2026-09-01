@@ -7,6 +7,7 @@
 **Native model execution, measurement-driven tuning, and persistent inference state—unified in a Rust runtime.**
 
 [Why Imparo](#why-imparo) ·
+[Latest Updates](#latest-updates) ·
 [Quick Start](#quick-start) ·
 [Contributing](#contributing) ·
 [Issues](https://github.com/zeraix/imparo/issues)
@@ -50,6 +51,18 @@ shape—from short decode steps to long prefills and repeated-prefix workloads.
 - **Correctness-gated optimization.** Candidate optimizations must preserve
   model outputs and state transitions before they can be selected. Performance
   results remain bound to the configuration and hardware that produced them.
+
+## Latest Updates
+
+Updates below reflect code already merged into the public `main` branch.
+Model and backend availability remains qualification-specific.
+
+- **[2026-08-25]** Published the initial Rust runtime with an OpenAI-compatible
+  chat-completions server.
+- **[2026-08-25]** Published initial Gemma 4 and LFM2 architecture support with
+  native CPU and Metal execution paths.
+- **[2026-08-25]** Published content-addressed paged inference state with
+  in-memory reuse and disk-backed persistence.
 
 ## Quick Start
 
