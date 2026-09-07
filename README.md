@@ -126,6 +126,17 @@ Ahead on every cell but one: LFM2's short-prompt decode ties oMLX (46.6 against 
 Updates below reflect code already merged into the public `main` branch.
 Model and backend availability remains qualification-specific.
 
+- **[2026-09-07]** Published Metal megakernel decode for Gemma 4 E4B and LFM2,
+  reducing GPU dispatches per token from about 180 to 42 and from 34 to 5,
+  respectively, with unsupported layers and failed regions safely returning to
+  the ordinary dispatch path.
+- **[2026-09-07]** Published interleaved Apple M3 Pro benchmarks for short,
+  medium, and long prefill and decode workloads against llama.cpp, oMLX, and
+  rapid-mlx.
+- **[2026-09-07]** Documented the model-plan/backend-kernel boundary and the
+  measurement- and correctness-gated process used to select hardware- and
+  workload-specific execution paths.
+
 - **[2026-08-25]** Published the initial Rust runtime with an OpenAI-compatible
   chat-completions server.
 - **[2026-08-25]** Published initial Gemma 4 and LFM2 architecture support with
