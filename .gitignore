@@ -1,13 +1,20 @@
 /build/
 /target/
+/target-*/
 /evidence/
 /dist/
 /models/
 /reference/
 /.zeraix/
+/.imparo/
 /.claude/
 /config/dev-evidence-registry.local.json
 /experiments/
+/artifacts/
+/*.exe
+/*.obj
+/tmp-*.bin
+/identity_paged_split.patch
 *.air
 *.metallib
 *.dSYM/
@@ -21,3 +28,6 @@ __pycache__/
 dev_harness/results/
 dev_harness/tmp/
 dev_harness/metal_visibility_repro/repro
+# Kernel-lab AOT outputs are reproducible build artifacts. Keep metadata and
+# source in Git; regenerate architecture-specific modules during validation.
+program-packs/lab/**/modules/*.cubin

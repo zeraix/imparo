@@ -106,13 +106,17 @@ fn fit(spans: &[f64], times: &[f64]) -> Line {
     let n = spans.len() as f64;
     let xbar = spans.iter().sum::<f64>() / n;
     let ybar = times.iter().sum::<f64>() / n;
-    let sxx: f64 = spans.iter().map(|x| (x - xbar) * (x - xbar)).sum();
-    let sxy: f64 = spans
+    let span_variance: f64 = spans.iter().map(|x| (x - xbar) * (x - xbar)).sum();
+    let covariance: f64 = spans
         .iter()
         .zip(times)
         .map(|(x, y)| (x - xbar) * (y - ybar))
         .sum();
-    let marginal = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    let marginal = if span_variance > 0.0 {
+        covariance / span_variance
+    } else {
+        0.0
+    };
     let fixed = ybar - marginal * xbar;
     let worst_rel = spans
         .iter()
@@ -201,8 +205,14 @@ pub fn estimate(samples: &[Sample]) -> Verdict {
         return Verdict::Crossing {
             span: f64::from(samples[0].span),
             // No fit was used, and saying so beats printing invented coefficients.
-            hi: LineOut { fixed: 0.0, marginal: 0.0 },
-            lo: LineOut { fixed: 0.0, marginal: 0.0 },
+            hi: LineOut {
+                fixed: 0.0,
+                marginal: 0.0,
+            },
+            lo: LineOut {
+                fixed: 0.0,
+                marginal: 0.0,
+            },
         };
     }
     if samples.iter().all(|s| s.lo_us <= s.hi_us * eps) {
@@ -298,8 +308,7 @@ pub fn settle_to_ladder(estimate: f64, current: u32, ladder: &[u32]) -> u32 {
         .iter()
         .copied()
         .min_by(|&a, &b| {
-            logd(f64::from(a), estimate)
-                .total_cmp(&logd(f64::from(b), estimate))
+            logd(f64::from(a), estimate).total_cmp(&logd(f64::from(b), estimate))
         })
         .unwrap_or(current);
     // Hysteresis: hold the current value unless the estimate is more than half a rung
@@ -343,11 +352,21 @@ mod tests {
 
     fn s(span: u32, hi_us: f64, lo_us: f64) -> Sample {
         // Noiseless by default: the fit tests are about the model, not the scatter band.
-        Sample { span, hi_us, lo_us, noise: 0.0 }
+        Sample {
+            span,
+            hi_us,
+            lo_us,
+            noise: 0.0,
+        }
     }
 
     fn sn(span: u32, hi_us: f64, lo_us: f64, noise: f64) -> Sample {
-        Sample { span, hi_us, lo_us, noise }
+        Sample {
+            span,
+            hi_us,
+            lo_us,
+            noise,
+        }
     }
 
     /// The real f16 ladder: score-tile ahead at the shallow rungs, streaming ahead from
@@ -442,7 +461,9 @@ mod tests {
             s(32768, 7860.1, 11841.4),
         ];
         match estimate(&samples) {
-            Verdict::Crossing { span, .. } => assert!((span - 2048.0).abs() < 1.0, "span {span}"),
+            Verdict::Crossing { span, .. } => {
+                assert!((span - 2048.0).abs() < 1.0, "span {span}");
+            }
             v => panic!("expected a crossing at the lowest rung, got {v:?}"),
         }
     }

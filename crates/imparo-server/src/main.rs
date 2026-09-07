@@ -9,9 +9,8 @@
 // The chat codec comes from the PLAN, not from an architecture named here. It has to be
 // reachable before the model is built: the template sniff below runs at load.
 use imparo_model::chat::{Channel, ChatCodec};
-mod disk;
+mod host_fit;
 mod http;
-mod pool;
 mod template;
 
 use std::io::Write;
@@ -52,11 +51,11 @@ struct Engine {
     store: Option<imparo_kv::Store>,
     /// The disk tier's writer. Every write goes through it, in order, off the
     /// request thread; reads still go straight to `store`.
-    disk: Option<disk::DiskQueue>,
+    disk: Option<imparo_kv::disk::DiskQueue>,
     root: imparo_kv::ConfigRoot,
     /// Pool residency mode (default on with a GPU): multi-conversation one-copy
     /// KV. IMPARO_KV_POOL=0 reverts to the single-resident legacy path.
-    pool: Option<pool::PoolMode>,
+    pool: Option<imparo_kv::pool::PoolMode>,
     disk_cap: u64,
     /// Label the resident KV belongs to (the client's conversation id, or a
     /// content-derived name for keyless traffic). Deletion must be able to drop
@@ -68,12 +67,87 @@ struct Engine {
     resident: Vec<u32>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum PoolEligibility {
+    DisabledByConfig,
+    NoPooledLayers,
+    NoBackend,
+    BackendNotSelected,
+    UnsafeCaps(Vec<imparo_backend::PoolCapsIssue>),
+    UnsafeCutGrid {
+        finest_cut_tokens: u32,
+        grid_tokens: usize,
+    },
+    Ready(imparo_backend::PoolAddressing),
+}
+
+/// Pure server-side admission decision for the common KV pool.
+///
+/// Environment parsing and model/backend discovery stay at the caller. Keeping the
+/// priority here explicit guarantees that `IMPARO_KV_POOL=0` cannot be overridden by a
+/// capable backend, and lets the no-backend path remain a quiet no-op.
+fn pool_eligibility(
+    pool_requested: bool,
+    has_pooled_layers: bool,
+    backend_selected: bool,
+    caps: Option<imparo_backend::PoolCaps>,
+) -> PoolEligibility {
+    if !pool_requested {
+        return PoolEligibility::DisabledByConfig;
+    }
+    if !has_pooled_layers {
+        return PoolEligibility::NoPooledLayers;
+    }
+    let Some(caps) = caps else {
+        return PoolEligibility::NoBackend;
+    };
+    // v2 derives the placement page/grid from the backend declaration. Keep the
+    // independent numerical cut invariant: the page may be coarser than the kernel's
+    // finest safe cut, but it must be an exact multiple of it.
+    let grid_tokens = imparo_kv::grid_tokens();
+    if caps.finest_cut_tokens == 0 || grid_tokens % caps.finest_cut_tokens as usize != 0
+    {
+        return PoolEligibility::UnsafeCutGrid {
+            finest_cut_tokens: caps.finest_cut_tokens,
+            grid_tokens,
+        };
+    }
+    let addressing = match caps.validate_for_pool(caps.page_cells) {
+        Ok(addressing) => addressing,
+        Err(issues) => return PoolEligibility::UnsafeCaps(issues),
+    };
+    if !backend_selected {
+        return PoolEligibility::BackendNotSelected;
+    }
+    PoolEligibility::Ready(addressing)
+}
+
+/// The current explicit mover demotes an outgoing conversation before it promotes
+/// the incoming one. At the worst boundary both can occupy a complete device arena:
+/// one in Host and one on Device. Requiring room for both prevents a capacity cycle
+/// where neither side can move first. This floor is derived from the allocator's
+/// runtime capacity; it is not a model or SM constant.
+fn host_fit_policy_for_device_blocks(
+    capacity_blocks: u32,
+) -> Option<host_fit::HostFitPolicy> {
+    let device_units = u64::from(capacity_blocks)
+        / u64::try_from(imparo_kv::resident::UNIT_BLOCKS).ok()?;
+    if device_units == 0 {
+        return None;
+    }
+    let policy = host_fit::HostFitPolicy {
+        minimum_units: device_units.checked_mul(2)?,
+        ..host_fit::HostFitPolicy::default()
+    };
+    Some(policy)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_path = None;
     let mut port = 8420_u16;
-    let mut ctx = 4096_usize;
-    let mut ctk: Option<String> = None;
-    let mut ctv: Option<String> = None;
+    let mut context_length = 4096_usize;
+    let mut cache_key_type: Option<String> = None;
+    let mut cache_value_type: Option<String> = None;
     let mut template_file: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -81,15 +155,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-m" | "--model" => model_path = args.next().map(PathBuf::from),
             "--port" => port = args.next().and_then(|v| v.parse().ok()).unwrap_or(port),
             "-c" | "--ctx" => {
-                ctx = args.next().and_then(|v| v.parse().ok()).unwrap_or(ctx);
+                context_length = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(context_length);
             }
             "--parallel" | "-md" | "--mmproj" => {
                 let _ = args.next();
             }
             // KV cache types, like llama.cpp's -ctk/-ctv: f16 (default) | q4_0 | q8_0.
             // USER CONFIG, not a tuned knob.
-            "-ctk" | "--cache-type-k" => ctk = args.next(),
-            "-ctv" | "--cache-type-v" => ctv = args.next(),
+            "-ctk" | "--cache-type-k" => cache_key_type = args.next(),
+            "-ctv" | "--cache-type-v" => cache_value_type = args.next(),
             // A user-supplied jinja template file overriding the GGUF-embedded one
             // (llama.cpp's --chat-template-file).
             "--chat-template-file" => template_file = args.next().map(PathBuf::from),
@@ -103,9 +180,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only configure when a flag was given: with no flags the engine falls back to the
     // IMPARO_CTK/IMPARO_CTV environment (probe binaries and harnesses use that), and
     // pinning f16 here would silently split the host sizing from the Metal path.
-    if ctk.is_some() || ctv.is_some() {
-        let k = ctk.as_deref().unwrap_or("f16");
-        let v = ctv.as_deref().unwrap_or("f16");
+    if cache_key_type.is_some() || cache_value_type.is_some() {
+        let k = cache_key_type.as_deref().unwrap_or("f16");
+        let v = cache_value_type.as_deref().unwrap_or("f16");
         if !imparo_model::host::configure_kv_types(k, v) {
             return Err(
                 format!("bad cache type: k={k} v={v} (f16 | q4_0 | q8_0)").into()
@@ -123,7 +200,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chat = imparo_model::chat::codec(&plan)?;
     imparo_model::host::log_footprint("plan");
     let mut weights = Weights::open_with(&document, &path)?;
-    imparo_model::backend::enable_gpu(&mut weights, &plan)?;
+    imparo_model::backend::enable_gpu(
+        &mut weights,
+        &plan,
+        context_length,
+        imparo_model::prefill_batch(),
+    )?;
     // Chat template (task #15). Source order: --chat-template-file, then the
     // GGUF-embedded tokenizer.chat_template, then this architecture's own codec.
     // A user FILE that fails to compile is fatal (they asked for it); an embedded
@@ -153,6 +235,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match template::Template::compile(src) {
             Ok(t) => {
                 sniff(src, "embedded");
+                if imparo_model::log_on() {
+                    eprintln!(
+                        "[imparo] chat: embedded template in use; tool-call arguments \
+                         rendered as {}",
+                        if t.requires_object_arguments() {
+                            "objects"
+                        } else {
+                            "the strings given"
+                        }
+                    );
+                }
                 Some(t)
             }
             Err(e) => {
@@ -183,13 +276,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The model file declares its trained context; that is the operational
     // limit for THIS model. The engine itself is length-clean far beyond it.
     let trained = plan.config.context_length as usize;
-    if ctx > trained {
+    if context_length > trained {
         eprintln!(
-            "[imparo] -c {ctx} exceeds the model's trained context {trained}; clamping"
+            "[imparo] -c {context_length} exceeds the model's trained context {trained}; clamping"
         );
-        ctx = trained;
+        context_length = trained;
     }
-    let mut model = imparo_model::load(weights, plan, ctx)?;
+    let mut model = imparo_model::load(weights, plan, context_length)?;
+    // Device setup and any selected persistent transformed-weight cache are model
+    // admission work, not a tax on the first user request. CPU execution and backends
+    // without such a cache retain their established path.
+    if imparo_model::backend::active().is_some() {
+        model.ensure_gpu_ready()?;
+    }
     // Startup allocates and frees a lot -- the GGUF document, the merge list, the token
     // strings the blob replaced. Hand it back before the server starts serving.
     imparo_model::host::release_free_memory();
@@ -198,7 +297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     imparo_model::host::release_free_memory();
     imparo_model::host::log_footprint("model prepare");
     eprintln!(
-        "[imparo] loaded ms={:.0} ctx={ctx} vocab={}",
+        "[imparo] loaded ms={:.0} ctx={context_length} vocab={}",
         t0.elapsed().as_secs_f64() * 1e3,
         tok.vocab_size()
     );
@@ -212,11 +311,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The disk tier: on by default (durability is the point); IMPARO_KV_DISK=0
     // turns it off, IMPARO_KV_DIR moves it, IMPARO_KV_DISK_CAP_GB caps it (LRU).
     let digest = imparo_model::kv::model_digest(&path).map_err(|e| e.clone())?;
-    let root = imparo_model::kv::config_root(model.plan(), &digest);
-    let store = if std::env::var("IMPARO_KV_DISK").is_ok_and(|v| v == "0") {
+    let root = imparo_model::kv::config_root(
+        model.plan(),
+        &digest,
+        &imparo_model::backend::active()
+            .map_or_else(|| "none".to_string(), imparo_backend::Backend::device_tag),
+    );
+    let disk_base = if std::env::var("IMPARO_KV_DISK").is_ok_and(|v| v == "0") {
         None
     } else {
-        let dir = std::env::var("IMPARO_KV_DIR").map_or_else(
+        Some(std::env::var("IMPARO_KV_DIR").map_or_else(
             |_| {
                 std::env::var("HOME")
                     .map_or_else(|_| PathBuf::from("."), PathBuf::from)
@@ -224,18 +328,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .join("kv")
             },
             PathBuf::from,
-        );
-        match imparo_kv::Store::open(&dir, &root) {
-            Ok(st) => {
-                eprintln!("[imparo] kv disk tier at {}", dir.display());
-                Some(st)
-            }
-            Err(e) => {
-                eprintln!("[imparo] kv disk tier DISABLED ({e})");
-                None
-            }
-        }
+        ))
     };
+    let store =
+        disk_base
+            .as_ref()
+            .and_then(|dir| match imparo_kv::Store::open(dir, &root) {
+                Ok(st) => {
+                    eprintln!("[imparo] kv disk tier at {}", dir.display());
+                    Some(st)
+                }
+                Err(e) => {
+                    eprintln!("[imparo] kv disk tier DISABLED ({e})");
+                    None
+                }
+            });
     let disk_cap = std::env::var("IMPARO_KV_DISK_CAP_GB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -248,41 +355,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[imparo] kv pregrow failed: {e}");
         }
     }
-    // A backend that cannot index KV through a block table cannot host the pool: the
-    // pool's whole placement model is "the table says where a position lives", and
-    // installing one for a kernel that ignores it reads somebody else's rows and answers
-    // with the wrong tokens -- silently, because nothing fails. `paged_reads` is the
-    // backend's own declaration of that capability; this is what makes it load-bearing
-    // rather than documentation. Such a backend runs the legacy single-resident path,
-    // which is correct, just not shared.
-    // `block_cells` is the other half of the same contract: the pool places on a 64-cell
-    // grid (`UNIT_BLOCKS = UNIT_TOKENS / 64`) and the engine gate proves byte-identity on
-    // it. A backend whose attention tiles at some other width would have its declaration
-    // ignored and its table read wrong, exactly as paged_reads was.
+    // PoolCaps is a safety contract, not backend documentation. In addition to paged
+    // reads and the byte-identity grid, validate the address-space/tier topology. This
+    // keeps today's discrete CUDA backend on the correct single-resident path until it
+    // has both paged attention and an implemented Device -> Host mover. Metal's unified
+    // path does not change and, importantly, never pretends to perform a host transfer.
     let caps = imparo_model::backend::active().map(imparo_backend::Backend::pool_caps);
-    let usable = caps.is_some_and(|c| c.paged_reads && c.block_cells as usize == 64);
-    let pool_mode = if std::env::var("IMPARO_KV_POOL").is_ok_and(|v| v == "0")
-        || !model.plan().layers.iter().any(|_| true)
-    {
-        None
-    } else if imparo_model::backend::active().is_some() && !usable {
-        let c = caps.unwrap_or(imparo_backend::PoolCaps {
-            block_cells: 0,
-            paged_reads: false,
-            shared_address: false,
-            tiers: &[],
-        });
-        eprintln!(
-            "[imparo] kv pool DISABLED: this backend declares paged_reads={} \
-block_cells={}, and the pool needs true/64 -- a block table would be installed and \
-misread; running the single-resident path",
-            c.paged_reads, c.block_cells
-        );
-        None
-    } else if imparo_model::backend::active().is_some()
-        && std::env::var("IMPARO_GPU").is_ok_and(|v| v != "0" && !v.is_empty())
-    {
-        match model.kv_prepare_pool() {
+    let eligibility = pool_eligibility(
+        !std::env::var("IMPARO_KV_POOL").is_ok_and(|v| v == "0"),
+        model.plan().layers.iter().any(|_| true),
+        std::env::var("IMPARO_GPU").is_ok_and(|v| v != "0" && !v.is_empty()),
+        caps,
+    );
+    let pool_mode = match eligibility {
+        PoolEligibility::DisabledByConfig
+        | PoolEligibility::NoPooledLayers
+        | PoolEligibility::NoBackend
+        | PoolEligibility::BackendNotSelected => None,
+        PoolEligibility::UnsafeCaps(issues) => {
+            let c = caps.expect("unsafe caps came from an active backend");
+            let reasons = issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            eprintln!(
+                "[imparo] kv pool DISABLED: unsafe backend caps ({reasons}); \
+shared_address={}, tiers={:?}; running the single-resident path",
+                c.shared_address, c.tiers
+            );
+            None
+        }
+        PoolEligibility::UnsafeCutGrid {
+            finest_cut_tokens,
+            grid_tokens,
+        } => {
+            eprintln!(
+                "[imparo] kv pool DISABLED: attention kernels require a \
+{finest_cut_tokens}-token cut, which does not divide the {grid_tokens}-token \
+placement grid; running the single-resident path"
+            );
+            None
+        }
+        PoolEligibility::Ready(addressing) => match model.kv_prepare_pool() {
             Ok(()) => {
                 let layers = model.kv_full_layers();
                 let blocks = model.kv_capacity_blocks();
@@ -290,26 +405,106 @@ misread; running the single-resident path",
                     "[imparo] kv pool: {} full-attention layers, {blocks} blocks/layer",
                     layers.len()
                 );
-                let strides = model
+                let strides: std::collections::BTreeMap<u32, (usize, usize)> = model
                     .kv_state_geometry()
                     .into_iter()
                     .filter(|g| matches!(g.kind, imparo_kv::StateKind::Full))
                     .map(|g| (g.layer, (g.k_stride, g.v_stride)))
                     .collect();
-                Some(pool::PoolMode::new(
-                    layers,
-                    blocks,
-                    model.kv_checkpoint_slack(),
-                    strides,
-                ))
+                // The pool's own unit size, not a second computation of it. This
+                // multiplied the same strides by UNIT_TOKENS (256) while the pool
+                // allocates and charges grid units (64), so the Host tier was sized
+                // in units four times the ones it would actually hold.
+                let unit_bytes =
+                    u64::try_from(imparo_kv::pool::unit_bytes(&strides)).ok();
+                let host_capacity_bytes = match addressing {
+                    imparo_backend::PoolAddressing::Shared => None,
+                    imparo_backend::PoolAddressing::ExplicitHostTransfers => {
+                        let user_cap = match std::env::var("IMPARO_KV_HOST_MAX_MB") {
+                            Ok(value) => value
+                                .parse::<u64>()
+                                .ok()
+                                .and_then(|mb| mb.checked_mul(1 << 20))
+                                .map(Some)
+                                .ok_or(()),
+                            Err(std::env::VarError::NotPresent) => Ok(None),
+                            Err(std::env::VarError::NotUnicode(_)) => Err(()),
+                        };
+                        match user_cap {
+                            Err(()) => {
+                                eprintln!(
+                                    "[imparo] kv Host tier DISABLED: InvalidConfig(\"IMPARO_KV_HOST_MAX_MB\")"
+                                );
+                                None
+                            }
+                            Ok(user_cap) => {
+                                let profile = imparo_model::backend::active()
+                                    .and_then(imparo_backend::Backend::kv_host_profile);
+                                let policy = host_fit_policy_for_device_blocks(blocks);
+                                let decision = match (profile, unit_bytes, policy) {
+                                    (Some(profile), Some(unit_bytes), Some(policy)) => {
+                                        host_fit::probe_and_fit_host_tier(
+                                            profile,
+                                            unit_bytes,
+                                            store
+                                                .as_ref()
+                                                .and(disk_base.as_deref()),
+                                            user_cap,
+                                            policy,
+                                        )
+                                    }
+                                    (None, _, _) => host_fit::HostFitDecision::Disabled(
+                                        host_fit::HostFitDisabled::UnknownOrZero(
+                                            host_fit::HostFact::AvailableHostBytes,
+                                        ),
+                                    ),
+                                    (_, None, _) | (_, _, None) => {
+                                        host_fit::HostFitDecision::Disabled(
+                                            host_fit::HostFitDisabled::ArithmeticOverflow(
+                                                host_fit::ArithmeticSite::CapacityBytes,
+                                            ),
+                                        )
+                                    }
+                                };
+                                match decision {
+                                    host_fit::HostFitDecision::Enabled(fit) => {
+                                        eprintln!(
+                                            "[imparo] kv Host tier ENABLED: {fit:?}"
+                                        );
+                                        Some(fit.capacity_bytes)
+                                    }
+                                    host_fit::HostFitDecision::Disabled(reason) => {
+                                        eprintln!(
+                                            "[imparo] kv Host tier DISABLED: {reason:?}"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                if addressing == imparo_backend::PoolAddressing::ExplicitHostTransfers
+                    && host_capacity_bytes.is_none()
+                {
+                    None
+                } else {
+                    Some(imparo_kv::pool::PoolMode::new(
+                        addressing,
+                        host_capacity_bytes,
+                        layers,
+                        blocks,
+                        model.kv_checkpoint_slack(),
+                        strides,
+                        root,
+                    ))
+                }
             }
             Err(e) => {
                 eprintln!("[imparo] kv pool DISABLED ({e})");
                 None
             }
-        }
-    } else {
-        None
+        },
     };
     // Tokenized ONCE. The branch-point scan needs the ids, and re-encoding a
     // dozen characters per request is pointless; more to the point, doing it here
@@ -328,54 +523,54 @@ by re-rendering (slower)",
     // a finished turn, a new user message). The scan is the fast path and the re-render
     // is what it replaces, so if the two disagree the answer is not "use the fast one" --
     // it is "this template needs the slow one", and the request path is told which.
-    let scan_trusted = !user_open.is_empty()
-        && {
-            let probe = |n: usize| -> Vec<u32> {
-                let msgs: Vec<Value> = vec![
-                    json!({"role": "system", "content": "You are a probe."}),
-                    json!({"role": "user", "content": "first question"}),
-                    json!({"role": "assistant", "content": "first answer"}),
-                    json!({"role": "user", "content": "second question"}),
-                ];
-                let tools: Vec<Value> = vec![json!({
-                    "type": "function",
-                    "function": {"name": "probe", "description": "A probe tool.",
-                                 "parameters": {"type": "object", "properties": {}}},
-                })];
-                let text = render_chat_prompt(
-                    TEMPLATE.get().and_then(Option::as_ref),
-                    chat,
-                    &msgs[..n],
-                    &tools,
-                    n == msgs.len(),
-                    tok.add_bos,
-                    &bos_text,
-                );
-                tok.encode(&text, true)
-            };
-            let full = probe(4);
-            let head = probe(3);
-            let expect = full.iter().zip(&head).take_while(|(a, b)| a == b).count();
-            let scanned = last_subsequence(&full, &user_open);
-            let ok = scanned == Some(expect);
-            if ok {
-                // Positively, not by silence: an empty log would also be what a probe
-                // that never ran looks like.
-                if imparo_model::log_on() {
-                    eprintln!(
-                        "[imparo] chat: turn-opener scan agrees with the re-render at \
-{expect} on the probe conversation"
-                    );
-                }
-            } else {
+    let scan_trusted = !user_open.is_empty() && {
+        let probe = |n: usize| -> Vec<u32> {
+            let msgs: Vec<Value> = vec![
+                json!({"role": "system", "content": "You are a probe."}),
+                json!({"role": "user", "content": "first question"}),
+                json!({"role": "assistant", "content": "first answer"}),
+                json!({"role": "user", "content": "second question"}),
+            ];
+            let tools: Vec<Value> = vec![json!({
+                "type": "function",
+                "function": {"name": "probe", "description": "A probe tool.",
+                             "parameters": {"type": "object", "properties": {}}},
+            })];
+            let text = render_chat_prompt(
+                TEMPLATE.get().and_then(Option::as_ref),
+                chat,
+                &msgs[..n],
+                &tools,
+                n == msgs.len(),
+                tok.add_bos,
+                &bos_text,
+                &template_kwargs(&Value::Null),
+            );
+            tok.encode(&text, true)
+        };
+        let full = probe(4);
+        let head = probe(3);
+        let expect = full.iter().zip(&head).take_while(|(a, b)| a == b).count();
+        let scanned = last_subsequence(&full, &user_open);
+        let ok = scanned == Some(expect);
+        if ok {
+            // Positively, not by silence: an empty log would also be what a probe
+            // that never ran looks like.
+            if imparo_model::log_on() {
                 eprintln!(
-                    "[imparo] chat: the turn-opener scan says {scanned:?} where a \
-re-render says {expect}; branch points will be found by re-rendering (slower)"
+                    "[imparo] chat: turn-opener scan agrees with the re-render at \
+{expect} on the probe conversation"
                 );
             }
-            ok
-        };
-    let disk = store.clone().map(disk::DiskQueue::new);
+        } else {
+            eprintln!(
+                "[imparo] chat: the turn-opener scan says {scanned:?} where a \
+re-render says {expect}; branch points will be found by re-rendering (slower)"
+            );
+        }
+        ok
+    };
+    let disk = store.clone().map(imparo_kv::disk::DiskQueue::new);
     let engine = Arc::new(Mutex::new(Engine {
         model,
         tok,
@@ -383,7 +578,7 @@ re-render says {expect}; branch points will be found by re-rendering (slower)"
         bos_text,
         user_open,
         scan_trusted,
-        ctx,
+        ctx: context_length,
         store,
         disk,
         root,
@@ -426,7 +621,9 @@ re-render says {expect}; branch points will be found by re-rendering (slower)"
             // to write -- but "usually" is not durability. The drain is what makes
             // process exit mean the bytes are on disk.
             if let Some(dq) = disk.as_ref() {
-                dq.drain();
+                if let Err(e) = dq.drain() {
+                    eprintln!("[imparo] kv shutdown barrier: {e}");
+                }
             }
             std::process::exit(0);
         });
@@ -497,10 +694,31 @@ fn conversation_label(conversation: &str, hashes: &[imparo_kv::UnitHash]) -> Str
     if conversation != "default" {
         return conversation.to_string();
     }
-    hashes.last().map_or_else(
-        || "keyless".to_string(),
-        |h| format!("keyless-{}", h.hex()),
-    )
+    hashes
+        .last()
+        .map_or_else(|| "keyless".to_string(), |h| format!("keyless-{}", h.hex()))
+}
+
+/// The template variables a request sets (`chat_template_kwargs`, llama.cpp's field), with
+/// llama-server's policy applied so both servers render the same prompt for the same
+/// request: `enable_thinking` is true unless the request says `false` or asks for
+/// `reasoning_effort: "none"`. The model's own template defaults `enable_thinking` to
+/// false when nothing sets it, which is what the MLX servers render; llama-server and
+/// this server default it to true.
+fn template_kwargs(body: &Value) -> serde_json::Map<String, Value> {
+    let mut kwargs = body
+        .get("chat_template_kwargs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let effort_none =
+        body.get("reasoning_effort").and_then(Value::as_str) == Some("none");
+    let thinking = match kwargs.get("enable_thinking") {
+        Some(Value::Bool(b)) => *b && !effort_none,
+        _ => !effort_none,
+    };
+    kwargs.insert("enable_thinking".to_string(), Value::Bool(thinking));
+    kwargs
 }
 
 fn render_chat_prompt(
@@ -511,18 +729,21 @@ fn render_chat_prompt(
     add_generation_prompt: bool,
     tokenizer_adds_bos: bool,
     bos_text: &str,
+    kwargs: &serde_json::Map<String, Value>,
 ) -> String {
     let mut prompt = match template {
-        Some(t) => match t.render(messages, tools, add_generation_prompt, bos_text) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "[imparo] chat template render failed ({e}); using the built-in \
-                     renderer for this request"
-                );
-                chat.render(messages, tools, add_generation_prompt, bos_text)
+        Some(t) => {
+            match t.render(messages, tools, add_generation_prompt, bos_text, kwargs) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "[imparo] chat template render failed ({e}); using the built-in \
+                     renderer for this request (it ignores chat_template_kwargs)"
+                    );
+                    chat.render(messages, tools, add_generation_prompt, bos_text)
+                }
             }
-        },
+        }
         None => chat.render(messages, tools, add_generation_prompt, bos_text),
     };
     if tokenizer_adds_bos && !bos_text.is_empty() && prompt.starts_with(bos_text) {
@@ -552,7 +773,32 @@ fn serve_one(
         ("POST", "/kv/conversations/erase") => {
             erase_conversations(&mut stream, &req, engine)
         }
+        ("POST", "/kv/barrier") => kv_disk_barrier(&mut stream, engine),
         _ => http::json(&mut stream, 404, &json!({"error": "not found"})),
+    }
+}
+
+/// Wait until every KV write accepted before this request is durable.
+///
+/// The writer is deliberately asynchronous on the inference path.  A lifecycle
+/// harness (and an orchestrator preparing to stop the process) needs an explicit
+/// boundary that works on Windows too, where `TerminateProcess` cannot run Rust
+/// destructors or the Unix signal-driven shutdown path.
+fn kv_disk_barrier(
+    stream: &mut TcpStream,
+    engine: &Arc<Mutex<Engine>>,
+) -> std::io::Result<()> {
+    let engine = engine
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(dq) = engine.disk.as_ref() else {
+        return http::json(stream, 200, &json!({"durable": true, "disk": false}));
+    };
+    match dq.drain() {
+        Ok(()) => http::json(stream, 200, &json!({"durable": true, "disk": true})),
+        Err(error) => {
+            http::json(stream, 500, &json!({"durable": false, "error": error}))
+        }
     }
 }
 
@@ -595,7 +841,9 @@ fn erase_conversations(
         engine.resident_conv.clear();
     }
     if let Some(pl) = engine.pool.as_mut() {
-        pl.forget(&ids);
+        if let Err(error) = pl.forget(&ids) {
+            eprintln!("[imparo] kv pool erase: {error}");
+        }
     }
     let Some(store) = &engine.store else {
         return http::json(stream, 200, &json!({"erased": 0, "disk": false}));
@@ -607,12 +855,46 @@ fn erase_conversations(
     // Through the queue, so it lands behind whatever those conversations' last turns
     // were still writing: a sweep that overtook a commit would delete the units that
     // commit is about to name.
-    let swept = dq.erase_blocking(ids.clone());
+    let swept = match dq.erase_blocking(ids.clone()) {
+        Ok(swept) => swept,
+        Err(error) => {
+            return http::json(stream, 500, &json!({"error": error}));
+        }
+    };
     http::json(
         stream,
         200,
         &json!({"erased": ids.len(), "units_swept": swept}),
     )
+}
+
+fn parse_raw_input_ids(
+    body: &Value,
+    enabled: bool,
+) -> Result<Option<Vec<u32>>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    let Some(value) = body.get("input_ids") else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| "input_ids must be an array".to_string())?;
+    if values.is_empty() {
+        return Err("input_ids must not be empty".to_string());
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_u64()
+                .and_then(|token| u32::try_from(token).ok())
+                .ok_or_else(|| format!("input_ids[{index}] must be a u32"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn chat_completions(
@@ -623,6 +905,13 @@ fn chat_completions(
     let body: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(e) => return http::json(stream, 400, &json!({"error": e.to_string()})),
+    };
+    let raw_ids = match parse_raw_input_ids(
+        &body,
+        std::env::var("IMPARO_DEV_RAW_TOKENS").is_ok_and(|value| value == "1"),
+    ) {
+        Ok(ids) => ids,
+        Err(error) => return http::json(stream, 400, &json!({"error": error})),
     };
     let messages = body
         .get("messages")
@@ -643,6 +932,13 @@ fn chat_completions(
     // that shares only the preamble matches a PREFIX of that chain, which the restore
     // refuses (measured: "agrees for 4 of its 5 units, so nothing is adoptable").
     let seed = body.get("seed").and_then(Value::as_bool).unwrap_or(false);
+    if seed && raw_ids.is_some() {
+        return http::json(
+            stream,
+            400,
+            &json!({"error": "seed cannot be combined with input_ids"}),
+        );
+    }
     let max_tokens = if seed {
         0
     } else {
@@ -651,6 +947,7 @@ fn chat_completions(
             .unwrap_or(128) as usize
     };
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let kwargs = template_kwargs(&body);
     let temperature = body
         .get("temperature")
         .and_then(Value::as_f64)
@@ -678,18 +975,25 @@ fn chat_completions(
     // prefix when the tokenizer adds its own -- exactly one owner. It used to render
     // with bos empty, which is the same answer only while every tokenizer adds BOS.
     let (adds_bos, bos_text, chat) = {
-        let e = engine.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let e = engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (e.tok.add_bos, e.bos_text.clone(), e.chat)
     };
-    let prompt = render_chat_prompt(
-        TEMPLATE.get().and_then(Option::as_ref),
-        chat,
-        &messages,
-        &tools,
-        true,
-        adds_bos,
-        &bos_text,
-    );
+    let prompt = if raw_ids.is_some() {
+        String::new()
+    } else {
+        render_chat_prompt(
+            TEMPLATE.get().and_then(Option::as_ref),
+            chat,
+            &messages,
+            &tools,
+            true,
+            adds_bos,
+            &bos_text,
+            &kwargs,
+        )
+    };
     // IMPARO_DUMP_PROMPT=1: print the rendered prompt between markers, for byte-diffing
     // against llama-server's /apply-template (task #7).
     if std::env::var("IMPARO_DUMP_PROMPT").is_ok_and(|v| v == "1") {
@@ -699,7 +1003,7 @@ fn chat_completions(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let t_tok = Instant::now();
-    let mut ids = engine.tok.encode(&prompt, true);
+    let mut ids = raw_ids.unwrap_or_else(|| engine.tok.encode(&prompt, true));
     if seed {
         // WHERE DOES THE PREAMBLE END? Not at "render without a generation prompt":
         // gemma4's template writes `<|think|>` into the system block only when one is
@@ -722,6 +1026,7 @@ fn chat_completions(
                 true,
                 adds_bos,
                 &bos_text,
+                &kwargs,
             );
             e.tok.encode(&p, true)
         };
@@ -798,7 +1103,7 @@ fn chat_completions(
     if !reuse_off && engine.pool.is_some() {
         let prof = std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1");
         let t_hash = Instant::now();
-        let hashes = imparo_kv::unit_hashes(&engine.root, &ids);
+        let hashes = imparo_kv::unit_ids(&engine.root, &ids);
         let ms_hash = t_hash.elapsed().as_secs_f64() * 1e3;
         let t_branch = Instant::now();
         // Branch point: the token where the LAST user message starts. Sub-agents
@@ -825,27 +1130,30 @@ fn chat_completions(
             last_subsequence(&ids, &engine.user_open)
         };
         let re_render = !branch_off && !engine.scan_trusted;
-        let branch_pos = scanned.unwrap_or_else(|| messages
-            .iter()
-            .take(if re_render { usize::MAX } else { 0 })
-            .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            .filter(|&i| i > 0)
-            .map_or(0, |i| {
-                let head = render_chat_prompt(
-                    TEMPLATE.get().and_then(Option::as_ref),
-                    chat,
-                    &messages[..i],
-                    &tools,
-                    false,
-                    adds_bos,
-                    &bos_text,
-                );
-                let head_ids = engine.tok.encode(&head, true);
-                ids.iter()
-                    .zip(&head_ids)
-                    .take_while(|(a, b)| a == b)
-                    .count()
-            }));
+        let branch_pos = scanned.unwrap_or_else(|| {
+            messages
+                .iter()
+                .take(if re_render { usize::MAX } else { 0 })
+                .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .filter(|&i| i > 0)
+                .map_or(0, |i| {
+                    let head = render_chat_prompt(
+                        TEMPLATE.get().and_then(Option::as_ref),
+                        chat,
+                        &messages[..i],
+                        &tools,
+                        false,
+                        adds_bos,
+                        &bos_text,
+                        &kwargs,
+                    );
+                    let head_ids = engine.tok.encode(&head, true);
+                    ids.iter()
+                        .zip(&head_ids)
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                })
+        });
         // Where the two conversations diverge, moved to a point a resume can reproduce
         // (imparo_model::kv::resume_point states that rule and why).
         //
@@ -881,8 +1189,8 @@ fn chat_completions(
                 conversation_label(&conversation, &hashes)
             );
         }
-        let label = continued
-            .unwrap_or_else(|| conversation_label(&conversation, &hashes));
+        let label =
+            continued.unwrap_or_else(|| conversation_label(&conversation, &hashes));
         let ms_label = t_label.elapsed().as_secs_f64() * 1e3;
         effective_label = Some(label.clone());
         let t_begin = Instant::now();
@@ -900,7 +1208,6 @@ fn chat_completions(
                 disk.as_ref(),
                 &label,
                 &ids,
-                &hashes,
                 upper,
                 conversation == "default",
                 new_conversation,
@@ -949,47 +1256,21 @@ fn chat_completions(
         0
     };
 
-    // Not an append of the resident conversation: probe the DISK tier by content
-    // (no id consulted -- the request's own tokens are the key) and switch in.
-    // The previously resident conversation needs no switch-out work here: its
-    // state was committed at the end of its own turn (write-through).
-    let mut restored = false;
-    let mut start_pos = pool_pos.unwrap_or(start_pos);
-    if pool_pos.is_none() && start_pos == 0 && !reuse_off {
-        if let Some(store) = &engine.store {
-            let hashes = imparo_kv::unit_hashes(&engine.root, &ids);
-            if let Some((mpath, manifest)) = store.best_match(&hashes) {
-                let units: Option<Vec<Vec<u8>>> =
-                    manifest.hashes.iter().map(|h| store.get_unit(h)).collect();
-                if let (Some(units), Some(ck)) = (units, store.checkpoint_for(&mpath)) {
-                    match imparo_kv::state::state_from_blobs(&units, &ck).and_then(
-                        |st| engine.model.kv_restore(&st).map(|()| st.boundary),
-                    ) {
-                        Ok(boundary) if boundary < ids.len() => {
-                            start_pos = imparo_model::kv::resume_point(boundary, ids.len());
-                            restored = true;
-                        }
-                        Ok(boundary) => {
-                            if imparo_model::log_on() {
-                                eprintln!(
-                                    "[imparo] kv disk restore skipped: boundary {boundary} against {} prompt tokens",
-                                    ids.len()
-                                );
-                            }
-                        }
-                        // Never silent: a restore that fails looks exactly like a cold
-                        // request in the reuse numbers.
-                        Err(e) => {
-                            if imparo_model::log_on() {
-                                eprintln!("[imparo] kv disk restore failed: {e}");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let _ = restored;
+    // DISK RESTORE LIVES IN THE POOL PATH, and only there.
+    //
+    // A second restore used to sit here for the single-resident path. It could not
+    // work: it read the checkpoint through `Store::checkpoint_for`, i.e. a file beside
+    // the manifest, and nothing has ever written one -- the only writer is
+    // `put_checkpoint`, which is content-addressed at `ckpt/<hash>` and reached through
+    // `Manifest::ckpts[].blob`. So it returned None on every request and the branch was
+    // unreachable; the `restored` flag it set was discarded a few lines later.
+    //
+    // Rebuilding it is not the fix either. What the pool stores per boundary is a chain
+    // LINK (`delta_blob`), and turning links back into a state is `assemble_chain` in
+    // the pool -- a second copy here would be the same code with its own bugs. With the
+    // pool off there is no disk restore, and the pool is on wherever the backend
+    // declares `paged_reads`.
+    let start_pos = pool_pos.unwrap_or(start_pos);
 
     let id = format!("chatcmpl-imparo-{prompt_tokens}");
     if streaming {
@@ -1041,10 +1322,15 @@ fn chat_completions(
                     return http::json(stream, 500, &json!({"error": e}));
                 }
             }
-            let units = branch / 256;
-            if let Some(tip) = bhashes.get(units - 1) {
+            // A RESIDENT record: its tokens are compared by `matching_ckpts` against
+            // the stretch above the last 256-TILE, so that is the grid they are cut
+            // on. The manifest's tail is a different measurement -- above the last
+            // EXTENT -- and `commit_to_disk` derives it there rather than inheriting
+            // this one.
+            let units = branch / imparo_kv::grid_tokens();
+            if let Some(tip) = bhashes.get(units.wrapping_sub(1)) {
                 let tip = *tip;
-                let tokens = ids[units * 256..branch].to_vec();
+                let tokens = ids[units * imparo_kv::grid_tokens()..branch].to_vec();
                 let Engine { model, pool, .. } = &mut *engine;
                 if let Some(pl) = pool.as_mut() {
                     let prev = pl.prev_ckpt_at(blabel, bhashes, &ids, branch - 1);
@@ -1076,10 +1362,13 @@ fn chat_completions(
     // would hide whichever one is stalling.
     imparo_model::host::prof_log("prefill", prefill_ms);
 
-    let eos = engine.tok.eos;
-    let eot = engine.tok.eot;
+    let end_sequence_token = engine.tok.eos;
+    let end_turn_token = engine.tok.eot;
     let mut generated: Vec<u32> = Vec::new();
     let mut emitted = String::new();
+    // The generated text's bytes, appended per token: decoding the WHOLE prefix each step
+    // was quadratic in generation length (review #116, D7).
+    let mut gen_bytes: Vec<u8> = Vec::new();
     let t_decode = Instant::now();
     // Counts forwards, not tokens. The first token is free -- it comes from the prefill
     // logits -- so N tokens cost N-1 decode steps, and llama.cpp reports its decode rate
@@ -1101,13 +1390,28 @@ fn chat_completions(
     if let Some(t) = t_s {
         t_sample += t.elapsed().as_secs_f64() * 1e3;
     }
+    // PIPELINED DECODE (docs/decode-turnaround.md): the step that consumes `next` is
+    // queued before `next` is emitted, and the step after it is queued before this one's
+    // pick is read, so the GPU never waits for the host between tokens. The host learns
+    // each token one step late; on a stop the one step still queued is discarded.
+    let pipelined = engine.model.decode_pipelined() && max_tokens > 1;
+    let mut queued = false;
+    if pipelined {
+        match engine.model.queue_step(Some(next), prompt_tokens) {
+            Ok(()) => queued = true,
+            Err(e) => return http::json(stream, 500, &json!({"error": e})),
+        }
+    }
     for step in 0..max_tokens {
-        if Some(next) == eos || Some(next) == eot {
+        if Some(next) == end_sequence_token || Some(next) == end_turn_token {
             break;
         }
         generated.push(next);
         let t_d = probe.then(Instant::now);
-        let piece = engine.tok.decode(&generated);
+        engine
+            .tok
+            .decode_bytes_into(&generated[generated.len() - 1..], &mut gen_bytes);
+        let piece = String::from_utf8_lossy(&gen_bytes).into_owned();
         if let Some(t) = t_d {
             t_detok += t.elapsed().as_secs_f64() * 1e3;
         }
@@ -1153,9 +1457,26 @@ fn chat_completions(
             break;
         }
         let pos = prompt_tokens + step;
-        match engine.model.forward_next(next, pos) {
-            Ok(id) => next = id,
-            Err(_) => break,
+        if pipelined {
+            // The step at `pos` is already queued. Its pick is token step+1; the step
+            // after it produces token step+2, wanted only if that token can be emitted.
+            let want_more = step + 2 < max_tokens;
+            if want_more && engine.model.queue_step(None, pos + 1).is_err() {
+                break;
+            }
+            match engine.model.wait_step() {
+                Ok(id) => next = id,
+                Err(_) => {
+                    queued = want_more;
+                    break;
+                }
+            }
+            queued = want_more;
+        } else {
+            match engine.model.forward_next(next, pos) {
+                Ok(id) => next = id,
+                Err(_) => break,
+            }
         }
         decode_steps += 1;
     }
@@ -1189,272 +1510,7 @@ fn chat_completions(
         message["tool_calls"] = Value::Array(tool_calls.clone());
     }
 
-    // CANONICALISE the recorded stream so it is a PREFIX of what the next turn's prompt
-    // will say. Without it the content hashes stop agreeing at this turn and every unit
-    // above it is unshareable (docs/kv-pool-review.md item 4):
-    //
-    //   recorded    ...<|im_start|>assistant\n<content minus its last token>
-    //   next prompt ...<|im_start|>assistant\n<content><|im_end|>\n<|im_start|>user...
-    //
-    // Two tokens go missing after every turn: the last generated one, which is never
-    // forwarded because its logits would be unread, and the turn's closing delimiter,
-    // which arrived as the stop token and the loop dropped. Rather than name them --
-    // every codec spells them differently -- render the conversation WITH this answer
-    // and run whatever the recorded stream is short by. RUN, not append: a token in the
-    // stream with no KV row is a wrong answer the next time anything resumes past it.
-    //
-    // Two cases, and only one of them is free (skipped when nothing was generated: a
-    // seed has no assistant turn to close, and rendering one would append an empty
-    // message the next prompt never says):
-    //
-    //   EXTENSION  the re-render is the recorded stream plus tokens -- the two missing
-    //              ones and nothing else. The ordinary turn, and the default.
-    //   MISMATCH   they PART below the tip, so rows already computed stop describing
-    //              the stream. Named from what the ENGINE can see: whether a template
-    //              dropped something, and why, is not visible here and not ours to
-    //              name. `kv_set_filled` would move the attention fill mark and leave a
-    //              recurrent model's ShortConv state where generation carried it, so
-    //              this path restores a recorded boundary instead.
-    if !generated.is_empty() {
-        let mut msgs = messages.clone();
-        // The message as the client gets it, THINKING INCLUDED. A codec keeps an
-        // assistant turn's reasoning while that turn is still the last thing in the
-        // conversation -- lfm2's renderer: `keep_thinking = index > last_user` -- so at
-        // turn close the canonical stream still carries it and this stays an EXTENSION.
-        // It is also what a tool-call loop needs: the client sends the thinking back
-        // with the tool result, the template preserves it, and the cache matches.
-        //
-        // The thinking leaves on its own at the NEXT user turn, when the template drops
-        // it and that turn re-prefills. Bounded: everything older was already rendered
-        // without thinking and still matches.
-        msgs.push(message.clone());
-        let canon = render_chat_prompt(
-            TEMPLATE.get().and_then(Option::as_ref),
-            chat,
-            &msgs,
-            &tools,
-            false,
-            adds_bos,
-            &bos_text,
-        );
-        let canon_ids = engine.tok.encode(&canon, true);
-        let agreed = engine
-            .resident
-            .iter()
-            .zip(&canon_ids)
-            .take_while(|(a, b)| a == b)
-            .count();
-        let discards = agreed < engine.resident.len();
-        // OFF only by explicit request now (`IMPARO_TURN_CLOSE=0`). What used to gate the
-        // destructive half was not the dropped rows -- those are re-run either here or by
-        // the next prompt -- but that `kv_set_filled` moved the attention cache's fill
-        // mark and left a recurrent model's convolution state where generation had
-        // carried it. That is answered below rather than avoided.
-        let allowed = !discards || !std::env::var("IMPARO_TURN_CLOSE").is_ok_and(|v| v == "0");
-        // Where the re-run starts. Below `agreed` the rows already hold these tokens.
-        //
-        //   attention only   the mark moves to `agreed`; rows above are overwritten
-        //   recurrent        `agreed` is not a state we hold. A convolution state has no
-        //                    inverse, so the way back is the SNAPSHOT at a recorded
-        //                    boundary at or below it -- the same restore the request path
-        //                    uses -- and the re-run starts from there instead.
-        let recurrent = engine.model.plan().recurrent_elems() > 0;
-        let from = if !discards || !recurrent {
-            engine.model.kv_set_filled(agreed);
-            Some(agreed)
-        } else {
-            let close_hashes = imparo_kv::unit_hashes(&engine.root, &canon_ids);
-            let close_label = effective_label.clone();
-            let Engine { model, pool, .. } = &mut *engine;
-            close_label.zip(pool.as_mut()).and_then(|(l, pl)| {
-                pl.rewind_to_checkpoint(&mut **model, &l, &close_hashes, &canon_ids, agreed)
-            })
-        };
-        if let (true, Some(from)) = (agreed < canon_ids.len() && allowed, from) {
-            // `logits` is the decode loop's buffer, already vocab-sized: these logits
-            // are unread, but a fresh Vec here is a 1 MB allocation per turn.
-            match engine.model.forward_into(&canon_ids[from..], from, &mut logits) {
-                Ok(()) => {
-                    if imparo_model::log_on() && discards {
-                        eprintln!(
-                            "[imparo] turn close: the recorded stream and the re-render \
-                             part at {agreed} of {} -- {} rows dropped, re-run from \
-                             {from} ({} tokens)",
-                            engine.resident.len(),
-                            engine.resident.len() - agreed,
-                            canon_ids.len() - from
-                        );
-                    }
-                    engine.resident = canon_ids;
-                }
-                Err(e) => {
-                    // Leave the stream as it was: short, but every token in it has a row.
-                    eprintln!("[imparo] turn close: closing the turn failed ({e})");
-                    let back = engine.resident.len();
-                    engine.model.kv_set_filled(back);
-                }
-            }
-        } else if discards && imparo_model::log_on() {
-            eprintln!(
-                "[imparo] turn close: declined -- {} rows would be dropped and {}",
-                engine.resident.len() - agreed,
-                if allowed {
-                    "no recorded boundary at or below the divergence can be restored"
-                } else {
-                    "IMPARO_TURN_CLOSE=0 forbids it"
-                }
-            );
-        }
-    }
-    // WRITE-THROUGH at the turn boundary: commit the resident conversation's
-    // sealed units + checkpoint. put_unit skips units the store already holds, so
-    // a turn costs only its new tail units plus the superseding checkpoint.
-    // (Synchronous for now; the async overlap is a measured-later optimization.)
-    if engine.pool.is_some() {
-        let mut wrote = false;
-        let final_tokens = engine.resident.clone();
-        let hashes_full = imparo_kv::unit_hashes(&engine.root, &final_tokens);
-        // The SAME label this request began under. Recomputing it here read the hash
-        // of the last sealed unit of prompt+generated, while `begin` had read the
-        // prompt's -- so a keyless turn whose generation crossed a unit boundary ended
-        // under a name that did not exist, `end` returned silently, and the turn
-        // sealed nothing at all.
-        let label = effective_label
-            .clone()
-            .unwrap_or_else(|| conversation_label(&conversation, &hashes_full));
-        let Engine { model, store, disk, pool, .. } = &mut *engine;
-        if let Some(pl) = pool.as_mut() {
-            if let Some((branch, bhashes, blabel, false)) = &pool_branch {
-                // deferred branch point: record now that the forward SUCCEEDED
-                let units = branch / 256;
-                if imparo_model::log_on() {
-                    eprintln!("[imparo] kv branch deferred at {branch}: units={units}");
-                }
-                if let Some(tip) = bhashes.get(units - 1) {
-                    // `final_tokens` starts with the prompt, so it carries the
-                    // same tokens `ids` did below the branch (`ids` itself moved
-                    // into engine.resident above).
-                    let ids = &final_tokens;
-                    let prev = pl.prev_ckpt_at(blabel, bhashes, ids, branch - 1);
-                    pl.note_branch(
-                        blabel,
-                        *tip,
-                        prev,
-                        *branch,
-                        ids[units * 256..*branch].to_vec(),
-                    );
-
-                }
-            }
-            if let Err(e) = pl.end(&label, final_tokens, &hashes_full) {
-                eprintln!("[imparo] kv pool end: {e}");
-            }
-            // WRITE-THROUGH, here and not at switch-out: by the time this conversation
-            // is evicted or the process is asked to stop, its units and its checkpoint
-            // are already on disk, so neither is the moment a long conversation
-            // discovers it has to write everything it ever computed.
-            match pl.commit_to_disk(&**model, store.as_ref(), disk.as_ref(), &label) {
-                Ok(w) => wrote = w,
-                Err(e) => eprintln!("[imparo] kv write-through: {e}"),
-            }
-        }
-        // Only when something was written: a GC pass stats every unit file in the store
-        // twice, and finds nothing new when nothing was added.
-        if wrote {
-            if let Some(dq) = engine.disk.as_ref() {
-                dq.gc(engine.disk_cap);
-            }
-        }
-    } else if let Some(store) = &engine.store {
-        if let Some(state) = engine.model.kv_spill() {
-            let hashes = imparo_kv::unit_hashes(
-                &engine.root,
-                &engine.resident[..state.boundary],
-            );
-            let blobs = imparo_kv::state::unit_blobs(&state);
-            let label = if conversation == "default" {
-                conversation_label(&conversation, &hashes)
-            } else {
-                conversation.clone()
-            };
-            let mut ok = !label.is_empty();
-            for (h, b) in hashes.iter().zip(&blobs) {
-                if let Err(e) = store.put_unit(h, b) {
-                    eprintln!("[imparo] kv spill: {e}");
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                let blob = imparo_kv::state::checkpoint_blob(&state);
-                let addr = match store.put_checkpoint(&blob) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        eprintln!("[imparo] kv commit: {e}");
-                        return Ok(());
-                    }
-                };
-                let m = imparo_kv::Manifest {
-                    boundary: state.boundary as u64,
-                    hashes,
-                    // The legacy (non-pool) spill captures at a unit-aligned
-                    // boundary, so there is nothing above the units to name.
-                    tail: Vec::new(),
-                    // The legacy path is only reached with an explicit label.
-                    keyless: false,
-                    ckpts: vec![imparo_kv::store::Ckpt {
-                        boundary: state.boundary as u64,
-                        from: 0,
-                        blob: addr,
-                        tail: Vec::new(),
-                    }],
-                };
-                if let Err(e) = store.commit(&label, &m) {
-                    eprintln!("[imparo] kv commit: {e}");
-                }
-                if let Err(e) = store.gc(engine.disk_cap) {
-                    eprintln!("[imparo] kv gc: {e}");
-                }
-            }
-        }
-    }
-    if probe {
-        let n = decode_steps.max(1) as f64;
-        eprintln!(
-            "[imparo] cpu-between-forwards per token: sample={:.3} ms detok={:.3} ms \
-                   emit={:.3} ms  total={:.3} ms",
-            t_sample / n,
-            t_detok / n,
-            t_send / n,
-            (t_sample + t_detok + t_send) / n
-        );
-    }
-    imparo_model::host::prof_log("decode ", decode_ms);
-    // A request boundary is the one place where returning free pages costs nothing: the
-    // next request will fault back in only what it actually uses.
-    imparo_model::host::release_free_memory();
-    // Sample after a request has run: the startup samples are taken before any GPU buffer
-    // exists, so they miss the KV pool and the activation buffers entirely -- and those
-    // are exactly what the prefill batch size trades against speed.
-    // Hand back the request's transients: the decoded strings, the JSON, the token vecs.
-    // The allocator keeps them in its arena for reuse, and `phys_footprint` charges for
-    // them either way, so a server that has served N requests carries N requests' worth of
-    // arena unless it asks. After `decode_ms` is taken, so it costs no measured time.
-    imparo_model::host::release_free_memory();
-    imparo_model::host::log_footprint("after request");
     let completion_tokens = generated.len();
-    let free_blocks = engine.pool.as_ref().map_or(String::new(), |pl| {
-        format!(" free_blocks={}", pl.free_blocks())
-    });
-    eprintln!(
-        "[imparo] conv={} prompt={prompt_tokens} reused={start_pos} \
-               gen={completion_tokens}{free_blocks} \
-               prefill_ms={prefill_ms:.0} ({:.1} tok/s) decode_ms={decode_ms:.0} ({:.2} tok/s)",
-        effective_label.as_deref().unwrap_or(&conversation),
-        (prompt_tokens - start_pos) as f64 / (prefill_ms / 1e3).max(1e-9),
-        decode_steps as f64 / (decode_ms / 1e3).max(1e-9)
-    );
-
     let finish = if tool_calls.is_empty() {
         "stop"
     } else {
@@ -1480,54 +1536,232 @@ fn chat_completions(
                        "total_tokens": prompt_tokens + completion_tokens,
                        "prompt_tokens_details": {"cached_tokens": start_pos}});
 
-    if streaming {
-        if reasoning.len() > sent_reasoning {
+    // THE RESPONSE GOES OUT FIRST. Everything below keeps the engine for this request
+    // but no longer feeds the answer: the pipelined step queued behind the stop is
+    // discarded and the turn's rows are written through. Measured on the response path
+    // before this ordering (IMPARO_PROF=1 `[prof] tail`): E4B 84-96 ms per response,
+    // LFM2 47-51 ms -- two to four decode tokens the client waited for after its last
+    // delta (most of it the turn-close forward, since deleted; see below). A write
+    // failure still commits the turn; the error is returned after.
+    // The request's log line goes out BEFORE the response: kv_gates and speed_gate read
+    // it as soon as the client has its answer. `free_blocks` is therefore the pool's
+    // count before this turn's seal.
+    let free_blocks = engine.pool.as_ref().map_or(String::new(), |pl| {
+        format!(" free_blocks={}", pl.free_blocks())
+    });
+    eprintln!(
+        "[imparo] conv={} prompt={prompt_tokens} reused={start_pos} \
+               gen={completion_tokens}{free_blocks} \
+               prefill_ms={prefill_ms:.0} ({:.1} tok/s) decode_ms={decode_ms:.0} ({:.2} tok/s)",
+        effective_label.as_deref().unwrap_or(&conversation),
+        (prompt_tokens - start_pos) as f64 / (prefill_ms / 1e3).max(1e-9),
+        decode_steps as f64 / (decode_ms / 1e3).max(1e-9)
+    );
+    let sent = (|| -> std::io::Result<()> {
+        if streaming {
+            if reasoning.len() > sent_reasoning {
+                http::sse(
+                    stream,
+                    &json!({
+                    "id": id, "object": "chat.completion.chunk", "model": "imparo",
+                    "choices": [{"index": 0,
+                                 "delta": {"reasoning_content": &reasoning[sent_reasoning..]},
+                                 "finish_reason": null}]}),
+                )?;
+            }
+            if body.len() > sent_visible {
+                http::sse(
+                    stream,
+                    &json!({
+                    "id": id, "object": "chat.completion.chunk", "model": "imparo",
+                    "choices": [{"index": 0, "delta": {"content": &body[sent_visible..]},
+                                 "finish_reason": null}]}),
+                )?;
+            }
+            if !tool_calls.is_empty() {
+                http::sse(
+                    stream,
+                    &json!({
+                    "id": id, "object": "chat.completion.chunk", "model": "imparo",
+                    "choices": [{"index": 0, "delta": {"tool_calls": tool_calls},
+                                 "finish_reason": null}]}),
+                )?;
+            }
             http::sse(
                 stream,
                 &json!({
                 "id": id, "object": "chat.completion.chunk", "model": "imparo",
-                "choices": [{"index": 0,
-                             "delta": {"reasoning_content": &reasoning[sent_reasoning..]},
-                             "finish_reason": null}]}),
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                "usage": usage, "timings": timings}),
             )?;
-        }
-        if body.len() > sent_visible {
-            http::sse(
+            stream.write_all(b"data: [DONE]\n\n")?;
+            stream.flush()
+        } else {
+            http::json(
                 stream,
+                200,
                 &json!({
-                "id": id, "object": "chat.completion.chunk", "model": "imparo",
-                "choices": [{"index": 0, "delta": {"content": &body[sent_visible..]},
-                             "finish_reason": null}]}),
-            )?;
+                "id": id, "object": "chat.completion", "model": "imparo",
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                "usage": usage, "timings": timings}),
+            )
         }
-        if !tool_calls.is_empty() {
-            http::sse(
-                stream,
-                &json!({
-                "id": id, "object": "chat.completion.chunk", "model": "imparo",
-                "choices": [{"index": 0, "delta": {"tool_calls": tool_calls},
-                             "finish_reason": null}]}),
-            )?;
+    })();
+    let t_tail = std::time::Instant::now();
+    if pipelined && queued {
+        // The step queued behind the last confirmed one ran for a token that will not be
+        // emitted; its position is not advanced into and its state advance is undone.
+        if let Err(e) = engine.model.discard_step() {
+            eprintln!("[imparo] discard_step: {e}");
         }
-        http::sse(
-            stream,
-            &json!({
-            "id": id, "object": "chat.completion.chunk", "model": "imparo",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
-            "usage": usage, "timings": timings}),
-        )?;
-        stream.write_all(b"data: [DONE]\n\n")?;
-        stream.flush()?;
-        return Ok(());
     }
-    http::json(
-        stream,
-        200,
-        &json!({
-        "id": id, "object": "chat.completion", "model": "imparo",
-        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-        "usage": usage, "timings": timings}),
-    )
+    let tail_discard_ms = t_tail.elapsed().as_secs_f64() * 1e3;
+    // THE RECORDED STREAM STAYS SHORT. Two tokens of this turn never get a KV row here:
+    // the last generated one (its logits would be unread) and the stop token the loop
+    // dropped. A turn close used to forward them -- a full weight pass for 4-5 tokens,
+    // 63 ms on E4B and 44 ms on LFM2 per response -- and the rows landed above the
+    // 64-token grid cut, where the next request's resume point re-runs them anyway
+    // (`resume_point`; docs/evidence/bracket/2026-09-05-response-tail.md section 3).
+    // The next prompt carries those tokens (the template renders the closed turn), so
+    // it prefills them together with its user message. Every token in `engine.resident`
+    // has a row, which is what a resume past it needs; a re-render that parts from the
+    // recorded stream inside this turn is the next request's own rewind.
+    let t_commit = std::time::Instant::now();
+    // WRITE-THROUGH at the turn boundary: commit the resident conversation's
+    // sealed units + checkpoint. put_unit skips units the store already holds, so
+    // a turn costs only its new tail units plus the superseding checkpoint.
+    // (Synchronous for now; the async overlap is a measured-later optimization.)
+    if engine.pool.is_some() {
+        let mut wrote = false;
+        let final_tokens = engine.resident.clone();
+        let hashes_full = imparo_kv::unit_ids(&engine.root, &final_tokens);
+        // The SAME label this request began under. Recomputing it here read the hash
+        // of the last sealed unit of prompt+generated, while `begin` had read the
+        // prompt's -- so a keyless turn whose generation crossed a unit boundary ended
+        // under a name that did not exist, `end` returned silently, and the turn
+        // sealed nothing at all.
+        let label = effective_label
+            .clone()
+            .unwrap_or_else(|| conversation_label(&conversation, &hashes_full));
+        let Engine {
+            model,
+            store,
+            disk,
+            pool,
+            ..
+        } = &mut *engine;
+        if let Some(pl) = pool.as_mut() {
+            if let Some((branch, bhashes, blabel, false)) = &pool_branch {
+                // deferred branch point: record now that the forward SUCCEEDED
+                let units = branch / imparo_kv::grid_tokens();
+                if imparo_model::log_on() {
+                    eprintln!("[imparo] kv branch deferred at {branch}: units={units}");
+                }
+                if let Some(tip) = bhashes.get(units.wrapping_sub(1)) {
+                    // `final_tokens` starts with the prompt, so it carries the
+                    // same tokens `ids` did below the branch (`ids` itself moved
+                    // into engine.resident above).
+                    let ids = &final_tokens;
+                    let prev = pl.prev_ckpt_at(blabel, bhashes, ids, branch - 1);
+                    pl.note_branch(
+                        blabel,
+                        *tip,
+                        prev,
+                        *branch,
+                        ids[units * imparo_kv::grid_tokens()..*branch].to_vec(),
+                    );
+                }
+            }
+            if let Err(e) = pl.end(&label, final_tokens, &hashes_full) {
+                eprintln!("[imparo] kv pool end: {e}");
+            }
+            // WRITE-THROUGH, here and not at switch-out: by the time this conversation
+            // is evicted or the process is asked to stop, its units and its checkpoint
+            // are already on disk, so neither is the moment a long conversation
+            // discovers it has to write everything it ever computed.
+            match pl.commit_to_disk(&**model, store.as_ref(), disk.as_ref(), &label) {
+                Ok(w) => wrote = w,
+                Err(e) => eprintln!("[imparo] kv write-through: {e}"),
+            }
+        }
+        // Only when something was written: a GC pass stats every unit file in the store
+        // twice, and finds nothing new when nothing was added.
+        if wrote {
+            if let Some(dq) = engine.disk.as_ref() {
+                dq.gc(engine.disk_cap);
+            }
+        }
+    } else if let Some(store) = &engine.store {
+        if let Some(state) = engine.model.kv_spill() {
+            // One call, shared with `imparo-forward --spill`: the extents, the anchor
+            // link and the manifest all come from the store. This was a copy of that
+            // code, and the copy is where the second blob format came from.
+            let staged = match store.stage_whole(
+                &engine.root,
+                &engine.resident[..state.boundary],
+                &state,
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("[imparo] kv spill: {e}");
+                    return Ok(());
+                }
+            };
+            let label = if conversation == "default" {
+                conversation_label(&conversation, &staged.unit_hashes())
+            } else {
+                conversation.clone()
+            };
+            if !label.is_empty() {
+                // The legacy path is only reached with an explicit label, so never keyless.
+                if let Err(e) =
+                    store.commit(&label, &staged.manifest(false), &staged.at)
+                {
+                    eprintln!("[imparo] kv commit: {e}");
+                }
+                if let Err(e) = store.gc(engine.disk_cap) {
+                    eprintln!("[imparo] kv gc: {e}");
+                }
+            }
+        }
+    }
+    if probe {
+        eprintln!(
+            "[prof] tail discard={tail_discard_ms:.1} commit={:.1} \
+             total={:.1} ms (stop={})",
+            t_commit.elapsed().as_secs_f64() * 1e3,
+            t_tail.elapsed().as_secs_f64() * 1e3,
+            if generated.len() >= max_tokens {
+                "max_tokens"
+            } else {
+                "eos"
+            },
+        );
+        let n = decode_steps.max(1) as f64;
+        eprintln!(
+            "[imparo] cpu-between-forwards per token: sample={:.3} ms detok={:.3} ms \
+                   emit={:.3} ms  total={:.3} ms",
+            t_sample / n,
+            t_detok / n,
+            t_send / n,
+            (t_sample + t_detok + t_send) / n
+        );
+    }
+    imparo_model::host::prof_log("decode ", decode_ms);
+    // A request boundary is the one place where returning free pages costs nothing: the
+    // next request will fault back in only what it actually uses.
+    imparo_model::host::release_free_memory();
+    // Sample after a request has run: the startup samples are taken before any GPU buffer
+    // exists, so they miss the KV pool and the activation buffers entirely -- and those
+    // are exactly what the prefill batch size trades against speed.
+    // Hand back the request's transients: the decoded strings, the JSON, the token vecs.
+    // The allocator keeps them in its arena for reuse, and `phys_footprint` charges for
+    // them either way, so a server that has served N requests carries N requests' worth of
+    // arena unless it asks. After `decode_ms` is taken, so it costs no measured time.
+    imparo_model::host::release_free_memory();
+    imparo_model::host::log_footprint("after request");
+
+    sent
 }
 
 /// Greedy at temperature 0; otherwise softmax sampling with a fixed stream of
@@ -1538,4 +1772,124 @@ fn chat_completions(
 /// on the GPU inside `forward_next`, which applies the same rule.
 fn sample(logits: &[f32], _temperature: f64) -> u32 {
     imparo_model::ops::argmax_f32(logits)
+}
+
+#[cfg(test)]
+mod pool_eligibility_tests {
+    use super::{
+        PoolEligibility, host_fit_policy_for_device_blocks, parse_raw_input_ids,
+        pool_eligibility,
+    };
+    use imparo_backend::{PoolAddressing, PoolCaps, PoolCapsIssue, Tier};
+    use serde_json::json;
+
+    const SHARED: PoolCaps = PoolCaps {
+        page_cells: 64,
+        finest_cut_tokens: 16,
+        paged_reads: true,
+        shared_address: true,
+        tiers: &[Tier::Unified, Tier::Disk],
+    };
+    const DISCRETE: PoolCaps = PoolCaps {
+        page_cells: 64,
+        finest_cut_tokens: 16,
+        paged_reads: true,
+        shared_address: false,
+        tiers: &[Tier::Device, Tier::Host, Tier::Disk],
+    };
+    const CURRENT_CUDA: PoolCaps = PoolCaps {
+        page_cells: 64,
+        finest_cut_tokens: 16,
+        paged_reads: true,
+        shared_address: false,
+        tiers: &[Tier::Device],
+    };
+
+    #[test]
+    fn invalid_caps_disable_pool_with_every_reason() {
+        assert_eq!(
+            pool_eligibility(true, true, true, Some(CURRENT_CUDA)),
+            PoolEligibility::UnsafeCaps(vec![
+                PoolCapsIssue::DiscreteAddressNeedsDeviceHostDisk
+            ])
+        );
+    }
+
+    #[test]
+    fn valid_shared_caps_enable_pool_without_a_transfer_route() {
+        assert_eq!(
+            pool_eligibility(true, true, true, Some(SHARED)),
+            PoolEligibility::Ready(PoolAddressing::Shared)
+        );
+    }
+
+    #[test]
+    fn valid_discrete_caps_enable_explicit_host_transfers() {
+        assert_eq!(
+            pool_eligibility(true, true, true, Some(DISCRETE)),
+            PoolEligibility::Ready(PoolAddressing::ExplicitHostTransfers)
+        );
+    }
+
+    #[test]
+    fn explicit_pool_disable_has_priority_over_invalid_backend_caps() {
+        assert_eq!(
+            pool_eligibility(false, true, true, Some(CURRENT_CUDA)),
+            PoolEligibility::DisabledByConfig
+        );
+    }
+
+    #[test]
+    fn no_backend_preserves_the_quiet_disabled_behavior() {
+        assert_eq!(
+            pool_eligibility(true, true, true, None),
+            PoolEligibility::NoBackend
+        );
+    }
+
+    #[test]
+    fn no_layers_and_unselected_backend_remain_disabled() {
+        assert_eq!(
+            pool_eligibility(true, false, true, Some(SHARED)),
+            PoolEligibility::NoPooledLayers
+        );
+        assert_eq!(
+            pool_eligibility(true, true, false, Some(SHARED)),
+            PoolEligibility::BackendNotSelected
+        );
+    }
+
+    #[test]
+    fn explicit_host_fit_can_swap_two_complete_device_working_sets() {
+        let unit_blocks = imparo_kv::resident::UNIT_BLOCKS as u32;
+        assert!(host_fit_policy_for_device_blocks(unit_blocks - 1).is_none());
+        assert_eq!(
+            host_fit_policy_for_device_blocks(4 * unit_blocks)
+                .expect("four device units")
+                .minimum_units,
+            8
+        );
+        assert_eq!(
+            host_fit_policy_for_device_blocks(16 * unit_blocks)
+                .expect("sixteen device units")
+                .minimum_units,
+            32
+        );
+    }
+
+    #[test]
+    fn raw_input_ids_are_disabled_by_default_and_fail_closed_when_enabled() {
+        let body = json!({"input_ids": [2, 1001, 1002]});
+        assert_eq!(parse_raw_input_ids(&body, false).unwrap(), None);
+        assert_eq!(
+            parse_raw_input_ids(&body, true).unwrap(),
+            Some(vec![2, 1001, 1002])
+        );
+        assert!(parse_raw_input_ids(&json!({"input_ids": []}), true).is_err());
+        assert!(parse_raw_input_ids(&json!({"input_ids": [2, -1]}), true).is_err());
+        assert!(
+            parse_raw_input_ids(&json!({"input_ids": [u64::from(u32::MAX) + 1]}), true)
+                .is_err()
+        );
+    }
 }

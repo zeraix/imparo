@@ -1,0 +1,476 @@
+{
+  "baseline_artifacts_unchanged": [
+    "program-packs/lab/q4-q8-mmq-sm86/run-a",
+    "program-packs/lab/q4-q8-mmq-sm86/run-b"
+  ],
+  "builder": {
+    "image_id": "sha256:357ea84b8e099d8b1884bde98172feef40a1acd9dc91f6b256dd16245573a1cf",
+    "image_identity_kind": "local_image_store_digest",
+    "python": "3.12.3",
+    "torch": "absent",
+    "triton": "3.8.0-source-pin"
+  },
+  "candidate": "q4_0_x_q8_1_mmq_epilogue0",
+  "hidden_launch_abi": [
+    {
+      "allocation_bytes": 0,
+      "argument_required": true,
+      "argument_value": "null",
+      "name": "global_scratch",
+      "ordinal": 8,
+      "type": "device_pointer"
+    },
+    {
+      "allocation_bytes": 0,
+      "argument_required": true,
+      "argument_value": "null",
+      "name": "profile_scratch",
+      "ordinal": 9,
+      "type": "device_pointer"
+    }
+  ],
+  "launch_abi": [
+    {
+      "alias": "weights+2",
+      "alignment": 2,
+      "name": "w_qs",
+      "ordinal": 0,
+      "type": "*i8"
+    },
+    {
+      "alias": "weights",
+      "alignment": 2,
+      "name": "w_d",
+      "ordinal": 1,
+      "type": "*fp16"
+    },
+    {
+      "alias": "q8",
+      "alignment": 16,
+      "name": "x_qs",
+      "ordinal": 2,
+      "type": "*i8"
+    },
+    {
+      "alias": "q8+128",
+      "alignment": 16,
+      "name": "x_d",
+      "ordinal": 3,
+      "type": "*fp32"
+    },
+    {
+      "alignment": 16,
+      "name": "y",
+      "ordinal": 4,
+      "type": "*fp32"
+    },
+    {
+      "evidence_value": 512,
+      "name": "n_tok",
+      "ordinal": 5,
+      "supported_range": [
+        1,
+        512
+      ],
+      "type": "i32"
+    },
+    {
+      "name": "out_stride",
+      "ordinal": 6,
+      "type": "i32"
+    },
+    {
+      "name": "numeric_stream_grid",
+      "ordinal": 7,
+      "type": "i32"
+    }
+  ],
+  "matrix": {
+    "bounded": true,
+    "no_cartesian_expansion": true,
+    "rejected_modules": 0,
+    "requested_configs": 4,
+    "requested_modules": 8,
+    "surviving_modules": 8
+  },
+  "milestone": "bounded-variant-resource-screen",
+  "numeric_contract": {
+    "fold_order": "suffix+prefix when seam is non-zero",
+    "native_tile": [
+      128,
+      128
+    ],
+    "revision": "numeric-seam-v1",
+    "seam_formula": "element-derived native tile; runtime numeric_stream_grid",
+    "variant_tiles_must_divide_native_tile": true
+  },
+  "phase": "A2",
+  "production_enabled": false,
+  "rejections": [],
+  "schema": 1,
+  "sources": [
+    {
+      "path": "q4_q8_mmq_variants_2560x10240.py",
+      "sha256": "d698639499e98a40b5e14be6bca8a4e37a5b82a0b2b65e0f7914983e106c8d10"
+    },
+    {
+      "path": "q4_q8_mmq_variants_10240x2560.py",
+      "sha256": "abc66c8182c4f0a25d8100f95984b669a7212b7036d31a139d080b8545591f56"
+    }
+  ],
+  "survivors": [
+    {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "compile_seconds": 1.6183546080000006,
+      "config_id": "cfg_cd1dd7eea1c5a04fa3fca1d1dbbde58075df25baad5830bf8d1fb179d1c7d5ed",
+      "grid_at_evidence_n_tok": [
+        80,
+        8,
+        1
+      ],
+      "grid_formula": [
+        "ceil_div(n_out,128)",
+        "ceil_div(n_tok,64)",
+        1
+      ],
+      "identity_descriptor_sha256": "cd1dd7eea1c5a04fa3fca1d1dbbde58075df25baad5830bf8d1fb179d1c7d5ed",
+      "lab_label": "bm128-bn64-w8-s2",
+      "module": "modules/k2560-m10240-ip_cd1dd7eea1c5a04fa3fca1d1dbbde58075df25baad5830bf8d1fb179d1c7d5ed.cubin",
+      "module_bytes": 64288,
+      "module_sha256": "bbf26d71916173b353d642dc09b8cf4a905f6d51d02dec5040bcf6611a116509",
+      "n_in": 2560,
+      "n_out": 10240,
+      "n_tok": 512,
+      "num_stages": 2,
+      "num_warps": 8,
+      "rationale": "halve row CTAs and repeated Q8 reads while preserving accumulator lanes per thread",
+      "rejected": false,
+      "resources": {
+        "dynamic_shared_bytes": 32768,
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 155
+      },
+      "shape_id": "k2560-m10240",
+      "symbol": "ip_cd1dd7eea1c5a04fa3fca1d1dbbde58075df25baad5830bf8d1fb179d1c7d5ed",
+      "tile": {
+        "rows": 128,
+        "tokens": 64
+      }
+    },
+    {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "compile_seconds": 0.24829455700000125,
+      "config_id": "cfg_040845b88cef1fe24b7900e33d507b81592c31ddc35ba8516ba7151c03741bc0",
+      "grid_at_evidence_n_tok": [
+        160,
+        4,
+        1
+      ],
+      "grid_formula": [
+        "ceil_div(n_out,64)",
+        "ceil_div(n_tok,128)",
+        1
+      ],
+      "identity_descriptor_sha256": "040845b88cef1fe24b7900e33d507b81592c31ddc35ba8516ba7151c03741bc0",
+      "lab_label": "bm64-bn128-w8-s2",
+      "module": "modules/k2560-m10240-ip_040845b88cef1fe24b7900e33d507b81592c31ddc35ba8516ba7151c03741bc0.cubin",
+      "module_bytes": 60320,
+      "module_sha256": "8c566758cc9603a6899f3848494b20e353f9df5bb436da7ba4e69901d74649b9",
+      "n_in": 2560,
+      "n_out": 10240,
+      "n_tok": 512,
+      "num_stages": 2,
+      "num_warps": 8,
+      "rationale": "halve token CTAs and repeated Q4 reads while preserving accumulator lanes per thread",
+      "rejected": false,
+      "resources": {
+        "dynamic_shared_bytes": 32768,
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 178
+      },
+      "shape_id": "k2560-m10240",
+      "symbol": "ip_040845b88cef1fe24b7900e33d507b81592c31ddc35ba8516ba7151c03741bc0",
+      "tile": {
+        "rows": 64,
+        "tokens": 128
+      }
+    },
+    {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "compile_seconds": 0.1984304210000012,
+      "config_id": "cfg_58bab621edc125e72372075f257ab39554b74abc49ff8855e6d836bbcdfd857c",
+      "grid_at_evidence_n_tok": [
+        160,
+        8,
+        1
+      ],
+      "grid_formula": [
+        "ceil_div(n_out,64)",
+        "ceil_div(n_tok,64)",
+        1
+      ],
+      "identity_descriptor_sha256": "58bab621edc125e72372075f257ab39554b74abc49ff8855e6d836bbcdfd857c",
+      "lab_label": "bm64-bn64-w8-s2",
+      "module": "modules/k2560-m10240-ip_58bab621edc125e72372075f257ab39554b74abc49ff8855e6d836bbcdfd857c.cubin",
+      "module_bytes": 42528,
+      "module_sha256": "715b630ae6a9c743df57f63ad733ea77a5d9498301b9f1c6224a0bf7dbf0b6d4",
+      "n_in": 2560,
+      "n_out": 10240,
+      "n_tok": 512,
+      "num_stages": 2,
+      "num_warps": 8,
+      "rationale": "isolate warp and register-pressure effects at the baseline tile",
+      "rejected": false,
+      "resources": {
+        "dynamic_shared_bytes": 16384,
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 101
+      },
+      "shape_id": "k2560-m10240",
+      "symbol": "ip_58bab621edc125e72372075f257ab39554b74abc49ff8855e6d836bbcdfd857c",
+      "tile": {
+        "rows": 64,
+        "tokens": 64
+      }
+    },
+    {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "compile_seconds": 0.1882065879999999,
+      "config_id": "cfg_2f16dc07d913306ecc0325a784eab13a396850af0b5c8bc1f8c59e6b69f7198b",
+      "grid_at_evidence_n_tok": [
+        160,
+        8,
+        1
+      ],
+      "grid_formula": [
+        "ceil_div(n_out,64)",
+        "ceil_div(n_tok,64)",
+        1
+      ],
+      "identity_descriptor_sha256": "2f16dc07d913306ecc0325a784eab13a396850af0b5c8bc1f8c59e6b69f7198b",
+      "lab_label": "bm64-bn64-w8-s1",
+      "module": "modules/k2560-m10240-ip_2f16dc07d913306ecc0325a784eab13a396850af0b5c8bc1f8c59e6b69f7198b.cubin",
+      "module_bytes": 41888,
+      "module_sha256": "7006694d5fb04c95a701b251994b7dcf8aeee14a1b73702907f4ec1c70fd4cab",
+      "n_in": 2560,
+      "n_out": 10240,
+      "n_tok": 512,
+      "num_stages": 1,
+      "num_warps": 8,
+      "rationale": "isolate stage, shared-memory, and register cost from the eight-warp tile",
+      "rejected": false,
+      "resources": {
+        "dynamic_shared_bytes": 16384,
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 96
+      },
+      "shape_id": "k2560-m10240",
+      "symbol": "ip_2f16dc07d913306ecc0325a784eab13a396850af0b5c8bc1f8c59e6b69f7198b",
+      "tile": {
+        "rows": 64,
+        "tokens": 64
+      }
+    },
+    {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "compile_seconds": 0.25375942900000226,
+      "config_id": "cfg_5ee29234f32c69540442430ee69071ca81e4fa89fc48a10d6e32654c8e3c9b32",
+      "grid_at_evidence_n_tok": [
+        20,
+        8,
+        1
+      ],
+      "grid_formula": [
+        "ceil_div(n_out,128)",
+        "ceil_div(n_tok,64)",
+        1
+      ],
+      "identity_descriptor_sha256": "5ee29234f32c69540442430ee69071ca81e4fa89fc48a10d6e32654c8e3c9b32",
+      "lab_label": "bm128-bn64-w8-s2",
+      "module": "modules/k10240-m2560-ip_5ee29234f32c69540442430ee69071ca81e4fa89fc48a10d6e32654c8e3c9b32.cubin",
+      "module_bytes": 64032,
+      "module_sha256": "c439040b3b338a869bee453a5f855b8aa08b1b2edba4951e38daf6fa2782bb3f",
+      "n_in": 10240,
+      "n_out": 2560,
+      "n_tok": 512,
+      "num_stages": 2,
+      "num_warps": 8,
+      "rationale": "halve row CTAs and repeated Q8 reads while preserving accumulator lanes per thread",
+      "rejected": false,
+      "resources": {
+        "dynamic_shared_bytes": 32768,
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 155
+      },
+      "shape_id": "k10240-m2560",
+      "symbol": "ip_5ee29234f32c69540442430ee69071ca81e4fa89fc48a10d6e32654c8e3c9b32",
+      "tile": {
+        "rows": 128,
+        "tokens": 64
+      }
+    },
+    {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "compile_seconds": 0.2540127840000004,
+      "config_id": "cfg_05e1dac74eaa31f6f6fd679867d0c92f3ad684d640d9797119078ed66d1280d4",
+      "grid_at_evidence_n_tok": [
+        40,
+        4,
+        1
+      ],
+      "grid_formula": [
+        "ceil_div(n_out,64)",
+        "ceil_div(n_tok,128)",
+        1
+      ],
+      "identity_descriptor_sha256": "05e1dac74eaa31f6f6fd679867d0c92f3ad684d640d9797119078ed66d1280d4",
+      "lab_label": "bm64-bn128-w8-s2",
+      "module": "modules/k10240-m2560-ip_05e1dac74eaa31f6f6fd679867d0c92f3ad684d640d9797119078ed66d1280d4.cubin",
+      "module_bytes": 60320,
+      "module_sha256": "05cf736717e36bdc2b7fcf8f6de82fe637aed7c29a9236646b665fa771867c1c",
+      "n_in": 10240,
+      "n_out": 2560,
+      "n_tok": 512,
+      "num_stages": 2,
+      "num_warps": 8,
+      "rationale": "halve token CTAs and repeated Q4 reads while preserving accumulator lanes per thread",
+      "rejected": false,
+      "resources": {
+        "dynamic_shared_bytes": 32768,
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 178
+      },
+      "shape_id": "k10240-m2560",
+      "symbol": "ip_05e1dac74eaa31f6f6fd679867d0c92f3ad684d640d9797119078ed66d1280d4",
+      "tile": {
+        "rows": 64,
+        "tokens": 128
+      }
+    },
+    {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "compile_seconds": 0.20253040600000105,
+      "config_id": "cfg_99be389d8e9794a218708e277fcaabde58f53ce81e73c9518a250726a2ded6eb",
+      "grid_at_evidence_n_tok": [
+        40,
+        8,
+        1
+      ],
+      "grid_formula": [
+        "ceil_div(n_out,64)",
+        "ceil_div(n_tok,64)",
+        1
+      ],
+      "identity_descriptor_sha256": "99be389d8e9794a218708e277fcaabde58f53ce81e73c9518a250726a2ded6eb",
+      "lab_label": "bm64-bn64-w8-s2",
+      "module": "modules/k10240-m2560-ip_99be389d8e9794a218708e277fcaabde58f53ce81e73c9518a250726a2ded6eb.cubin",
+      "module_bytes": 42400,
+      "module_sha256": "aec71430c575a4eada8f18f567644f695a34fdc036ca3746bb852092bc74c87a",
+      "n_in": 10240,
+      "n_out": 2560,
+      "n_tok": 512,
+      "num_stages": 2,
+      "num_warps": 8,
+      "rationale": "isolate warp and register-pressure effects at the baseline tile",
+      "rejected": false,
+      "resources": {
+        "dynamic_shared_bytes": 16384,
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 101
+      },
+      "shape_id": "k10240-m2560",
+      "symbol": "ip_99be389d8e9794a218708e277fcaabde58f53ce81e73c9518a250726a2ded6eb",
+      "tile": {
+        "rows": 64,
+        "tokens": 64
+      }
+    },
+    {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "compile_seconds": 0.19553899399999963,
+      "config_id": "cfg_6b4e87dd0bfbf0dd95feac24ca12b2a4c112665dc7bd352e202cb3e84c1c264d",
+      "grid_at_evidence_n_tok": [
+        40,
+        8,
+        1
+      ],
+      "grid_formula": [
+        "ceil_div(n_out,64)",
+        "ceil_div(n_tok,64)",
+        1
+      ],
+      "identity_descriptor_sha256": "6b4e87dd0bfbf0dd95feac24ca12b2a4c112665dc7bd352e202cb3e84c1c264d",
+      "lab_label": "bm64-bn64-w8-s1",
+      "module": "modules/k10240-m2560-ip_6b4e87dd0bfbf0dd95feac24ca12b2a4c112665dc7bd352e202cb3e84c1c264d.cubin",
+      "module_bytes": 41760,
+      "module_sha256": "87ab7b48453dc0eb0ebd105d3461b57b1937b34ed131384bfd86730dce688225",
+      "n_in": 10240,
+      "n_out": 2560,
+      "n_tok": 512,
+      "num_stages": 1,
+      "num_warps": 8,
+      "rationale": "isolate stage, shared-memory, and register cost from the eight-warp tile",
+      "rejected": false,
+      "resources": {
+        "dynamic_shared_bytes": 16384,
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 96
+      },
+      "shape_id": "k10240-m2560",
+      "symbol": "ip_6b4e87dd0bfbf0dd95feac24ca12b2a4c112665dc7bd352e202cb3e84c1c264d",
+      "tile": {
+        "rows": 64,
+        "tokens": 64
+      }
+    }
+  ],
+  "target": "cuda:86:32"
+}

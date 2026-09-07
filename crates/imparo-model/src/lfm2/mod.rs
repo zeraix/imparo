@@ -18,5 +18,6 @@ crate::architecture!(Lfm2Arch => Lfm2 {
     prepare:             workflow_cpu::prepare,
     batch_host:          workflow_cpu::batch,
     device_batch:        workflow_gpu::batch,
+    device_prepare:      workflow_gpu::prepare_device,
     buffer_requirements: workflow_gpu::buffer_requirements,
 });

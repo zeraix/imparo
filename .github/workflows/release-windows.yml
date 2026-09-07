@@ -1,8 +1,10 @@
 name: release-windows
 
-# Manual: builds the windows-x64 server and tuner with the CUDA backend compiled in (see
-# release-linux for the version/static-cudart reasoning). Attaches to the tag's
-# DRAFT release, created if missing.
+# Manual thin release: one common runtime plus independently downloadable, signed
+# per-SM CUDA DLLs. The common runtime detects the GPU, downloads exactly one DLL,
+# verifies its embedded hash + Ed25519 signature, caches it, then loads the catalog ABI.
+# The supported architectures live in crates/imparo-cuda/cuda-sm.json so both platforms publish the
+# same independently downloadable set.
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +20,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Verify release tag owns checkout
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $tagCommit = git rev-list -n 1 "refs/tags/$env:RELEASE_TAG"
+          $headCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $headCommit) {
+            throw "release tag does not resolve to the checked-out commit"
+          }
       # nvcc needs MSVC's cl as its host compiler; VS is installed but not on PATH
       # until this sets the environment.
       - uses: ilammy/msvc-dev-cmd@v1
@@ -27,24 +42,89 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart"]'
           use-github-cache: true
-      - name: Build
-        shell: bash
-        run: cargo build --release --locked --bin imparo-server --bin imparo-tune --features cuda
-      - name: Package
-        shell: bash
+      - name: Build per-SM CUDA DLLs
+        shell: pwsh
         run: |
-          set -euo pipefail
-          name="imparo-${{ inputs.tag }}-windows-x64"
-          mkdir -p "dist/$name"
-          cp target/release/imparo-server.exe target/release/imparo-tune.exe \
-             README.md LICENSE "dist/$name/"
-          cd dist && 7z a "$name.zip" "$name" > /dev/null
+          New-Item -ItemType Directory -Force dist/backends | Out-Null
+          $catalog = Get-Content crates/imparo-cuda/cuda-sm.json -Raw | ConvertFrom-Json
+          if ($catalog.schema -ne 1 -or $catalog.backend_abi -lt 1) {
+            throw "crates/imparo-cuda/cuda-sm.json schema or backend ABI is unsupported"
+          }
+          cargo build --release --locked -p imparo-cuda --features signing-tool `
+            --bin imparo-cuda-sign
+          if ($LASTEXITCODE -ne 0) { throw "build imparo-cuda-sign failed" }
+          $identityTool = (Resolve-Path target/release/imparo-cuda-sign.exe).Path
+          $source = (Resolve-Path crates/imparo-cuda/native/imparo_cuda.cu).Path
+          $exports = (Resolve-Path crates/imparo-cuda/native/imparo_cuda.def).Path
+          foreach ($sm in $catalog.sms) {
+            $out = "dist/backends/imparo-cuda-sm$sm.dll"
+            $buildId = & $identityTool build-id windows-x86_64 ([string]$sm) fast nvcc
+            if ($LASTEXITCODE -ne 0 -or $buildId -notmatch '^[0-9a-f]{64}$') {
+              throw "compute CUDA sm$sm build identity failed"
+            }
+            # Static cudart keeps each downloadable backend self-contained. The common
+            # package therefore remains CUDA-toolkit-free and contains no backend DLL.
+            & nvcc -O3 -std=c++17 -lineinfo --use_fast_math -shared --cudart static -Xcompiler=/MT `
+              "-DIMPARO_CUDA_BACKEND_ABI=$($catalog.backend_abi)" `
+              "-DIMPARO_CUDA_BUILD_SHA256=`"$buildId`"" `
+              "--generate-code=arch=compute_$sm,code=sm_$sm" `
+              "-Xlinker=/DEF:$exports" $source -o $out
+            if ($LASTEXITCODE -ne 0) { throw "nvcc sm$sm failed" }
+          }
+      - name: Sign backends and generate embedded manifest
+        shell: pwsh
+        env:
+          IMPARO_CUDA_RELEASE_PRIVATE_KEY: ${{ secrets.IMPARO_CUDA_RELEASE_PRIVATE_KEY }}
+          IMPARO_CUDA_RELEASE_PUBLIC_KEY: ${{ vars.IMPARO_CUDA_RELEASE_PUBLIC_KEY }}
+        run: |
+          if (-not $env:IMPARO_CUDA_RELEASE_PRIVATE_KEY -or -not $env:IMPARO_CUDA_RELEASE_PUBLIC_KEY) {
+            throw "configure IMPARO_CUDA_RELEASE_PRIVATE_KEY secret and IMPARO_CUDA_RELEASE_PUBLIC_KEY variable"
+          }
+          $base = "https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}"
+          $dlls = Get-ChildItem dist/backends/imparo-cuda-sm*.dll | ForEach-Object FullName
+          cargo run --release --locked -p imparo-cuda --features signing-tool `
+            --bin imparo-cuda-sign -- windows-x86_64 $base `
+            dist/imparo-cuda-manifest.json $dlls
+      - name: Build thin common runtime
+        shell: pwsh
+        env:
+          IMPARO_CUDA_RELEASE_PUBLIC_KEY: ${{ vars.IMPARO_CUDA_RELEASE_PUBLIC_KEY }}
+        run: |
+          $env:IMPARO_CUDA_EMBED_MANIFEST = (Resolve-Path dist/imparo-cuda-manifest.json).Path
+          cargo build --release --locked --bin imparo-server --bin imparo-tune --features cuda-dynamic
+      - name: Verify signed SM resolution and ABI loading
+        shell: pwsh
+        env:
+          IMPARO_CUDA_RELEASE_PUBLIC_KEY: ${{ vars.IMPARO_CUDA_RELEASE_PUBLIC_KEY }}
+        run: |
+          $manifest = Get-Content dist/imparo-cuda-manifest.json -Raw | ConvertFrom-Json
+          $entry = $manifest.backends | Select-Object -First 1
+          $cache = (New-Item -ItemType Directory -Force dist/runtime-test-cache).FullName
+          $backendDir = New-Item -ItemType Directory -Force "$cache/cuda/abi$($entry.abi)/sm$($entry.sm)"
+          Copy-Item "dist/backends/$($entry.file)" $backendDir.FullName
+          $env:IMPARO_CUDA_EMBED_MANIFEST = (Resolve-Path dist/imparo-cuda-manifest.json).Path
+          $env:IMPARO_BACKEND_CACHE = $cache
+          $env:IMPARO_CUDA_SM = [string]$entry.sm
+          Remove-Item Env:IMPARO_CUDA_BACKEND -ErrorAction SilentlyContinue
+          cargo test --release --locked -p imparo-cuda --features cuda-dynamic `
+            ffi::imp_dynamic::tests::resolved_plugin_loads_and_matches_abi -- --exact
+      - name: Package common runtime
+        shell: pwsh
+        run: |
+          $name = "imparo-${{ inputs.tag }}-windows-x64"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item target/release/imparo-server.exe,target/release/imparo-tune.exe,README.md,LICENSE "dist/$name/"
+          Push-Location dist
+          7z a "$name.zip" $name | Out-Null
+          Pop-Location
       - name: Attach to draft release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          gh release view "${{ inputs.tag }}" >/dev/null 2>&1 || \
-            gh release create "${{ inputs.tag }}" --target "$GITHUB_SHA" --draft \
-              --title "Imparo ${{ inputs.tag }}" --generate-notes
-          gh release upload "${{ inputs.tag }}" dist/*.zip --clobber
+          target_commit="$(git rev-parse HEAD)"
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --target "$target_commit" --draft \
+              --title "Imparo $RELEASE_TAG" --generate-notes
+          gh release upload "$RELEASE_TAG" dist/*.zip dist/backends/*.dll --clobber

@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "status": "source_pin_pre_release",
+  "source_date_epoch": 1787606393,
+  "build_requirements_sha256": "4cc8a34cea96b5a380e9dae31e8f3611879c6e31f57d9301a24e66d5d0e8cf34",
+  "python": {
+    "version": "3.12.3"
+  },
+  "triton": {
+    "version": "3.8.0",
+    "revision": "b252c7c4cea49216b27e5a47db061f9d0dbf49f3",
+    "source_url": "https://github.com/triton-lang/triton/archive/b252c7c4cea49216b27e5a47db061f9d0dbf49f3.tar.gz",
+    "source_bytes": 7711249,
+    "source_sha256": "1e25ae6d0dd4a1172002c53bb516b5a3c0ceb33c72900e7ad70394c58e1bd6a5",
+    "official_tag": null
+  },
+  "llvm": {
+    "revision": "5f07f818b51b786b0a87b4e514882600ecba112f",
+    "ubuntu_x64_sha256": "62dd9524eed689360882a7ae06132182b4a724ca5dfdca77667556fcef940022"
+  },
+  "cuda": {
+    "toolkit": "12.9",
+    "ptxas_version": "12.9.86",
+    "cuobjdump_version": "12.9.82",
+    "ptxas_wheel": "nvidia_cuda_nvcc_cu12-12.9.86-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl",
+    "ptxas_wheel_sha256": "5d6a0d32fdc7ea39917c20065614ae93add6f577d840233237ff08e9a38f58f0"
+  },
+  "builder": {
+    "image": "imparo-triton-builder:3.8.0-b252c7c4",
+    "image_sha256": null,
+    "image_identity_kind": null,
+    "base_image": "nvidia/cuda:12.9.1-devel-ubuntu24.04@sha256:e542739fcaa4f45da5add8c4cf5769783a61628b2518304a5bbe4ace468b8c8f",
+    "base_image_sha256": "e542739fcaa4f45da5add8c4cf5769783a61628b2518304a5bbe4ace468b8c8f",
+    "python_image": "python:3.12.3-slim-bookworm@sha256:fd3817f3a855f6c2ada16ac9468e5ee93e361005bd226fd5a5ee1a504e038c84"
+  }
+}

@@ -22,6 +22,11 @@ imparo-metal = { path = "../imparo-metal" }
 
 [features]
 cuda = ["dep:imparo-cuda", "imparo-cuda/cuda"]
+cuda-dynamic = ["dep:imparo-cuda", "imparo-cuda/cuda-dynamic"]
+# CUDA-only laboratory capture surface. This is deliberately not a default feature:
+# every capture inserts synchronization/readback boundaries and is inadmissible timing
+# evidence by construction.
+cuda-gate0-capture = ["cuda"]
 [[bin]]
 name = "imparo-plan"
 path = "src/bin/imparo-plan.rs"

@@ -67,7 +67,10 @@ pub fn shortconv(
     kernel: usize,
     n_tok: usize,
 ) {
-    assert!(kernel >= 2, "a short conv needs at least 2 taps to carry state");
+    assert!(
+        kernel >= 2,
+        "a short conv needs at least 2 taps to carry state"
+    );
     let history = kernel - 1;
     assert_eq!(bcx.len(), n_tok * 3 * width, "bcx is n_tok x 3 x width");
     assert_eq!(conv_w.len(), width * kernel, "conv_w is width x kernel");
@@ -204,8 +207,9 @@ pub fn argmax_f32(logits: &[f32]) -> u32 {
 }
 
 use imparo_gguf::weights::{
-    GGML_F32, GGML_Q4_0, GGML_Q8_0, Q4_0_BLOCK_BYTES, Q8_0_BLOCK_BYTES, QK4_0, QK8_0,
-    Tensor, Weights, f16_to_f32,
+    GGML_F32, GGML_Q4_0, GGML_Q4_0_TM, GGML_Q8_0, GGML_Q8_0_TM, Q4_0_BLOCK_BYTES,
+    Q8_0_BLOCK_BYTES, QK4_0, QK8_0, TM_RULES, Tensor, Weights, f16_to_f32,
+    q8_0_tm_payload_offset, q8_0_tm_scale_offset,
 };
 
 /// Worker threads for row-parallel matmuls. IMPARO_THREADS overrides.
@@ -316,10 +320,7 @@ fn row_bytes(data: &[u8], kind: u32, n_in: usize, r: usize, out: &mut [f32]) {
     match kind {
         GGML_F32 => {
             let lo = r * n_in * 4;
-            for (o, c) in out
-                .iter_mut()
-                .zip(data[lo..lo + n_in * 4].chunks_exact(4))
-            {
+            for (o, c) in out.iter_mut().zip(data[lo..lo + n_in * 4].chunks_exact(4)) {
                 *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             }
         }
@@ -339,6 +340,8 @@ fn row_bytes(data: &[u8], kind: u32, n_in: usize, r: usize, out: &mut [f32]) {
                 out,
             );
         }
+        GGML_Q8_0_TM => dequant_q8_0_tm_row(data, n_in, r, out),
+        GGML_Q4_0_TM => dequant_q4_0_tm_row(data, n_in, r, out),
         other => panic!("row_bytes: unsupported ggml type {other}"),
     }
 }
@@ -351,8 +354,8 @@ fn row_bytes(data: &[u8], kind: u32, n_in: usize, r: usize, out: &mut [f32]) {
 pub fn row_bytes_len(kind: u32, n_in: usize) -> usize {
     match kind {
         GGML_F32 => n_in * 4,
-        GGML_Q4_0 => n_in / QK4_0 * Q4_0_BLOCK_BYTES,
-        GGML_Q8_0 => n_in / QK8_0 * Q8_0_BLOCK_BYTES,
+        GGML_Q4_0 | GGML_Q4_0_TM => n_in / QK4_0 * Q4_0_BLOCK_BYTES,
+        GGML_Q8_0 | GGML_Q8_0_TM => n_in / QK8_0 * Q8_0_BLOCK_BYTES,
         other => panic!("row_bytes_len: unsupported ggml type {other}"),
     }
 }
@@ -375,7 +378,10 @@ pub fn mul_mat_bytes(
     y: &mut [f32],
 ) {
     let rb = row_bytes_len(kind, n_in);
-    assert!(blob.len() >= n_out * rb, "weight blob shorter than its shape");
+    assert!(
+        blob.len() >= n_out * rb,
+        "weight blob shorter than its shape"
+    );
     assert_eq!(x.len(), n_in * n_tokens, "mul_mat_bytes input");
     assert_eq!(y.len(), n_out * n_tokens, "mul_mat_bytes output");
     let threads = threads().min(n_out.max(1));
@@ -408,7 +414,13 @@ pub fn mul_mat_bytes(
 ///
 /// # Panics
 /// When `out` is not `width` long, or the kind is unsupported.
-pub fn row_from_bytes(blob: &[u8], kind: u32, width: usize, index: usize, out: &mut [f32]) {
+pub fn row_from_bytes(
+    blob: &[u8],
+    kind: u32,
+    width: usize,
+    index: usize,
+    out: &mut [f32],
+) {
     assert_eq!(out.len(), width, "row width");
     row_bytes(blob, kind, width, index, out);
 }
@@ -448,6 +460,18 @@ fn mul_mat_range(weights: &Weights, w: &Tensor, x: &[f32], y: &mut [f32], base: 
                 );
             }
         }
+        GGML_Q8_0_TM => {
+            let data = weights.raw(w);
+            for (j, out) in y.iter_mut().enumerate() {
+                *out = dot_q8_0_tm_row(data, n_in, base + j, x);
+            }
+        }
+        GGML_Q4_0_TM => {
+            let data = weights.raw(w);
+            for (j, out) in y.iter_mut().enumerate() {
+                *out = dot_q4_0_tm_row(data, n_in, base + j, x);
+            }
+        }
         other => panic!("mul_mat: unsupported ggml type {other}"),
     }
 }
@@ -479,6 +503,8 @@ pub fn row(weights: &Weights, t: &Tensor, index: usize, out: &mut [f32]) {
                 ..(index + 1) * blocks * Q8_0_BLOCK_BYTES];
             dequant_q8_0_row(row, out);
         }
+        GGML_Q8_0_TM => dequant_q8_0_tm_row(weights.raw(t), width, index, out),
+        GGML_Q4_0_TM => dequant_q4_0_tm_row(weights.raw(t), width, index, out),
         other => panic!("row: unsupported ggml type {other}"),
     }
 }
@@ -567,6 +593,93 @@ fn dequant_q8_0_row(row: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Q8_0_TM: the same values as Q8_0 read from the tile-major layout (`data` is the WHOLE
+/// tensor, `n_in` its row width, `r` the row). The row count comes from the blob's length,
+/// which is why no caller signature changed. Same accumulation order as the row-major
+/// readers, so the oracle's numbers are the GGUF's numbers.
+fn q8_0_tm_rows(data: &[u8], n_in: usize) -> usize {
+    assert_eq!(n_in % QK8_0, 0, "Q8_0_TM row not a multiple of 32");
+    data.len() / (n_in / QK8_0 * Q8_0_BLOCK_BYTES)
+}
+
+fn dequant_q8_0_tm_row(data: &[u8], n_in: usize, r: usize, out: &mut [f32]) {
+    let blocks = n_in / QK8_0;
+    let n_out = q8_0_tm_rows(data, n_in);
+    for b in 0..blocks {
+        let p = q8_0_tm_payload_offset(r, b, blocks);
+        let s = q8_0_tm_scale_offset(r, b, blocks, n_out);
+        let d = f16_to_f32(u16::from_le_bytes([data[s], data[s + 1]]));
+        let base = b * QK8_0;
+        for i in 0..QK8_0 {
+            out[base + i] = f32::from(data[p + i] as i8) * d;
+        }
+    }
+}
+
+fn dot_q8_0_tm_row(data: &[u8], n_in: usize, r: usize, x: &[f32]) -> f32 {
+    let blocks = n_in / QK8_0;
+    let n_out = q8_0_tm_rows(data, n_in);
+    let mut acc = 0.0_f32;
+    for b in 0..blocks {
+        let p = q8_0_tm_payload_offset(r, b, blocks);
+        let s = q8_0_tm_scale_offset(r, b, blocks, n_out);
+        let d = f16_to_f32(u16::from_le_bytes([data[s], data[s + 1]]));
+        let base = b * QK8_0;
+        let mut block = 0.0_f32;
+        for i in 0..QK8_0 {
+            block += f32::from(data[p + i] as i8) * x[base + i];
+        }
+        acc += block * d;
+    }
+    acc
+}
+
+/// Q4_0_TM: the same values as Q4_0 read from the tile-major layout (16-byte payload per
+/// block, scales after the payload); `data` is the WHOLE tensor. Same nibble order and the
+/// same accumulation order as `dot_q4_0_row` / `dequant_q4_0_row`.
+fn q4_0_tm_rows(data: &[u8], n_in: usize) -> usize {
+    assert_eq!(n_in % QK4_0, 0, "Q4_0_TM row not a multiple of 32");
+    data.len() / (n_in / QK4_0 * Q4_0_BLOCK_BYTES)
+}
+
+fn dequant_q4_0_tm_row(data: &[u8], n_in: usize, r: usize, out: &mut [f32]) {
+    let rule = &TM_RULES[1];
+    let blocks = n_in / QK4_0;
+    let n_out = q4_0_tm_rows(data, n_in);
+    for b in 0..blocks {
+        let p = rule.payload_offset(r, b, blocks);
+        let s = rule.scale_offset(r, b, blocks, n_out);
+        let d = f16_to_f32(u16::from_le_bytes([data[s], data[s + 1]]));
+        let base = b * QK4_0;
+        for i in 0..QK4_0 / 2 {
+            let byte = data[p + i];
+            out[base + i] = (f32::from(byte & 0x0F) - 8.0) * d;
+            out[base + i + QK4_0 / 2] = (f32::from(byte >> 4) - 8.0) * d;
+        }
+    }
+}
+
+fn dot_q4_0_tm_row(data: &[u8], n_in: usize, r: usize, x: &[f32]) -> f32 {
+    let rule = &TM_RULES[1];
+    let blocks = n_in / QK4_0;
+    let n_out = q4_0_tm_rows(data, n_in);
+    let mut acc = 0.0_f32;
+    for b in 0..blocks {
+        let p = rule.payload_offset(r, b, blocks);
+        let s = rule.scale_offset(r, b, blocks, n_out);
+        let d = f16_to_f32(u16::from_le_bytes([data[s], data[s + 1]]));
+        let base = b * QK4_0;
+        let mut block = 0.0_f32;
+        for i in 0..QK4_0 / 2 {
+            let byte = data[p + i];
+            block += (f32::from(byte & 0x0F) - 8.0) * x[base + i];
+            block += (f32::from(byte >> 4) - 8.0) * x[base + i + QK4_0 / 2];
+        }
+        acc += block * d;
+    }
+    acc
+}
+
 /// Block-local sum then one multiply by the scale -- the SAME accumulation order as
 /// `dot_q4_0_row`, so the two quants differ in layout and nothing else.
 fn dot_q8_0_row(row: &[u8], x: &[f32]) -> f32 {
@@ -589,7 +702,7 @@ fn dot_q8_0_row(row: &[u8], x: &[f32]) -> f32 {
 // tolerance.
 #[allow(clippy::float_cmp)]
 mod tests {
-    use super::{QK8_0, Q8_0_BLOCK_BYTES, dequant_q8_0_row, dot_q8_0_row, shortconv};
+    use super::{Q8_0_BLOCK_BYTES, QK8_0, dequant_q8_0_row, dot_q8_0_row, shortconv};
     use imparo_gguf::weights::f32_to_f16;
 
     /// One Q8_0 block: f16 scale in bytes 0..2, then 32 signed values.
@@ -639,7 +752,15 @@ mod tests {
 
         let mut s_batch = vec![0.0f32; (kernel - 1) * width];
         let mut out_batch = vec![0.0f32; n_tok * width];
-        shortconv(&bcx, &conv_w, &mut s_batch, &mut out_batch, width, kernel, n_tok);
+        shortconv(
+            &bcx,
+            &conv_w,
+            &mut s_batch,
+            &mut out_batch,
+            width,
+            kernel,
+            n_tok,
+        );
 
         let mut s_one = vec![0.0f32; (kernel - 1) * width];
         let mut out_one = vec![0.0f32; n_tok * width];
@@ -666,7 +787,11 @@ mod tests {
         // Only tap 0 is non-zero: out[t] = c * seq[t + 0].
         let conv_w = vec![1.0, 0.0, 0.0];
         shortconv(&bcx, &conv_w, &mut state, &mut out, width, kernel, 2);
-        assert_eq!(out, vec![5.0, 7.0], "tap 0 must select the oldest window value");
+        assert_eq!(
+            out,
+            vec![5.0, 7.0],
+            "tap 0 must select the oldest window value"
+        );
         // The new state is the last two of seq = [5,7,1,1] -> [1, 1].
         assert_eq!(state, vec![1.0, 1.0]);
 
@@ -675,7 +800,11 @@ mod tests {
         let mut out2 = vec![0.0f32; 2];
         let conv_w2 = vec![0.0, 0.0, 1.0];
         shortconv(&bcx, &conv_w2, &mut state2, &mut out2, width, kernel, 2);
-        assert_eq!(out2, vec![1.0, 1.0], "the last tap must select the current value");
+        assert_eq!(
+            out2,
+            vec![1.0, 1.0],
+            "the last tap must select the current value"
+        );
     }
 
     /// c gates the OUTPUT, b and x form the convolved signal. Zeroing c must zero the

@@ -1,0 +1,738 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://imparo.dev/schemas/program-pack-v1.schema.json",
+  "title": "Imparo Program Pack v1 manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "program_pack_abi",
+    "pack_id",
+    "pack_version",
+    "distribution",
+    "release_channel",
+    "required_entitlement_features",
+    "backend",
+    "engine_api",
+    "backend_abi",
+    "target",
+    "required_extensions",
+    "optional_extensions",
+    "toolchain",
+    "modules",
+    "choice_groups",
+    "variants",
+    "notices_sha256",
+    "sbom_sha256",
+    "provenance_sha256"
+  ],
+  "properties": {
+    "schema": { "const": 1 },
+    "program_pack_abi": { "const": 1 },
+    "pack_id": { "$ref": "#/$defs/namespacedId" },
+    "pack_version": { "$ref": "#/$defs/stableSemverCore" },
+    "distribution": { "enum": ["community", "commercial"] },
+    "release_channel": { "$ref": "#/$defs/namespacedId" },
+    "required_entitlement_features": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/namespacedId" }
+    },
+    "backend": { "const": "cuda" },
+    "engine_api": { "$ref": "#/$defs/versionRange" },
+    "backend_abi": { "$ref": "#/$defs/versionRange" },
+    "target": { "$ref": "#/$defs/target" },
+    "required_extensions": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/extension" }
+    },
+    "optional_extensions": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/extension" }
+    },
+    "toolchain": { "$ref": "#/$defs/toolchain" },
+    "modules": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/module" }
+    },
+    "choice_groups": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/choiceGroup" }
+    },
+    "variants": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/variant" }
+    },
+    "notices_sha256": { "$ref": "#/$defs/sha256" },
+    "sbom_sha256": { "$ref": "#/$defs/sha256" },
+    "provenance_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "opaqueId": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "namespacedId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)+(?![\\s\\S])"
+    },
+    "slotId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*(?![\\s\\S])"
+    },
+    "stableSemverCore": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 64,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?![\\s\\S])"
+    },
+    "versionRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max_exclusive"],
+      "properties": {
+        "min": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "max_exclusive": { "type": "integer", "minimum": 2, "maximum": 4294967295 }
+      }
+    },
+    "extension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision"],
+      "properties": {
+        "id": { "$ref": "#/$defs/namespacedId" },
+        "revision": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sm", "warp_size", "driver_min", "math_mode"],
+      "properties": {
+        "sm": { "type": "integer", "minimum": 50, "maximum": 999 },
+        "warp_size": { "const": 32 },
+        "driver_min": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "math_mode": { "enum": ["strict", "fast"] }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "builder_image_sha256",
+        "build_recipe_sha256",
+        "producer"
+      ],
+      "properties": {
+        "builder_image_sha256": { "$ref": "#/$defs/sha256" },
+        "build_recipe_sha256": { "$ref": "#/$defs/sha256" },
+        "producer": { "$ref": "#/$defs/aotProducer" }
+      }
+    },
+    "toolVersion": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 32,
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?(?![\\s\\S])"
+    },
+    "gitRevision": {
+      "type": "string",
+      "minLength": 40,
+      "maxLength": 40,
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "aotProducer": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "triton_revision", "triton_version", "python", "cuda_toolkit"],
+          "properties": {
+            "kind": { "const": "triton" },
+            "triton_revision": { "$ref": "#/$defs/gitRevision" },
+            "triton_version": { "$ref": "#/$defs/stableSemverCore" },
+            "python": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 32,
+              "pattern": "^(3|[4-9]|[1-9][0-9]+)\\.[0-9]+(?:\\.[0-9]+)?(?![\\s\\S])"
+            },
+            "cuda_toolkit": { "$ref": "#/$defs/toolVersion" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "compiler_id", "compiler_version", "cuda_toolkit"],
+          "properties": {
+            "kind": { "const": "cuda_cpp" },
+            "compiler_id": { "enum": ["nvcc", "clang_cuda"] },
+            "compiler_version": { "$ref": "#/$defs/toolVersion" },
+            "cuda_toolkit": { "$ref": "#/$defs/toolVersion" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "producer_id", "producer_revision", "source_sha256", "toolchain_sha256"],
+          "properties": {
+            "kind": { "const": "external_aot" },
+            "producer_id": { "$ref": "#/$defs/namespacedId" },
+            "producer_revision": { "$ref": "#/$defs/gitRevision" },
+            "source_sha256": { "$ref": "#/$defs/sha256" },
+            "toolchain_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "module": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "file", "format", "bytes", "sha256"],
+      "properties": {
+        "id": { "$ref": "#/$defs/opaqueId" },
+        "file": {
+          "type": "string",
+          "minLength": 78,
+          "maxLength": 78,
+          "pattern": "^modules/[0-9a-f]{64}\\.cubin(?![\\s\\S])"
+        },
+        "format": { "const": "cubin" },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 268435456
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "contractRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "sha256"],
+      "properties": {
+        "id": { "$ref": "#/$defs/namespacedId" },
+        "revision": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "workloadParameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "narrow_tokens": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workload_id",
+        "revision",
+        "parameters",
+        "parameters_sha256",
+        "fixture_sha256"
+      ],
+      "properties": {
+        "workload_id": {
+          "enum": [
+            "imparo.workload.decode_mix",
+            "imparo.workload.narrow_mix",
+            "imparo.workload.attention_decode",
+            "imparo.workload.attention_decode_deep",
+            "imparo.workload.attention_prefill",
+            "imparo.workload.attention_prefill_deep",
+            "imparo.workload.decode_attention_step",
+            "imparo.workload.attention_prefill_reuse",
+            "imparo.workload.prefill_gemm"
+          ]
+        },
+        "revision": { "const": 1 },
+        "parameters": { "$ref": "#/$defs/workloadParameters" },
+        "parameters_sha256": { "$ref": "#/$defs/sha256" },
+        "fixture_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "choiceGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "choice_group_id",
+        "contract",
+        "workload",
+        "screened",
+        "bit_affecting",
+        "joint_with"
+      ],
+      "properties": {
+        "choice_group_id": { "$ref": "#/$defs/namespacedId" },
+        "contract": { "$ref": "#/$defs/contractRef" },
+        "workload": { "$ref": "#/$defs/workload" },
+        "cross_check": { "$ref": "#/$defs/workload" },
+        "screened": { "type": "boolean" },
+        "bit_affecting": { "type": "boolean" },
+        "joint_with": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/namespacedId" }
+        }
+      }
+    },
+    "shapeConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "axis", "min", "max", "multiple_of"],
+      "properties": {
+        "slot": { "$ref": "#/$defs/slotId" },
+        "axis": { "type": "integer", "minimum": 0, "maximum": 31 },
+        "min": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "max": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "multiple_of": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "one_of": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+        }
+      }
+    },
+    "dtypeConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "allowed"],
+      "properties": {
+        "slot": { "$ref": "#/$defs/slotId" },
+        "allowed": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "enum": ["f16", "bf16", "f32", "i32", "u32", "u64"] }
+        }
+      }
+    },
+    "quantizationConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "allowed"],
+      "properties": {
+        "slot": { "$ref": "#/$defs/slotId" },
+        "allowed": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "enum": ["none", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0"] }
+        }
+      }
+    },
+    "layoutConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "allowed"],
+      "properties": {
+        "slot": { "$ref": "#/$defs/slotId" },
+        "allowed": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["contiguous", "row_major", "column_major", "paged_kv", "head_major"]
+          }
+        }
+      }
+    },
+    "alignmentConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "bytes"],
+      "properties": {
+        "slot": { "$ref": "#/$defs/slotId" },
+        "bytes": { "enum": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shapes", "dtypes", "quantizations", "layouts", "alignments"],
+      "properties": {
+        "shapes": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/shapeConstraint" }
+        },
+        "dtypes": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/dtypeConstraint" }
+        },
+        "quantizations": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/quantizationConstraint" }
+        },
+        "layouts": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/layoutConstraint" }
+        },
+        "alignments": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/alignmentConstraint" }
+        }
+      }
+    },
+    "aliasRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "target_slot"],
+      "properties": {
+        "mode": { "enum": ["forbidden", "may_alias", "must_alias"] },
+        "target_slot": { "$ref": "#/$defs/slotId" }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "access", "aliasing"],
+      "properties": {
+        "slot": { "$ref": "#/$defs/slotId" },
+        "access": { "enum": ["read", "write", "read_write"] },
+        "aliasing": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/aliasRule" }
+        }
+      }
+    },
+    "scratch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_bytes", "alignment", "zero_initialized"],
+      "properties": {
+        "max_bytes": { "type": "integer", "minimum": 0, "maximum": 2147483648 },
+        "alignment": { "enum": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] },
+        "zero_initialized": { "type": "boolean" }
+      }
+    },
+    "wireType": {
+      "enum": [
+        "tensor_ptr",
+        "state_ptr",
+        "scratch_ptr",
+        "scalar_i32",
+        "scalar_u32",
+        "scalar_u64",
+        "scalar_f32",
+        "manifest_u32"
+      ]
+    },
+    "launchArgument": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "slot", "wire_type"],
+          "properties": {
+            "kind": { "const": "slot" },
+            "slot": { "$ref": "#/$defs/slotId" },
+            "wire_type": { "$ref": "#/$defs/wireType" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "value"],
+          "properties": {
+            "kind": { "const": "manifest_u32" },
+            "name": { "$ref": "#/$defs/slotId" },
+            "value": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          }
+        }
+      ]
+    },
+    "integerExpression": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "const" },
+            "value": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "slot"],
+          "properties": {
+            "kind": { "const": "slot" },
+            "slot": { "$ref": "#/$defs/slotId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "op", "args"],
+          "properties": {
+            "kind": { "const": "op" },
+            "op": { "enum": ["add", "mul", "ceil_div", "min", "max"] },
+            "args": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": { "$ref": "#/$defs/integerExpression" }
+            }
+          }
+        }
+      ]
+    },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "z"],
+      "properties": {
+        "x": { "$ref": "#/$defs/integerExpression" },
+        "y": { "$ref": "#/$defs/integerExpression" },
+        "z": { "$ref": "#/$defs/integerExpression" }
+      }
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "z"],
+      "properties": {
+        "x": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "y": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "z": { "type": "integer", "minimum": 1, "maximum": 64 }
+      }
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["arguments", "grid", "block", "dynamic_shared_bytes"],
+      "properties": {
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/launchArgument" }
+        },
+        "grid": { "$ref": "#/$defs/grid" },
+        "block": { "$ref": "#/$defs/block" },
+        "dynamic_shared_bytes": { "$ref": "#/$defs/integerExpression" }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registers_per_thread_max",
+        "static_shared_bytes_max",
+        "dynamic_shared_bytes_max",
+        "local_memory_bytes_max",
+        "threads_per_block_max"
+      ],
+      "properties": {
+        "registers_per_thread_max": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "static_shared_bytes_max": { "type": "integer", "minimum": 0, "maximum": 262144 },
+        "dynamic_shared_bytes_max": { "type": "integer", "minimum": 0, "maximum": 262144 },
+        "local_memory_bytes_max": { "type": "integer", "minimum": 0, "maximum": 1073741824 },
+        "threads_per_block_max": { "type": "integer", "minimum": 1, "maximum": 1024 }
+      }
+    },
+    "numericalClass": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reference", "contract_version"],
+          "properties": {
+            "kind": { "const": "bit_exact" },
+            "reference": { "$ref": "#/$defs/namespacedId" },
+            "contract_version": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "gate_suite", "contract_version"],
+          "properties": {
+            "kind": { "const": "gate_bounded" },
+            "gate_suite": { "$ref": "#/$defs/namespacedId" },
+            "contract_version": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "diagnostic_only" }
+          }
+        }
+      ]
+    },
+    "typedReference": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": { "const": "variant" },
+            "id": { "$ref": "#/$defs/opaqueId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": { "const": "choice_group" },
+            "id": { "$ref": "#/$defs/namespacedId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": { "const": "feature" },
+            "id": { "$ref": "#/$defs/namespacedId" }
+          }
+        }
+      ]
+    },
+    "featureReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "const": "feature" },
+        "id": { "$ref": "#/$defs/namespacedId" }
+      }
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "variant_id",
+        "config_id",
+        "choice_group_id",
+        "contract",
+        "module_id",
+        "symbol",
+        "constraints",
+        "effects",
+        "scratch",
+        "launch",
+        "resources",
+        "graph_capture",
+        "graph_update_slots",
+        "numerical_class",
+        "determinism",
+        "bit_affecting",
+        "required_entitlement_features",
+        "requires",
+        "conflicts",
+        "provides",
+        "joint_with"
+      ],
+      "properties": {
+        "variant_id": { "$ref": "#/$defs/opaqueId" },
+        "config_id": { "$ref": "#/$defs/opaqueId" },
+        "choice_group_id": { "$ref": "#/$defs/namespacedId" },
+        "extension": { "$ref": "#/$defs/extension" },
+        "contract": { "$ref": "#/$defs/contractRef" },
+        "module_id": { "$ref": "#/$defs/opaqueId" },
+        "symbol": {
+          "type": "string",
+          "minLength": 67,
+          "maxLength": 67,
+          "pattern": "^ip_[0-9a-f]{64}$"
+        },
+        "constraints": { "$ref": "#/$defs/constraints" },
+        "effects": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/effect" }
+        },
+        "scratch": { "$ref": "#/$defs/scratch" },
+        "launch": { "$ref": "#/$defs/launch" },
+        "resources": { "$ref": "#/$defs/resources" },
+        "graph_capture": {
+          "enum": ["forbidden", "capture_only", "replay_update_safe"]
+        },
+        "graph_update_slots": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/slotId" }
+        },
+        "numerical_class": { "$ref": "#/$defs/numericalClass" },
+        "determinism": { "enum": ["required", "not_required"] },
+        "bit_affecting": { "type": "boolean" },
+        "required_entitlement_features": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/namespacedId" }
+        },
+        "requires": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/typedReference" }
+        },
+        "conflicts": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/typedReference" }
+        },
+        "provides": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/featureReference" }
+        },
+        "joint_with": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/namespacedId" }
+        }
+      }
+    }
+  }
+}

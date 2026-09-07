@@ -39,6 +39,35 @@ constant uint EPI_SILU = 2u;
 // One value per PROCESS, which is what a model is: gemma4 is GELU in every layer and
 // LFM2 is SiLU in every layer. A file that mixed them per layer would need pipelines of
 // both kinds and a dispatch-time choice.
+
+// SCHEDULING FENCES INSIDE THE MMA LOOP, which llama.cpp's mul_mm has and this kernel
+// does not. Between the weight loads, the activation loads and the multiplies it places
+// `simdgroup_barrier(mem_flags::mem_none)` -- no memory ordering at all, purely a fence
+// the compiler may not schedule across.
+//
+// Worth testing precisely because it runs the OTHER WAY from everything else tried here.
+// Seven attempts to give this kernel less to do have measured slower; if what limits it
+// is how the compiler orders the loads against the multiplies rather than how many there
+// are, then constraining that order is the lever and removing work is not.
+// DEFAULT TRUE, and measured: +5.1% at the short leg, +3.1% at depth. The constant stays
+// so the negative can be reproduced, but the shipping pipeline has the fences.
+// The same question asked of the Q4 rt_gemm, which has NO simdgroup barrier today and
+// gets its ordering from an explicit prefetch pipeline instead. Default FALSE: that
+// kernel is the one that already beats upstream, so it does not change until measured.
+// And the same question for PREFILL ATTENTION, which is what the deep leg's remaining
+// deficit scales with. Its score loop already prefetches one d-step ahead -- the same
+// shape as the Q4 rt_gemm, which has no fence -- so the prior is that it does not want
+// one. Default false; the lever exists so that is measured rather than assumed.
+// PHASE PROBE for prefill attention, the shape that worked on the Q8 GEMM:
+//   bit 0  no score MMA      bit 1  no softmax      bit 2  no P x V
+// A function constant, so an unset build compiles the shipping kernel byte for byte.
+// Attention is 15.4% of the deep prefill and runs 20.9% behind
+// `kernel_flash_attn_ext`; neither KV bandwidth nor the query tile explains that, so the
+// next question is which PHASE of the inner loop the time is in. Answers are wrong on
+// purpose; only the time is read.
+constant uint ATTN_SKIP_FC [[function_constant(17)]];
+constant uint ATTN_SKIP = is_function_constant_defined(ATTN_SKIP_FC) ? ATTN_SKIP_FC : 0u;
+
 constant uint EPI_ACT_FC [[function_constant(11)]];
 constant uint EPI_ACT = is_function_constant_defined(EPI_ACT_FC) ? EPI_ACT_FC : EPI_GELU;
 
@@ -51,6 +80,13 @@ constant uint Q4_0_BYTES = 18u;
 // Q8_0: 32 values per block, an f16 scale then 32 SIGNED bytes. Element i is byte 2+i.
 constant uint QK8_0 = 32u;
 constant uint Q8_0_BYTES = 34u;
+
+// DEQUANT FORM of the prefill GEMMs, st_gemm and rt_gemm (task #105): half(q) * d in HALF
+// arithmetic -- one convert and one half multiply per element. It is bit-identical to the
+// ported form half(float(q) * float(d)): q (or nibble - 8) is exact in half, the product of
+// an int8 by a half is exact in float (19 significant bits), so both round the same exact
+// product once. Measured 2026-09-02 on the original files: LFM2 +6.8% (455), E4B +2.3% (449)
+// / +2.0% (16191) -- the conversion arithmetic had been 7% of the short leg.
 
 // "this norm has no weight tensor". It used to be 0xFFFFFFFF, which collided with any
 // real offset congruent to it mod 2^32 while the offset was 32 bits, and with exactly
@@ -115,7 +151,66 @@ constant bool SKIP_MMA [[function_constant(1)]];
 // registers without adding independent work. NR0 rows give NR0 chains for free, and share
 // one activation read. llama.cpp's mul_vec_q_n_f32_impl uses 4.
 constant uint NR0 [[function_constant(2)]];
-constant uint TOKEN_TILE    = 4u;
+// Tokens per lane in the Q4 matmat. Injected as a preprocessor macro by the host
+// (imparo_metal.mm: Q4_TOKEN_TILE) because the DISPATCH GRID divides n_tok by the same
+// number -- they were two independent 4s, and a change to either alone would have sized
+// the grid for a tile the kernel does not use. Compile-time, so the unrolled body and the
+// `tiles == 1` decode branch fold exactly as before.
+//
+// MEASURED, on the Q8 kernel that does the same thing with a tunable tile (LFM2.5-2.6B
+// Q8_0, narrow batch, us per pass): 1 -> 1286, 2 -> 833, 4 -> 799, 8 -> 1534. A clean
+// interior minimum at 4 with both sides turning over, and +92% at 8 where the registers
+// spill. That is why this one is a constant rather than a knob: the analogous kernel
+// answers the question, and four times the pipelines would rediscover it.
+#ifndef Q4_TOKEN_TILE
+#define Q4_TOKEN_TILE 4u
+#endif
+constant uint TOKEN_TILE    = Q4_TOKEN_TILE;
+
+// BRICK: Q4_0 ROW GROUP PARTIAL. This lane's blocks (sub, sub + LANES_PER_ROW, ...) of NR0 rows
+// (row_off[i] = byte offset of row i from `w`), one activation read shared by all NR0 rows;
+// acc[i] accumulates block-by-block in the decode GEMV's order: part = sum over the 4 nibble
+// groups of dot(lo, xa) + dot(hi, xb), then acc += part * d. The decode GEMV's fast path and
+// every mega row phase are this one body (NR0 is the pipeline's function constant: the GEMV's
+// tuned row count, 1 in the mega block), so a row's bits are the same wherever it is computed.
+// XS is the activation row's address space: device const float4 * or threadgroup const float4 *.
+// BRICK: LANE-GROUP SUM. The LANES_PER_ROW lanes that share a row fold their block partials
+// into the group's first lane (sub == 0) with the decode GEMV's shuffle tree; the other lanes
+// hold garbage afterwards, as they always did.
+inline float lane_group_sum(float acc) {
+    #pragma unroll
+    for (uint off = LANES_PER_ROW / 2u; off > 0u; off >>= 1u) { acc += simd_shuffle_down(acc, off); }
+    return acc;
+}
+
+template <typename XS>
+inline void q4_rows_partial(device const uchar * w, thread const ulong * row_off, XS xs,
+                            uint blocks, uint sub, thread float * acc) {
+    for (uint b = sub; b < blocks; b += LANES_PER_ROW) {
+        const uint base4 = b * (QK4_0 / 4u);
+        float d[8], part[8];
+        #pragma unroll
+        for (uint i = 0; i < NR0; ++i) {
+            device const uchar * blk = w + row_off[i] + b * Q4_0_BYTES;
+            d[i] = float(as_type<half>((ushort)(blk[0] | (blk[1] << 8))));
+            part[i] = 0.0f;
+        }
+        #pragma unroll
+        for (uint g = 0; g < 4; ++g) {
+            const float4 xa = xs[base4 + g];
+            const float4 xb = xs[base4 + g + 4u];
+            #pragma unroll
+            for (uint i = 0; i < NR0; ++i) {
+                // One 32-bit load per four values; the payload is 2-byte aligned inside the
+                // block, so the address is cast rather than indexed through a uchar4 pointer.
+                const uchar4 pk = *(device const uchar4 *)(w + row_off[i] + b * Q4_0_BYTES + 2u + g * 4u);
+                part[i] += dot(unpack_lo(pk), xa) + dot(unpack_hi(pk), xb);
+            }
+        }
+        #pragma unroll
+        for (uint i = 0; i < NR0; ++i) { acc[i] += part[i] * d[i]; }
+    }
+}
 
 kernel void imparo_q4_0_matmat(
     device const uchar * weights [[buffer(0)]],
@@ -166,46 +261,20 @@ kernel void imparo_q4_0_matmat(
         // One 32-bit load per four values, not four byte loads. The payload is only 2-byte
         // aligned inside the block, so the address is cast directly rather than indexed
         // through a uchar4 pointer -- indexed access assumes a vector-aligned base.
-        // NR0 accumulators, NR0 row pointers, ONE activation read shared by all of them.
+        // NR0 accumulators, NR0 rows, ONE activation read shared by all of them: the
+        // q4_rows_partial brick.
         float acc[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-        device const uchar * rp[8];
+        ulong row_off[8];
         #pragma unroll
         for (uint i = 0; i < NR0; ++i) {
             // Clamp rather than branch: a tail thread reads a valid row and throws the
             // result away at the store, which keeps the inner loop uniform.
             const uint rr = min(r + i, n_out - 1u);
-            rp[i] = weights + w_offset + (ulong)rr * blocks * Q4_0_BYTES;
+            row_off[i] = w_offset + (ulong)rr * blocks * Q4_0_BYTES;
         }
-        for (uint b = sub; b < blocks; b += LANES_PER_ROW) {
-            const uint base4 = b * (QK4_0 / 4u);
-            float d[8], part[8];
-            #pragma unroll
-            for (uint i = 0; i < NR0; ++i) {
-                device const uchar * blk = rp[i] + b * Q4_0_BYTES;
-                d[i] = float(as_type<half>((ushort)(blk[0] | (blk[1] << 8))));
-                part[i] = 0.0f;
-            }
-            #pragma unroll
-            for (uint g = 0; g < 4; ++g) {
-                const float4 xa = xs[base4 + g];
-                const float4 xb = xs[base4 + g + 4u];
-                #pragma unroll
-                for (uint i = 0; i < NR0; ++i) {
-                    const uchar4 pk = *(device const uchar4 *)(rp[i] + b * Q4_0_BYTES
-                                                               + 2u + g * 4u);
-                    part[i] += dot(unpack_lo(pk), xa) + dot(unpack_hi(pk), xb);
-                }
-            }
-            #pragma unroll
-            for (uint i = 0; i < NR0; ++i) { acc[i] += part[i] * d[i]; }
-        }
+        q4_rows_partial(weights, row_off, xs, blocks, sub, acc);
         #pragma unroll
-        for (uint i = 0; i < NR0; ++i) {
-            #pragma unroll
-            for (uint off = LANES_PER_ROW / 2u; off > 0u; off >>= 1u) {
-                acc[i] += simd_shuffle_down(acc[i], off);
-            }
-        }
+        for (uint i = 0; i < NR0; ++i) { acc[i] = lane_group_sum(acc[i]); }
         if (sub == 0u) {
             #pragma unroll
             for (uint i = 0; i < NR0; ++i) {
@@ -300,8 +369,25 @@ kernel void imparo_q4_0_matmat(
 // The way to widen rows without paying either price is MORE SIMDGROUPS, not more
 // accumulators each: 64 rows x 32 tokens is 2048 outputs, which over 16 simdgroups is still
 // two 8x8 tiles apiece, and SG_K stays 32 so threadgroup memory is 14.3 KB.
-constant uint SG_ROWS   = 64u;
-constant uint SG_TOKENS = 32u;
+// SG_ROWS and SG_TOKENS are INJECTED by the host (imparo_metal.mm: SG_ROWS/SG_TOKENS),
+// because the DISPATCH GRID is n_out/SG_ROWS by n_tok/SG_TOKENS and the thread count is
+// SG_ROWS*SG_TOKENS/128 simdgroups. Those were written on the host as 63/64, 31/32 and
+// 512, three independent copies of numbers that live here: changing this tile alone would
+// have sized the grid for a shape the kernel does not use, and the kernel would have read
+// past its tile rather than failed.
+//
+// The injected macro carries the VALUE; the names stay `constant uint` as before. Defining
+// SG_ROWS as a bare macro instead made `min(SG_ROWS, n_out - r0)` ambiguous between min(int,
+// int) and min(uint, uint), because the host injects `64` and not `64u` -- the library
+// stopped compiling, every forward failed in a second, and det_gate caught it.
+#ifndef IMPARO_SG_ROWS
+#define IMPARO_SG_ROWS 64
+#endif
+#ifndef IMPARO_SG_TOKENS
+#define IMPARO_SG_TOKENS 32
+#endif
+constant uint SG_ROWS   = IMPARO_SG_ROWS;
+constant uint SG_TOKENS = IMPARO_SG_TOKENS;
 // SG_TOKENS sets how many times each weight is DEQUANTISED: n_tok / SG_TOKENS. At 64 a
 // batch of 64 dequantises every weight ONCE instead of twice. MEASURED SLOWER TWICE:
 // 232-241 -> 196-200 when the activation tile still sat in threadgroup memory, and again
@@ -343,6 +429,29 @@ kernel void imparo_cvt_f32_f16(
 }
 
 // ---------------------------------------------------------------------------------------
+// THE GATED PAIR: one GEMM over gate AND up, closed by act(G) * U in the write-back.
+//
+// A gated FFN runs two projections over the SAME activation tile and then multiplies
+// them elementwise. As two dispatches that costs every row-block threadgroup a second
+// read of the activation tile, a float G buffer written by the first dispatch and read
+// back by the second, and the dispatch itself. Here the two weight tensors are read as
+// ONE virtual matrix of 2 * n_out rows whose 8-row tiles alternate gate (even tile) and
+// up (odd tile); nothing is copied or re-laid out in memory -- the interleave is an
+// address mapping, so the weights stay zero-copy from the file. Any row tile of 16 or
+// more rows then holds matched G/U pairs at tile positions (2m, 2m+1), whatever shape the
+// tuner picks, and the epilogue reads both from the tile it already staged for the
+// write-back. Per output the K walk is the one the split GEMM did, and act(G) * U is
+// computed on the same float bits, so the answer is bit-identical to the two-dispatch
+// form.
+//
+// Tile row v of the virtual matrix comes from tensor (v / 8) % 2, row (v / 16) * 8 + v % 8.
+template<bool GATED> inline bool gated_is_up(uint v) { return GATED && (((v >> 3) & 1u) != 0u); }
+template<bool GATED> inline uint gated_src_row(uint v) { return GATED ? (((v >> 4) << 3) | (v & 7u)) : v; }
+// Where output column c (0 <= c < rows / 2) of a gated tile finds its gate slot; the up
+// slot is 8 further on.
+inline uint gated_gate_slot(uint c) { return ((c >> 3) << 4) | (c & 7u); }
+
+// ---------------------------------------------------------------------------------------
 // Register-tiled prefill GEMM.
 //
 // The other prefill kernel computes two INDEPENDENT 8x8 output tiles per simdgroup, so
@@ -362,13 +471,27 @@ kernel void imparo_cvt_f32_f16(
 // shape uses -- a padded worst-case array would hand every small shape the register
 // pressure of the largest one. Each shape is instantiated as its own named kernel and the
 // host picks between them at run time, so measuring a shape still costs no rebuild.
-template<uint NA, uint NB, uint SGX, uint SGY, bool HALF_A = false>
+// WQ is the WEIGHT FORMAT this instantiation stages: 4 for Q4_0 (18-byte blocks, nibble
+// pairs), 8 for Q8_0 (34-byte blocks, signed bytes). Both are 32 elements wide, so the
+// chunking, the tile and the whole multiply loop are shared; only `stage` reads bytes
+// differently. The register-tiled design against the staged one (st_gemm) is therefore
+// the same comparison at either format: rt_gemm<Q8> and st_gemm<Q8> multiply identical
+// half operands in the same k order.
+template<uint NA, uint NB, uint SGX, uint SGY, bool HALF_A = false, uint WQ = 4u,
+         bool GATED = false>
 static void rt_gemm(
     device const uchar * weights, device const float * x, device float * y,
-    ulong w_offset, uint n_in, uint n_out, uint n_tok, uint src_row,
-    threadgroup float * shared, uint3 tgid, uint tid, uint tcount, uint sgid,
+    ulong w_offset, ulong w_offset2, uint n_in, uint n_out, uint n_tok, uint src_row,
+    threadgroup float * shared, uint3 tgid, uint tid, uint tcount, uint sgid, uint lane,
     uint skip, uint epilogue, device half * xh2, uint epi_half)
 {
+    static_assert(WQ == 4u || WQ == 8u, "rt_gemm stages Q4_0 or Q8_0 weights");
+    // GATED (see THE GATED PAIR above): `w_offset` is the gate tensor, `w_offset2` the up
+    // tensor, `n_out` the OUTPUT width, and the grid walks 2 * n_out virtual rows. The
+    // pair lives inside one row tile only if the tile holds whole 16-row groups.
+    static_assert(!GATED || (NB % 2u) == 0u,
+                  "a gated rt_gemm simdgroup must hold whole gate/up pairs");
+    static_assert(QK4_0 == QK8_0, "one chunking for both formats needs one block width");
     constexpr uint RT_ROWS   = NB * 8u * SGX;           // output rows per threadgroup
     constexpr uint RT_TOKENS = NA * 8u * SGY;           // tokens per threadgroup
     // Two Q4_0 blocks per row per chunk. At RT_K == QK4_0 a 2560-wide matmul runs 80
@@ -411,12 +534,12 @@ static void rt_gemm(
     //   [row][k], contiguous writes + transpose  412.0
     //   tile-major, 8x8 blocks contiguous        400.7
     //
-    // DOUBLE BUFFERED: chunk c+1 is staged while chunk c is being multiplied. A single
-    // buffer forces two barriers per chunk that serialise the two phases -- every thread
-    // waits for staging to finish before any multiply starts, and again before restaging.
-    // llama.cpp pays for 14 dequantisation passes over a 440-token batch where this kernel
-    // pays for 7, and its whole MUL_MAT still costs what this kernel's multiplies alone do,
-    // which is what overlap buys.
+    // SINGLE staged tile, and the reason is at the chunk loop below with its numbers:
+    // double buffering was implemented and measured WORSE. This comment used to claim
+    // the kernel was double buffered, which contradicted the loop it describes.
+    //
+    // What the deeper chunk does buy: llama.cpp dequantises a 440-token batch 14 times
+    // where this kernel does it 7, because RT_K is 64 against its NK of 32.
     // Weight tile as [k][row]; activations read straight from device.
     //
     // llama.cpp's mul_mm stages BOTH operands tile-major, so every simdgroup_load reads one
@@ -470,10 +593,11 @@ static void rt_gemm(
     // weights. Swapping the grid so they share the weight tile instead was measured --
     // 11520 and 11528 ms against 11517-11537 -- exactly nothing, logits unchanged. The
     // kernel is latency-bound on the activation reads, but not because of this ordering.
+    const uint vrows = GATED ? 2u * n_out : n_out;   // rows the grid walks
     const uint r0 = tgid.x * RT_ROWS;
     const uint t0 = tgid.y * RT_TOKENS;
-    if (r0 >= n_out || t0 >= n_tok) { return; }
-    const uint nrow = min(RT_ROWS, n_out - r0);
+    if (r0 >= vrows || t0 >= n_tok) { return; }
+    const uint nrow = min(RT_ROWS, vrows - r0);
     const uint ntok = min(RT_TOKENS, n_tok - t0);
     const uint blocks = n_in / QK4_0;
 
@@ -492,6 +616,45 @@ static void rt_gemm(
     // wrong-logits failures of both whole-block attempts.
     auto stage = [&](uint c00, threadgroup half * dst) {
         const uint bi = c00 / QK4_0;
+        if (WQ == 8u) {
+            // ONE THREAD PER 34-BYTE Q8_0 BLOCK: the half scale, then 32 signed bytes into
+            // 32 consecutive k slots of the [k][row] tile. `half(q * d)` is exactly the
+            // rounding st_gemm applies when it stages, so the two Q8 designs feed the
+            // matrix units identical operands. Dead rows stage zeros, as the Q4 arm does.
+            // The device read of the NEXT chunk's bytes into registers, to overlap this
+            // chunk's multiplies, was built and measured: -2.0% on the 17123-token prefill
+            // (787 against 803 tok/s, three interleaved rounds). Its ceiling was the read's
+            // whole cost, +3.1% with the reads removed, and nine more live registers on
+            // top of the activation pipeline cost more than the latency they hid.
+            constexpr uint BPCH = RT_K / QK8_0;   // blocks per row per chunk: TWO
+            for (uint e = tid; e < RT_ROWS * BPCH; e += tcount) {
+                const uint rr = e / BPCH, bb = e % BPCH;
+                const bool read = rr < nrow && !(skip & 4u);
+                float d = 0.0f;
+                device const uchar * blk = weights;
+                if (read) {
+                    blk = weights + (gated_is_up<GATED>(r0 + rr) ? w_offset2 : w_offset)
+                        + (ulong)gated_src_row<GATED>(r0 + rr) * blocks * Q8_0_BYTES
+                        + (bi + bb) * Q8_0_BYTES;
+                    d = float(as_type<half>((ushort)(blk[0] | (blk[1] << 8))));
+                }
+                const uint k0 = bb * QK8_0;
+                #pragma unroll
+                for (uint g = 0; g < 8u; ++g) {
+                    char4 q = char4(0);
+                    if (read) {
+                        q = char4(*(device const packed_char4 *)(blk + 2u + g * 4u));
+                    }
+                    // Same exact product rounded once (see the dequant-form note above).
+                    const half4 v4h = half4(q) * half(d);
+                    #pragma unroll
+                    for (uint j = 0; j < 4u; ++j) {
+                        dst[(k0 + g * 4u + j) * RT_WS + rr] = v4h[j];
+                    }
+                }
+            }
+            return;
+        }
         // One thread dequantises one WHOLE 18-byte block: one scale read and one base
         // address instead of four of each, and a quarter of the loop iterations. Same
         // values to the same slots in the same k-mapping as the 4-byte-per-thread form it
@@ -512,8 +675,9 @@ static void rt_gemm(
                 float d = live ? 1.0f : 0.0f;
                 device const uchar * blk = weights;
                 if (read) {
-                    blk = weights + w_offset
-                        + (ulong)(r0 + rr) * blocks * Q4_0_BYTES + (bi + bb) * Q4_0_BYTES;
+                    blk = weights + (gated_is_up<GATED>(r0 + rr) ? w_offset2 : w_offset)
+                        + (ulong)gated_src_row<GATED>(r0 + rr) * blocks * Q4_0_BYTES
+                        + (bi + bb) * Q4_0_BYTES;
                     d = float(as_type<half>((ushort)(blk[0] | (blk[1] << 8))));
                 }
                 const uint k0 = bb * QK4_0;
@@ -523,13 +687,17 @@ static void rt_gemm(
                     if (read) {
                         quad = uchar4(*(device const packed_uchar4 *)(blk + 2u + g * 4u));
                     }
-                    const float4 lo4 = (float4(quad & uchar4(0x0F)) - 8.0f) * d;
-                    const float4 hi4 = (float4(quad >> 4)           - 8.0f) * d;
+                    // nibble - 8 is exact in half and its product with the half scale is
+                    // exact in float, so the half-arithmetic form rounds the same product
+                    // once: bit-identical, one convert and one multiply fewer per element.
+                    const half dh = half(d);
+                    const half4 lo4h = (half4(quad & uchar4(0x0F)) - half(8.0h)) * dh;
+                    const half4 hi4h = (half4(quad >> 4)           - half(8.0h)) * dh;
                     #pragma unroll
                     for (uint j = 0; j < 4u; ++j) {
                         const uint kk = k0 + g * 4u + j;
-                        dst[kk * RT_WS + rr]         = half(lo4[j]);
-                        dst[(kk + 16u) * RT_WS + rr] = half(hi4[j]);
+                        dst[kk * RT_WS + rr]         = lo4h[j];
+                        dst[(kk + 16u) * RT_WS + rr] = hi4h[j];
                     }
                 }
             }
@@ -621,6 +789,12 @@ static void rt_gemm(
 
             #pragma unroll
             for (uint k = 0; k < KSTEPS; k += 8u) {
+                // THE SAME SCHEDULING FENCES the Q8 GEMM gained, asked of a kernel that
+                // already has an explicit pipeline. This one rotates prefetch registers
+                // by hand, so the data dependency through the rotation ALREADY imposes an
+                // order the compiler must respect -- the Q8 kernel had neither and gained
+                // 5.1%. Whether a second constraint helps here or fights the pipeline is
+                // a measurement, and this is the lever for it.
                 if (k + APF * 8u < KSTEPS) {
                     #pragma unroll
                     for (uint i = 0; i < NA; ++i) {
@@ -685,7 +859,9 @@ static void rt_gemm(
     // Rows never straddle the end: n_out is a multiple of 64 for every matmul in this
     // model. Tokens can, so the caller rounds the activation buffers up to a whole token
     // tile; rows past the token count receive values nothing reads.
-    if (epilogue == 0u) {
+    // A GATED dispatch always has an activation (the host refuses it otherwise), so it
+    // never takes the straight store: its rows are gate and up halves, not outputs.
+    if (epilogue == 0u && !GATED) {
         #pragma unroll
         for (uint i = 0; i < NA; ++i) {
             #pragma unroll
@@ -708,12 +884,68 @@ static void rt_gemm(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup float * ob = shared;
     constexpr uint OB_S = RT_ROWS;
-    #pragma unroll
-    for (uint i = 0; i < NA; ++i) {
+    // UNGATED ONLY. The gated pair below never reads this tile, and the host sizes a gated
+    // dispatch at max(staged weight tile, 128 floats per simdgroup) = 8448 B for the
+    // 64x64 shape -- this spill is RT_TOKENS x RT_ROWS floats = 16384 B. Until 2026-09-02
+    // the loop ran for both variants: 16 dead simdgroup_stores per simdgroup on every
+    // gated FFN dispatch, written past the end of the threadgroup allocation.
+    if (!GATED) {
         #pragma unroll
-        for (uint j = 0; j < NB; ++j) {
-            simdgroup_store(mc[i * NB + j], ob + (ty + i * 8u) * OB_S + rx + j * 8u, OB_S);
+        for (uint i = 0; i < NA; ++i) {
+            #pragma unroll
+            for (uint j = 0; j < NB; ++j) {
+                simdgroup_store(mc[i * NB + j], ob + (ty + i * 8u) * OB_S + rx + j * 8u, OB_S);
+            }
         }
+    }
+    if (GATED) {
+        // THE PAIR CLOSED INSIDE ITS SIMDGROUP, with no threadgroup round trip. The ungated
+        // epilogue below spills the whole RT_TOKENS x RT_ROWS tile and walks it with every
+        // thread: two threadgroup barriers and a 16 KB allocation against the plain
+        // store's 8.4 KB. Routed that way the pair LOST 0.6-2.3% on E4B (Q4, 64x64) while
+        // it gained ~1% on LFM2, whose st_gemm write-back spills either way -- the gate
+        // half had been trading a straight register store for the big spill. A simdgroup
+        // owns both tiles of each pair, so it stores just those two (512 B of the dead
+        // staging tile), multiplies, writes, and moves on; the threadgroup allocation
+        // stays at the staged weight tile.
+        //
+        // ONE threadgroup barrier stands between the last chunk's MMA loop and the first
+        // accumulator store here: the one above the ungated spill. A second one used to sit
+        // below, kept as "REQUIRED" because without it a 64-token E4B forward gave three
+        // different logit vectors in three runs. The mechanism was found on 2026-09-02: the
+        // ungated spill (RT_TOKENS x RT_ROWS floats = 16 KB) also ran for this variant, into
+        // an 8448 B allocation, so the over-run raced whatever the extra barrier happened to
+        // order. With the spill scoped to the ungated path, three runs hash identical without
+        // the second barrier, det_gate pins EXACT, and the A/B reads +0.4 / +1.3 %.
+        //
+        // act(G) * U on the same float bits the two-dispatch form multiplied (a
+        // simdgroup_store of the same accumulator, read back), so the same product.
+        // Output column of pair m: virtual tile row (r0 + rx + 16 m) maps to
+        // (r0 + rx) / 2 + 8 m. Tokens past ntok are masked; rows never straddle n_out.
+        //
+        threadgroup float * sc = shared + sgid * 128u;
+        #pragma unroll
+        for (uint i = 0; i < NA; ++i) {
+            #pragma unroll
+            for (uint m = 0; m < NB / 2u; ++m) {
+                simdgroup_store(mc[i * NB + 2u * m],      sc,      16u);
+                simdgroup_store(mc[i * NB + 2u * m + 1u], sc + 8u, 16u);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint e = lane; e < 64u; e += 32u) {
+                    const uint tt = e >> 3, cc = e & 7u;
+                    const uint tok = ty + i * 8u + tt;
+                    if (tok < ntok) {
+                        const float v = imparo_act_f(sc[tt * 16u + cc]) * sc[tt * 16u + 8u + cc];
+                        const ulong idx = (ulong)(t0 + tok) * n_out
+                                        + ((r0 + rx) >> 1) + m * 8u + cc;
+                        if (epi_half != 0u) { xh2[idx] = half(v); }
+                        else                { y[idx] = v; }
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        return;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < ntok * nrow; e += tcount) {
@@ -732,12 +964,13 @@ static void rt_gemm(
 
 // One named kernel per shape. The host builds all of them and selects by index; the names
 // must stay in step with RT_SHAPES on the host side.
-#define IMPARO_RT_KERNEL(NAME, NA, NB, SGX, SGY)                                          \
+#define IMPARO_RT_ENTRY(NAME, NA, NB, SGX, SGY, HALF_A, WQ, GATED)                        \
 kernel void NAME(                                                                          \
     device const uchar * weights [[buffer(0)]],                                            \
     device const float * x       [[buffer(1)]],                                            \
     device float       * y       [[buffer(2)]],                                            \
     constant ulong & w_offset [[buffer(3)]], constant uint & n_in  [[buffer(4)]],           \
+    constant ulong & w_offset2 [[buffer(10)]],                                             \
     constant uint & n_out    [[buffer(5)]], constant uint & n_tok [[buffer(6)]],           \
     constant uint & src_row  [[buffer(7)]], constant uint & skip [[buffer(12)]],           \
     constant uint & epilogue [[buffer(13)]],                                               \
@@ -746,12 +979,20 @@ kernel void NAME(                                                               
     uint3 tgid  [[threadgroup_position_in_grid]],                                          \
     uint3 tid3  [[thread_position_in_threadgroup]],                                        \
     uint3 tcnt3 [[threads_per_threadgroup]],                                               \
-    uint  sgid  [[simdgroup_index_in_threadgroup]])                                        \
+    uint  sgid  [[simdgroup_index_in_threadgroup]],                                        \
+    uint  lane  [[thread_index_in_simdgroup]])                                             \
 {                                                                                          \
-    rt_gemm<NA, NB, SGX, SGY>(weights, x, y, w_offset, n_in, n_out, n_tok, src_row,        \
-                              shared, tgid, tid3.x, tcnt3.x, sgid, skip, epilogue,        \
-                              xh2, epi_half);                                             \
+    rt_gemm<NA, NB, SGX, SGY, HALF_A, WQ, GATED>(weights, x, y, w_offset, w_offset2,      \
+                              n_in, n_out, n_tok,                                          \
+                              src_row, shared, tgid, tid3.x, tcnt3.x, sgid, lane, skip,   \
+                              epilogue, xh2, epi_half);                                   \
 }
+// Q4_0 weights, f32 activations (IMPARO_RT_KERNEL) or the half mirror (_H); the Q8_0
+// twins follow the _H list. One body, four names, so a signature change lands once.
+#define IMPARO_RT_KERNEL(NAME, NA, NB, SGX, SGY)    IMPARO_RT_ENTRY(NAME, NA, NB, SGX, SGY, false, 4u, false)
+#define IMPARO_RT_KERNEL_H(NAME, NA, NB, SGX, SGY)  IMPARO_RT_ENTRY(NAME, NA, NB, SGX, SGY, true, 4u, false)
+// The gated pair (_gh): half activations, Q4_0 gate and up as one virtual matrix.
+#define IMPARO_RT_KERNEL_GH(NAME, NA, NB, SGX, SGY) IMPARO_RT_ENTRY(NAME, NA, NB, SGX, SGY, true, 4u, true)
 
 IMPARO_RT_KERNEL(imparo_rt_0, 2, 4, 2, 2)
 IMPARO_RT_KERNEL(imparo_rt_1, 4, 4, 2, 2)
@@ -780,27 +1021,6 @@ IMPARO_RT_KERNEL(imparo_rt_7, 8, 2, 2, 2)
 
 // Half-activation variants (IMPARO_HALF_A): x is the XH scratch, converted by
 // imparo_cvt_f32_f16. One per shape, so the sweep stays possible.
-#define IMPARO_RT_KERNEL_H(NAME, NA, NB, SGX, SGY)                                         \
-kernel void NAME(                                                                          \
-    device const uchar * weights [[buffer(0)]],                                            \
-    device const float * x       [[buffer(1)]],                                            \
-    device float       * y       [[buffer(2)]],                                            \
-    constant ulong & w_offset [[buffer(3)]], constant uint & n_in  [[buffer(4)]],           \
-    constant uint & n_out    [[buffer(5)]], constant uint & n_tok [[buffer(6)]],           \
-    constant uint & src_row  [[buffer(7)]], constant uint & skip [[buffer(12)]],           \
-    constant uint & epilogue [[buffer(13)]],                                               \
-    device half * xh2 [[buffer(8)]], constant uint & epi_half [[buffer(9)]],               \
-    threadgroup float * shared [[threadgroup(0)]],                                         \
-    uint3 tgid  [[threadgroup_position_in_grid]],                                          \
-    uint3 tid3  [[thread_position_in_threadgroup]],                                        \
-    uint3 tcnt3 [[threads_per_threadgroup]],                                               \
-    uint  sgid  [[simdgroup_index_in_threadgroup]])                                        \
-{                                                                                          \
-    rt_gemm<NA, NB, SGX, SGY, true>(weights, x, y, w_offset, n_in, n_out, n_tok, src_row,  \
-                              shared, tgid, tid3.x, tcnt3.x, sgid, skip, epilogue,         \
-                              xh2, epi_half);                                              \
-}
-
 IMPARO_RT_KERNEL_H(imparo_rt_0_h, 2, 4, 2, 2)
 IMPARO_RT_KERNEL_H(imparo_rt_1_h, 4, 4, 2, 2)
 IMPARO_RT_KERNEL_H(imparo_rt_2_h, 2, 4, 2, 4)
@@ -809,6 +1029,42 @@ IMPARO_RT_KERNEL_H(imparo_rt_4_h, 4, 2, 4, 2)
 IMPARO_RT_KERNEL_H(imparo_rt_5_h, 2, 2, 4, 4)
 IMPARO_RT_KERNEL_H(imparo_rt_6_h, 4, 4, 2, 4)
 IMPARO_RT_KERNEL_H(imparo_rt_7_h, 8, 2, 2, 2)
+IMPARO_RT_KERNEL_GH(imparo_rt_0_gh, 2, 4, 2, 2)
+IMPARO_RT_KERNEL_GH(imparo_rt_1_gh, 4, 4, 2, 2)
+IMPARO_RT_KERNEL_GH(imparo_rt_2_gh, 2, 4, 2, 4)
+IMPARO_RT_KERNEL_GH(imparo_rt_3_gh, 2, 4, 4, 2)
+IMPARO_RT_KERNEL_GH(imparo_rt_4_gh, 4, 2, 4, 2)
+IMPARO_RT_KERNEL_GH(imparo_rt_5_gh, 2, 2, 4, 4)
+IMPARO_RT_KERNEL_GH(imparo_rt_6_gh, 4, 4, 2, 4)
+IMPARO_RT_KERNEL_GH(imparo_rt_7_gh, 8, 2, 2, 2)
+
+// rt_gemm<Q8>: the register-tiled design on Q8_0 weights, one entry per RT_SHAPES row so
+// the tuner can rank the tile for this format (Q8 weights are 1.9x the bytes of Q4 per
+// element, so the winning shape need not be Q4's). The half-mirror twin of each, as above.
+IMPARO_RT_ENTRY(imparo_rt8_0, 2, 4, 2, 2, false, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_1, 4, 4, 2, 2, false, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_2, 2, 4, 2, 4, false, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_3, 2, 4, 4, 2, false, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_4, 4, 2, 4, 2, false, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_5, 2, 2, 4, 4, false, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_6, 4, 4, 2, 4, false, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_7, 8, 2, 2, 2, false, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_0_h, 2, 4, 2, 2, true, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_1_h, 4, 4, 2, 2, true, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_2_h, 2, 4, 2, 4, true, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_3_h, 2, 4, 4, 2, true, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_4_h, 4, 2, 4, 2, true, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_5_h, 2, 2, 4, 4, true, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_6_h, 4, 4, 2, 4, true, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_7_h, 8, 2, 2, 2, true, 8u, false)
+IMPARO_RT_ENTRY(imparo_rt8_0_gh, 2, 4, 2, 2, true, 8u, true)
+IMPARO_RT_ENTRY(imparo_rt8_1_gh, 4, 4, 2, 2, true, 8u, true)
+IMPARO_RT_ENTRY(imparo_rt8_2_gh, 2, 4, 2, 4, true, 8u, true)
+IMPARO_RT_ENTRY(imparo_rt8_3_gh, 2, 4, 4, 2, true, 8u, true)
+IMPARO_RT_ENTRY(imparo_rt8_4_gh, 4, 2, 4, 2, true, 8u, true)
+IMPARO_RT_ENTRY(imparo_rt8_5_gh, 2, 2, 4, 4, true, 8u, true)
+IMPARO_RT_ENTRY(imparo_rt8_6_gh, 4, 4, 2, 4, true, 8u, true)
+IMPARO_RT_ENTRY(imparo_rt8_7_gh, 8, 2, 2, 2, true, 8u, true)
 
 // Narrow-N tile for 2..15-token batches (task #11, modeled on the fork's
 // kernel_mul_mm_nb8, author liuliquan): 64 rows x 8 tokens, 2 simdgroups, 64
@@ -818,12 +1074,23 @@ IMPARO_RT_KERNEL_H(imparo_rt_7_h, 8, 2, 2, 2)
 // every output as any other shape, so routing through it is BIT-IDENTICAL.
 // This is also the #5 story's end state: with 2..15 covered here, no multi-token
 // batch can reach the GEMV in shipping (the wobble's only reachable expression).
-IMPARO_RT_KERNEL(imparo_rt_nb8, 1, 4, 2, 1)
-IMPARO_RT_KERNEL_H(imparo_rt_nb8_h, 1, 4, 2, 1)
+// The template arguments come from the host (imparo_metal.mm: NB8_NA..NB8_SGY) because the
+// DISPATCH GRID is n_out/RT_ROWS by n_tok/RT_TOKENS, and RT_ROWS = NB*8*SGX is computed
+// from them. Both sides said 64 and 8 independently.
+#ifndef NB8_NA
+#define NB8_NA 1
+#define NB8_NB 4
+#define NB8_SGX 2
+#define NB8_SGY 1
+#endif
+IMPARO_RT_KERNEL(imparo_rt_nb8, NB8_NA, NB8_NB, NB8_SGX, NB8_SGY)
+IMPARO_RT_KERNEL_H(imparo_rt_nb8_h, NB8_NA, NB8_NB, NB8_SGX, NB8_SGY)
+IMPARO_RT_KERNEL_GH(imparo_rt_nb8_gh, NB8_NA, NB8_NB, NB8_SGX, NB8_SGY)
 // Variant b: the same 64x8 tile on ONE simdgroup (32 threads, 8 accumulators).
 // Which occupancy shape wins is a device property, so it is a tuned knob.
 IMPARO_RT_KERNEL(imparo_rt_nb8b, 1, 8, 1, 1)
 IMPARO_RT_KERNEL_H(imparo_rt_nb8b_h, 1, 8, 1, 1)
+IMPARO_RT_KERNEL_GH(imparo_rt_nb8b_gh, 1, 8, 1, 1)
 
 
 kernel void imparo_q4_0_matmat_prefill(
@@ -995,6 +1262,69 @@ constant bool Q8_GRID_TOKEN_X = is_function_constant_defined(Q8_GRID_TOKEN_X_FC)
 constant bool Q8_TYPED_SCALE_FC [[function_constant(9)]];
 constant bool Q8_TYPED_SCALE = is_function_constant_defined(Q8_TYPED_SCALE_FC)
                              ? Q8_TYPED_SCALE_FC : false;
+// ATTRIBUTION PROBE for the prefill GEMM, the same three bits the Q4 rt_gemm carries:
+//
+//   bit 0   do not multiply          -> what the MMA costs
+//   bit 1   do not stage             -> what the threadgroup round trip costs
+//   bit 2   do not read the weights  -> what the device weight fetch costs
+//
+// Index 12: 10 is the attention live mask and 11 the epilogue activation.
+// A FUNCTION CONSTANT, not a kernel argument: the shipping pipeline is compiled with it
+// undefined, so every arm below folds away and the measured build is byte-identical to
+// the one without this probe. A runtime uniform would cost a branch in the hot loop and
+// could move the answer. The host compiles the probe variants only when asked.
+constant uint Q8_SKIP_FC [[function_constant(12)]];
+constant uint Q8_SKIP = is_function_constant_defined(Q8_SKIP_FC) ? Q8_SKIP_FC : 0u;
+
+// CLAMP THE EDGE INSTEAD OF PREDICATING IT, which is what llama.cpp's mul_mm does:
+//
+//   llama   lr0 = (tiitg/NL0) < nr0 ? (tiitg/NL0) : nr0 - 1;   ONCE, outside the loop
+//           then every load in the K loop is unconditional
+//   here    if (live) { ...read... } else { ...zero... }        every K chunk
+//
+// A clamped index loads a DUPLICATE row for the out-of-range lanes instead of zeroing
+// them. Those lanes' outputs are masked at write-back either way, so the answer cannot
+// change -- what changes is that the staging loop has no branch and no zero-fill arm.
+// This is the one difference between the two staging loops that had not been tested;
+// unlike the two instruction reductions already measured slower, it removes BRANCHES
+// rather than arithmetic.
+constant bool Q8_CLAMP_EDGE_FC [[function_constant(13)]];
+constant bool Q8_CLAMP_EDGE = is_function_constant_defined(Q8_CLAMP_EDGE_FC)
+                            ? Q8_CLAMP_EDGE_FC : false;
+
+constant bool Q8_MMA_FENCE_FC [[function_constant(14)]];
+constant bool Q8_MMA_FENCE = is_function_constant_defined(Q8_MMA_FENCE_FC)
+                           ? Q8_MMA_FENCE_FC : true;
+
+// Q8_0_TM: the weight bytes are in the tile-major order imparo-repack writes
+// (docs/q8-tile-major-weights.md): per (8-row tile, 32-wide K block) a 256-byte unit
+// [row][k] of int8, units row-tile-major with K blocks adjacent, and every scale after the
+// payload as half[unit][8]. A pipeline is compiled for one layout or the other -- the
+// constant is a function constant, not a uniform, so the row-major kernels are unchanged
+// byte for byte and the TM kernels carry no runtime branch.
+
+constant bool Q8_TM_FC [[function_constant(15)]];
+constant bool Q8_TM = is_function_constant_defined(Q8_TM_FC) ? Q8_TM_FC : false;
+// One unit = the eight rows' half scales (16 bytes) then their eight 32-byte payload rows:
+// 272 bytes, units row-tile-major with K blocks adjacent. MIRRORS imparo_gguf::weights::
+// TM_RULES (pinned bit-identical by the gates). The scales moved into the unit on
+// 2026-09-04: kept in one array after the payload, the decode GEMV streamed two regions
+// per tensor and read 0.7..1.2% slower than row-major.
+constant uint Q8_TM_UNIT_ROWS  = 8u;
+constant uint Q8_TM_UNIT_BYTES = Q8_TM_UNIT_ROWS * (2u + QK8_0);   // 272
+inline ulong q8_tm_unit(uint row, uint block, uint blocks) {
+    return ((ulong)(row / Q8_TM_UNIT_ROWS) * blocks + block) * Q8_TM_UNIT_BYTES;
+}
+// Byte offset of `row`'s 32 values for K block `block`; `blocks` = K blocks per row.
+inline ulong q8_tm_payload(uint row, uint block, uint blocks) {
+    return q8_tm_unit(row, block, blocks) + Q8_TM_UNIT_ROWS * 2u
+         + (ulong)(row % Q8_TM_UNIT_ROWS) * QK8_0;
+}
+// Byte offset of `row`'s half scale for K block `block` (`n_rows` unused by the layout now).
+inline ulong q8_tm_scale(uint row, uint block, uint blocks, uint n_rows) {
+    (void)n_rows;
+    return q8_tm_unit(row, block, blocks) + (ulong)(row % Q8_TM_UNIT_ROWS) * 2u;
+}
 
 // SKIP THE MASK LOOP when a position block is provably live for every query in the tile.
 // Defaults TRUE: the test is a handful of uniform integer ops per block against a loop of
@@ -1022,13 +1352,66 @@ kernel void imparo_q8_0_gemv(
     uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
 {
     if (n_tok != 1u) { return; }
+    const uint blocks = n_in / QK8_0;
+    device const float * xb = x + (ulong)src_row * n_in;
+    if (Q8_TM) {
+        // TILE-MAJOR: a threadgroup owns one 8-row unit tile and every simdgroup step reads
+        // ONE WHOLE 256-BYTE UNIT -- lane = (row in tile, k quarter), 8 bytes each, one
+        // contiguous span. The row-major mapping below (32 lanes over 8 K blocks of one row)
+        // would read eight 32-byte pieces 256 bytes apart here, and the other seven rows of
+        // each unit's cache lines from other threadgroups: measured -1.5..-2.9% decode on
+        // the first A/B. The host dispatches n_out/8 threadgroups for this layout.
+        const uint r0 = tgid.x * Q8_TM_UNIT_ROWS;
+        if (r0 >= n_out) { return; }
+        // TWO ROWS PER LANE, like the row-major kernel: each activation load feeds two
+        // rows' multiplies. One row per lane doubled the x loads per MAC (2 float4 per 8
+        // MACs against 2 per 16) and the probe read the mean 2-6% over row-major with the
+        // min tied. Lane = (unit half u, row pair rp, k quarter il): 16 lanes cover one
+        // unit's 256 payload bytes, the simdgroup covers two ADJACENT units (K blocks ib,
+        // ib+1) per step -- 544 contiguous bytes including the two 16-byte scale heads.
+        const uint u = lane / 16u, rp = (lane / 4u) % 4u, il = lane % 4u;
+        const uint rowa = min(r0 + rp * 2u, n_out - 1u);
+        const uint rowb = min(r0 + rp * 2u + 1u, n_out - 1u);
+        device const uchar * w = weights + w_offset;
+        float acca = 0.0f, accb = 0.0f;
+        for (uint ib = sgid * 2u + u; ib < blocks; ib += nsg * 2u) {
+            const uint i = ib * QK8_0 + il * 8u;
+            const float4 xa  = *(device const float4 *)(xb + i);
+            const float4 xb4 = *(device const float4 *)(xb + i + 4u);
+            device const uchar * pa = w + q8_tm_payload(rowa, ib, blocks) + il * 8u;
+            device const uchar * pb = w + q8_tm_payload(rowb, ib, blocks) + il * 8u;
+            const float da = float(*(device const half *)(w + q8_tm_scale(rowa, ib, blocks, n_out)));
+            const float db = float(*(device const half *)(w + q8_tm_scale(rowb, ib, blocks, n_out)));
+            const char4 qa0 = as_type<char4>(*(device const uint *)pa);
+            const char4 qa1 = as_type<char4>(*(device const uint *)(pa + 4u));
+            const char4 qb0 = as_type<char4>(*(device const uint *)pb);
+            const char4 qb1 = as_type<char4>(*(device const uint *)(pb + 4u));
+            acca += (dot(float4(qa0), xa) + dot(float4(qa1), xb4)) * da;
+            accb += (dot(float4(qb0), xa) + dot(float4(qb1), xb4)) * db;
+        }
+        // The four k-quarter lanes of a row pair sum first, then the two unit halves,
+        // then the simdgroups through threadgroup memory.
+        acca += simd_shuffle_xor(acca, 1u);  accb += simd_shuffle_xor(accb, 1u);
+        acca += simd_shuffle_xor(acca, 2u);  accb += simd_shuffle_xor(accb, 2u);
+        acca += simd_shuffle_xor(acca, 16u); accb += simd_shuffle_xor(accb, 16u);
+        if (lane < 16u && il == 0u) {
+            partial[sgid * Q8_TM_UNIT_ROWS + rp * 2u]      = acca;
+            partial[sgid * Q8_TM_UNIT_ROWS + rp * 2u + 1u] = accb;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgid == 0u && lane < Q8_TM_UNIT_ROWS && r0 + lane < n_out) {
+            float total = 0.0f;
+            for (uint s = 0; s < nsg; ++s) { total += partial[s * Q8_TM_UNIT_ROWS + lane]; }
+            device float * slot = y + r0 + lane;
+            *slot = epilogue ? (imparo_act_f(*slot) * total) : total;
+        }
+        return;
+    }
     const uint r0 = tgid.x * Q8_DECODE_ROWS;
     if (r0 >= n_out) { return; }
-    const uint blocks = n_in / QK8_0;
     const uint ix = lane / 4u;
     const uint il = lane % 4u;
     const uint ib0 = sgid * 8u + ix;
-    device const float * xb = x + (ulong)src_row * n_in;
 
     device const uchar * rows[4];
     #pragma unroll
@@ -1089,7 +1472,7 @@ kernel void imparo_q8_0_matmat(
     const uint tiles = min(Q8_TOKEN_TILE, n_tok - t0);
     const uint last = tiles - 1u;
     const uint blocks = n_in / QK8_0;
-    device const uchar * row = weights + w_offset + (ulong)r * blocks * Q8_0_BYTES;
+    device const uchar * row = weights + w_offset + (Q8_TM ? 0ul : (ulong)r * blocks * Q8_0_BYTES);
     device const float * xb = x + (ulong)(src_row + t0) * n_in;
     const ulong o1 = (ulong)min(1u, last) * n_in;
     const ulong o2 = (ulong)min(2u, last) * n_in;
@@ -1101,9 +1484,15 @@ kernel void imparo_q8_0_matmat(
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
     for (uint b = 0; b < blocks; ++b) {
-        device const uchar * blk = row + (ulong)b * Q8_0_BYTES;
-        const float d = float(as_type<half>((ushort)(blk[0] | (blk[1] << 8))));
-        const float wv = float(as_type<char>(blk[2u + lane])) * d;
+        float d, wv;
+        if (Q8_TM) {
+            d  = float(*(device const half *)(row + q8_tm_scale(r, b, blocks, n_out)));
+            wv = float(as_type<char>(row[q8_tm_payload(r, b, blocks) + lane])) * d;
+        } else {
+            device const uchar * blk = row + (ulong)b * Q8_0_BYTES;
+            d  = float(as_type<half>((ushort)(blk[0] | (blk[1] << 8))));
+            wv = float(as_type<char>(blk[2u + lane])) * d;
+        }
         const uint i = b * QK8_0 + lane;
         a0 += wv * xb[i];
         if (Q8_TOKEN_TILE > 1u) { a1 += wv * xb[o1 + i]; }
@@ -1148,15 +1537,22 @@ kernel void imparo_q8_0_matmat(
 // predicate and zero-fill arm from the hot tile; the generic instantiation is the
 // fallback. HALF_A reads an already-converted half activation instead of converting f32
 // here.
-template<uint ROWS, uint TOKENS, uint NSG, uint SGR, bool FULL = false,
-         bool HALF_A = false>
-static void q8_0_gemm(
-    device const uchar * weights, device const uchar * x_bytes, device float * y,
+template<uint ROWS, uint TOKENS, uint NSG, uint SGR, uint KCH, bool FULL = false,
+         bool HALF_A = false, bool STAGE_A = true, uint APF = 0u, bool GATED = false>
+static void st_gemm(
+    device const uchar * weights, device const uchar * weights2,
+    device const uchar * x_bytes, device float * y,
     uint n_in, uint n_out, uint n_tok, uint src_row, uint epilogue,
+    device half * xh2, uint epi_half,
     threadgroup half * shared, uint3 tgid, uint tid, uint sgid)
 {
     static_assert(ROWS > 0u && (ROWS % 8u) == 0u,
                   "Q8 GEMM rows must be a non-zero multiple of one MMA tile");
+    // GATED (see THE GATED PAIR above rt_gemm): `weights` is the gate tensor, `weights2`
+    // the up tensor, `n_out` the OUTPUT width, and the grid walks 2 * n_out virtual rows.
+    static_assert(!GATED || (ROWS % 16u) == 0u,
+                  "a gated st_gemm tile must hold whole gate/up pairs");
+    static_assert(!GATED || !FULL, "the gated write-back is the masked one");
     static_assert(TOKENS > 0u && (TOKENS % 8u) == 0u,
                   "Q8 GEMM tokens must be a non-zero multiple of one MMA tile");
     static_assert(NSG > 0u && SGR > 0u && (NSG % SGR) == 0u,
@@ -1165,7 +1561,25 @@ static void q8_0_gemm(
                   "Q8 GEMM row tiles must split evenly across row simdgroups");
     static_assert(((TOKENS / 8u) % (NSG / SGR)) == 0u,
                   "Q8 GEMM token tiles must split evenly across token simdgroups");
-    constexpr uint K = QK8_0;
+    // K CHUNK DEPTH, in elements, a multiple of the 32-element Q8_0 block.
+    //
+    // At KCH == 32 -- llama.cpp's NK, which this kernel was ported from -- the loop pays
+    // TWO threadgroup barriers for every four 8-deep MMA steps. Measured on LFM2's short
+    // prefill, the MMA block runs at 5.6-6.8 TFLOP/s where this device sustains 20.33
+    // TFLOPS on the same six-loads-per-eight-multiplies ratio with no barriers in the
+    // way, and removing the multiplies takes the whole prefill from 521.6 ms to 194.0.
+    // Doubling the chunk halves the barrier count per unit of MMA work; it also doubles
+    // the contiguous weight bytes per row per chunk, from 34 to 68 against a 128-byte
+    // line. What it costs is threadgroup memory, and therefore resident threadgroups --
+    // the two pull opposite ways, so the depth is a shape the host picks and the tuner
+    // ranks, not a constant argued for here.
+    //
+    // The host must not select a depth that does not divide n_in: the chunk loop walks
+    // whole KCH steps and would read past the row.
+    static_assert(KCH >= QK8_0 && (KCH % QK8_0) == 0u,
+                  "Q8 GEMM K chunk must be a non-zero multiple of one Q8_0 block");
+    constexpr uint K = KCH;
+    constexpr uint BLOCKS_PER_CHUNK = KCH / QK8_0;
     constexpr uint ROW_TILES = ROWS / 8u;
     constexpr uint TOKEN_TILES = TOKENS / 8u;
     constexpr uint K_TILES = K / 8u;
@@ -1180,13 +1594,29 @@ static void q8_0_gemm(
     constexpr uint THREADS_PER_TG = NSG * 32u;
     const uint row_group = Q8_GRID_TOKEN_X ? tgid.y : tgid.x;
     const uint token_group = Q8_GRID_TOKEN_X ? tgid.x : tgid.y;
+    const uint vrows = GATED ? 2u * n_out : n_out;   // rows the grid walks
     const uint r0 = row_group * ROWS, t0 = token_group * TOKENS;
-    if (!FULL && (r0 >= n_out || t0 >= n_tok)) { return; }
-    const uint nrow = FULL ? ROWS : min(ROWS, n_out - r0);
+    if (!FULL && (r0 >= vrows || t0 >= n_tok)) { return; }
+    const uint nrow = FULL ? ROWS : min(ROWS, vrows - r0);
     const uint ntok = FULL ? TOKENS : min(TOKENS, n_tok - t0);
     const uint row_tile0 = (sgid % SGR) * ROW_TILES_PER_SG;
     const uint token_tile0 = (sgid / SGR) * TOKEN_TILES_PER_SG;
     const uint blocks = n_in / QK8_0;
+    // STAGE_A=false reads the activation operand straight from device instead of copying
+    // it into threadgroup memory first, which is what the Q4 rt_gemm does and what its
+    // notes measured 2.3x better THERE. The reason to want it here is RESIDENCY: the
+    // activation stage is TOKENS*KCH halves, and dropping it takes the 64x32 shape's
+    // allocation from 6144 bytes to 4096. Two instruction reductions in this kernel have
+    // already measured slower, and the probe says it overlaps staging with multiplying
+    // across resident threadgroups -- so more resident threadgroups is the lever the
+    // evidence points at, and fewer instructions is not.
+    //
+    // Every row-block threadgroup of one dispatch reads the SAME activation rows, so the
+    // device read lands in L2 rather than going to DRAM; that is why the copy can be
+    // removed rather than merely moved. Requires HALF_A: the operand has to already be
+    // half in memory for `simdgroup_load` to take it as one.
+    static_assert(STAGE_A || HALF_A,
+                  "reading A from device needs the half mirror; f32 has no half fragment");
     threadgroup half * ws = shared;
     threadgroup half * as = shared + K * ROWS;
 
@@ -1196,33 +1626,108 @@ static void q8_0_gemm(
         mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
 
+    // THE A PREFETCH PIPELINE, and the reason it can exist at this chunk depth.
+    //
+    // When A is read straight from the mirror its address is a function of the GLOBAL k
+    // position, not of anything the chunk barrier orders -- so unlike the weight tile,
+    // its loads can be issued arbitrarily far ahead and the barrier does not break the
+    // pipeline. A 32-deep chunk is only four MMA steps, but the prefetch walks all
+    // n_in/8 of them.
+    //
+    // That matters because the device read is what this route trades for its threadgroup
+    // memory: an 8x8 half fragment at stride n_in is eight separate cache lines. Measured
+    // WITHOUT prefetch it lost 3.6% at the short leg and 4.1% at depth. The Q4 rt_gemm's
+    // own ladder for the same operand runs 4.41 -> 4.71 TFLOPS from depth one to five.
+    device const half * xh_a = (device const half *)x_bytes;
+    const uint a_row0 = src_row + t0;
+    simdgroup_half8x8 apre[STAGE_A ? 1u : APF + 1u][TOKEN_TILES_PER_SG];
+    if (!STAGE_A) {
+        #pragma unroll
+        for (uint d = 0; d < APF; ++d) {
+            #pragma unroll
+            for (uint ti = 0; ti < TOKEN_TILES_PER_SG; ++ti) {
+                const uint tt = (token_tile0 + ti) * 8u;
+                const ulong base = (ulong)(a_row0 + min(tt, ntok - 1u)) * n_in
+                                 + min(d * 8u, n_in - 8u);
+                simdgroup_load(apre[d][ti], xh_a + base, n_in);
+            }
+        }
+    }
+    uint a_k = APF * 8u;   // the global k position the next issued load reads
+
     for (uint c00 = 0; c00 < n_in; c00 += K) {
         const uint bi = c00 / QK8_0;
-        // Two threads dequantise one row: each handles sixteen contiguous signed bytes.
+        if (!(Q8_SKIP & 2u)) {
+        // Two threads dequantise one BLOCK: each handles sixteen contiguous signed bytes.
+        // A chunk is BLOCKS_PER_CHUNK blocks per row, so the work item carries which block
+        // it is as well as which half of it.
+        constexpr uint HALVES_PER_ROW = BLOCKS_PER_CHUNK * 2u;
         #pragma unroll
-        for (uint e = tid; e < ROWS * 2u; e += THREADS_PER_TG) {
-            const uint rr = e / 2u, h = e % 2u;
-            const bool live = FULL || rr < nrow;
+        for (uint e = tid; e < ROWS * HALVES_PER_ROW; e += THREADS_PER_TG) {
+            // Row-major: consecutive threads walk one row's blocks. Tile-major: sixteen
+            // consecutive threads own one 256-byte unit (8 rows x 2 halves), so their
+            // sixteen aligned 16-byte loads are one contiguous span instead of sixteen
+            // misaligned 4-byte pieces of eight different 34-byte blocks.
+            uint rr0, bb, h;
+            if (Q8_TM) {
+                const uint unit = e / 16u, within = e % 16u;
+                rr0 = (unit / BLOCKS_PER_CHUNK) * Q8_TM_UNIT_ROWS + within / 2u;
+                bb  = unit % BLOCKS_PER_CHUNK;
+                h   = within % 2u;
+            } else {
+                rr0 = e / HALVES_PER_ROW;
+                const uint hh = e % HALVES_PER_ROW;
+                bb = hh / 2u; h = hh % 2u;
+            }
+            // Clamped: read a duplicate row rather than branch. `rr` still addresses the
+            // staging slot, so the tile's shape is unchanged; only WHICH row those
+            // out-of-range slots hold differs, and the write-back masks them.
+            const uint rr = rr0;
+            const uint rr_src = (Q8_CLAMP_EDGE && !FULL) ? min(rr0, nrow - 1u) : rr0;
+            const bool live = (FULL || Q8_CLAMP_EDGE || rr0 < nrow) && !(Q8_SKIP & 4u);
             device const uchar * blk = weights;
             float d = 0.0f;
+            // TM: the sixteen bytes this thread stages, loaded once, aligned.
+            uint4 tm16 = uint4(0u);
             if (live) {
-                blk = weights + (ulong)(r0 + rr) * blocks * Q8_0_BYTES
-                    + (ulong)bi * Q8_0_BYTES;
-                const ushort scale_bits = Q8_TYPED_SCALE
-                    ? *(device const ushort *)blk
-                    : (ushort)(blk[0] | (blk[1] << 8));
-                d = float(as_type<half>(scale_bits));
+                device const uchar * base = gated_is_up<GATED>(r0 + rr_src) ? weights2 : weights;
+                const uint srow = gated_src_row<GATED>(r0 + rr_src);
+                if (Q8_TM) {
+                    blk = base + q8_tm_payload(srow, bi + bb, blocks) + h * 16u;
+                    tm16 = *(device const uint4 *)blk;
+                    d = float(*(device const half *)(base + q8_tm_scale(srow, bi + bb, blocks, n_out)));
+                } else {
+                    blk = base + (ulong)srow * blocks * Q8_0_BYTES + (ulong)(bi + bb) * Q8_0_BYTES;
+                    const ushort scale_bits = Q8_TYPED_SCALE
+                        ? *(device const ushort *)blk
+                        : (ushort)(blk[0] | (blk[1] << 8));
+                    d = float(as_type<half>(scale_bits));
+                }
             }
             #pragma unroll
             for (uint g4 = 0; g4 < 4u; ++g4) {
                 char4 q = char4(0);
                 if (live) {
-                    q = char4(*(device const packed_char4 *)(blk + 2u + h * 16u + g4 * 4u));
+                    q = Q8_TM ? as_type<char4>(tm16[g4])
+                              : char4(*(device const packed_char4 *)(blk + 2u + h * 16u + g4 * 4u));
                 }
-                const half4 v = half4(float4(q) * d);
+                // Q8_SKIP bit 8 (probe): keep the loads and the stores, drop the
+                // int8 -> half conversion -- a bit-cast of the same bytes -- so the
+                // conversion's ALU share separates from the tile-store share.
+                half4 v;
+                if (Q8_SKIP & 8u) {
+                    // Four bytes reinterpreted, masked to the low nibble so the halves are
+                    // tiny (garbage that cannot overflow into NaN logits), times the scale
+                    // in half so `d` stays live and the scale READ is still paid: what this
+                    // probe removes is the conversion arithmetic and nothing else.
+                    const half2 bits = as_type<half2>(q & char4(0x0f));
+                    v = half4(bits, bits) * half(d);
+                } else {
+                    v = half4(q) * half(d);
+                }
                 #pragma unroll
                 for (uint j = 0; j < 4u; ++j) {
-                    const uint k = h * 16u + g4 * 4u + j;
+                    const uint k = bb * QK8_0 + h * 16u + g4 * 4u + j;
                     const uint tile = (k / 8u) * ROW_TILES + rr / 8u;
                     ws[tile * 64u + (k & 7u) * 8u + (rr & 7u)] = v[j];
                 }
@@ -1233,7 +1738,7 @@ static void q8_0_gemm(
         // tile-major threadgroup writes are vector operations rather than eight scalar
         // values from different token rows.
         #pragma unroll
-        for (uint e = tid; e < TOKENS * K_TILES; e += THREADS_PER_TG) {
+        for (uint e = tid; STAGE_A && e < TOKENS * K_TILES; e += THREADS_PER_TG) {
             const uint tt = e / K_TILES, kt = e % K_TILES;
             // K-major activation tiles keep the two token operands consumed by one
             // simdgroup adjacent for each K step. This is only a threadgroup-memory
@@ -1241,8 +1746,10 @@ static void q8_0_gemm(
             const uint tile = kt * TOKEN_TILES + tt / 8u;
             threadgroup half4 * dst4 =
                 (threadgroup half4 *)(as + tile * 64u + (tt & 7u) * 8u);
-            if (FULL || tt < ntok) {
-                const ulong element = (ulong)(src_row + t0 + tt) * n_in
+            if (FULL || Q8_CLAMP_EDGE || tt < ntok) {
+                const uint tt_src =
+                    (Q8_CLAMP_EDGE && !FULL) ? min(tt, ntok - 1u) : tt;
+                const ulong element = (ulong)(src_row + t0 + tt_src) * n_in
                                     + c00 + kt * 8u;
                 if (HALF_A) {
                     device const half4 * src4 =
@@ -1260,8 +1767,10 @@ static void q8_0_gemm(
                 dst4[1] = half4(0.0h);
             }
         }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        if (!(Q8_SKIP & 1u)) {
         #pragma unroll
         for (uint kk = 0; kk < K; kk += 8u) {
             // A simdgroup owns a rectangular set of output tiles. Load each of its row
@@ -1271,16 +1780,41 @@ static void q8_0_gemm(
             // two activation loads.
             simdgroup_half8x8 wm[ROW_TILES_PER_SG];
             simdgroup_half8x8 am[TOKEN_TILES_PER_SG];
+            if (Q8_MMA_FENCE) { simdgroup_barrier(mem_flags::mem_none); }
             #pragma unroll
             for (uint ri = 0; ri < ROW_TILES_PER_SG; ++ri) {
                 const uint tile = (kk / 8u) * ROW_TILES + row_tile0 + ri;
                 simdgroup_load(wm[ri], ws + tile * 64u, 8u);
             }
+            if (Q8_MMA_FENCE) { simdgroup_barrier(mem_flags::mem_none); }
             #pragma unroll
             for (uint ti = 0; ti < TOKEN_TILES_PER_SG; ++ti) {
-                const uint tile = (kk / 8u) * TOKEN_TILES + token_tile0 + ti;
-                simdgroup_load(am[ti], as + tile * 64u, 8u);
+                if (STAGE_A) {
+                    const uint tile = (kk / 8u) * TOKEN_TILES + token_tile0 + ti;
+                    simdgroup_load(am[ti], as + tile * 64u, 8u);
+                } else {
+                    // Issue the load APF steps ahead FIRST, so its latency overlaps this
+                    // step's multiplies rather than preceding them, then take the one
+                    // that was issued APF steps ago. `min` clamps the tail; those loads
+                    // are consumed by no multiply.
+                    const uint tt = (token_tile0 + ti) * 8u;
+                    const ulong base = (ulong)(a_row0 + min(tt, ntok - 1u)) * n_in
+                                     + min(a_k, n_in - 8u);
+                    simdgroup_load(apre[APF][ti], xh_a + base, n_in);
+                    am[ti] = apre[0][ti];
+                }
             }
+            if (!STAGE_A) {
+                a_k += 8u;
+                #pragma unroll
+                for (uint d = 0; d < APF; ++d) {
+                    #pragma unroll
+                    for (uint ti = 0; ti < TOKEN_TILES_PER_SG; ++ti) {
+                        apre[d][ti] = apre[d + 1u][ti];
+                    }
+                }
+            }
+            if (Q8_MMA_FENCE) { simdgroup_barrier(mem_flags::mem_none); }
             #pragma unroll
             for (uint ti = 0; ti < TOKEN_TILES_PER_SG; ++ti) {
                 #pragma unroll
@@ -1290,6 +1824,7 @@ static void q8_0_gemm(
                 }
             }
         }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -1297,7 +1832,7 @@ static void q8_0_gemm(
     // to device memory. An unconditional shared-memory spill would add another barrier
     // and a scalar copy to every Q8 projection. Partial rows/tokens and the fused gated
     // epilogue take the masked path below.
-    if (FULL || (epilogue == 0u && nrow == ROWS && ntok == TOKENS)) {
+    if (!GATED && (FULL || (epilogue == 0u && nrow == ROWS && ntok == TOKENS))) {
         #pragma unroll
         for (uint ti = 0; ti < TOKEN_TILES_PER_SG; ++ti) {
             #pragma unroll
@@ -1311,109 +1846,274 @@ static void q8_0_gemm(
         return;
     }
 
-    // The operand stage is dead now, so its bytes become a masked float output tile.
+    // The operand stage is dead now, so its bytes become a masked float output tile --
+    // IN TOKEN HALVES, and that is what decides how many threadgroups stay resident.
+    //
+    // Spilling the whole tile needs ROWS * TOKENS floats: 8192 bytes at 64x32, against
+    // 6144 for the staged operands. The host allocates the larger of the two, so the
+    // SPILL was setting the threadgroup budget and the operands were riding along under
+    // it. Measured on this device, residency is what this kernel lives on -- the same
+    // 64x32 tile at a 64-deep K chunk allocates 12288, drops from four resident
+    // threadgroups to two, and loses 10.4% on LFM2's short prefill, while at a MATCHED
+    // allocation the deeper chunk wins 1.1%. Halving the spill puts the allocation back
+    // on the operands at 6144, which is five resident instead of four.
+    //
+    // What it costs: one extra barrier pair. A simdgroup's token tiles are contiguous, so
+    // with SGT == 2 each pass is exactly one simdgroup group's share and the other group
+    // stores nothing; with SGT == 1 every simdgroup stores half its tiles per pass.
+    static_assert((TOKENS % 16u) == 0u,
+                  "Q8 GEMM token tile must split into two whole 8-row halves");
+    constexpr uint WB_PASSES = 2u;
+    constexpr uint WB_TOKENS = TOKENS / WB_PASSES;
     threadgroup float * out = (threadgroup float *)shared;
-    #pragma unroll
-    for (uint ti = 0; ti < TOKEN_TILES_PER_SG; ++ti) {
+    for (uint p = 0; p < WB_PASSES; ++p) {
+        const uint t_lo = p * WB_TOKENS;
         #pragma unroll
-        for (uint ri = 0; ri < ROW_TILES_PER_SG; ++ri) {
-            const uint ai = ti * ROW_TILES_PER_SG + ri;
-            const uint tt = (token_tile0 + ti) * 8u;
-            const uint rr = (row_tile0 + ri) * 8u;
-            simdgroup_store(mc[ai], out + tt * ROWS + rr, ROWS);
+        for (uint ti = 0; ti < TOKEN_TILES_PER_SG; ++ti) {
+            #pragma unroll
+            for (uint ri = 0; ri < ROW_TILES_PER_SG; ++ri) {
+                const uint ai = ti * ROW_TILES_PER_SG + ri;
+                const uint tt = (token_tile0 + ti) * 8u;
+                const uint rr = (row_tile0 + ri) * 8u;
+                if (tt >= t_lo && tt < t_lo + WB_TOKENS) {
+                    simdgroup_store(mc[ai], out + (tt - t_lo) * ROWS + rr, ROWS);
+                }
+            }
         }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint e = tid; e < ntok * nrow; e += THREADS_PER_TG) {
-        const uint tt = e / nrow, rr = e % nrow;
-        device float * slot = y + (ulong)(t0 + tt) * n_out + r0 + rr;
-        const float v = out[tt * ROWS + rr];
-        *slot = epilogue ? (imparo_act_f(*slot) * v) : v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint tn = ntok > t_lo ? min(WB_TOKENS, ntok - t_lo) : 0u;
+        if (GATED) {
+            // act(G) * U from the two accumulators already in `out` (gate at the pair's
+            // even slot, up 8 on); same float bits the two-dispatch form multiplied, so
+            // the same product. Output column of tile column c is r0 / 2 + c.
+            // In mirror mode ONLY the mirror is written: the down projection reads the
+            // mirror and nothing else reads float G at prefill (the rt design's epilogue
+            // has skipped the float store all along). Until 2026-09-02 both were written --
+            // n_ff x tokens x 4 B of dead stores per FFN, 22 MB per 512-token chunk on LFM2.
+            const uint ncol = nrow / 2u;
+            for (uint e = tid; e < tn * ncol; e += THREADS_PER_TG) {
+                const uint tt = e / ncol, c = e % ncol;
+                const uint gs = gated_gate_slot(c);
+                const float o = imparo_act_f(out[tt * ROWS + gs]) * out[tt * ROWS + gs + 8u];
+                const ulong idx = (ulong)(t0 + t_lo + tt) * n_out + (r0 >> 1) + c;
+                if (epi_half != 0u) { xh2[idx] = half(o); }
+                else                { y[idx] = o; }
+            }
+        } else
+        for (uint e = tid; e < tn * nrow; e += THREADS_PER_TG) {
+            const uint tt = e / nrow, rr = e % nrow;
+            const ulong idx = (ulong)(t0 + t_lo + tt) * n_out + r0 + rr;
+            device float * slot = y + idx;
+            const float v = out[tt * ROWS + rr];
+            const float o = epilogue ? (imparo_act_f(*slot) * v) : v;
+            *slot = o;
+            // THE FUSED EPILOGUE'S HALF MIRROR, which the Q4 rt path has had all along
+            // and this one never did. G is 10752 wide on LFM2 and the down projection
+            // reads it next, so without this every one of the 30 down projections ran a
+            // full conversion pass over 5.16M elements -- 929 MB of traffic per forward
+            // that the Q4 family does not pay. Same value, written once more as half,
+            // so the mirror cannot disagree with what the next GEMM would have converted.
+            if (epi_half != 0u) { xh2[idx] = half(o); }
+        }
+        // The next pass overwrites the same bytes, so every reader must be done first.
+        if (p + 1u < WB_PASSES) { threadgroup_barrier(mem_flags::mem_threadgroup); }
     }
 }
 
 // The launch contract is checked in the wrapper, before any barrier: a threadgroup that
 // is not exactly NSG*32 wide would desynchronise the staging loops.
-#define IMPARO_Q8_GEMM(NAME, ROWS, TOKENS, NSG, SGR, FULL)                                \
+#define IMPARO_ST_GEMM(NAME, ROWS, TOKENS, NSG, SGR, KCH, FULL)                          \
 kernel void NAME(                                                                         \
     device const uchar * weights [[buffer(0)]], device const float * x [[buffer(1)]],     \
     device float * y [[buffer(2)]], constant ulong & w_offset [[buffer(3)]],              \
     constant uint & n_in [[buffer(4)]], constant uint & n_out [[buffer(5)]],              \
     constant uint & n_tok [[buffer(6)]], constant uint & src_row [[buffer(7)]],           \
     constant uint & epilogue [[buffer(13)]],                                              \
+    device half * xh2 [[buffer(8)]], constant uint & epi_half [[buffer(9)]],              \
     threadgroup half * shared [[threadgroup(0)]],                                         \
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
     uint3 tcnt3 [[threads_per_threadgroup]], uint sgid [[simdgroup_index_in_threadgroup]]) \
 {                                                                                         \
     if (tcnt3.x != NSG * 32u || tcnt3.y != 1u || tcnt3.z != 1u) { return; }                \
-    q8_0_gemm<ROWS, TOKENS, NSG, SGR, FULL, false>(                                       \
-        weights + w_offset, (device const uchar *)x, y, n_in, n_out, n_tok, src_row,       \
-        epilogue, shared, tgid, tid, sgid);                                                \
+    st_gemm<ROWS, TOKENS, NSG, SGR, KCH, FULL, false>(                                       \
+        weights + w_offset, weights + w_offset, (device const uchar *)x, y, n_in, n_out, n_tok, src_row,       \
+        epilogue, xh2, epi_half, shared, tgid, tid, sgid);                                                \
 }
 
-#define IMPARO_Q8_GEMM_HALF(NAME, ROWS, TOKENS, NSG, SGR, FULL)                           \
-kernel void NAME(                                                                         \
-    device const uchar * weights [[buffer(0)]], device const half * x [[buffer(1)]],      \
-    device float * y [[buffer(2)]], constant ulong & w_offset [[buffer(3)]],              \
-    constant uint & n_in [[buffer(4)]], constant uint & n_out [[buffer(5)]],              \
-    constant uint & n_tok [[buffer(6)]], constant uint & src_row [[buffer(7)]],           \
-    constant uint & epilogue [[buffer(13)]],                                              \
-    threadgroup half * shared [[threadgroup(0)]],                                         \
-    uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
-    uint3 tcnt3 [[threads_per_threadgroup]], uint sgid [[simdgroup_index_in_threadgroup]]) \
-{                                                                                         \
-    if (tcnt3.x != NSG * 32u || tcnt3.y != 1u || tcnt3.z != 1u) { return; }                \
-    q8_0_gemm<ROWS, TOKENS, NSG, SGR, FULL, true>(                                        \
-        weights + w_offset, (device const uchar *)x, y, n_in, n_out, n_tok, src_row,       \
-        epilogue, shared, tgid, tid, sgid);                                                \
-}
 
 // The shape table. Keep it in step with Q8_SHAPES in the bridge -- the host sizes the
 // grid and the threadgroup from that table, and a disagreement is a wrong-size launch,
 // not a slow one. Shape 9 (128x32) is retained because the LFM branch measured it exact
 // and slower, and a rejected candidate that is still reachable is evidence; the host
 // builds only the selected shapes.
-IMPARO_Q8_GEMM(imparo_q8_gemm_0,      32, 16,  4, 2, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_0_full, 32, 16,  4, 2, true)
-IMPARO_Q8_GEMM(imparo_q8_gemm_1,      32, 32,  4, 2, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_1_full, 32, 32,  4, 2, true)
-IMPARO_Q8_GEMM(imparo_q8_gemm_2,      64, 16,  4, 2, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_2_full, 64, 16,  4, 2, true)
-IMPARO_Q8_GEMM(imparo_q8_gemm_3,      64, 32,  4, 2, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_3_full, 64, 32,  4, 2, true)
-IMPARO_Q8_GEMM(imparo_q8_gemm_4,      64, 32,  8, 4, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_4_full, 64, 32,  8, 4, true)
-IMPARO_Q8_GEMM(imparo_q8_gemm_5,      64, 32, 16, 4, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_5_full, 64, 32, 16, 4, true)
-IMPARO_Q8_GEMM(imparo_q8_gemm_6,      64, 64,  8, 4, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_6_full, 64, 64,  8, 4, true)
-IMPARO_Q8_GEMM(imparo_q8_gemm_7,      64, 64,  4, 2, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_7_full, 64, 64,  4, 2, true)
-IMPARO_Q8_GEMM(imparo_q8_gemm_8,      32,128,  4, 2, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_8_full, 32,128,  4, 2, true)
-IMPARO_Q8_GEMM(imparo_q8_gemm_9,     128, 32,  4, 4, false)
-IMPARO_Q8_GEMM(imparo_q8_gemm_9_full,128, 32,  4, 4, true)
+// HALF-ACTIVATION ENTRY POINTS. The template has carried HALF_A since it was ported --
+// "reads an already-converted half activation instead of converting f32 here" -- and
+// nothing instantiated it, so the Q8 family read f32 activations while the Q4 rt family
+// read the f16 mirror.
+//
+// WORTH +0.66% ON LFM2, NOT THE THIRD THE BYTE COUNT PREDICTS. On the FFN up-projection
+// (n_in 2048, n_out 10752, 512-token chunk) the activation is REQUESTED 705 MB against
+// 374 MB of weights, so halving it should remove about a third of the GEMM's bytes. The
+// clean A/B at 17123 tokens measured 768.3 against 763.3 tok/s. Requested bytes are not
+// DRAM traffic: the 168 row groups re-read one 4 MB activation tile, and the cache
+// already absorbs it, so what the mirror actually removes is the repeated f32 -> f16
+// conversion, not memory traffic. Same lesson as the QT-16 attention tiles.
+//
+// It changes no arithmetic: both paths stage the operand as simdgroup_half8x8 into an
+// f32 accumulator, so the mirror only moves WHERE the single rounding happens. Logits
+// measured bit-identical with it on and off.
+//
+// Generic variant only. `_full` deletes the edge predicates and is legal solely on an
+// exact grid with no epilogue; keeping the mirror out of that interaction is one less
+// thing to be wrong on the first landing, and q8_full_tiles currently tunes to 0 anyway.
+#define IMPARO_ST_GEMM_H(NAME, ROWS, TOKENS, NSG, SGR, KCH, FULL)                        \
+kernel void NAME(                                                                         \
+    device const uchar * weights [[buffer(0)]], device const half * x [[buffer(1)]],      \
+    device float * y [[buffer(2)]], constant ulong & w_offset [[buffer(3)]],              \
+    constant uint & n_in [[buffer(4)]], constant uint & n_out [[buffer(5)]],              \
+    constant uint & n_tok [[buffer(6)]], constant uint & src_row [[buffer(7)]],           \
+    constant uint & epilogue [[buffer(13)]],                                              \
+    device half * xh2 [[buffer(8)]], constant uint & epi_half [[buffer(9)]],              \
+    threadgroup half * shared [[threadgroup(0)]],                                         \
+    uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint3 tcnt3 [[threads_per_threadgroup]], uint sgid [[simdgroup_index_in_threadgroup]]) \
+{                                                                                         \
+    if (tcnt3.x != NSG * 32u || tcnt3.y != 1u || tcnt3.z != 1u) { return; }                \
+    st_gemm<ROWS, TOKENS, NSG, SGR, KCH, FULL, true>(                                       \
+        weights + w_offset, weights + w_offset, (device const uchar *)x, y, n_in, n_out, n_tok, src_row,       \
+        epilogue, xh2, epi_half, shared, tgid, tid, sgid);                                                \
+}
 
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_0,      32, 16,  4, 2, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_0_full, 32, 16,  4, 2, true)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_1,      32, 32,  4, 2, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_1_full, 32, 32,  4, 2, true)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_2,      64, 16,  4, 2, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_2_full, 64, 16,  4, 2, true)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_3,      64, 32,  4, 2, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_3_full, 64, 32,  4, 2, true)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_4,      64, 32,  8, 4, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_4_full, 64, 32,  8, 4, true)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_5,      64, 32, 16, 4, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_5_full, 64, 32, 16, 4, true)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_6,      64, 64,  8, 4, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_6_full, 64, 64,  8, 4, true)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_7,      64, 64,  4, 2, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_7_full, 64, 64,  4, 2, true)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_8,      32,128,  4, 2, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_8_full, 32,128,  4, 2, true)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_9,     128, 32,  4, 4, false)
-IMPARO_Q8_GEMM_HALF(imparo_q8_gemm_h_9_full,128, 32,  4, 4, true)
+IMPARO_ST_GEMM(imparo_st_gemm_0,      32, 16,  4, 2, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_0_full, 32, 16,  4, 2, 32, true)
+IMPARO_ST_GEMM(imparo_st_gemm_1,      32, 32,  4, 2, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_1_full, 32, 32,  4, 2, 32, true)
+IMPARO_ST_GEMM(imparo_st_gemm_2,      64, 16,  4, 2, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_2_full, 64, 16,  4, 2, 32, true)
+IMPARO_ST_GEMM(imparo_st_gemm_3,      64, 32,  4, 2, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_3_full, 64, 32,  4, 2, 32, true)
+IMPARO_ST_GEMM(imparo_st_gemm_4,      64, 32,  8, 4, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_4_full, 64, 32,  8, 4, 32, true)
+IMPARO_ST_GEMM(imparo_st_gemm_5,      64, 32, 16, 4, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_5_full, 64, 32, 16, 4, 32, true)
+IMPARO_ST_GEMM(imparo_st_gemm_6,      64, 64,  8, 4, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_6_full, 64, 64,  8, 4, 32, true)
+IMPARO_ST_GEMM(imparo_st_gemm_7,      64, 64,  4, 2, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_7_full, 64, 64,  4, 2, 32, true)
+IMPARO_ST_GEMM(imparo_st_gemm_8,      32,128,  4, 2, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_8_full, 32,128,  4, 2, 32, true)
+IMPARO_ST_GEMM(imparo_st_gemm_9,     128, 32,  4, 4, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_9_full,128, 32,  4, 4, 32, true)
+// DEEPER K CHUNK, 64 elements = two Q8_0 blocks per row per chunk. Same tiles, same MMA
+// order, same output: only the number of chunk barriers changes, and with it the
+// threadgroup memory the staged operands need. 10 and 11 are 3 and 7 at twice the depth,
+// so each pair is a one-variable comparison.
+IMPARO_ST_GEMM(imparo_st_gemm_10,     64, 32,  4, 2, 64, false)
+IMPARO_ST_GEMM(imparo_st_gemm_10_full,64, 32,  4, 2, 64, true)
+IMPARO_ST_GEMM(imparo_st_gemm_11,     64, 64,  4, 2, 64, false)
+IMPARO_ST_GEMM(imparo_st_gemm_11_full,64, 64,  4, 2, 64, true)
+
+// The half-activation twin of each shape above, GENERATED FROM THOSE LINES: the
+// tuples were transcribed by hand once and four of ten had the wrong SGR, which
+// compiles a differently shaped kernel under the same index.
+// THE GATED PAIR on the staged design: gate at `w_offset`, up at `w_offset2` (buffer
+// 10), half activations, masked write-back. See THE GATED PAIR above rt_gemm.
+#define IMPARO_ST_GEMM_GH(NAME, ROWS, TOKENS, NSG, SGR, KCH)                              \
+kernel void NAME(                                                                         \
+    device const uchar * weights [[buffer(0)]], device const half * x [[buffer(1)]],      \
+    device float * y [[buffer(2)]], constant ulong & w_offset [[buffer(3)]],              \
+    constant uint & n_in [[buffer(4)]], constant uint & n_out [[buffer(5)]],              \
+    constant uint & n_tok [[buffer(6)]], constant uint & src_row [[buffer(7)]],           \
+    constant ulong & w_offset2 [[buffer(10)]],                                            \
+    constant uint & epilogue [[buffer(13)]],                                              \
+    device half * xh2 [[buffer(8)]], constant uint & epi_half [[buffer(9)]],              \
+    threadgroup half * shared [[threadgroup(0)]],                                         \
+    uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint3 tcnt3 [[threads_per_threadgroup]], uint sgid [[simdgroup_index_in_threadgroup]]) \
+{                                                                                         \
+    if (tcnt3.x != NSG * 32u || tcnt3.y != 1u || tcnt3.z != 1u) { return; }                \
+    st_gemm<ROWS, TOKENS, NSG, SGR, KCH, false, true, true, 0u, true>(                     \
+        weights + w_offset, weights + w_offset2, (device const uchar *)x, y,              \
+        n_in, n_out, n_tok, src_row, epilogue, xh2, epi_half, shared, tgid, tid, sgid);   \
+}
+
+IMPARO_ST_GEMM_H(imparo_st_gemm_0_h, 32, 16, 4, 2, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_1_h, 32, 32, 4, 2, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_2_h, 64, 16, 4, 2, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_3_h, 64, 32, 4, 2, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_4_h, 64, 32, 8, 4, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_5_h, 64, 32, 16, 4, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_6_h, 64, 64, 8, 4, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_7_h, 64, 64, 4, 2, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_8_h, 32, 128, 4, 2, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_9_h, 128, 32, 4, 4, 32, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_10_h, 64, 32, 4, 2, 64, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_11_h, 64, 64, 4, 2, 64, false)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_0_gh, 32, 16, 4, 2, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_1_gh, 32, 32, 4, 2, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_2_gh, 64, 16, 4, 2, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_3_gh, 64, 32, 4, 2, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_4_gh, 64, 32, 8, 4, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_5_gh, 64, 32, 16, 4, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_6_gh, 64, 64, 8, 4, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_7_gh, 64, 64, 4, 2, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_8_gh, 32, 128, 4, 2, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_9_gh, 128, 32, 4, 4, 32)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_10_gh, 64, 32, 4, 2, 64)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_11_gh, 64, 64, 4, 2, 64)
+// FULL *and* the f16 activation mirror. Until these existed, selecting the
+// edge-predicate-free entry point silently dropped the mirror -- the host's mirror
+// condition carried `!full` because there was nothing to bind it to -- so the one knob
+// that chose between them was really choosing between two things at once, and it
+// measured the fast path 2.6% SLOWER at 17123 tokens for that reason.
+IMPARO_ST_GEMM_H(imparo_st_gemm_0_full_h,  32, 16, 4, 2, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_1_full_h,  32, 32, 4, 2, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_2_full_h,  64, 16, 4, 2, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_3_full_h,  64, 32, 4, 2, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_4_full_h,  64, 32, 8, 4, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_5_full_h,  64, 32, 16, 4, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_6_full_h,  64, 64, 8, 4, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_7_full_h,  64, 64, 4, 2, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_8_full_h,  32, 128, 4, 2, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_9_full_h, 128, 32, 4, 4, 32, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_10_full_h, 64, 32, 4, 2, 64, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_11_full_h, 64, 64, 4, 2, 64, true)
+
+// A READ STRAIGHT FROM THE MIRROR, no activation stage. Same tiles, same K order, same
+// answers -- only the operand's route into the MMA changes, and with it the threadgroup
+// allocation: 64x32 goes from 6144 bytes to 4096, so more threadgroups stay resident.
+// That is the lever the probe points at; two attempts to make this kernel do FEWER
+// INSTRUCTIONS both measured slower, and residency is what it overlaps staging against.
+#define IMPARO_ST_GEMM_DA(NAME, ROWS, TOKENS, NSG, SGR, KCH, APF)                        \
+kernel void NAME(                                                                         \
+    device const uchar * weights [[buffer(0)]], device const half * x [[buffer(1)]],      \
+    device float * y [[buffer(2)]], constant ulong & w_offset [[buffer(3)]],              \
+    constant uint & n_in [[buffer(4)]], constant uint & n_out [[buffer(5)]],              \
+    constant uint & n_tok [[buffer(6)]], constant uint & src_row [[buffer(7)]],           \
+    constant uint & epilogue [[buffer(13)]],                                              \
+    device half * xh2 [[buffer(8)]], constant uint & epi_half [[buffer(9)]],              \
+    threadgroup half * shared [[threadgroup(0)]],                                         \
+    uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint3 tcnt3 [[threads_per_threadgroup]], uint sgid [[simdgroup_index_in_threadgroup]]) \
+{                                                                                         \
+    if (tcnt3.x != NSG * 32u || tcnt3.y != 1u || tcnt3.z != 1u) { return; }                \
+    st_gemm<ROWS, TOKENS, NSG, SGR, KCH, false, true, false, APF>(                            \
+        weights + w_offset, weights + w_offset, (device const uchar *)x, y, n_in, n_out, n_tok, src_row,       \
+        epilogue, xh2, epi_half, shared, tgid, tid, sgid);                                                \
+}
+
+// The prefetch depth is part of the entry point because it sizes a register array. Depth
+// 0 is the variant measured WITHOUT prefetch (-3.6% short, -4.1% deep); the Q4 kernel's
+// ladder for the same operand says the useful range is 1..5, so the sweep is over the
+// shapes the host can select rather than over a knob.
+IMPARO_ST_GEMM_DA(imparo_st_gemm_3_da,  64, 32, 4, 2, 32, 0)
+IMPARO_ST_GEMM_DA(imparo_st_gemm_7_da,  64, 64, 4, 2, 32, 0)
+IMPARO_ST_GEMM_DA(imparo_st_gemm_3_da2, 64, 32, 4, 2, 32, 2)
+IMPARO_ST_GEMM_DA(imparo_st_gemm_7_da2, 64, 64, 4, 2, 32, 2)
+IMPARO_ST_GEMM_DA(imparo_st_gemm_3_da5, 64, 32, 4, 2, 32, 5)
+IMPARO_ST_GEMM_DA(imparo_st_gemm_7_da5, 64, 64, 4, 2, 32, 5)
+
+
 
 // dequantise one Q4_0 row (an embedding lookup) and scale
 kernel void imparo_q4_0_row(
@@ -1464,13 +2164,169 @@ kernel void imparo_q8_0_row(
 // sat idle: measured at 19.95 us for 10 KB, against 1.79 us for a trivial dispatch of the
 // same size. At 210 norms per decode token that was 4.19 ms, the largest non-matmul cost
 // in the whole forward.
+// ONE ROW PER THREADGROUP: post-norm, residual add, and (dual) the next pre-norm, as one
+// dispatch. mid = (add + rms(src) * w1) * out_scale  -> dst;  dual: out = rms(mid) * w2.
+// Bit-identical to the three separate dispatches it replaces: the sum of squares runs in
+// imparo_rms_norm's order (the host launches the same thread count for the width), every
+// product is a rounded float before the add (contraction off), the add is the elementwise
+// kernel's `a + b`, and the second norm re-reads the row it just wrote, as the separate
+// kernel would. Rows are float4-aligned by contract (width % 4 == 0, base 0).
+kernel void imparo_rms_norm_add_row(
+    device const uchar * weights [[buffer(0)]],
+    device const float * src     [[buffer(1)]],
+    device const float * addend  [[buffer(2)]],
+    device float       * dst     [[buffer(3)]],
+    constant ulong & w1_off [[buffer(4)]], constant uint & width [[buffer(5)]],
+    constant float & eps    [[buffer(6)]], constant uint & n_row [[buffer(7)]],
+    constant float & out_scale [[buffer(8)]],
+    constant uint  & dual   [[buffer(9)]], constant ulong & w2_off [[buffer(10)]],
+    device float       * out     [[buffer(11)]],
+    // The second norm weight belongs to the NEXT layer, which may live in another weight
+    // segment (docs/memory-tiers-and-fit.md): its own buffer, its own local offset.
+    device const uchar * weights2 [[buffer(12)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 tid3  [[thread_position_in_threadgroup]],
+    uint3 tcnt3 [[threads_per_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]],
+    uint  nsg   [[simdgroups_per_threadgroup]])
+{
+    const uint r = tgid.x;
+    if (r >= n_row) { return; }
+    const uint tid = tid3.x, tcount = tcnt3.x;
+    const uint w4 = width / 4u;
+    device const float4 * s4 = (device const float4 *)(src + (ulong)r * width);
+    device const float4 * a4 = (device const float4 *)(addend + (ulong)r * width);
+    device float4       * d4 = (device float4 *)(dst + (ulong)r * width);
+    float sq = 0.0f;
+    for (uint i = tid; i < w4; i += tcount) { sq += dot(s4[i], s4[i]); }
+    sq = simd_sum(sq);
+    float inv;
+    if (nsg == 1u) {
+        inv = rsqrt(simd_broadcast_first(sq) / float(width) + eps);
+    } else {
+        if (lane == 0) { partial[sgid] = sq; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgid == 0) {
+            const float v = (lane < nsg) ? partial[lane] : 0.0f;
+            const float total = simd_sum(v);
+            if (lane == 0) { partial[0] = rsqrt(total / float(width) + eps); }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        inv = partial[0];
+    }
+    // THE ROUNDED PRODUCT GOES THROUGH THREADGROUP MEMORY. The separate kernels round the
+    // normalised value into the row and the add kernel reads it back; staging it here keeps
+    // it a rounded float before the add whatever the compiler would contract (a pragma
+    // moved the sum of squares instead, 2026-09-02), and threadgroup memory rather than
+    // the row because `dst` may alias `addend` (the scaled per-layer site: X = (X + t) k).
+    device const float * w1 = (device const float *)(weights + w1_off);
+    device const float * sr = src + (ulong)r * width;
+    threadgroup float * stage = partial + ((nsg + 3u) & ~3u);
+    threadgroup float4 * st4 = (threadgroup float4 *)stage;
+    if (((w1_off / 4u) % 4u) == 0u) {
+        device const float4 * w14 = (device const float4 *)w1;
+        for (uint i = tid; i < w4; i += tcount) { st4[i] = s4[i] * inv * w14[i]; }
+    } else {
+        for (uint i = tid; i < width; i += tcount) { stage[i] = sr[i] * inv * w1[i]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (out_scale == 1.0f) {
+        for (uint i = tid; i < w4; i += tcount) { d4[i] = a4[i] + st4[i]; }
+    } else {
+        // add_scale's `(a + b) * k`, the sum rounded before the scale.
+        for (uint i = tid; i < w4; i += tcount) { st4[i] = a4[i] + st4[i]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < w4; i += tcount) { d4[i] = st4[i] * out_scale; }
+    }
+    if (!dual) { return; }
+    // The second norm reads the row this threadgroup just wrote, as a separate dispatch
+    // would; the barrier makes every thread's stores visible to every other's loads.
+    threadgroup_barrier(mem_flags::mem_device);
+    float sq2 = 0.0f;
+    for (uint i = tid; i < w4; i += tcount) { sq2 += dot(d4[i], d4[i]); }
+    sq2 = simd_sum(sq2);
+    float inv2;
+    if (nsg == 1u) {
+        inv2 = rsqrt(simd_broadcast_first(sq2) / float(width) + eps);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // partial[] is reused
+        if (lane == 0) { partial[sgid] = sq2; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgid == 0) {
+            const float v = (lane < nsg) ? partial[lane] : 0.0f;
+            const float total = simd_sum(v);
+            if (lane == 0) { partial[0] = rsqrt(total / float(width) + eps); }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        inv2 = partial[0];
+    }
+    device const float * w2 = (device const float *)(weights2 + w2_off);
+    device float4 * o4 = (device float4 *)(out + (ulong)r * width);
+    if (((w2_off / 4u) % 4u) == 0u) {
+        device const float4 * w24 = (device const float4 *)w2;
+        for (uint i = tid; i < w4; i += tcount) { o4[i] = d4[i] * inv2 * w24[i]; }
+    } else {
+        device const float * dr = dst + (ulong)r * width;
+        device float * orow = out + (ulong)r * width;
+        for (uint i = tid; i < width; i += tcount) { orow[i] = dr[i] * inv2 * w2[i]; }
+    }
+}
+
+// BRICK: RMS NORM SCALE, in two stages, at a VIRTUAL geometry of norm_t threads (vt = norm_t / 32
+// simdgroups): virtual thread (vg, lane) owns the float4 vectors vg*32 + lane, + norm_t, ...;
+// each virtual simdgroup reduces its sum of squares with simd_sum; simdgroup 0 sums the vt
+// partials with one simd_sum and forms rsqrt(total / width + eps). With norm_t equal to the
+// real thread count this IS imparo_rms_norm's reduction; the mega block runs the same virtual
+// geometry with fewer real simdgroups (each covers the virtual groups vg = sgid, sgid + nsg, ...),
+// so a row's scale has the kernel's bits whichever threadgroup shape computes it.
+// XS is the row's address space: device const float4 * or threadgroup const float4 *.
+template <typename XS>
+inline float rms_sumsq(XS s4, uint w4, uint norm_t, uint vg, uint lane) {
+    float sq = 0.0f;
+    for (uint i = vg * 32u + lane; i < w4; i += norm_t) { sq += dot(s4[i], s4[i]); }
+    return simd_sum(sq);
+}
+// partial[0..vt) holds the virtual groups' sums (written by their lane 0). Returns the scale to
+// every thread. `guard_reuse` adds the barrier that lets the caller overwrite `partial` at once
+// (the mega block norms several rows in a row); a kernel that norms one row skips it.
+inline float rms_finish(uint vt, uint width, float eps, threadgroup float * partial,
+                        uint lane, uint sgid, bool guard_reuse) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0u) {
+        float total;
+        if (vt == 1u) { total = partial[0]; }
+        else { const float v = (lane < vt) ? partial[lane] : 0.0f; total = simd_sum(v); }
+        if (lane == 0u) { partial[0] = rsqrt(total / float(width) + eps); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = partial[0];
+    if (guard_reuse) { threadgroup_barrier(mem_flags::mem_threadgroup); }
+    return inv;
+}
+// Both stages over a whole row at the virtual geometry (the mega block's form).
+template <typename XS>
+inline float rms_inv(XS s4, uint w4, uint width, float eps, uint norm_t,
+                     threadgroup float * partial, uint lane, uint sgid, uint nsg) {
+    const uint vt = norm_t / 32u;
+    for (uint vg = sgid; vg < vt; vg += nsg) {
+        const float sq = rms_sumsq(s4, w4, norm_t, vg, lane);
+        if (lane == 0u) { partial[vg] = sq; }
+    }
+    return rms_finish(vt, width, eps, partial, lane, sgid, true);
+}
+
 kernel void imparo_rms_norm(
     device const uchar * weights [[buffer(0)]],
     device float       * x       [[buffer(1)]],
     constant ulong & w_offset [[buffer(2)]], constant uint & width [[buffer(3)]],
     constant float & eps     [[buffer(4)]], constant uint & n_row [[buffer(5)]],
     constant uint & row_stride [[buffer(6)]], constant uint & base_off [[buffer(7)]],
-    device const float * addend [[buffer(8)]], constant uint & has_add [[buffer(9)]],
+    // has_add: 0 none; 1 POST-add (row = norm(src) + addend, gemma4's order); 2 PRE-add
+    // (t = addend + src; addend = t; row = norm(t) -- LFM2's residual order, where the
+    // addend is the residual stream and is written back). Non-const for mode 2.
+    device float * addend [[buffer(8)]], constant uint & has_add [[buffer(9)]],
     // Separate SOURCE row. Bound to the same buffer as `x` for an in-place norm; bound to
     // a different one where the caller previously had to copy the row first. Two of those
     // copies ran per layer -- 84 dispatches per decoded token to move 10 KB each, in a
@@ -1501,16 +2357,33 @@ kernel void imparo_rms_norm(
     // ~0.4 us of work against 5.8 us measured, 294 of them per decoded token -- so what
     // matters is the NUMBER of memory instructions, not the bytes. llama.cpp's rms_norm
     // reduces with `dot(x[i], x[i])` over a vector type for the same reason.
-    const bool vec4 = (width % 4u) == 0u && ((base_off + r * row_stride) % 4u) == 0u;
+    // PRE-ADD (has_add == 2): the row normalised is t = resid + src, resid being `addend`
+    // (the residual stream X, read here and written back below) and src the mixer / FFN
+    // output. The separate add kernel computed exactly resid[i] + src[i] in float4 and
+    // the norm then read the sum back, so the same operands here give the same bits. The
+    // sum is recomputed in the scale pass instead of kept (the register note above).
+    const bool pre_add = (has_add == 2u);
+    device float * rrow = addend + base_off + (ulong)r * row_stride;
+    const bool vec4 = (width % 4u) == 0u && ((base_off + r * row_stride) % 4u) == 0u
+                   && (!pre_add || (((ulong)rrow & 15ul) == 0ul));
     float sq = 0.0f;
     if (vec4) {
         device const float4 * s4 = (device const float4 *)srow;
+        device const float4 * r4 = (device const float4 *)rrow;
         const uint w4 = width / 4u;
-        for (uint i = tid; i < w4; i += tcount) { sq += dot(s4[i], s4[i]); }
+        if (pre_add) {
+            for (uint i = tid; i < w4; i += tcount) { const float4 t = r4[i] + s4[i]; sq += dot(t, t); }
+            sq = simd_sum(sq);
+        } else {
+            sq = rms_sumsq(s4, w4, tcount, sgid, lane);   // the brick: this simdgroup's virtual group is itself
+        }
+    } else if (pre_add) {
+        for (uint i = tid; i < width; i += tcount) { const float t = rrow[i] + srow[i]; sq += t * t; }
+        sq = simd_sum(sq);
     } else {
         for (uint i = tid; i < width; i += tcount) { sq += srow[i] * srow[i]; }
+        sq = simd_sum(sq);
     }
-    sq = simd_sum(sq);
 
     float inv;
     if (nsg == 1u) {
@@ -1520,20 +2393,12 @@ kernel void imparo_rms_norm(
         // barriers are most of the difference. 294 of these run per token.
         inv = rsqrt(simd_broadcast_first(sq) / float(width) + eps);
     } else {
+        // Second stage by simd_sum, not a serial loop on thread 0 (rms_finish): the thread
+        // count is derived from the row width, so a 2560-wide row runs 640 threads = 20
+        // simdgroups, and summing 20 partials one at a time on one thread put a 20-iteration
+        // serial loop on the critical path with 639 threads idle behind it.
         if (lane == 0) { partial[sgid] = sq; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Second stage by simd_sum, not a serial loop on thread 0.
-        //
-        // The thread count is now derived from the row width, so a 2560-wide row runs 640
-        // threads = 20 simdgroups. Summing 20 partials one at a time on a single thread put
-        // a 20-iteration serial loop on the critical path with 639 threads idle behind it.
-        if (sgid == 0) {
-            const float v = (lane < nsg) ? partial[lane] : 0.0f;
-            const float total = simd_sum(v);
-            if (lane == 0) { partial[0] = rsqrt(total / float(width) + eps); }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        inv = partial[0];
+        inv = rms_finish(nsg, width, eps, partial, lane, sgid, false);
     }
 
     // The residual add is folded into the scale pass.
@@ -1546,7 +2411,34 @@ kernel void imparo_rms_norm(
     const uint w4 = width / 4u;
     device float4 * row4 = (device float4 *)row;
     device const float4 * srow4 = (device const float4 *)srow;
-    if (has_add) {
+    if (pre_add) {
+        // The sum goes back to the residual stream, the normalised row to `x`. Each
+        // thread rewrites only the elements it read in the first pass (same ownership).
+        device float4 * r4w = (device float4 *)rrow;
+        if (w_offset == IMPARO_NO_WEIGHT) {
+            if (vec4) {
+                for (uint i = tid; i < w4; i += tcount) {
+                    const float4 t = r4w[i] + srow4[i]; r4w[i] = t; row4[i] = t * inv;
+                }
+            } else {
+                for (uint i = tid; i < width; i += tcount) {
+                    const float t = rrow[i] + srow[i]; rrow[i] = t; row[i] = t * inv;
+                }
+            }
+        } else {
+            device const float * w = (device const float *)(weights + w_offset);
+            if (vec4 && ((w_offset / 4u) % 4u) == 0u) {
+                device const float4 * w4p = (device const float4 *)w;
+                for (uint i = tid; i < w4; i += tcount) {
+                    const float4 t = r4w[i] + srow4[i]; r4w[i] = t; row4[i] = t * inv * w4p[i];
+                }
+            } else {
+                for (uint i = tid; i < width; i += tcount) {
+                    const float t = rrow[i] + srow[i]; rrow[i] = t; row[i] = t * inv * w[i];
+                }
+            }
+        }
+    } else if (has_add) {
         device const float4 * add4 = (device const float4 *)add_row;
         const bool add_vec4 = vec4 && (((ulong)add_row & 15ul) == 0ul);
         if (w_offset == IMPARO_NO_WEIGHT) {
@@ -1614,6 +2506,88 @@ kernel void imparo_rms_norm(
     }
 }
 
+// BRICK: NEOX ROPE, one pair. Rotates (row[i], row[i + half_rot]) at position pos by the
+// inverse frequency base^(-2i / n_rot) / freqs[i] (freqs: the model's rope factor table, 1 when
+// absent). imparo_rope_neox's expression; imparo_head_norm_rope and the mega block's head phase
+// call it, so a rotated pair has the same bits on every route.
+inline void rope_neox_pair(device float * row, uint i, uint half_rot, uint n_rot, float base,
+                           constant float * freqs, uint n_freqs, uint pos) {
+    const float ff = (n_freqs > 0u && i < n_freqs) ? freqs[i] : 1.0f;
+    const float inv = pow(base, -2.0f * float(i) / float(n_rot)) / ff;
+    const float theta = float(pos) * inv;
+    const float c = cos(theta), s = sin(theta);
+    const float x0 = row[i], x1 = row[i + half_rot];
+    row[i]            = x0 * c - x1 * s;
+    row[i + half_rot] = x0 * s + x1 * c;
+}
+
+// HEAD NORM + ROPE in one dispatch (gemma4's Q and K post-projection: per-head rms_norm,
+// then NEOX rope). One threadgroup per (token, head) row exactly as imparo_rms_norm runs it
+// (same thread count, same two-stage simd_sum reduction, same scale expression), then a
+// device barrier and imparo_rope_neox's rotation on the written row. Two dispatches and a
+// barrier become one; the bits are the two-dispatch form's (review #116, P10).
+kernel void imparo_head_norm_rope(
+    device const uchar * weights [[buffer(0)]],
+    device float       * x       [[buffer(1)]],
+    constant ulong & w_offset [[buffer(2)]], constant uint & width [[buffer(3)]],
+    constant float & eps     [[buffer(4)]], constant uint & n_row [[buffer(5)]],
+    constant uint & n_rot    [[buffer(6)]], constant float & base [[buffer(7)]],
+    constant uint & n_heads  [[buffer(8)]], constant uint & start_pos [[buffer(9)]],
+    constant float * freqs   [[buffer(10)]], constant uint & n_freqs [[buffer(11)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 tid3  [[thread_position_in_threadgroup]],
+    uint3 tcnt3 [[threads_per_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]],
+    uint  nsg   [[simdgroups_per_threadgroup]])
+{
+    const uint r = tgid.x;
+    if (r >= n_row) { return; }
+    const uint tid = tid3.x, tcount = tcnt3.x;
+    device float * row = x + (ulong)r * width;                 // base_off 0, stride == width
+    // ---- imparo_rms_norm, src == x ----
+    const bool vec4 = (width % 4u) == 0u && ((r * width) % 4u) == 0u;
+    float sq = 0.0f;
+    if (vec4) {
+        sq = rms_sumsq((device const float4 *)row, width / 4u, tcount, sgid, lane);   // the brick
+    } else {
+        for (uint i = tid; i < width; i += tcount) { sq += row[i] * row[i]; }
+        sq = simd_sum(sq);
+    }
+    float inv;
+    if (nsg == 1u) {
+        inv = rsqrt(simd_broadcast_first(sq) / float(width) + eps);
+    } else {
+        if (lane == 0) { partial[sgid] = sq; }
+        inv = rms_finish(nsg, width, eps, partial, lane, sgid, false);
+    }
+    const uint w4 = width / 4u;
+    device float4 * row4 = (device float4 *)row;
+    if (w_offset == IMPARO_NO_WEIGHT) {
+        if (vec4) {
+            for (uint i = tid; i < w4; i += tcount) { row4[i] = row4[i] * inv; }
+        } else {
+            for (uint i = tid; i < width; i += tcount) { row[i] = row[i] * inv; }
+        }
+    } else {
+        device const float * w = (device const float *)(weights + w_offset);
+        if (vec4 && ((w_offset / 4u) % 4u) == 0u) {
+            device const float4 * w4p = (device const float4 *)w;
+            for (uint i = tid; i < w4; i += tcount) { row4[i] = row4[i] * inv * w4p[i]; }
+        } else {
+            for (uint i = tid; i < width; i += tcount) { row[i] = row[i] * inv * w[i]; }
+        }
+    }
+    // ---- imparo_rope_neox on the written row: a pair may span two threads' writes ----
+    threadgroup_barrier(mem_flags::mem_device);
+    const uint half_rot = n_rot / 2u;
+    const uint t = r / n_heads;
+    for (uint i = tid; i < half_rot; i += tcount) {
+        rope_neox_pair(row, i, half_rot, n_rot, base, freqs, n_freqs, start_pos + t);
+    }
+}
+
 kernel void imparo_rope_neox(
     device float * x [[buffer(0)]],
     constant uint & n_rot [[buffer(1)]], constant float & base [[buffer(2)]],
@@ -1633,13 +2607,7 @@ kernel void imparo_rope_neox(
     // 17, 23 here -- got unscaled rope while the CPU scaled it. Position 0 is unaffected,
     // rope being the identity there, which is why token 0 always agreed and later tokens did
     // not.
-    const float ff = (n_freqs > 0u && i < n_freqs) ? freqs[i] : 1.0f;
-    const float inv = pow(base, -2.0f * float(i) / float(n_rot)) / ff;
-    const float theta = float(start_pos + t) * inv;
-    const float c = cos(theta), s = sin(theta);
-    const float x0 = head[i], x1 = head[i + half_rot];
-    head[i]            = x0 * c - x1 * s;
-    head[i + half_rot] = x0 * s + x1 * c;
+    rope_neox_pair(head, i, half_rot, n_rot, base, freqs, n_freqs, start_pos + t);
 }
 
 // copy this batch's K/V rows into the cache at their positions
@@ -1665,12 +2633,20 @@ kernel void imparo_rope_neox(
 // built WITHOUT the constant default to true (the paged form), so every
 // existing build keeps its behavior; the host picks the identity variant per
 // dispatch when the layer's table is the identity mapping.
+// Paged attention's page, in KV cells. Injected as a preprocessor macro by the host
+// (imparo_metal.mm: KV_PAGE_CELLS) so the two cannot hold different numbers -- a
+// compile-time constant, so `/` and `%` still fold to a shift and a mask here.
+#ifndef KV_PAGE_CELLS
+#define KV_PAGE_CELLS 64u
+#endif
+
 constant bool KV_PAGED_FC [[function_constant(5)]];
 constant bool KV_PAGED = is_function_constant_defined(KV_PAGED_FC) ? KV_PAGED_FC : true;
 
 inline uint kv_slot(uint gp, uint ring_mask, device const uint * pt) {
     if (ring_mask > 0u) { return gp & ring_mask; }
-    return KV_PAGED ? ((pt[gp >> 6] << 6) | (gp & 63u)) : gp;
+    return KV_PAGED ? (pt[gp / KV_PAGE_CELLS] * KV_PAGE_CELLS + gp % KV_PAGE_CELLS)
+                    : gp;
 }
 // An n-run starting at gp0 reads contiguous cache bytes unless it straddles the
 // ring wrap (windowed) or a non-adjacent page boundary (paged full layers). With
@@ -1678,7 +2654,7 @@ inline uint kv_slot(uint gp, uint ring_mask, device const uint * pt) {
 // path it had.
 // WHOLE-RANGE wrap test: does [gp0, gp0+n) straddle the ring seam? Ring semantics
 // only. On paged full layers this must stay FALSE: their 8-runs are 8-aligned and a
-// 64-cell page cannot be straddled by an aligned 8-run, so nothing is ever skipped
+// page (KV_PAGE_CELLS) cannot be straddled by an aligned 8-run, so nothing is ever skipped
 // to the tail -- and routing whole tiles to the device-spill tail makes threadgroups
 // race on its scratch (the collision its indexing comment warns about; found the
 // hard way by the pair-swap placement test).
@@ -1688,8 +2664,9 @@ inline bool kv_range_wraps(uint gp0, uint n, uint ring_mask) {
 inline bool kv_run_breaks(uint gp0, uint n, uint ring_mask, device const uint * pt) {
     if (ring_mask > 0u) { return (gp0 & ring_mask) + n > ring_mask + 1u; }
     if (!KV_PAGED) { return false; } // identity: full-layer runs are contiguous
-    if ((gp0 & 63u) + n <= 64u) { return false; }
-    return pt[gp0 >> 6] + 1u != pt[(gp0 + n - 1u) >> 6];
+    if (gp0 % KV_PAGE_CELLS + n <= KV_PAGE_CELLS) { return false; }
+    return pt[gp0 / KV_PAGE_CELLS] + 1u
+         != pt[(gp0 + n - 1u) / KV_PAGE_CELLS];
 }
 
 kernel void imparo_kv_store(
@@ -2307,10 +3284,15 @@ constant uint PT = 128u;    // positions per tile, for the kernels that are not 
 // ceiling is threadgroup memory, which holds QT x head_dim for the running output -- 16 KB
 // at QT 8 and head_dim 512, so 16 does not fit there. It does at head_dim 256, which is 35
 // of this model's 42 layers, so the host picks per layer.
-template<uint QT, uint HD_C, uint BLK, uint PT>
+// PT IS A RUNTIME ARGUMENT here for the same reason as in the qcomb body: it appears only
+// as a stride, an offset and a loop bound, and no array is declared with it. It matters
+// MORE here -- qtile carries a dynamic head dim (HD_C = 0), so it is the kernel a model
+// with no specialisation actually runs on, and freezing its tile froze the fallback path
+// for every such model.
+template<uint QT, uint HD_C, uint BLK>
 static void attention_prefill_qtile_body(
     device const float * q, device const half * kc, device const half * vc,
-    device float * out, uint head_dim, uint n_heads, uint n_kv, uint kv_width,
+    device float * out, uint PT, uint head_dim, uint n_heads, uint n_kv, uint kv_width,
     uint start_pos, uint window, uint ring_mask, device const uint * pt,
     uint n_tok, uint stage,
     threadgroup float * shared, uint3 tgid, uint tid, uint tcount,
@@ -2628,7 +3610,7 @@ static void attention_prefill_qtile_body(
         // One simdgroup per query, STRIDED: a threadgroup has nsg simdgroups and QT may
         // exceed it. Writing `if (sgid < QT)` silently skipped every query past the
         // simdgroup count, which at QT 16 with 256 threads is half of them.
-        for (uint qi = sgid; qi < QT; qi += nsg) {
+        for (uint qi = sgid; !(ATTN_SKIP & 2u) && qi < QT; qi += nsg) {
             const float prev_max = rmax[qi];
             float m = -INFINITY;
             for (uint sp = lane; sp < np; sp += 32u) { m = max(m, sc[qi * PT + sp]); }
@@ -2748,9 +3730,13 @@ static void attention_prefill_qtile_body(
         //
         // Both conditions are uniform across the threadgroup, so the barrier after this
         // block is still reached by every thread.
+        // ZEROING full_np DOES NOT SKIP THE WORK, it moves every position to the SCALAR
+        // tail below -- which measured 346.3 against a baseline of 864.3, 2.5x SLOWER with
+        // work supposedly removed. An impossible number, and the reason the probe skips
+        // the MMA inside the loop and the tail separately instead.
         const uint tail_gp0 = lo + p0;
         const bool tail_wrap = kv_range_wraps(tail_gp0, np, ring_mask);
-        if (full_np < np || tail_wrap) {
+        if (!(ATTN_SKIP & 4u) && (full_np < np || tail_wrap)) {
             for (uint d = tid; d < hd; d += tcount) {
                 for (uint sp = 0; sp < np; ++sp) {
                     const uint gp = lo + p0 + sp;
@@ -2776,7 +3762,7 @@ static void attention_prefill_qtile_body(
     }
 }
 
-#define IMPARO_QTILE_KERNEL(NAME, QT_N, HD_C, BLK_N, PT_N)                                                    \
+#define IMPARO_QTILE_KERNEL(NAME, QT_N, HD_C, BLK_N)                                                    \
 kernel void NAME(                                                                          \
     device const float * q     [[buffer(0)]],                                              \
     device const half  * kc    [[buffer(1)]],                                              \
@@ -2788,6 +3774,7 @@ kernel void NAME(                                                               
     constant uint & ring_mask [[buffer(10)]], constant uint & n_tok [[buffer(11)]],        \
     constant uint & stage    [[buffer(12)]],                                               \
     device const uint * pt   [[buffer(18)]],                                               \
+    constant uint & ptile    [[buffer(19)]],                                               \
     threadgroup float * shared [[threadgroup(0)]],                                         \
     uint3 tgid  [[threadgroup_position_in_grid]],                                          \
     uint3 tid3  [[thread_position_in_threadgroup]],                                        \
@@ -2796,20 +3783,20 @@ kernel void NAME(                                                               
     uint  sgid  [[simdgroup_index_in_threadgroup]],                                        \
     uint  nsg   [[simdgroups_per_threadgroup]])                                            \
 {                                                                                          \
-    attention_prefill_qtile_body<QT_N, HD_C, BLK_N, PT_N>(q, kc, vc, out, hd, n_heads, n_kv, kv_width,    \
+    attention_prefill_qtile_body<QT_N, HD_C, BLK_N>(q, kc, vc, out, ptile, hd, n_heads, n_kv, kv_width,    \
                                start_pos, window, ring_mask, pt, n_tok, stage, shared, tgid,   \
                                tid3.x, tcnt3.x, lane, sgid, nsg);                          \
 }
 
-IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile, 8, 0, 4, 128)
-IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile16, 16, 0, 4, 128)
+IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile, 8, 0, 4)
+IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile16, 16, 0, 4)
 // One pipeline per blocking depth, the way rt_shape has one per shape. The ceiling is the
 // register file -- a DEVICE property -- and how much is needed depends on QT and head_dim,
 // which are MODEL properties, so neither alone decides it and it has to be benched on the
 // pair. 4 measures 496 tok/s here, 8 measures 434; 2 has never been tried.
-IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile16h2, 16, 256, 2, 128)
-IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile16h, 16, 256, 4, 128)
-IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile16h8, 16, 256, 8, 128)
+IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile16h2, 16, 256, 2)
+IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile16h, 16, 256, 4)
+IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile16h8, 16, 256, 8)
 
 // COMBINED rewrite of the query-tiled kernel, per "The prefill attention rewrite,
 // specified" in STATUS.md: the P x V accumulator moves from threadgroup memory into
@@ -2840,19 +3827,34 @@ IMPARO_QTILE_KERNEL(imparo_attention_prefill_qtile16h8, 16, 256, 8, 128)
 //   spill        8 x 256 floats    8 KB
 //   diag + running max/sum         ~0.3 KB
 //                                  20.3 KB of 32
-template<uint QT, uint HD_C, uint BLK, uint PT, uint NSG, bool DSPILL, bool HALF_Q = false,
+// PT IS A RUNTIME ARGUMENT, not a template parameter. It appears only as a stride and a
+// loop bound -- `sc[qi * PT + sp]`, `simdgroup_load(..., PT)`, `p0 += PT` -- and no array
+// is declared with it, so nothing forces it to be compiled in. Frozen at 128 it ignored
+// most of the device: `qcomb_derive_pt` says this budget fits 480 at head_dim 256 and 864
+// at 64, and PT is the position tile a scan advances by, so a bigger one is fewer passes
+// over the KV.
+//
+// HD_C and NSG stay compile-time because they size a REGISTER array (o[QROWS][NDB],
+// NDB = HD_C/8/NSG), which is the only thing here the hardware actually forces.
+template<uint QT, uint HD_C, uint BLK, uint NSG, bool DSPILL, uint KVW, bool HALF_Q = false,
          bool KT = false>
 static void attention_prefill_qcomb_body(
     device const float * q, device const half * kc, device const half * vc,
     device float * out, device float * dspill,
     device const half * kt, uint kt_stride,
-    uint head_dim, uint n_heads, uint n_kv, uint kv_width,
+    uint PT,
+    uint head_dim, uint n_heads, uint n_kv, uint kv_width_u,
     uint start_pos, uint window, uint ring_mask, device const uint * pt,
     uint n_tok, uint stage,
     device half * xh, uint xh_on,
     threadgroup float * shared, uint3 tgid, uint tid, uint tcount,
     uint lane, uint sgid, uint nsg)
 {
+    // The K/V row stride as a COMPILE-TIME constant when the host gave it (IMPARO_KVW<slot>,
+    // set with the head dims before init): every K and V tile load below carries this
+    // stride, and as an immediate it costs no uniform read and no multiply per tile. Measured
+    // on the FA op first: -10% at 16896 keys, -13% at 8704, -15% at 1024. 0 = the uniform.
+    const uint kv_width = (KVW != 0u) ? KVW : kv_width_u;
     // The body is written in 8-row GROUPS: QT 8 is one group and keeps the original
     // structure (and its bit-exact arithmetic) unchanged; QT 16 runs two groups that
     // SHARE every K and V read, which is what halves the KV traffic per scan.
@@ -2944,6 +3946,29 @@ static void attention_prefill_qcomb_body(
     for (uint p0 = 0; p0 < n; p0 += PT) {
         const uint np = min(PT, n - p0);
 
+        // THE TILE'S PAGES, LOADED ONCE. On a paged layer kv_slot reads pt[gp / 64] for
+        // every 8-slot block, and the block's K or V address depends on that load -- so
+        // each block paid a device round trip before its first operand could even be
+        // requested: 4 per tile per simdgroup in the score phase and 16 in P x V at hd 64,
+        // PT 128. A tile spans at most PT/64 + 1 pages, so lane l fetches the l-th one
+        // here, in ONE round trip, and every run below reads its page with a register
+        // shuffle instead of a load. Same slots in the same order: bit-identical.
+        // Ring layers never consult the table; a KV_PAGED = false build compiles it out.
+        const uint pg0 = (lo + p0) / KV_PAGE_CELLS;
+        uint tile_pg = 0u;
+        if (KV_PAGED && ring_mask == 0u) {
+            const uint npg = (lo + p0 + np - 1u) / KV_PAGE_CELLS - pg0 + 1u;
+            if (lane < npg) { tile_pg = pt[pg0 + lane]; }
+        }
+        // UNIFORM call sites only: simd_shuffle needs every lane present. The scalar
+        // edge and tail paths, which run per thread, keep kv_slot.
+        auto tile_slot = [&](uint gp) -> uint {
+            if (ring_mask > 0u) { return gp & ring_mask; }
+            if (!KV_PAGED) { return gp; }
+            return simd_shuffle(tile_pg, (ushort)(gp / KV_PAGE_CELLS - pg0)) * KV_PAGE_CELLS
+                 + gp % KV_PAGE_CELLS;
+        };
+
         // Scores: the shipping kernel's register-blocked simdgroup MMA, with Q read from
         // threadgroup instead of device. Same d order into the same accumulators, so every
         // score is the same sum in the same order. The work unit is (row group, position
@@ -2976,10 +4001,18 @@ static void attention_prefill_qcomb_body(
                     }
                 }
                 device const half * krows[PB];
+                // One slot lookup for the whole group when its PB blocks share a run
+                // (no page boundary, no wrap between them); the blocks' slots are then
+                // consecutive and the addresses affine. Otherwise one lookup per block.
+                const uint gpg = lo + p0 + sp8b;
+                const bool one_run = (ring_mask > 0u)
+                    ? ((gpg & ring_mask) + 8u * PB <= ring_mask + 1u)
+                    : (!KV_PAGED || gpg % KV_PAGE_CELLS + 8u * PB <= KV_PAGE_CELLS);
+                const uint ps_g = tile_slot(gpg);
                 #pragma unroll
                 for (uint pb = 0; pb < PB; ++pb) {
-                    const uint gp = lo + p0 + sp8b + pb * 8u;
-                    const uint ps = kv_slot(gp, ring_mask, pt);
+                    const uint gp = gpg + pb * 8u;
+                    const uint ps = one_run ? ps_g + pb * 8u : tile_slot(gp);
                     // KT: base of the transposed tile [dim][slot] for this chunk's 8
                     // slots; the per-step offset advances by 8 dims * kt_stride.
                     krows[pb] = KT ? kt + (ulong)(kvh * hd) * kt_stride + ps
@@ -3033,6 +4066,12 @@ static void attention_prefill_qcomb_body(
                                 simdgroup_load(qn[g], sq + (ulong)dn * QT + g * 8u, QT);
                             }
                         }
+                        // ATTN_SKIP bit 3 (8): drop the per-step K RELOAD but keep every
+                        // MMA. kb was validly filled before this loop, so the multiplies run
+                        // on real data with the memory traffic removed -- which separates
+                        // "this loop is waiting on K" from "this loop is at the matrix
+                        // unit's limit". Wrong answers, only the time is read.
+                        if (!(ATTN_SKIP & 8u))
                         #pragma unroll
                         for (uint pb = 0; pb < PB; ++pb) {
                             if (KT) {
@@ -3043,6 +4082,7 @@ static void attention_prefill_qcomb_body(
                             }
                         }
                     }
+                    if (!(ATTN_SKIP & 1u))
                     #pragma unroll
                     for (uint pb = 0; pb < PB; ++pb) {
                         #pragma unroll
@@ -3061,6 +4101,9 @@ static void attention_prefill_qcomb_body(
                     for (uint g = 0; g < QROWS; ++g) {
                         if (HALF_Q) { qah[g] = qnh[g]; } else { qa[g] = qn[g]; }
                     }
+                    // The rotation goes with the reload: with bit 3 set, kn is never
+                    // written, so propagating it would multiply garbage registers.
+                    if (!(ATTN_SKIP & 8u))
                     #pragma unroll
                     for (uint pb = 0; pb < PB; ++pb) { kb[pb] = kn[pb]; }
                 }
@@ -3270,25 +4313,93 @@ static void attention_prefill_qcomb_body(
             }
         }
         const uint full_np = (np / 8u) * 8u;
-        for (uint sp8 = 0; sp8 < full_np; sp8 += 8u) {
-            const uint gp = lo + p0 + sp8;
-            if (kv_run_breaks(gp, 8u, ring_mask, pt)) { continue; }
-            const uint ps = kv_slot(gp, ring_mask, pt);
-            device const half * vrow = vc + (ulong)ps * kv_width + kvh * hd;
-            simdgroup_float8x8 pa[QROWS];
-            #pragma unroll
-            for (uint g = 0; g < QROWS; ++g) {
-                simdgroup_load(pa[g], sc + (ulong)(g * 8u) * PT + sp8, PT);
-            }
+        // Filled once from a real V row so the ATTN_SKIP bit-4 probe multiplies defined
+        // data rather than uninitialised registers.
+        simdgroup_half8x8 vfix[NDB];
+        if (ATTN_SKIP & 16u) {
+            const uint ps0 = kv_slot(lo + p0, ring_mask, pt);
+            device const half * v0 = vc + (ulong)ps0 * kv_width + kvh * hd;
             #pragma unroll
             for (uint k = 0; k < NDB; ++k) {
-                simdgroup_half8x8 vb;
-                simdgroup_load(vb, vrow + (db0 + k) * 8u, kv_width);
+                simdgroup_load(vfix[k], v0 + (db0 + k) * 8u, kv_width);
+            }
+        }
+        // P x V in RUNS of whole 8-slot blocks that share one slot base: a page on a
+        // paged layer, the stretch up to the wrap on a ring. One slot lookup per run and
+        // pointer increments inside it -- the loop shape a KV_PAGED = false build gets
+        // for free, and the shape is what mattered. Measured on the 17123-token prefill,
+        // pool on, three interleaved rounds against a page-table load per block:
+        //   this loop            +1.8%  of the WHOLE prefill (~12% of attention)
+        //   shuffle per block    +0.1%  (the load gone, the dependency kept)
+        //   KV_PAGED=false build +2.0%  (pool off, identity table)
+        // An address that depends on anything but the loop counter stops the compiler
+        // issuing a run's V loads ahead of its MMAs. A block straddling the wrap is
+        // skipped here and summed by the tail, as before; a block cannot straddle a page
+        // (8 divides KV_PAGE_CELLS). Same blocks, same order: bit-identical.
+        for (uint sp8 = 0; sp8 < full_np; ) {
+            const uint gp = lo + p0 + sp8;
+            const uint left = (full_np - sp8) / 8u;
+            uint nblk = left;
+            bool straddle = false;
+            if (ring_mask > 0u) {
+                const uint lim = ring_mask + 1u - (gp & ring_mask);
+                nblk = min(left, lim / 8u);
+                straddle = (lim % 8u != 0u) && (nblk < left);
+            } else if (KV_PAGED) {
+                nblk = min(left, (KV_PAGE_CELLS - gp % KV_PAGE_CELLS) / 8u);
+            }
+            device const half * vrow = vc + (ulong)tile_slot(gp) * kv_width + kvh * hd;
+            // EXPLICIT ONE-BLOCK LOOK-AHEAD: block b+1's P and V fragments are requested
+            // before block b's multiplies, the rotation the score loop already uses for K.
+            simdgroup_float8x8 pa[QROWS], pn[QROWS];
+            simdgroup_half8x8  vb[NDB],   vn[NDB];
+            if (nblk > 0u) {
                 #pragma unroll
                 for (uint g = 0; g < QROWS; ++g) {
-                    simdgroup_multiply_accumulate(o[g][k], pa[g], vb, o[g][k]);
+                    simdgroup_load(pa[g], sc + (ulong)(g * 8u) * PT + sp8, PT);
+                }
+                #pragma unroll
+                for (uint k = 0; k < NDB; ++k) {
+                    if (ATTN_SKIP & 16u) { vb[k] = vfix[k]; }
+                    else { simdgroup_load(vb[k], vrow + (db0 + k) * 8u, kv_width); }
                 }
             }
+            for (uint b = 0; b < nblk; ++b, sp8 += 8u, vrow += 8u * kv_width) {
+                const bool more = b + 1u < nblk;
+                if (more) {
+                    #pragma unroll
+                    for (uint g = 0; g < QROWS; ++g) {
+                        simdgroup_load(pn[g], sc + (ulong)(g * 8u) * PT + sp8 + 8u, PT);
+                    }
+                    #pragma unroll
+                    for (uint k = 0; k < NDB; ++k) {
+                        if (ATTN_SKIP & 16u) { vn[k] = vfix[k]; }
+                        else { simdgroup_load(vn[k], vrow + 8u * kv_width + (db0 + k) * 8u,
+                                              kv_width); }
+                    }
+                }
+                // ATTN_SKIP bit 4 (16): drop the per-position V LOAD but keep every MMA.
+                // vfix is filled once from the first row this threadgroup would read, so
+                // the multiplies run on real data with the traffic removed -- the P x V
+                // half of the load-bound vs MMA-bound question. Wrong answers, only the
+                // time is read.
+                if (!(ATTN_SKIP & 4u)) {
+                    #pragma unroll
+                    for (uint k = 0; k < NDB; ++k) {
+                        #pragma unroll
+                        for (uint g = 0; g < QROWS; ++g) {
+                            simdgroup_multiply_accumulate(o[g][k], pa[g], vb[k], o[g][k]);
+                        }
+                    }
+                }
+                if (more) {
+                    #pragma unroll
+                    for (uint g = 0; g < QROWS; ++g) { pa[g] = pn[g]; }
+                    #pragma unroll
+                    for (uint k = 0; k < NDB; ++k) { vb[k] = vn[k]; }
+                }
+            }
+            if (straddle) { sp8 += 8u; }
         }
         // Tail: partial 8-block, or a block straddling the ring wrap. Position-at-a-time
         // adds in the shipping kernel's order, on spilled fragments. Conditional, uniform.
@@ -3455,9 +4566,9 @@ static void attention_prefill_qcomb_body(
     }
 }
 
-#define IMPARO_QCOMB_KERNEL(NAME, QT_N, HD_N, BLK_N, PT_N, NSG_N, DS_N, ...)  \
-    IMPARO_QCOMB_KERNEL_KT(NAME, QT_N, HD_N, BLK_N, PT_N, NSG_N, DS_N, ##__VA_ARGS__)
-#define IMPARO_QCOMB_KERNEL_KT(NAME, QT_N, HD_N, BLK_N, PT_N, NSG_N, DS_N, ...)                       \
+#define IMPARO_QCOMB_KERNEL(NAME, QT_N, HD_N, BLK_N, NSG_N, DS_N, KVW_N, ...)  \
+    IMPARO_QCOMB_KERNEL_KT(NAME, QT_N, HD_N, BLK_N, NSG_N, DS_N, KVW_N, ##__VA_ARGS__)
+#define IMPARO_QCOMB_KERNEL_KT(NAME, QT_N, HD_N, BLK_N, NSG_N, DS_N, KVW_N, ...)                       \
 kernel void NAME(                                                                          \
     device const float * q     [[buffer(0)]],                                              \
     device const half  * kc    [[buffer(1)]],                                              \
@@ -3474,6 +4585,7 @@ kernel void NAME(                                                               
     device half * xh           [[buffer(16)]],                                             \
     constant uint & xh_on      [[buffer(17)]],                                             \
     device const uint * pt     [[buffer(18)]],                                             \
+    constant uint & ptile      [[buffer(19)]],                                             \
     threadgroup float * shared [[threadgroup(0)]],                                         \
     uint3 tgid  [[threadgroup_position_in_grid]],                                          \
     uint3 tid3  [[thread_position_in_threadgroup]],                                        \
@@ -3482,15 +4594,462 @@ kernel void NAME(                                                               
     uint  sgid  [[simdgroup_index_in_threadgroup]],                                        \
     uint  nsg   [[simdgroups_per_threadgroup]])                                            \
 {                                                                                          \
-    attention_prefill_qcomb_body<QT_N, HD_N, BLK_N, PT_N, NSG_N, DS_N, ##__VA_ARGS__>(            \
-                               q, kc, vc, out, dspill, ktb, kt_stride,                     \
+    attention_prefill_qcomb_body<QT_N, HD_N, BLK_N, NSG_N, DS_N, KVW_N, ##__VA_ARGS__>(            \
+                               q, kc, vc, out, dspill, ktb, kt_stride, ptile,              \
                                hd, n_heads, n_kv,                                          \
                                kv_width, start_pos, window, ring_mask, pt, n_tok, stage,   \
                                xh, xh_on,                                                  \
                                shared, tgid, tid3.x, tcnt3.x, lane, sgid, nsg);            \
 }
 
-IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb256, 8, 256, 4, 128, 8, false)
+// ONE SLOT PER HEAD DIM THE MODEL USES, injected at library-compile time. No dim is named
+// here: the host reads them off the plan's layers and derives each one's NSG and DSPILL
+// from THIS device, exactly as it already does for the QT-16 rows' NSG and PT.
+//
+// The dim has to be a compile-time constant -- NDB = HD/8/NSG sizes `o[QROWS][NDB]`, a
+// register array, and the Metal compiler rejects a runtime bound ("array size is not a
+// constant expression"). Since the library is compiled from source on the device at every
+// start, specialising for the model's own dims costs nothing and compiles nothing it
+// cannot dispatch. A dim with no slot falls through to qtile, whose head dim is dynamic.
+#ifndef IMPARO_HD0
+#define IMPARO_HD0 0
+#define IMPARO_NSG0 8
+#define IMPARO_DS0 0
+#endif
+#ifndef IMPARO_HD1
+#define IMPARO_HD1 0
+#define IMPARO_NSG1 8
+#define IMPARO_DS1 0
+#endif
+#ifndef IMPARO_HD2
+#define IMPARO_HD2 0
+#define IMPARO_NSG2 8
+#define IMPARO_DS2 0
+#endif
+#ifndef IMPARO_HD3
+#define IMPARO_HD3 0
+#define IMPARO_NSG3 8
+#define IMPARO_DS3 0
+#endif
+
+// THE K-SHARING VARIANT BELONGS TO EVERY SLOT, not to two written-down dims.
+//
+// QT-16 is the shape where one simdgroup carries BOTH query row groups of its position
+// group, so each K fragment is loaded once and multiplied twice -- half the K traffic a
+// prefill scan pulls. It existed only as `qcomb256x` and `qcomb512x`, hand-named at two
+// dims, so every dim the host injects got QT-8 only and re-read K every 8 queries.
+//
+// That is the same defect as the dims themselves once were: a family that specialises per
+// model, with one member still naming sizes. It costs most exactly where it was never
+// built -- LFM2 at head_dim 64 is FULL attention (no sliding window in the file), so its
+// scan is quadratic and K traffic dominates; attention is 33% of its prefill against 15%
+// for E4B, where the 1.94% this shape was worth was measured.
+//
+// NSGX/DSX are separate from the QT-8 slot's NSG/DS because QT 16 doubles QROWS, and both
+// the accumulator budget and the tail-scratch question are answered against that.
+#ifndef IMPARO_BLKX0
+#define IMPARO_BLKX0 2
+#endif
+#ifndef IMPARO_NSGX0
+#define IMPARO_NSGX0 8
+#endif
+#ifndef IMPARO_DSX0
+#define IMPARO_DSX0 0
+#endif
+#ifndef IMPARO_BLKX1
+#define IMPARO_BLKX1 2
+#endif
+#ifndef IMPARO_NSGX1
+#define IMPARO_NSGX1 8
+#endif
+#ifndef IMPARO_DSX1
+#define IMPARO_DSX1 0
+#endif
+#ifndef IMPARO_BLKX2
+#define IMPARO_BLKX2 2
+#endif
+#ifndef IMPARO_NSGX2
+#define IMPARO_NSGX2 8
+#endif
+#ifndef IMPARO_DSX2
+#define IMPARO_DSX2 0
+#endif
+#ifndef IMPARO_BLKX3
+#define IMPARO_BLKX3 2
+#endif
+#ifndef IMPARO_NSGX3
+#define IMPARO_NSGX3 8
+#endif
+#ifndef IMPARO_DSX3
+#define IMPARO_DSX3 0
+#endif
+
+// ===========================================================================
+// FA-SHAPED PREFILL ATTENTION -- llama.cpp's `kernel_flash_attn_ext` block
+// structure, a NEW op beside qcomb (IMPARO_ATTN_FA=1 until it earns the default).
+//
+// THE BLOCK STRUCTURE IS UPSTREAM'S: QB queries per threadgroup staged once as
+// half, CB keys per block, Q*K^T split over the simdgroups by column tile, scores
+// through threadgroup memory (row stride 2*CB, upstream's SH), online softmax
+// split by QUERY row across simdgroups in one float2 pass per lane, O in
+// threadgroup memory rescaled elementwise by `ms`, P x V split by output column
+// tile, three threadgroup barriers per block. 7168 B of threadgroup memory at
+// HD 64 / QB 8 / CB 64 -- the same bytes as upstream's.
+//
+// WHAT MADE IT FAST, measured one change per build against upstream's kernel on
+// identical geometry (docs/evidence/bracket/2026-09-01-fa-attention-bisection.md;
+// the revived port ran 45% behind with the SAME structure):
+//   - the K/V row stride is a COMPILE-TIME constant (KVW, injected per slot as
+//     IMPARO_KVW<slot> beside IMPARO_HD<slot>; upstream's NS10/NS20 are function
+//     constants): -10..15%. A runtime stride is a uniform read and a multiply in
+//     every transposed tile load.
+//   - every K tile and every V tile of a block is loaded into registers BEFORE
+//     the block's MMAs, and the Q tile lives in registers for the whole key loop:
+//     -15% and -6%. The compiler does not reorder simdgroup loads across MMAs on
+//     its own, unrolled or not; the phase costs summed to the total before this,
+//     which is what a latency-bound kernel looks like.
+//   - no branch inside the block: a tile past the last key clamps its ADDRESS to
+//     the last valid tile and the mask zeroes its P (-3%).
+// Register budget for the tiles at HD 64, NSG 4, CB 64: Q 16 + K 32 + V 16 a lane.
+// The op is therefore built for head dims up to 128 (see the instantiation).
+//
+// WHAT IS DIFFERENT FROM UPSTREAM, only what our interface forces:
+//   - no mask TENSOR: causality and the window are synthesised from positions,
+//     as qcomb does, so no `blk` precompute pass and no pad kernel either; the
+//     block that crosses a query's position takes the per-position test, every
+//     block below it takes the fully-live fast path
+//   - no ALiBi/sinks/softcap: LFM2 and E4B use none of them
+//   - Q arrives PRE-SCALED (the caller folds the score scale, task #30)
+//   - K/V come from the pool through `kv_slot`; the host routes only non-ringed
+//     layers here (a block's 8-row tiles must be contiguous)
+//
+// ATTN_SKIP probe bits (function constant 17, compiled out at 0), for attribution
+// in the bench: 1 no QK MMA, 2 no softmax, 4 no V load, 8 no K load, 32 no PV MMA.
+template<uint HD, uint QB, uint CB, uint NSG, uint KVW>
+static void attention_prefill_fa_body(
+    device const float * q, device const half * kc, device const half * vc,
+    device float * out,
+    uint n_heads, uint n_kv, uint kv_width,
+    uint start_pos, uint window, uint ring_mask, device const uint * pt,
+    uint n_tok,
+    device half * xh, uint xh_on,
+    threadgroup float * shared, uint3 tgid, uint tid, uint tcount,
+    uint lane, uint sgid, uint nsg)
+{
+    (void)nsg;
+    // The K/V row stride as a COMPILE-TIME constant when the host gave it (upstream's
+    // NS10/NS20 are function constants for the same reason): every transposed K tile
+    // load and every V tile load carries this stride, and as an immediate it costs no
+    // uniform read and no multiply per tile. 0 falls back to the uniform.
+    const uint kvw = (KVW != 0u) ? KVW : kv_width;
+    constexpr uint HD8 = HD / 8u;
+    constexpr uint NQ  = QB / NSG;         // queries each simdgroup owns in softmax
+    constexpr uint NC  = (CB / 8u) / NSG;  // score column tiles per simdgroup
+    constexpr uint NO  = HD8 / NSG;        // output column tiles per simdgroup
+    static_assert(QB % NSG == 0u, "queries must divide over the simdgroups");
+    static_assert((CB / 8u) % NSG == 0u, "score columns must divide over the simdgroups");
+    static_assert(HD8 % NSG == 0u, "output columns must divide over the simdgroups");
+    static_assert(CB == 64u, "the one-pass softmax owns two columns per lane: CB is 2 x 32");
+    static_assert(QB == 8u, "one 8-row MMA query tile per threadgroup: mq, mqk and lo are sized for it");
+
+    const uint h = tgid.x, q0 = tgid.y * QB;
+    const uint kvh = h / (n_heads / n_kv);
+
+    // Scores row stride CB. Upstream's is 2*CB with the mask tile in the second half; this
+    // kernel synthesises its mask, so that half was 2 KB of threadgroup memory nothing read
+    // -- and threadgroup memory sets how many threadgroups share a core, which is what lets
+    // one threadgroup's loads overlap another's MMAs: 7168 -> 5120 B measured -2.4% at
+    // depth (register-resident prefetch of the next block measured -5..-27% instead, and
+    // 4096 B by aliasing the output tile onto the dead Q staging measured no further gain).
+    constexpr uint SS = CB;
+    threadgroup half  * sq = (threadgroup half *)shared;          // QB x HD, staged Q
+    threadgroup float * ss = shared + (QB * HD) / 2u;             // QB x SS, scores then P
+    threadgroup float * so = ss + QB * SS;                        // QB x HD, output
+
+    for (uint e = tid; e < QB * HD; e += tcount) {
+        const uint row = e / HD, dim = e % HD;
+        const uint t = q0 + row;
+        sq[row * HD + dim] =
+            t < n_tok ? half(q[((ulong)t * n_heads + h) * HD + dim]) : half(0.0f);
+    }
+    for (uint e = tid; e < QB * HD; e += tcount) { so[e] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[NQ], M[NQ];
+    #pragma unroll
+    for (uint jj = 0; jj < NQ; ++jj) { S[jj] = 0.0f; M[jj] = -INFINITY; }
+
+    // THE QUERY TILE LIVES IN REGISTERS FOR THE WHOLE KEY LOOP. It never changes, and the
+    // QB x HD half tile is HD8 8x8 fragments -- 16 registers a lane at HD 64 -- so every
+    // Q*K^T step reads it from registers instead of re-loading it from threadgroup memory
+    // per K tile (upstream re-loads; the port did too).
+    simdgroup_half8x8 mq[HD8];
+    #pragma unroll
+    for (uint i = 0; i < HD8; ++i) { simdgroup_load(mq[i], sq + 8u * i, HD); }
+
+    // Both bounds come from the whole query tile: the earliest query sets where the
+    // scan starts under a window, the latest sets where it ends.
+    const uint last_q    = min(q0 + QB, n_tok) - 1u;
+    const uint pos_last  = start_pos + last_q;
+    const uint pos_first = start_pos + q0;
+    const uint scan_lo   = (window > 0u && pos_first + 1u > window)
+                         ? (pos_first + 1u - window) : 0u;
+
+    // ONE PAGE PER BLOCK, FETCHED A BLOCK AHEAD. kv_slot reads pt[gp / 64] for every 8-key
+    // tile, and with the tile loads hoisted below that dependent load stands in front of all
+    // of them: compiled out (KV_PAGED false, identity placement) the kernel is 8% faster at
+    // every depth, while a scattered table costs nothing over an identity one -- the cost is
+    // the per-tile lookup, not the placement. A 64-key block is exactly one 64-cell page
+    // when its start is page-aligned (the FA route has no ring, and scan_lo is 0 without a
+    // window), so the block's page is one uniform load, issued during the PREVIOUS block so
+    // no tile load ever waits on it. An unaligned start (a window) keeps kv_slot per tile.
+    static_assert(CB == KV_PAGE_CELLS, "a block is one page: the page fetch below assumes it");
+    const bool paged_blocks = KV_PAGED && ring_mask == 0u;
+    uint pg_next = paged_blocks ? pt[scan_lo / KV_PAGE_CELLS] : 0u;
+
+    for (uint ic = scan_lo; ic <= pos_last; ic += CB) {
+        const uint pg_cur  = pg_next;
+        const uint ic_next = ic + CB;
+        if (paged_blocks && ic_next <= pos_last) { pg_next = pt[ic_next / KV_PAGE_CELLS]; }
+        const bool one_page = paged_blocks && (ic % KV_PAGE_CELLS) == 0u;
+        auto tile_slot = [&](uint gp) -> uint {   // gp >= ic, inside this block
+            return one_page ? pg_cur * KV_PAGE_CELLS + (gp - ic) : kv_slot(gp, ring_mask, pt);
+        };
+
+        // NO BOUNDS BRANCH INSIDE THE BLOCK. A tile past the last key CLAMPS its address to
+        // the last valid tile instead of skipping: the load hits a line already fetched,
+        // and the mask pass below sets every column past the query's position to -INF, so
+        // P is 0 there and the duplicate contributes nothing -- the same numbers as the
+        // skip. What it buys is the loop shape upstream has by padding K/V: every load in
+        // the block can be issued ahead of every MMA, with no data-dependent branch or
+        // early exit between them.
+        const uint last_tile = pos_last & ~7u;
+
+        // ---- Q * K^T, NC 8-position column tiles per simdgroup per block ----
+        // EVERY K TILE OF THE BLOCK IS LOADED BEFORE THE FIRST MMA (as the V tiles below):
+        // NC x HD8 transposed fragments, 32 registers a lane at HD 64 with NC 2.
+        // ATTN_SKIP probes (function constant, compiled out at 0): bit 8 drops the K load
+        // and keeps the MMA; bit 1 drops the MMA and with it the load.
+        simdgroup_half8x8 mkb[NC][HD8];
+        #pragma unroll
+        for (uint cc = 0; cc < NC; ++cc) {
+            const uint gp0 = min(ic + (cc * NSG + sgid) * 8u, last_tile);
+            const uint ps0 = tile_slot(gp0);
+            device const half * pk = kc + (ulong)ps0 * kvw + kvh * HD;
+            #pragma unroll
+            for (uint i = 0; i < HD8; ++i) {
+                if (ATTN_SKIP & 8u) { mkb[cc][i] = make_filled_simdgroup_matrix<half, 8, 8>(half(0.01f)); }
+                else { simdgroup_load(mkb[cc][i], pk + 8u * i, kvw, 0, true); }
+            }
+        }
+        #pragma unroll
+        for (uint cc = 0; cc < NC; ++cc) {
+            const uint col = (cc * NSG + sgid) * 8u;
+            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma unroll
+            for (uint i = 0; i < HD8; ++i) {
+                if (!(ATTN_SKIP & 1u)) { simdgroup_multiply_accumulate(mqk, mq[i], mkb[cc][i], mqk); }
+            }
+            simdgroup_store(mqk, ss + col, SS, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- online softmax: each simdgroup owns NQ whole query rows ----
+        // The masking is applied before the max so a masked position can never set it.
+        #pragma unroll
+        for (uint jj = 0; jj < NQ; ++jj) {
+            if (ATTN_SKIP & 2u) { break; }   // probe: no softmax, P = raw scores
+            const uint j = jj * NSG + sgid;
+            const uint t = q0 + j;
+            const uint t_pos = start_pos + t;
+            const uint t_lo = (window > 0u && t_pos + 1u > window)
+                            ? (t_pos + 1u - window) : 0u;
+            const bool row_live = t < n_tok;
+            const float m_prev = M[jj];
+
+            // FULLY-LIVE FAST PATH, the same idea as qcomb's ATTN_LIVE_MASK and upstream's
+            // blk_cur == 2: when the whole block is live for this query, the per-position
+            // causal test is 2 comparisons per position that can never fire. At depth
+            // almost every block is far below the diagonal and takes this path.
+            const bool blk_live = row_live && (ic + CB - 1u) <= t_pos && ic >= t_lo;
+            // ONE PASS, upstream's form: a lane owns columns 2*lane and 2*lane+1 as a
+            // float2, so the block max is one simd_max and every score is read once and
+            // written once. CB is 64 by construction (static_assert above).
+            threadgroup float2 * ss2 = (threadgroup float2 *)(ss + j * SS);
+            float2 s2 = ss2[lane];
+            if (!blk_live) {
+                const uint gp = ic + 2u * lane;
+                s2.x = (row_live && gp      <= t_pos && gp      >= t_lo) ? s2.x : -INFINITY;
+                s2.y = (row_live && gp + 1u <= t_pos && gp + 1u >= t_lo) ? s2.y : -INFINITY;
+            }
+            M[jj] = simd_max(max(M[jj], max(s2.x, s2.y)));
+            // A row with nothing live yet would make exp(-INF - -INF) a NaN; zero it
+            // instead, exactly as qcomb does for rows past the batch.
+            const bool dead = M[jj] == -INFINITY;
+            const float  ms  = dead ? 0.0f : exp(m_prev - M[jj]);
+            const float2 vs2 = dead ? float2(0.0f) : exp(s2 - M[jj]);
+            S[jj] = S[jj] * ms + simd_sum(vs2.x + vs2.y);
+            ss2[lane] = vs2;
+            // LAZY RESCALE: the running max settles within the first blocks, after which
+            // m_prev == M and ms is exactly 1.0 -- the rescale pass over the row's output
+            // (HD floats of threadgroup memory, read and written, every block) does nothing
+            // then. The test is simdgroup-uniform (one row per simdgroup here), so it is a
+            // branch, not a divergence. Same arithmetic when it runs: x * 1.0 == x exactly.
+            if (ms != 1.0f) {
+                for (uint d = lane; d < HD; d += 32u) { so[j * HD + d] *= ms; }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- O += P * V, one 8-dim output tile per simdgroup per step ----
+        {
+            simdgroup_float8x8 lo[NO];
+            #pragma unroll
+            for (uint ii = 0; ii < NO; ++ii) {
+                simdgroup_load(lo[ii], so + 8u * (sgid + ii * NSG), HD);
+            }
+            // EVERY V TILE OF THE BLOCK IS LOADED BEFORE THE FIRST MMA. The loads do not
+            // depend on P, so issuing all CB/8 x NO of them first puts the block's whole V
+            // latency in flight at once instead of one tile's worth per MMA pair; the
+            // attribution read the V load at 3x the K load for the same bytes.
+            simdgroup_half8x8 mvb[CB / 8u][NO];
+            #pragma unroll
+            for (uint cc = 0; cc < CB / 8u; ++cc) {
+                const uint gp0 = min(ic + cc * 8u, last_tile);   // clamp, see above
+                const uint ps0 = tile_slot(gp0);
+                device const half * pv = vc + (ulong)ps0 * kvw + kvh * HD;
+                #pragma unroll
+                for (uint ii = 0; ii < NO; ++ii) {
+                    // ATTN_SKIP bit 4 drops the V load (MMA kept).
+                    if (ATTN_SKIP & 4u) { mvb[cc][ii] = make_filled_simdgroup_matrix<half, 8, 8>(half(0.01f)); }
+                    else { simdgroup_load(mvb[cc][ii], pv + 8u * (sgid + ii * NSG), kvw); }
+                }
+            }
+            #pragma unroll
+            for (uint cc = 0; cc < CB / 8u; ++cc) {
+                simdgroup_float8x8 vs;
+                simdgroup_load(vs, ss + 8u * cc, SS);
+                #pragma unroll
+                for (uint ii = 0; ii < NO; ++ii) {
+                    // ATTN_SKIP bit 32 drops the MMA.
+                    if (!(ATTN_SKIP & 32u)) { simdgroup_multiply_accumulate(lo[ii], vs, mvb[cc][ii], lo[ii]); }
+                }
+            }
+            #pragma unroll
+            for (uint ii = 0; ii < NO; ++ii) {
+                simdgroup_store(lo[ii], so + 8u * (sgid + ii * NSG), HD);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Each query row is owned by exactly one simdgroup (j % NSG == sgid), and
+    // simd_max/simd_sum already broadcast S across its lanes.
+    #pragma unroll
+    for (uint jj = 0; jj < NQ; ++jj) {
+        const uint j = jj * NSG + sgid;
+        const uint t = q0 + j;
+        if (t >= n_tok) { continue; }
+        const float inv = S[jj] > 0.0f ? 1.0f / S[jj] : 0.0f;
+        for (uint d = lane; d < HD; d += 32u) {
+            const ulong idx = ((ulong)t * n_heads + h) * HD + d;
+            const float v = so[j * HD + d] * inv;
+            out[idx] = v;
+            if (xh_on != 0u) { xh[idx] = half(v); }
+        }
+    }
+}
+
+#define IMPARO_FA_KERNEL(NAME, HD_N, QB_N, CB_N, NSG_N, KVW_N)                                    \
+kernel void NAME(                                                                          \
+    device const float * q      [[buffer(0)]],                                             \
+    device const half  * kc     [[buffer(1)]],                                             \
+    device const half  * vc     [[buffer(2)]],                                             \
+    device float       * out    [[buffer(3)]],                                             \
+    constant uint & n_heads     [[buffer(4)]],                                             \
+    constant uint & n_kv        [[buffer(5)]],                                             \
+    constant uint & kv_width    [[buffer(6)]],                                             \
+    constant uint & start_pos   [[buffer(7)]],                                             \
+    constant uint & window      [[buffer(8)]],                                             \
+    constant uint & ring_mask   [[buffer(9)]],                                             \
+    constant uint & n_tok       [[buffer(10)]],                                            \
+    device half        * xh     [[buffer(11)]],                                            \
+    constant uint & xh_on       [[buffer(12)]],                                            \
+    device const uint  * pt     [[buffer(13)]],                                            \
+    threadgroup float * shared  [[threadgroup(0)]],                                        \
+    uint3 tgid  [[threadgroup_position_in_grid]],                                          \
+    uint3 tid3  [[thread_position_in_threadgroup]],                                        \
+    uint3 tcnt3 [[threads_per_threadgroup]],                                               \
+    uint  lane  [[thread_index_in_simdgroup]],                                             \
+    uint  sgid  [[simdgroup_index_in_threadgroup]],                                        \
+    uint  nsg   [[simdgroups_per_threadgroup]])                                            \
+{                                                                                          \
+    attention_prefill_fa_body<HD_N, QB_N, CB_N, NSG_N, KVW_N>(                                    \
+        q, kc, vc, out, n_heads, n_kv, kv_width, start_pos, window, ring_mask, pt,         \
+        n_tok, xh, xh_on, shared, tgid, tid3.x, tcnt3.x, lane, sgid, nsg);                 \
+}
+
+#ifndef IMPARO_KVW0
+#define IMPARO_KVW0 0u
+#endif
+#ifndef IMPARO_KVW1
+#define IMPARO_KVW1 0u
+#endif
+#ifndef IMPARO_KVW2
+#define IMPARO_KVW2 0u
+#endif
+#ifndef IMPARO_KVW3
+#define IMPARO_KVW3 0u
+#endif
+// The FA op holds a block's K and V tiles in registers ahead of the MMAs (NC x HD/8 and
+// CB/8 x HD/8/NSG fragments) plus the Q tile: 64 registers a lane at HD 64. At HD 256 that
+// is four times over the file, so the kernel is built for head dims up to 128 only; the
+// host finds no pipeline for a wider slot and qcomb serves it, as before.
+#ifndef IMPARO_FA_NSG0
+#define IMPARO_FA_NSG0 4
+#endif
+#ifndef IMPARO_FA_ALL
+#define IMPARO_FA_ALL 0
+#endif
+// NSG is the op's knob (attn_fa_nsg). It sizes register arrays, so each value is its own
+// kernel: the engine builds the seated one (IMPARO_FA_NSG0), the tuner builds every legal
+// one (IMPARO_FA_ALL, its prepare step) so a sweep can select them at dispatch -- a knob
+// that only exists at library compile is inert to a sweep that runs after init. QB 8 is
+// structural: one 8-row MMA query tile per threadgroup (a two-tile body measured 70%
+// slower at 16). CB 64 is one page and the one-pass softmax's 2 x 32 lanes.
+#if IMPARO_HD0 && (IMPARO_HD0 <= 128)
+#if IMPARO_FA_ALL || (IMPARO_FA_NSG0 == 1)
+IMPARO_FA_KERNEL(imparo_attention_prefill_fa_s0_n1, IMPARO_HD0, 8, 64, 1, IMPARO_KVW0)
+#endif
+#if IMPARO_FA_ALL || (IMPARO_FA_NSG0 == 2)
+IMPARO_FA_KERNEL(imparo_attention_prefill_fa_s0_n2, IMPARO_HD0, 8, 64, 2, IMPARO_KVW0)
+#endif
+#if IMPARO_FA_ALL || (IMPARO_FA_NSG0 == 4)
+IMPARO_FA_KERNEL(imparo_attention_prefill_fa_s0_n4, IMPARO_HD0, 8, 64, 4, IMPARO_KVW0)
+#endif
+#if IMPARO_FA_ALL || (IMPARO_FA_NSG0 == 8)
+IMPARO_FA_KERNEL(imparo_attention_prefill_fa_s0_n8, IMPARO_HD0, 8, 64, 8, IMPARO_KVW0)
+#endif
+#endif
+
+#define IMPARO_QCOMB_SLOT(I, HD, NSG, DS, BLKX, NSGX, DSX)                                 \
+    IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb_s##I,   8, HD, 4, NSG, DS, IMPARO_KVW##I)   \
+    IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb_s##I##b2, 8, HD, 2, NSG, DS, IMPARO_KVW##I) \
+    IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb_s##I##x, 16, HD, BLKX, NSGX, DSX, IMPARO_KVW##I, true)
+
+#if IMPARO_HD0
+IMPARO_QCOMB_SLOT(0, IMPARO_HD0, IMPARO_NSG0, IMPARO_DS0, IMPARO_BLKX0, IMPARO_NSGX0, IMPARO_DSX0)
+#endif
+#if IMPARO_HD1
+IMPARO_QCOMB_SLOT(1, IMPARO_HD1, IMPARO_NSG1, IMPARO_DS1, IMPARO_BLKX1, IMPARO_NSGX1, IMPARO_DSX1)
+#endif
+#if IMPARO_HD2
+IMPARO_QCOMB_SLOT(2, IMPARO_HD2, IMPARO_NSG2, IMPARO_DS2, IMPARO_BLKX2, IMPARO_NSGX2, IMPARO_DSX2)
+#endif
+#if IMPARO_HD3
+IMPARO_QCOMB_SLOT(3, IMPARO_HD3, IMPARO_NSG3, IMPARO_DS3, IMPARO_BLKX3, IMPARO_NSGX3, IMPARO_DSX3)
+#endif
+
 // BLK 2 variants of the QT-8 kernels. Their score phase splits a PT-128 position tile into
 // ceil(PT / (8*BLK)) work units and hands one to each simdgroup, so at BLK 4 that is 4
 // units over NSG 8 -- HALF THE SIMDGROUPS IDLE. At BLK 2 it is 8 units over 8. The trade is
@@ -3498,7 +5057,9 @@ IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb256, 8, 256, 4, 128, 8, false)
 // MAC to 1.50, against double the parallelism. BLK also does not touch threadgroup memory
 // (only QT and PT do) and needs FEWER accumulator registers, so the wider occupancy costs
 // nothing structural. These are the kernels q4 and q8 prefill run on.
-IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb256b2, 8, 256, 2, 128, 8, false)
+// The BLK-2 shape at hd 64, so the blk axis exists at every dim the family serves rather
+// than only where someone happened to write it.
+
 // The same K-sharing shape for the WINDOW layers (35 of 42). Head size 256
 // makes NDB = 256/8/8 = 4, so two row groups fit at NSG 8 without the extra
 // simdgroups the hd-512 variant needs.
@@ -3533,16 +5094,13 @@ IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb256b2, 8, 256, 2, 128, 8, fals
 #ifndef IMPARO_BLK_256X
 #define IMPARO_BLK_256X 2
 #endif
-IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb256x, 16, 256, IMPARO_BLK_256X, IMPARO_PT_256X,
-                    IMPARO_NSG_256X, false, true)
+IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb256x, 16, 256, IMPARO_BLK_256X, IMPARO_NSG_256X, false, 0u, true)
 // QT 16 was tried at head size 256 (the WINDOW layers, 35 of 42, whose
 // accumulator is half the hd-512 one so the wider tile fits): 32472 ms against
 // 32672 on a 16k prefill, 0.6%. It stages Q as half to fit the budget, so it
 // moves the logits -- not worth regenerating pins and giving up numeric ground
 // for 0.6%.
 // head_dim 512 (the full-attention layers): the tail scratch moves to device memory.
-IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb512, 8, 512, 4, 128, 8, true)
-IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb512b2, 8, 512, 2, 128, 8, true)
 // K-SHARING configuration (IMPARO_QCOMB_X=1). Now that one simdgroup carries
 // every row group in its position group, QT 16 finally halves K traffic
 // instead of merely re-loading it twice. Every term is forced:
@@ -3570,8 +5128,7 @@ IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb512b2, 8, 512, 2, 128, 8, true
 #ifndef IMPARO_BLK_512X
 #define IMPARO_BLK_512X 2
 #endif
-IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb512x, 16, 512, IMPARO_BLK_512X, IMPARO_PT_512X,
-                    IMPARO_NSG_512X, true, true)
+IMPARO_QCOMB_KERNEL(imparo_attention_prefill_qcomb512x, 16, 512, IMPARO_BLK_512X, IMPARO_NSG_512X, true, 0u, true)
 // The coupled configuration of task #37 was built and measured here (QT 16,
 // NSG 16, PT 224, half-staged Q): 32860 ms against 32658 on a 16k prefill,
 // 0.6% SLOWER. The reason is above, at the work-unit definition: a unit is
@@ -3611,6 +5168,10 @@ constant uint KVT_K_FC [[function_constant(3)]];
 constant uint KVT_V_FC [[function_constant(4)]];
 constant uint KVT_K = is_function_constant_defined(KVT_K_FC) ? KVT_K_FC : 1u;
 constant uint KVT_V = is_function_constant_defined(KVT_V_FC) ? KVT_V_FC : 1u;
+// A quantized cache on either side (task #156): the mega-kernel's typed loader, quantizer and
+// cache-basis rotations are compiled only into pipelines built with a typed K or V, so the
+// f16 pipelines keep the code (and the footprint) they were measured with.
+constant bool MEGA_KVQ = (KVT_K != 1u) || (KVT_V != 1u);
 
 // Byte offset of value `head_off` in cache row `slot` for storage type `kvt`.
 inline ulong imparo_kv_row_off(uint kvt, uint width, uint slot, uint head_off) {
@@ -3974,8 +5535,9 @@ kernel void imparo_attention_decode_stream_t(
     for (uint ib = sp * nsg + sgid; ib < nblk; ib += slices * nsg) {
         const uint gp = ib * C;
         const uint nc = min(C, n - gp);
-        const ulong prow = KV_PAGED ? (ulong)((pt[gp >> 6] << 6) | (gp & 63u))
-                                    : (ulong)gp;
+        const ulong prow = KV_PAGED
+            ? (ulong)(pt[gp / KV_PAGE_CELLS] * KV_PAGE_CELLS + gp % KV_PAGE_CELLS)
+            : (ulong)gp;
 
         // scores: the row is read ONCE into registers, then scored for every
         // head this threadgroup owns; lane cc keeps row cc's score.
@@ -4390,6 +5952,476 @@ template [[host_name("imparo_attention_decode_scoretile_gqa_hq4")]] kernel impar
 template [[host_name("imparo_attention_decode_scoretile_gqa_hq8")]] kernel imparo_attn_gqa_kt imparo_attention_decode_scoretile_gqa_t<8u>;
 
 
+// FLASH-DECODING FOR SMALL HEAD DIMS (hd <= 128), GROUPED BY KV HEAD.
+//
+// Decode attention at depth on LFM2 (hd 64, GQA 4) read 134 MB per layer per token at
+// 209 GB/s: the ungrouped scoretile kernel gives every QUERY head its own threadgroup, so
+// each K/V row of a KV head is read four times, and at 16k keys the cache does not
+// collapse the repeats (skip-and-diff, 17123 tokens: 6.9 ms/token of attention against
+// upstream's 3.1). The grouped scoretile kernel reads each row once but gives one
+// SIMDGROUP one position -- 16 of 32 lanes load a half4 and then FOUR simd_sums per
+// position -- which at hd 64 is the kernel (2-5x slower than ungrouped). So this kernel:
+//
+//   scores  one POSITION per thread: the thread reads its K row (HD halves) once and
+//           forms HQ dot products against Q staged in threadgroup memory -- no cross-
+//           lane reduction per position; HQ x chunk scores go to threadgroup memory
+//   softmax per head over the slice's chunk: one max and one sum reduction per head
+//           per SLICE (a threadgroup), not per position
+//   P x V   lanes own DIMS (HD/32 each), simdgroups split the positions: a V row is
+//           read once, coalesced, and weights HQ outputs; HQ x HD/32 accumulators a
+//           thread; the simdgroups' partials meet once in threadgroup memory
+//   slices  the context is split into ~512-key chunks by the host (upstream's decode
+//           kernel: nwg 32 at 16k keys), so 8 KV heads x 32 slices keep the memory
+//           system busy; the existing combine merges the slices.
+//
+// Same bindings as scoretile_gqa (a drop-in on the split route); the partial layout
+// (HD accumulators, max, sum per query head per slice) is the combine's. Positions
+// resolve through kv_slot: f16 cache only (a quantized cache keeps the scoretile route).
+template <uint HD, uint HQ, uint KVW>
+kernel void imparo_attention_decode_fd_t(
+    device const float * q     [[buffer(0)]],
+    device const half  * kc    [[buffer(1)]],
+    device const half  * vc    [[buffer(2)]],
+    device float       * part  [[buffer(3)]],
+    constant uint & head_dim [[buffer(4)]], constant uint & n_heads [[buffer(5)]],
+    constant uint & n_kv     [[buffer(6)]], constant uint & kv_width [[buffer(7)]],
+    constant uint & start_pos [[buffer(8)]], constant uint & window [[buffer(9)]],
+    constant uint & ring_mask [[buffer(10)]], constant uint & slices [[buffer(11)]],
+    device const uint * pt [[buffer(18)]],
+    threadgroup float * scores [[threadgroup(0)]],   // HQ x chunk
+    threadgroup float * red    [[threadgroup(1)]],   // HQ*HD (Q) + 2*nsg*HQ + nsg*HQ*HD
+    uint3 tgid   [[threadgroup_position_in_grid]],
+    uint3 tid3   [[thread_position_in_threadgroup]],
+    uint3 tcnt3  [[threads_per_threadgroup]],
+    uint  lane   [[thread_index_in_simdgroup]],
+    uint  sgid   [[simdgroup_index_in_threadgroup]],
+    uint  nsg    [[simdgroups_per_threadgroup]])
+{
+    static_assert(HD % 32u == 0u, "P x V gives each lane HD/32 dims");
+    constexpr uint HD4 = HD / 4u;
+    constexpr uint DPL = HD / 32u;                 // dims per lane in P x V
+    const uint kvw = (KVW != 0u) ? KVW : kv_width;
+    const uint tid = tid3.x, tcount = tcnt3.x;
+    (void)head_dim;
+    const uint share = n_heads / n_kv;
+    const uint groups_per_kvh = share / HQ;
+    const uint kvh = tgid.x / groups_per_kvh;
+    const uint h0 = kvh * share + (tgid.x % groups_per_kvh) * HQ;
+    const uint t = tgid.y, sp = tgid.z;
+    const uint pos = start_pos + t;
+    const uint lo = (window > 0u && pos + 1u > window) ? (pos + 1u - window) : 0u;
+    const uint n = pos + 1u - lo;
+    const uint chunk = (n + slices - 1u) / slices;
+    const uint s0 = min(n, sp * chunk), s1 = min(n, s0 + chunk);
+
+    threadgroup float * qs = red;                       // HQ x HD, this group's queries
+    threadgroup float * rmax = red + HQ * HD;           // nsg x HQ
+    threadgroup float * rsum = rmax + nsg * HQ;         // nsg x HQ
+    threadgroup float * racc = rsum + nsg * HQ;         // nsg x HQ x HD
+    for (uint e = tid; e < HQ * HD; e += tcount) {
+        qs[e] = q[((ulong)t * n_heads + h0 + e / HD) * HD + e % HD];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- scores: one position per thread per pass, HQ dot products from one K row ----
+    float lmax[HQ];
+    for (uint j = 0; j < HQ; ++j) { lmax[j] = -INFINITY; }
+    for (uint s = s0 + tid; s < s1; s += tcount) {
+        const uint ps = kv_slot(lo + s, ring_mask, pt);
+        device const half4 * k4 = (device const half4 *)(kc + (ulong)ps * kvw + kvh * HD);
+        float acc[HQ];
+        for (uint j = 0; j < HQ; ++j) { acc[j] = 0.0f; }
+        for (uint i = 0; i < HD4; ++i) {
+            const float4 kf = float4(k4[i]);
+            for (uint j = 0; j < HQ; ++j) {
+                const float4 qf = *((threadgroup const float4 *)(qs + j * HD) + i);
+                acc[j] += dot(qf, kf);
+            }
+        }
+        for (uint j = 0; j < HQ; ++j) {
+            scores[j * chunk + (s - s0)] = acc[j];
+            lmax[j] = max(lmax[j], acc[j]);
+        }
+    }
+    for (uint j = 0; j < HQ; ++j) {
+        const float m = simd_max(lmax[j]);
+        if (lane == 0u) { rmax[sgid * HQ + j] = m; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mx[HQ];
+    for (uint j = 0; j < HQ; ++j) {
+        float m = -INFINITY;
+        for (uint g = 0; g < nsg; ++g) { m = max(m, rmax[g * HQ + j]); }
+        mx[j] = m;
+    }
+    // ---- softmax over the slice: exp and sum, in place ----
+    float lsum[HQ];
+    for (uint j = 0; j < HQ; ++j) { lsum[j] = 0.0f; }
+    for (uint s = s0 + tid; s < s1; s += tcount) {
+        for (uint j = 0; j < HQ; ++j) {
+            const float p = exp(scores[j * chunk + (s - s0)] - mx[j]);
+            scores[j * chunk + (s - s0)] = p;
+            lsum[j] += p;
+        }
+    }
+    for (uint j = 0; j < HQ; ++j) {
+        const float sm = simd_sum(lsum[j]);
+        if (lane == 0u) { rsum[sgid * HQ + j] = sm; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- P x V: lanes own dims, simdgroups split positions ----
+    float vacc[HQ][DPL];
+    for (uint j = 0; j < HQ; ++j) { for (uint d = 0; d < DPL; ++d) { vacc[j][d] = 0.0f; } }
+    for (uint s = s0 + sgid; s < s1; s += nsg) {
+        const uint ps = kv_slot(lo + s, ring_mask, pt);
+        device const half * vr = vc + (ulong)ps * kvw + kvh * HD + lane * DPL;
+        float vf[DPL];
+        for (uint d = 0; d < DPL; ++d) { vf[d] = float(vr[d]); }
+        for (uint j = 0; j < HQ; ++j) {
+            const float p = scores[j * chunk + (s - s0)];
+            for (uint d = 0; d < DPL; ++d) { vacc[j][d] += p * vf[d]; }
+        }
+    }
+    for (uint j = 0; j < HQ; ++j) {
+        for (uint d = 0; d < DPL; ++d) { racc[(sgid * HQ + j) * HD + lane * DPL + d] = vacc[j][d]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- the slice's partial: HD accumulators, max, sum per query head ----
+    for (uint e = tid; e < HQ * HD; e += tcount) {
+        const uint j = e / HD, d = e % HD;
+        float a = 0.0f;
+        for (uint g = 0; g < nsg; ++g) { a += racc[(g * HQ + j) * HD + d]; }
+        part[((ulong)(t * n_heads + h0 + j) * slices + sp) * (HD + 2u) + d] = a;
+    }
+    if (tid < HQ) {
+        const uint j = tid;
+        float sm = 0.0f;
+        for (uint g = 0; g < nsg; ++g) { sm += rsum[g * HQ + j]; }
+        device float * pj = part + ((ulong)(t * n_heads + h0 + j) * slices + sp) * (HD + 2u);
+        pj[HD] = mx[j];
+        pj[HD + 1u] = sm;
+    }
+}
+#if IMPARO_HD0 && (IMPARO_HD0 <= 128)
+template [[host_name("imparo_attention_decode_fd_s0_hq2")]] kernel void imparo_attention_decode_fd_t<IMPARO_HD0, 2u, IMPARO_KVW0>(
+    device const float *, device const half *, device const half *, device float *, constant uint &, constant uint &,
+    constant uint &, constant uint &, constant uint &, constant uint &, constant uint &, constant uint &,
+    device const uint *, threadgroup float *, threadgroup float *, uint3, uint3, uint3, uint, uint, uint);
+template [[host_name("imparo_attention_decode_fd_s0_hq4")]] kernel void imparo_attention_decode_fd_t<IMPARO_HD0, 4u, IMPARO_KVW0>(
+    device const float *, device const half *, device const half *, device float *, constant uint &, constant uint &,
+    constant uint &, constant uint &, constant uint &, constant uint &, constant uint &, constant uint &,
+    device const uint *, threadgroup float *, threadgroup float *, uint3, uint3, uint3, uint, uint, uint);
+template [[host_name("imparo_attention_decode_fd_s0_hq8")]] kernel void imparo_attention_decode_fd_t<IMPARO_HD0, 8u, IMPARO_KVW0>(
+    device const float *, device const half *, device const half *, device float *, constant uint &, constant uint &,
+    constant uint &, constant uint &, constant uint &, constant uint &, constant uint &, constant uint &,
+    device const uint *, threadgroup float *, threadgroup float *, uint3, uint3, uint3, uint, uint, uint);
+#endif
+
+// BRICKS: DECODE ATTENTION, ONE SIMDGROUP PER POSITION, LANES OWN HD/32 DIMS.
+// attn_span_online: positions s0, s0 + step, ... below n over the span starting at lo -- this
+// lane's dims of the K and V rows (half4 loads when they divide, half2 otherwise), ONE simd_sum
+// for the score, the online softmax kept per simdgroup in (m, l, o[DPL]). The vec kernel
+// strides it by its simdgroup count; the mega block by (part, simdgroup) over its split.
+// attn_store_slot / attn_merge_slot / attn_fold_slots: the (o, m, l) hand-off through
+// threadgroup memory, in the vec kernel's form. A state that saw no position carries
+// m = -inf and weight 0; two empty states stay empty (exp(-inf - -inf) is NaN; task #142).
+// attn_load_row: this lane's HD/32 dims of one K row and one V row (half4 loads when they
+// divide, half2 otherwise), as floats.
+template <uint HD>
+inline void attn_load_row(device const half * kc, device const half * vc, ulong row,
+                          thread float * kf, thread float * vf) {
+    constexpr uint DPL = HD / 32u;
+    constexpr bool V4 = (DPL % 4u) == 0u;
+    constexpr uint NV = V4 ? DPL / 4u : DPL / 2u;
+    if (V4) {
+        device const half4 * k4 = (device const half4 *)(kc + row);
+        device const half4 * v4 = (device const half4 *)(vc + row);
+        for (uint i = 0; i < NV; ++i) {
+            const float4 k = float4(k4[i]), v = float4(v4[i]);
+            kf[4u * i] = k.x; kf[4u * i + 1u] = k.y; kf[4u * i + 2u] = k.z; kf[4u * i + 3u] = k.w;
+            vf[4u * i] = v.x; vf[4u * i + 1u] = v.y; vf[4u * i + 2u] = v.z; vf[4u * i + 3u] = v.w;
+        }
+    } else {
+        device const half2 * k2 = (device const half2 *)(kc + row);
+        device const half2 * v2 = (device const half2 *)(vc + row);
+        for (uint i = 0; i < NV; ++i) {
+            const float2 k = float2(k2[i]), v = float2(v2[i]);
+            kf[2u * i] = k.x; kf[2u * i + 1u] = k.y;
+            vf[2u * i] = v.x; vf[2u * i + 1u] = v.y;
+        }
+    }
+}
+// One side of a cache row for this lane, whatever the storage type (KVT_K / KVT_V, the
+// decode-attention function constants): block-scaled rows (q4_0 18, q8_0 34 bytes per 32
+// values) dequantised four values at a time through imparo_kv_load4; at two dims per lane
+// (hd 64) a lane pair shares one four-value group. Task #156.
+template <uint HD>
+inline void attn_load_side(uint kvt, device const uchar * cache, uint kvw, uint ps, uint kvh, uint lane,
+                           thread float * f) {
+    constexpr uint DPL = HD / 32u;
+    device const uchar * row = cache + imparo_kv_row_off(kvt, kvw, ps, kvh * HD);
+    if (DPL >= 4u) {
+        for (uint i = 0; i < DPL / 4u; ++i) {
+            const float4 v = imparo_kv_load4(kvt, row, lane * DPL + 4u * i);
+            f[4u * i] = v.x; f[4u * i + 1u] = v.y; f[4u * i + 2u] = v.z; f[4u * i + 3u] = v.w;
+        }
+    } else {
+        const float4 v = imparo_kv_load4(kvt, row, (lane * DPL) & ~3u);
+        f[0] = (lane & 1u) ? v.z : v.x;
+        f[1] = (lane & 1u) ? v.w : v.y;
+    }
+}
+// This lane's dims of K and V at cache slot `ps`: the f16 form when both sides are f16 (the
+// pipelines built without the constants compile exactly the code they had), the typed
+// loader otherwise.
+template <uint HD>
+inline void attn_load_kv(device const half * kc, device const half * vc, uint kvw, uint ps, uint kvh, uint lane,
+                         thread float * kf, thread float * vf) {
+    constexpr uint DPL = HD / 32u;
+    if (!MEGA_KVQ) {
+        attn_load_row<HD>(kc, vc, (ulong)ps * kvw + kvh * HD + lane * DPL, kf, vf);
+        return;
+    }
+    attn_load_side<HD>(KVT_K, (device const uchar *)kc, kvw, ps, kvh, lane, kf);
+    attn_load_side<HD>(KVT_V, (device const uchar *)vc, kvw, ps, kvh, lane, vf);
+}
+template <uint HD, uint KVW>
+inline void attn_span_online(device const half * kc, device const half * vc, uint kvw, uint kvh,
+                             uint lo, uint n, uint s0, uint step, uint ring_mask,
+                             device const uint * pt, uint lane, thread const float * qr,
+                             thread float & m, thread float & l, thread float * o) {
+    constexpr uint DPL = HD / 32u;
+    for (uint s = s0; s < n; s += step) {
+        const uint ps = kv_slot(lo + s, ring_mask, pt);
+        float kf[DPL], vf[DPL];
+        attn_load_kv<HD>(kc, vc, kvw, ps, kvh, lane, kf, vf);
+        float sc = 0.0f;
+        for (uint i = 0; i < DPL; ++i) { sc += qr[i] * kf[i]; }
+        sc = simd_sum(sc);
+        const float mn = max(m, sc);
+        const float f = exp(m - mn);
+        const float p = exp(sc - mn);
+        l = l * f + p;
+        for (uint i = 0; i < DPL; ++i) { o[i] = o[i] * f + p * vf[i]; }
+        m = mn;
+    }
+}
+template <uint HD>
+inline void attn_store_slot(threadgroup float * slot, uint lane, float m, float l, thread const float * o) {
+    constexpr uint DPL = HD / 32u;
+    for (uint i = 0; i < DPL; ++i) { slot[lane * DPL + i] = o[i]; }
+    if (lane == 0u) { slot[HD] = m; slot[HD + 1u] = l; }
+}
+template <uint HD>
+inline void attn_merge_slot(threadgroup const float * slot, uint lane, thread float & m, thread float & l, thread float * o) {
+    constexpr uint DPL = HD / 32u;
+    const float m2 = slot[HD], l2 = slot[HD + 1u];
+    const float M = max(m, m2);
+    const float f1 = (m == -INFINITY) ? 0.0f : exp(m - M);
+    const float f2 = (m2 == -INFINITY) ? 0.0f : exp(m2 - M);
+    l = l * f1 + l2 * f2;
+    for (uint i = 0; i < DPL; ++i) { o[i] = o[i] * f1 + slot[lane * DPL + i] * f2; }
+    m = M;
+}
+// Simdgroup 0 folds its own state with slots 1..G-1 onto a common maximum: (M, L, acc) unnormalised.
+template <uint HD>
+inline void attn_fold_slots(threadgroup const float * red, uint G, uint lane, float m, float l,
+                            thread const float * o, thread float & M, thread float & L, thread float * acc) {
+    constexpr uint DPL = HD / 32u;
+    M = m;
+    for (uint g = 1; g < G; ++g) { M = max(M, red[g * (HD + 2u) + HD]); }
+    const float f0 = (m == -INFINITY) ? 0.0f : exp(m - M);
+    L = l * f0;
+    for (uint i = 0; i < DPL; ++i) { acc[i] = o[i] * f0; }
+    for (uint g = 1; g < G; ++g) {
+        threadgroup const float * rg = red + g * (HD + 2u);
+        const float f = (rg[HD] == -INFINITY) ? 0.0f : exp(rg[HD] - M);
+        L += f * rg[HD + 1u];
+        for (uint i = 0; i < DPL; ++i) { acc[i] += f * rg[lane * DPL + i]; }
+    }
+}
+
+// BRICK: GROUPED DECODE ATTENTION OVER A CONTIGUOUS RUN, K/V ONCE PER KV HEAD (task #151).
+// The mega-kernel's deep body: one simdgroup walks positions [s0, s1) for `hq` query heads
+// of one KV head. Each K/V row is loaded once (this lane's HD/32 dims) and scored for every
+// head -- one simd_sum per (position, head) -- and the online softmax state of every head
+// stays in registers. A paged full layer looks its page up once per KV page (the run is
+// contiguous); a ring layer masks. Heads the item does not own (j >= hq) keep the empty
+// state (m = -inf, weight 0). ATTN_GROUP_HQ(HD) is the heads per item, from the register
+// budget of two HD/32-float arrays per head within 64 floats: 2 at hd 512, 4 at hd 256,
+// 8 at hd 128 and below; a wider query group takes several items (sub-groups).
+constexpr uint attn_group_hq(uint hd) { return (1024u / hd) < 8u ? (1024u / hd) : 8u; }
+// Positions in flight per simdgroup: the run is a dependent chain (row load, dot, simd_sum,
+// exp, update) and at a small head dim the rows are too short to hide it -- LFM2's hd-64
+// layers at 16k keys read 2-4% behind the flash-decoding dispatch one position at a time.
+// So a batch of ATTN_GROUP_U rows is loaded at once and folded with one rescale: 8 at
+// hd <= 128, 4 at hd 256, 1 at hd 512 (the two-head state already fills the registers there).
+constexpr uint attn_group_u(uint hd) { return hd >= 512u ? 1u : ((64u / (hd / 16u)) < 8u ? (64u / (hd / 16u)) : 8u); }
+template <uint HD, uint KVW>
+inline void attn_group_run_online(device const half * kc, device const half * vc, uint kvw, uint kvh,
+                                  uint lo, uint s0, uint s1, uint ring_mask, device const uint * pt,
+                                  uint lane, uint hq, thread const float * qr,
+                                  thread float * m, thread float * l, thread float * o) {
+    constexpr uint HQ = attn_group_hq(HD);
+    constexpr uint DPL = HD / 32u;
+    constexpr uint U = attn_group_u(HD);
+    uint page = 0u;
+    uint s = s0;
+    if (U > 1u) {
+        for (; s + U <= s1; s += U) {
+            float kf[U * DPL], vf[U * DPL];
+#pragma unroll
+            for (uint u = 0; u < U; ++u) {
+                const uint gp = lo + s + u;
+                uint ps;
+                if (ring_mask > 0u) { ps = gp & ring_mask; }
+                else if (KV_PAGED) {
+                    if ((u == 0u && s == s0) || (gp % KV_PAGE_CELLS) == 0u) { page = pt[gp / KV_PAGE_CELLS]; }
+                    ps = page * KV_PAGE_CELLS + gp % KV_PAGE_CELLS;
+                } else { ps = gp; }
+                attn_load_kv<HD>(kc, vc, kvw, ps, kvh, lane, kf + u * DPL, vf + u * DPL);
+            }
+#pragma unroll
+            for (uint j = 0; j < HQ; ++j) {
+                if (j < hq) {
+                    float sc[U];
+                    float smax = -INFINITY;
+#pragma unroll
+                    for (uint u = 0; u < U; ++u) {
+                        float d = 0.0f;
+                        for (uint i = 0; i < DPL; ++i) { d += qr[j * DPL + i] * kf[u * DPL + i]; }
+                        sc[u] = simd_sum(d);
+                        smax = max(smax, sc[u]);
+                    }
+                    const float mn = max(m[j], smax);
+                    const float f = exp(m[j] - mn);
+                    l[j] *= f;
+                    for (uint i = 0; i < DPL; ++i) { o[j * DPL + i] *= f; }
+#pragma unroll
+                    for (uint u = 0; u < U; ++u) {
+                        const float pw = exp(sc[u] - mn);
+                        l[j] += pw;
+                        for (uint i = 0; i < DPL; ++i) { o[j * DPL + i] += pw * vf[u * DPL + i]; }
+                    }
+                    m[j] = mn;
+                }
+            }
+        }
+    }
+    // The tail (and the whole run at U == 1): one position at a time.
+    for (; s < s1; ++s) {
+        const uint gp = lo + s;
+        uint ps;
+        if (ring_mask > 0u) { ps = gp & ring_mask; }
+        else if (KV_PAGED) {
+            if (s == s0 || (gp % KV_PAGE_CELLS) == 0u) { page = pt[gp / KV_PAGE_CELLS]; }
+            ps = page * KV_PAGE_CELLS + gp % KV_PAGE_CELLS;
+        } else { ps = gp; }
+        float kf[DPL], vf[DPL];
+        attn_load_kv<HD>(kc, vc, kvw, ps, kvh, lane, kf, vf);
+#pragma unroll
+        for (uint j = 0; j < HQ; ++j) {
+            if (j < hq) {
+                float sc = 0.0f;
+                for (uint i = 0; i < DPL; ++i) { sc += qr[j * DPL + i] * kf[i]; }
+                sc = simd_sum(sc);
+                const float mn = max(m[j], sc);
+                const float f = exp(m[j] - mn);
+                const float pw = exp(sc - mn);
+                l[j] = l[j] * f + pw;
+                for (uint i = 0; i < DPL; ++i) { o[j * DPL + i] = o[j * DPL + i] * f + pw * vf[i]; }
+                m[j] = mn;
+            }
+        }
+    }
+}
+
+// DECODE ATTENTION AS A VECTOR KERNEL: ONE SIMDGROUP PER POSITION, LANES OWN DIMS.
+//
+// For a single query over a span whose K/V stays cache-resident (a windowed layer, a short
+// context), the time is not DRAM traffic but the per-position loop and how many simdgroups
+// keep it going: measured on a 256-dim head over 512 keys, the prefill-shaped route took
+// 20-27 us and the grouped fd kernel above 25-44 us against an 8 us bandwidth floor. So: a
+// query head per threadgroup, NSG simdgroups striding over the positions, each lane holding
+// HD/32 dims of Q in registers and loading its own bytes of the K row (one coalesced row per
+// simdgroup), ONE simd_sum per position, an online softmax kept per simdgroup, the V row
+// accumulated the same way, and the simdgroups merged once through threadgroup memory. The
+// normalised output is written directly: no partials, no combine. K is read once per QUERY
+// head, which on a cache-resident span costs nothing and keeps the loop at one reduction
+// per position; past the span limit the host's other routes (K once per KV head, sliced)
+// take over -- `attn_vec_max_keys` is that limit and the tuner ranks it.
+// Instantiated for every head-dim slot the model declares; any head dim that is a multiple
+// of 32 fits (each lane owns HD/32 dims, loaded as half4 when that is a multiple of 4).
+template <uint HD, uint KVW, uint NSG>
+kernel void imparo_attention_decode_vec_t(
+    device const float * q     [[buffer(0)]],
+    device const half  * kc    [[buffer(1)]],
+    device const half  * vc    [[buffer(2)]],
+    device float       * out   [[buffer(3)]],
+    constant uint & head_dim [[buffer(4)]], constant uint & n_heads [[buffer(5)]],
+    constant uint & n_kv     [[buffer(6)]], constant uint & kv_width [[buffer(7)]],
+    constant uint & start_pos [[buffer(8)]], constant uint & window [[buffer(9)]],
+    constant uint & ring_mask [[buffer(10)]],
+    device const uint * pt [[buffer(18)]],
+    threadgroup float * red [[threadgroup(0)]],   // (NSG / 2) x (HD + 2)
+    uint3 tgid   [[threadgroup_position_in_grid]],
+    uint  lane   [[thread_index_in_simdgroup]],
+    uint  sgid   [[simdgroup_index_in_threadgroup]])
+{
+    static_assert(HD % 32u == 0u, "lanes own HD/32 dims");
+    constexpr uint DPL = HD / 32u;
+    const uint kvw = (KVW != 0u) ? KVW : kv_width;
+    (void)head_dim;
+    const uint h = tgid.x, t = tgid.y;
+    const uint kvh = h / (n_heads / n_kv);
+    const uint pos = start_pos + t;
+    const uint lo = (window > 0u && pos + 1u > window) ? (pos + 1u - window) : 0u;
+    const uint n = pos + 1u - lo;
+
+    float qr[DPL];
+    {
+        device const float * qp = q + ((ulong)t * n_heads + h) * HD + lane * DPL;
+        for (uint i = 0; i < DPL; ++i) { qr[i] = qp[i]; }
+    }
+    float m = -INFINITY, l = 0.0f;
+    float o[DPL];
+    for (uint i = 0; i < DPL; ++i) { o[i] = 0.0f; }
+    attn_span_online<HD, KVW>(kc, vc, kvw, kvh, lo, n, sgid, NSG, ring_mask, pt, lane, qr, m, l, o);
+    // ---- merge the simdgroups in two rounds over NSG/2 slots of (o, m, l): the upper half
+    // hands its state to the lower half, then simdgroups 1.. hand theirs to simdgroup 0.
+    // Half the slots keep the buffer inside the 32 KB threadgroup limit at 16 simdgroups
+    // and hd 512 (16 x 514 floats would be 32.9 KB).
+    constexpr uint HALF = NSG / 2u;
+    static_assert(NSG % 2u == 0u && NSG >= 2u, "two-round merge");
+    if (sgid >= HALF) { attn_store_slot<HD>(red + (sgid - HALF) * (HD + 2u), lane, m, l, o); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid < HALF) { attn_merge_slot<HD>(red + sgid * (HD + 2u), lane, m, l, o); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid > 0u && sgid < HALF) { attn_store_slot<HD>(red + sgid * (HD + 2u), lane, m, l, o); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0u) {
+        float M, L, acc[DPL];
+        attn_fold_slots<HD>(red, HALF, lane, m, l, o, M, L, acc);
+        device float * op = out + ((ulong)t * n_heads + h) * HD + lane * DPL;
+        const float inv = 1.0f / L;
+        for (uint i = 0; i < DPL; ++i) { op[i] = acc[i] * inv; }
+    }
+}
+#define IMPARO_VEC_INST(SLOT, HDV, KVWV) \
+template [[host_name("imparo_attention_decode_vec_s" #SLOT)]] kernel void imparo_attention_decode_vec_t<HDV, KVWV, 16u>( \
+    device const float *, device const half *, device const half *, device float *, constant uint &, constant uint &, \
+    constant uint &, constant uint &, constant uint &, constant uint &, constant uint &, \
+    device const uint *, threadgroup float *, uint3, uint, uint);
+#if IMPARO_HD0 && (IMPARO_HD0 % 32 == 0)
+IMPARO_VEC_INST(0, IMPARO_HD0, IMPARO_KVW0)
+#endif
+#if IMPARO_HD1 && (IMPARO_HD1 % 32 == 0)
+IMPARO_VEC_INST(1, IMPARO_HD1, IMPARO_KVW1)
+#endif
+#undef IMPARO_VEC_INST
+
 // Merge the split-KV slices' unnormalised partials onto a common maximum and normalise.
 kernel void imparo_attention_decode_combine(
     device const float * part [[buffer(0)]], device float * out [[buffer(1)]],
@@ -4567,6 +6599,12 @@ kernel void imparo_shortconv(
     constant uint & width      [[buffer(4)]],
     constant uint & kern       [[buffer(5)]],
     constant uint & n_tok      [[buffer(6)]],
+    // Optional half mirror of `out` (IMPARO_HALF_A): the out_proj GEMM's activation copy,
+    // written here -- same rounding, same flat [token][channel] slots as the cvt pass --
+    // so the separate conversion dispatch (one per conv block per chunk, 22 on LFM2,
+    // 138 MB per 512-token chunk) disappears, as it did for the norm and add producers.
+    device half * outh         [[buffer(7)]],
+    constant uint & xh_on      [[buffer(8)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= n_tok * width) { return; }
@@ -4585,7 +6623,9 @@ kernel void imparo_shortconv(
         }
         acc += cw[ch * kern + k] * v;
     }
-    out[(ulong)t * width + ch] = bcx[(ulong)t * 3u * width + width + ch] * acc;
+    const float v = bcx[(ulong)t * 3u * width + width + ch] * acc;
+    out[(ulong)t * width + ch] = v;
+    if (xh_on != 0u) { outh[(ulong)t * width + ch] = half(v); }
 }
 
 // The tail of `seq` becomes the new state. ONE THREAD PER CHANNEL, reading every value it
@@ -4593,6 +6633,59 @@ kernel void imparo_shortconv(
 // of the old one, and a thread that wrote first would clobber a slot it still has to read.
 // One thread per channel makes that a register question instead of a cross-thread one.
 constant uint SHORTCONV_MAX_HISTORY = 8u;
+// ONE CHANNEL of the short-conv step, shared by the standalone step kernel and the mega conv
+// phase (task #158): out = b_ch * sum_k cw[ch * kern + k] * v_k, v_k the history row k for
+// k < kern - 1 and this token's b * x after it.
+inline float shortconv_channel_out(device const float * bcx, device const float * cw, device const float * state,
+                                   uint width, uint kern, uint ch) {
+    const uint history = kern - 1u;
+    float acc = 0.0f;
+    for (uint k = 0u; k < kern; ++k) {
+        float v;
+        if (k < history) {
+            v = state[k * width + ch];
+        } else {
+            const ulong row = (ulong)(k - history) * 3u * width;
+            v = bcx[row + ch] * bcx[row + 2u * width + ch];
+        }
+        acc += cw[ch * kern + k] * v;
+    }
+    return bcx[width + ch] * acc;
+}
+// The channel's history advanced by one token: every value read before any is written; the
+// advanced row also goes to `snap` when a checkpoint is armed at this token (has_snap).
+inline void shortconv_channel_shift(device const float * bcx, device float * state, device float * snap, bool has_snap,
+                                    uint width, uint history, uint ch) {
+    float next[SHORTCONV_MAX_HISTORY];
+    for (uint sI = 0u; sI < history; ++sI) {
+        const uint e = 1u + sI;
+        if (e < history) {
+            next[sI] = state[e * width + ch];
+        } else {
+            const ulong row = (ulong)(e - history) * 3u * width;
+            next[sI] = bcx[row + ch] * bcx[row + 2u * width + ch];
+        }
+    }
+    for (uint sI = 0u; sI < history; ++sI) { state[sI * width + ch] = next[sI]; }
+    if (has_snap) { for (uint sI = 0u; sI < history; ++sI) { snap[sI * width + ch] = next[sI]; } }
+}
+// ONE TOKEN: the conv output and the state shift in one dispatch, one thread per channel.
+// The two kernels below are dependent through `state` (the conv reads it, the shift writes
+// it), so nothing overlapped before and nothing is lost; the thread reads every state value
+// it needs before it writes any. Same expressions in the same order as the two kernels.
+kernel void imparo_shortconv_step(
+    device const float * bcx   [[buffer(0)]],
+    device const float * cw    [[buffer(1)]],
+    device float       * state [[buffer(2)]],
+    device float       * out   [[buffer(3)]],
+    constant uint & width      [[buffer(4)]],
+    constant uint & kern       [[buffer(5)]],
+    uint ch [[thread_position_in_grid]])
+{
+    if (ch >= width) { return; }
+    out[ch] = shortconv_channel_out(bcx, cw, state, width, kern, ch);
+    shortconv_channel_shift(bcx, state, state, false, width, min(kern - 1u, SHORTCONV_MAX_HISTORY), ch);
+}
 
 // SEPARATE in and out, which is what lets the same kernel serve two jobs:
 //
@@ -4764,7 +6857,21 @@ kernel void imparo_argmax(
     threadgroup uint  bi[1024];
     float best = -INFINITY;
     uint  besti = 0u;
-    for (uint i = tid; i < n; i += tw) {
+    // float4 loads over the aligned run (both vocabularies are multiples of 4): a quarter of
+    // the load and compare instructions of the scalar scan. Components are compared in
+    // index order with a strict `>`, so each thread's local best is its smallest-index
+    // maximum and the tree below keeps the global smallest-index rule (2026-09-02, #119 D8).
+    const uint n4 = n / 4u;
+    device const float4 * x4 = (device const float4 *)x;
+    for (uint i4 = tid; i4 < n4; i4 += tw) {
+        const float4 v = x4[i4];
+        const uint i = i4 * 4u;
+        if (v.x > best) { best = v.x; besti = i; }
+        if (v.y > best) { best = v.y; besti = i + 1u; }
+        if (v.z > best) { best = v.z; besti = i + 2u; }
+        if (v.w > best) { best = v.w; besti = i + 3u; }
+    }
+    for (uint i = n4 * 4u + tid; i < n; i += tw) {
         const float v = x[i];
         if (v > best) { best = v; besti = i; }
     }
@@ -4783,6 +6890,52 @@ kernel void imparo_argmax(
     if (tid == 0u) { out[0] = bi[0]; }
 }
 
+// THE PICK THAT FEEDS THE NEXT STEP (docs/decode-turnaround.md): the same argmax, stored
+// twice -- into `tokens[0]`, which the next decode step's embedding gather reads, and into
+// `pick[pick_off]`, which the host reads one step later. Same reduction, same tie rule,
+// so the token is the plain argmax's.
+kernel void imparo_argmax_feed(
+    device const float * x  [[buffer(0)]],
+    device uint * tokens    [[buffer(1)]],
+    constant uint & n       [[buffer(2)]],
+    device uint * pick      [[buffer(3)]],
+    constant uint & pick_off [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tw  [[threads_per_threadgroup]])
+{
+    threadgroup float bv[1024];
+    threadgroup uint  bi[1024];
+    float best = -INFINITY;
+    uint  besti = 0u;
+    const uint n4 = n / 4u;
+    device const float4 * x4 = (device const float4 *)x;
+    for (uint i4 = tid; i4 < n4; i4 += tw) {
+        const float4 v = x4[i4];
+        const uint i = i4 * 4u;
+        if (v.x > best) { best = v.x; besti = i; }
+        if (v.y > best) { best = v.y; besti = i + 1u; }
+        if (v.z > best) { best = v.z; besti = i + 2u; }
+        if (v.w > best) { best = v.w; besti = i + 3u; }
+    }
+    for (uint i = n4 * 4u + tid; i < n; i += tw) {
+        const float v = x[i];
+        if (v > best) { best = v; besti = i; }
+    }
+    bv[tid] = best; bi[tid] = besti;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tw / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            const float ov = bv[tid + s];
+            const uint  oi = bi[tid + s];
+            if (ov > bv[tid] || (ov == bv[tid] && oi < bi[tid])) {
+                bv[tid] = ov; bi[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) { tokens[0] = bi[0]; pick[pick_off] = bi[0]; }
+}
+
 // per-layer path: y[t*ple + i] = (proj[t*W + l*ple + i] + emb[i]*embscale) * combscale
 // Gather each token's per-layer embedding row and fold it into the projection in ONE pass.
 //
@@ -4799,6 +6952,9 @@ kernel void imparo_ple_gather_combine(
     constant ulong & w_offset  [[buffer(3)]], constant uint & width [[buffer(4)]],
     constant float & emb_scale [[buffer(5)]], constant float & comb_scale [[buffer(6)]],
     constant uint & n_tok     [[buffer(7)]],
+    // staged = 1: `weights` holds this batch's rows in token order (the host gathered
+    // them; Table tier), so row t is token t and `tokens` is not read.
+    constant uint & staged    [[buffer(8)]],
     uint2 gid [[thread_position_in_grid]])
 {
     // FOUR values per thread. Values j..j+3 are the low nibbles of four adjacent payload
@@ -4810,8 +6966,9 @@ kernel void imparo_ple_gather_combine(
     const uint i = i4 * 4u;
     const uint blocks = width / QK4_0;
     const uint bi = i / QK4_0, j = i % QK4_0;
+    const uint row = staged ? t : tokens[t];
     device const uchar * blk = weights + w_offset
-                             + ((ulong)tokens[t] * blocks + bi) * Q4_0_BYTES;
+                             + ((ulong)row * blocks + bi) * Q4_0_BYTES;
     const float d = float(as_type<half>((ushort)(blk[0] | (blk[1] << 8))));
     // Alignment here is arbitrary, not merely every-other-block: the offset carries a
     // runtime `j % 16`.
@@ -4916,3 +7073,1400 @@ kernel void imparo_ple_combine(
     const ulong o = (ulong)t * width + i;
     proj[o] = (proj[o] + emb[(ulong)t * width + i] * emb_scale) * comb_scale;
 }
+
+
+// ---- Load-time repack: row-major Q8_0 -> tile-major Q8_0_TM ----------------------------
+// One thread per (K block, row): copy the block's 32 payload bytes to the unit address and
+// its 2 scale bytes to the scale array (q8_tm_payload / q8_tm_scale are the same formulas
+// imparo_gguf::weights::TM_RULES states; the host verifies the result against that rule
+// under IMPARO_LOAD_REPACK_VERIFY=1). Run once at startup per fast-tier tensor; the
+// destination is a private buffer, the source the mapped file.
+kernel void imparo_repack_q8_0_tm(
+    device const uchar * src [[buffer(0)]],
+    device uchar * dst       [[buffer(1)]],
+    constant uint & n_in     [[buffer(2)]],
+    constant uint & n_out    [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint blocks = n_in / QK8_0;
+    const uint b = gid.x, r = gid.y;
+    if (b >= blocks || r >= n_out) { return; }
+    device const uchar * blk = src + ((ulong)r * blocks + b) * Q8_0_BYTES;
+    device uchar * p = dst + q8_tm_payload(r, b, blocks);
+    for (uint i = 0; i < QK8_0; ++i) { p[i] = blk[2u + i]; }
+    device uchar * sc = dst + q8_tm_scale(r, b, blocks, n_out);
+    sc[0] = blk[0]; sc[1] = blk[1];
+}
+
+
+
+
+// ===================================================================================
+// MEGA FFN BLOCK (task #141, stage 1): gate|up GEMVs -> act*mul -> down GEMV as ONE
+// persistent dispatch: a fixed grid of threadgroups that are all resident at once loops over the
+// rows; the three phases are separated by software grid barriers on device counters.
+//
+// Why: per decode token ~2.2 ms of sub-microsecond work sits in 5-7 us dispatches and each
+// GEMV stage starts its weight stream only after the previous barrier (evidence 2026-09-05
+// section 22). A fuse cannot cross a full-vector boundary on Metal; this crosses it.
+//
+// Arithmetic is the decode GEMV fast path's, in its order (LANES_PER_ROW lanes per row,
+// one row per lane group, the same lane-group reduce), and the activation is
+// imparo_act_mul's expression -- so the block is bit-identical to the three dispatches.
+//
+// Synchronisation: Metal has no grid barrier and Apple GPUs do not guarantee linear
+// progress (Sorensen et al. 2021), so the ONLY safe wait is on threadgroups that are all
+// resident: the host sizes the grid to a measured capacity. Counters: [0] barrier 1,
+// [1] barrier 2, [2] exit, [3] error. The last threadgroup out resets [0..2], so the host
+// keeps no epoch and nothing wraps; the next dispatch is ordered after this one by the
+// hazard tracker (its inputs depend on this output). Every spin is bounded: past
+// MEGA_SPIN_MAX it sets [3] and continues; the host reads [3] after the region and falls
+// back to the dispatch path. Needs MSL 3.2 for the device-scope fence; below that the
+// kernel is absent and the host route stays off.
+#if __METAL_VERSION__ >= 320
+// A legitimate wait is one phase (< 300 us). The cap must also outlast a threadgroup that the
+// GPU deschedules for another client (the window server, a browser's GPU process): 400k spins
+// (~20 ms) timed out on such stalls (task #148, 2026-09-06); 4M spins (~200 ms) still fails a
+// deliberate over-capacity dispatch in a fraction of a second rather than minutes.
+// The stall budget of one barrier wait, in spin iterations. Measured 2026-09-06 on the M3 Pro:
+// one iteration is ~1.25 us when 18..31 threadgroups spin on the same word, so 1M iterations
+// is ~1.2 s (a threadgroup descheduled by another GPU client comes back well inside that).
+// The budget is paid at most ONCE per region: a timeout sets the error word, every other
+// spinner sees it within 256 iterations and gives up too, the dispatch runs to its exit
+// without further barriers, and every later dispatch leaves at entry (the word is sticky).
+constant uint MEGA_SPIN_MAX = 1000000u;
+// IMPARO_MEGA_DEBUG=1 (function constant 18): the attention phase and the combine record
+// what they wrote and what they read, per (dispatch, head, part), into the sync buffer
+// past the scratch -- 8 words per record: [PA M, PA L, PA input non-finite bits (1 = q),
+// PA span|split<<16|heads<<24, combine-read M, combine-read L, combine L, combine flags
+// (1 non-finite output, 2 L<=0, 4 o_proj saw a non-finite attn value)]. The host scans
+// after the region. Off, none of this exists in the pipeline.
+constant bool MEGA_DBG_FC [[function_constant(18)]];
+constant bool MEGA_DBG = is_function_constant_defined(MEGA_DBG_FC) ? MEGA_DBG_FC : false;
+// MEGA_DEEP: the layer kernels' deep attention body (task #151) is compiled into a SEPARATE
+// pipeline variant, dispatched at one threadgroup per core; the plain variants keep the
+// footprint the two-per-core grid was measured on (design doc, constraint 8).
+constant bool MEGA_DEEP_FC [[function_constant(19)]];
+constant bool MEGA_DEEP = is_function_constant_defined(MEGA_DEEP_FC) ? MEGA_DEEP_FC : false;
+// MEGA_PROGRAM (task #153): the entry comes from a program of entries in a buffer, indexed at
+// runtime (tok.entry_index) -- the read the footprint cliff (constraint 8) charges for, so the
+// variant is dispatched at one threadgroup per core. Off, the entry is prog[0] at a compile-time
+// index: the argument path the plain pipelines were measured on.
+constant bool MEGA_PROGRAM_FC [[function_constant(20)]];
+constant bool MEGA_PROGRAM = is_function_constant_defined(MEGA_PROGRAM_FC) ? MEGA_PROGRAM_FC : false;
+// The vec phase's items stride the grid on every pipeline that runs at one threadgroup per core
+// by construction (typed, program); the f16 plain pipelines keep one item per threadgroup.
+constant bool MEGA_STRIDE = MEGA_KVQ || MEGA_PROGRAM;
+constant uint MEGA_DBG_REC = 8u;
+// One Q capture per region slot (MEGA_DBG): [0] claimed, [1] seq, [2] head, [3] part, [4] span,
+// [5] tgid, [8..8+HD) the q values the flagged threadgroup loaded, as bits.
+constant uint MEGA_DBG_REC_WORDS = 4u * 64u * 32u * 8u;   // 4 region slots x 64 dispatches x 32 items
+// Sync buffer layout (words): [0, 16) barrier counters + error; [16, MEGA_SYNC_HDR) unused, so
+// the counters' cache lines carry nothing else; [MEGA_SYNC_HDR, +scratch) the attention
+// partials; then the debug records. The host mirrors MEGA_SYNC_HDR.
+constant uint MEGA_SYNC_HDR = 1024u;
+constant uint MEGA_DBG_CAP_WORDS = 8u + 512u;
+inline bool mega_nonfinite(float x) { return (as_type<uint>(x) & 0x7f800000u) == 0x7f800000u; }
+
+// THE CACHE BASIS (task #156). A quantized cache is stored in a rotated basis: the engine's
+// quantized modes rotate Q, K and V by an orthonormal blockwise Hadamard before the store
+// (llama.cpp's attn_rot defense: scores are invariant, (Hq).(Hk) = q.k, and the rotation
+// spreads a 32-value block's energy so the shared scale stops starving small values) and
+// rotate the attention output back (H is symmetric and orthonormal, so the same transform
+// inverts). The dispatch path does this with imparo_hadamard64 around its kernels; inside the
+// mega-kernel the head phase rotates the rows it forms and the combine rotates the output it
+// writes, so the cache bytes and the o_proj input are the dispatch path's. The transform is
+// imparo_hadamard64's: Sylvester butterflies over consecutive `nrot` values, then 1/sqrt(nrot).
+inline float mega_had_scale(uint nrot) {
+    // 1/sqrt(nrot) as the host computes it (1.0f / sqrtf): the same float for every legal width.
+    switch (nrot) {
+        case 32u:  return 0.17677669529663687f;
+        case 64u:  return 0.125f;
+        case 128u: return 0.08838834764831845f;
+        case 256u: return 0.0625f;
+        case 512u: return 0.044194173824159216f;
+        default:   return 1.0f / precise::sqrt((float)nrot);
+    }
+}
+// One head row (HD floats in device memory) rotated in place, one threadgroup: HD/nrot blocks,
+// the butterflies on the row itself with a device barrier per stage (log2(nrot) stages).
+template <uint HD>
+inline void mega_hadamard_row(device float * row, uint nrot, uint tid, uint tcount) {
+    const uint half_blk = nrot / 2u;
+    for (uint stride = 1u; stride < nrot; stride <<= 1u) {
+        for (uint q = tid; q < HD / 2u; q += tcount) {
+            const uint blk = q / half_blk, p = q - blk * half_blk;
+            const uint i = blk * nrot + (((p & ~(stride - 1u)) << 1u) | (p & (stride - 1u)));
+            const float a = row[i], b = row[i | stride];
+            row[i] = a + b;
+            row[i | stride] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    const float scale = mega_had_scale(nrot);
+    for (uint i = tid; i < HD; i += tcount) { row[i] = row[i] * scale; }
+    threadgroup_barrier(mem_flags::mem_device);
+}
+// The same transform on a head row held by one simdgroup, lane `lane` owning dims
+// [lane*DPL, lane*DPL + DPL): strides inside a lane are register pairs, strides across lanes
+// are simd_shuffle_xor partners (nrot >= DPL, nrot a power of two: a block is a lane group).
+template <uint HD>
+inline void mega_hadamard_lanes(thread float * v, uint nrot, uint lane) {
+    constexpr uint DPL = HD / 32u;
+    for (uint stride = 1u; stride < DPL && stride < nrot; stride <<= 1u) {
+        for (uint i = 0; i < DPL; ++i) {
+            if ((i & stride) == 0u) {
+                const float a = v[i], b = v[i | stride];
+                v[i] = a + b;
+                v[i | stride] = a - b;
+            }
+        }
+    }
+    for (uint lstride = 1u; lstride * DPL < nrot; lstride <<= 1u) {
+        const bool upper = (lane & lstride) != 0u;
+        for (uint i = 0; i < DPL; ++i) {
+            const float mine = v[i];
+            const float other = simd_shuffle_xor(mine, (ushort)lstride);
+            v[i] = upper ? (other - mine) : (mine + other);
+        }
+    }
+    const float scale = mega_had_scale(nrot);
+    for (uint i = 0; i < DPL; ++i) { v[i] = v[i] * scale; }
+}
+
+
+inline void mega_barrier(device atomic_uint * ctr, uint target, device atomic_uint * err,
+                         uint tid, uint tag = 0u) {   // tag: (barrier index << 4) | (tgid << 24), stored with the error
+    // Release: the threadgroup barrier (mem_device) completes every thread's device writes,
+    // then thread 0 fences at device scope and arrives; acquire: thread 0 fences after the
+    // wait, then the threadgroup barrier releases the others. Per-thread fences (every thread
+    // fencing before the arrival and after the wait) were tried on 2026-09-06 against a
+    // once-in-40 wrong result: they did not remove it (the cause was the attention partials
+    // aliasing Q, task #148) and they cost +0.7% decode (21.69/21.63 vs 21.53/21.46 ms per
+    // token, two interleaved rounds). If a cross-threadgroup visibility failure is ever
+    // observed with this form, per-thread fences are the first thing to try.
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0u) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        atomic_fetch_add_explicit(ctr, 1u, memory_order_relaxed);
+        // A failure costs ONE spin cap: once the error word is set (by this barrier's timeout
+        // or an earlier one's), no barrier of the dispatch spins again -- the threadgroups
+        // that never arrived will not arrive later either.
+        uint spins = 0u;
+        if (atomic_load_explicit(err, memory_order_relaxed) == 0u) {
+            while (atomic_load_explicit(ctr, memory_order_relaxed) < target) {
+                if (++spins > MEGA_SPIN_MAX) {
+                    // Error word: bit 0, barrier index (bits 4..15), arrivals seen (bits 16..23), tgid (24..31).
+                    const uint seen = min(atomic_load_explicit(ctr, memory_order_relaxed), 255u);
+                    atomic_store_explicit(err, 1u | tag | (seen << 16), memory_order_relaxed);
+                    break;
+                }
+                if ((spins & 255u) == 0u && atomic_load_explicit(err, memory_order_relaxed) != 0u) { break; }
+            }
+        }
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
+// THE BLOCK'S BARRIER: one monotonic counter per dispatch -- the k-th barrier waits for
+// k * n_tg arrivals, the last threadgroup out resets the counter at exit. A timeout writes the
+// error word (bit 0, phase in bits 4..15, arrivals in the phase 16..23, threadgroup 24..31);
+// the word is sticky and every later dispatch leaves at entry, so a failed region costs one
+// spin cap (design doc, constraint 4).
+inline void mega_step(device atomic_uint * ctr, thread uint & phase, uint n_tg, device atomic_uint * err,
+                      uint tid, uint tgid) {
+    phase += 1u;
+    const uint target = phase * n_tg;
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0u) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        atomic_fetch_add_explicit(ctr, 1u, memory_order_relaxed);
+        // A failure costs ONE spin cap: once the error word is set (by this barrier's timeout
+        // or an earlier one's), no barrier of the dispatch spins again -- the threadgroups
+        // that never arrived will not arrive later either -- and a spinner that sees another
+        // threadgroup's error gives up within 256 iterations. Measured 2026-09-07: without
+        // this a timed-out layer dispatch paid the cap at every one of its later barriers.
+        uint spins = 0u;
+        if (atomic_load_explicit(err, memory_order_relaxed) == 0u) {
+            while (atomic_load_explicit(ctr, memory_order_relaxed) < target) {
+                if (++spins > MEGA_SPIN_MAX) {
+                    const uint seen = atomic_load_explicit(ctr, memory_order_relaxed);
+                    const uint arrived = (seen + n_tg >= target) ? min(seen + n_tg - target, 255u) : 0u;
+                    atomic_store_explicit(err, 1u | ((phase & 0xfffu) << 4) | (arrived << 16) | (tgid << 24), memory_order_relaxed);
+                    break;
+                }
+                if ((spins & 255u) == 0u && atomic_load_explicit(err, memory_order_relaxed) != 0u) { break; }
+            }
+        }
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
+// One Q4_0 row, this lane's share (blocks sub, sub+LANES, ...): the decode fast path's
+// per-block arithmetic in its order. The caller reduces across the lane group.
+inline float mega_q4_row_partial(device const uchar * row, device const float4 * xs,
+                                 uint blocks, uint sub) {
+    // The q4_rows_partial brick at one row (the mega pipelines are built with NR0 == 1; the
+    // arrays carry the brick's bound so a wider NR0 stays in bounds).
+    ulong off[8] = { 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul };
+    float acc[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    q4_rows_partial(row, off, xs, blocks, sub, acc);
+    return acc[0];
+}
+
+// DECODE ATTENTION AS A MEGA PHASE: imparo_attention_decode_vec_t's body for one query head,
+// run by one threadgroup of the persistent grid (nsg simdgroups stride the span, lanes own
+// HD/32 dims, online softmax per simdgroup). The merge differs from the vec kernel's
+// two-round form: the scratch is capped at MEGA_ATTN_SLOTS states so it fits the block's
+// n_embd-float threadgroup row at any head dim, and the simdgroups fold in rounds of
+// MEGA_ATTN_SLOTS (nsg must be a multiple of it and at least twice it -- the host checks).
+constant uint MEGA_ATTN_SLOTS = 4u;
+template <uint HD, uint KVW>
+inline void mega_attn_vec(device const float * q, device const half * kc, device const half * vc,
+                          device float * partials, uint n_heads, uint n_kv, uint kv_width,
+                          uint start_pos, uint window, uint ring_mask, device const uint * pt,
+                          threadgroup float * red, uint h, uint part, uint split,
+                          uint lane, uint sgid, uint nsg, device atomic_uint * dbg,
+                          device atomic_uint * cap, uint seq, uint tgid_dbg) {
+    constexpr uint DPL = HD / 32u;
+    uint dbg_bad = 0u;
+    const uint kvw = (KVW != 0u) ? KVW : kv_width;
+    const uint kvh = h / (n_heads / n_kv);
+    const uint pos = start_pos;
+    const uint lo = (window > 0u && pos + 1u > window) ? (pos + 1u - window) : 0u;
+    const uint n = pos + 1u - lo;
+    float qr[DPL];
+    {
+        device const float * qp = q + (ulong)h * HD + lane * DPL;
+        for (uint i = 0; i < DPL; ++i) { qr[i] = qp[i]; }
+        if (MEGA_DBG) { for (uint i = 0; i < DPL; ++i) { dbg_bad |= mega_nonfinite(qr[i]) ? 1u : 0u; } }
+    }
+    float m = -INFINITY, l = 0.0f;
+    float o[DPL];
+    for (uint i = 0; i < DPL; ++i) { o[i] = 0.0f; }
+    // MEGA_DBG KV capture (task #156 probe): the region slot's first head-0 threadgroup records
+    // the K and V values the typed loader returns for the span's first position: [0]=2 (a KV
+    // capture), [1] seq, [2] cache slot, [3] kvw, [4] n, [5] tgid, [6] HD, [7] kvh; then K as
+    // bits at [8, 8+HD) and V at [8+HD, 8+2HD) (HD <= 256). The host prints them next to its
+    // own dequantisation of the same cache bytes.
+    if (MEGA_DBG && HD <= 256u && h == 0u && part == 0u && sgid == 0u && n > 0u) {
+        uint won = 0u;
+        if (lane == 0u) {
+            uint expected = 0u;
+            won = atomic_compare_exchange_weak_explicit(cap, &expected, 2u, memory_order_relaxed, memory_order_relaxed) ? 1u : 0u;
+        }
+        won = simd_broadcast_first(won);
+        if (won != 0u) {
+            const uint ps = kv_slot(lo, ring_mask, pt);
+            float kf[DPL], vf[DPL];
+            attn_load_kv<HD>(kc, vc, kvw, ps, kvh, lane, kf, vf);
+            for (uint i = 0; i < DPL; ++i) {
+                atomic_store_explicit(cap + 8 + lane * DPL + i, as_type<uint>(kf[i]), memory_order_relaxed);
+                atomic_store_explicit(cap + 8 + HD + lane * DPL + i, as_type<uint>(vf[i]), memory_order_relaxed);
+            }
+            if (lane == 0u) {
+                atomic_store_explicit(cap + 1, seq, memory_order_relaxed);
+                atomic_store_explicit(cap + 2, ps, memory_order_relaxed);
+                atomic_store_explicit(cap + 3, kvw, memory_order_relaxed);
+                atomic_store_explicit(cap + 4, n, memory_order_relaxed);
+                atomic_store_explicit(cap + 5, tgid_dbg, memory_order_relaxed);
+                atomic_store_explicit(cap + 6, HD, memory_order_relaxed);
+                atomic_store_explicit(cap + 7, kvh, memory_order_relaxed);
+            }
+        }
+    }
+    // This threadgroup's simdgroups take positions part*nsg + sgid, stepping split*nsg.
+    attn_span_online<HD, KVW>(kc, vc, kvw, kvh, lo, n, part * nsg + sgid, split * nsg, ring_mask, pt,
+                              lane, qr, m, l, o);
+    if (MEGA_DBG) {
+        dbg_bad = simd_or(dbg_bad);
+        if (lane == 0u && dbg_bad != 0u) { atomic_fetch_or_explicit(dbg + 2, dbg_bad, memory_order_relaxed); }
+        if ((dbg_bad & 1u) != 0u && sgid == 0u) {
+            // First flagged threadgroup of the region slot keeps its q vector for the host.
+            uint won = 0u;
+            if (lane == 0u) {
+                uint expected = 0u;
+                won = atomic_compare_exchange_weak_explicit(cap, &expected, 1u, memory_order_relaxed, memory_order_relaxed) ? 1u : 0u;
+            }
+            won = simd_broadcast_first(won);
+            if (won != 0u) {
+                for (uint i = 0; i < DPL; ++i) { atomic_store_explicit(cap + 8 + lane * DPL + i, as_type<uint>(qr[i]), memory_order_relaxed); }
+                if (lane == 0u) {
+                    atomic_store_explicit(cap + 1, seq, memory_order_relaxed);
+                    atomic_store_explicit(cap + 2, h, memory_order_relaxed);
+                    atomic_store_explicit(cap + 3, part, memory_order_relaxed);
+                    atomic_store_explicit(cap + 4, n, memory_order_relaxed);
+                    atomic_store_explicit(cap + 5, tgid_dbg, memory_order_relaxed);
+                    atomic_store_explicit(cap + 6, HD, memory_order_relaxed);
+                }
+            }
+        }
+    }
+    // Fold the simdgroups in rounds of MEGA_ATTN_SLOTS: [base, base+S) hand their state to
+    // [base-S, base), until simdgroups 0..S-1 hold everything; then 1..S-1 hand theirs to 0.
+    for (uint base = nsg - MEGA_ATTN_SLOTS; base >= MEGA_ATTN_SLOTS; base -= MEGA_ATTN_SLOTS) {
+        if (sgid >= base && sgid < base + MEGA_ATTN_SLOTS) {
+            attn_store_slot<HD>(red + (sgid - base) * (HD + 2u), lane, m, l, o);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgid >= base - MEGA_ATTN_SLOTS && sgid < base) {
+            attn_merge_slot<HD>(red + (sgid - (base - MEGA_ATTN_SLOTS)) * (HD + 2u), lane, m, l, o);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sgid > 0u && sgid < MEGA_ATTN_SLOTS) { attn_store_slot<HD>(red + sgid * (HD + 2u), lane, m, l, o); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0u) {
+        float M, L, acc[DPL];
+        attn_fold_slots<HD>(red, MEGA_ATTN_SLOTS, lane, m, l, o, M, L, acc);
+        // The threadgroup's partial (unnormalised): the combine phase merges the parts.
+        device float * pp = partials + ((ulong)h * split + part) * (HD + 2u);
+        for (uint i = 0; i < DPL; ++i) { pp[lane * DPL + i] = acc[i]; }
+        if (lane == 0u) { pp[HD] = M; pp[HD + 1u] = L; }
+        if (MEGA_DBG && lane == 0u) {
+            atomic_store_explicit(dbg + 0, as_type<uint>(M), memory_order_relaxed);
+            atomic_store_explicit(dbg + 1, as_type<uint>(L), memory_order_relaxed);
+            atomic_store_explicit(dbg + 3, n | (split << 16) | (n_heads << 24), memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);   // red (the block's row) is reused next
+}
+
+// Merge a head's `split` partials onto a common maximum and normalise: one simdgroup.
+template <uint HD>
+inline void mega_attn_combine(device const float * partials, device float * out, uint h,
+                              uint split, uint had_v, uint lane, device atomic_uint * dbg) {
+    constexpr uint DPL = HD / 32u;
+    device const float * base = partials + (ulong)h * split * (HD + 2u);
+    float M = -INFINITY;
+    for (uint p = 0; p < split; ++p) { M = max(M, base[p * (HD + 2u) + HD]); }
+    float L = 0.0f;
+    float acc[DPL];
+    for (uint i = 0; i < DPL; ++i) { acc[i] = 0.0f; }
+    for (uint p = 0; p < split; ++p) {
+        device const float * pp = base + p * (HD + 2u);
+        const float mp = pp[HD];
+        const float f = (mp == -INFINITY) ? 0.0f : exp(mp - M);
+        L += f * pp[HD + 1u];
+        for (uint i = 0; i < DPL; ++i) { acc[i] += f * pp[lane * DPL + i]; }
+        if (MEGA_DBG && lane == 0u) {
+            atomic_store_explicit(dbg + p * MEGA_DBG_REC + 4, as_type<uint>(mp), memory_order_relaxed);
+            atomic_store_explicit(dbg + p * MEGA_DBG_REC + 5, as_type<uint>(pp[HD + 1u]), memory_order_relaxed);
+        }
+    }
+    device float * op = out + (ulong)h * HD + lane * DPL;
+    const float inv = 1.0f / L;
+    for (uint i = 0; i < DPL; ++i) { acc[i] = acc[i] * inv; }
+    // A rotated (quantized) V basis: the output back to model space (task #156).
+    if (MEGA_KVQ && had_v != 0u) { mega_hadamard_lanes<HD>(acc, had_v, lane); }
+    for (uint i = 0; i < DPL; ++i) { op[i] = acc[i]; }
+    if (MEGA_DBG) {
+        uint bad = 0u;
+        for (uint i = 0; i < DPL; ++i) { bad |= mega_nonfinite(acc[i]) ? 1u : 0u; }
+        bad = simd_or(bad);
+        if (lane == 0u) {
+            if (!(L > 0.0f)) { bad |= 2u; }
+            for (uint p = 0; p < split; ++p) {
+                atomic_store_explicit(dbg + p * MEGA_DBG_REC + 6, as_type<uint>(L), memory_order_relaxed);
+                atomic_fetch_or_explicit(dbg + p * MEGA_DBG_REC + 7, bad, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+// THE DEEP BODY AS A MEGA PHASE (task #151): work item = (KV head, head sub-group, key slice),
+// `slices` per (KV head, sub-group) -- the host's attn_split -- one item per threadgroup. The
+// slice is split into contiguous runs, one per simdgroup, walked by the grouped brick (K/V
+// once per item); then, head by head, the simdgroups fold through `red` in the vec body's
+// rounds of MEGA_ATTN_SLOTS, and the (head, slice) partial goes to the scratch in the vec
+// body's layout, so mega_attn_combine merges either body's partials.
+template <uint HD, uint KVW>
+inline void mega_attn_group(device const float * q, device const half * kc, device const half * vc,
+                            device float * partials, uint n_heads, uint n_kv, uint kv_width,
+                            uint start_pos, uint window, uint ring_mask, device const uint * pt,
+                            threadgroup float * red, uint item, uint slices,
+                            uint lane, uint sgid, uint nsg) {
+    constexpr uint HQ = attn_group_hq(HD);
+    constexpr uint DPL = HD / 32u;
+    const uint kvw = (KVW != 0u) ? KVW : kv_width;
+    const uint share = n_heads / n_kv;
+    const uint n_sub = (share + HQ - 1u) / HQ;
+    const uint kvh = item / (n_sub * slices);
+    const uint sub = (item / slices) % n_sub;
+    const uint sl  = item % slices;
+    const uint h0  = kvh * share + sub * HQ;
+    const uint hq  = min(HQ, share - sub * HQ);
+    const uint pos = start_pos;
+    const uint lo = (window > 0u && pos + 1u > window) ? (pos + 1u - window) : 0u;
+    const uint n = pos + 1u - lo;
+    // Slice sl covers [sb, se) of the span; simdgroup sgid a contiguous run of it.
+    const uint per = (n + slices - 1u) / slices;
+    const uint sb = min(n, sl * per), se = min(n, sb + per);
+    const uint run = (se - sb + nsg - 1u) / nsg;
+    const uint s0 = min(se, sb + sgid * run), s1 = min(se, s0 + run);
+    float qr[HQ * DPL], m[HQ], l[HQ], o[HQ * DPL];
+#pragma unroll
+    for (uint j = 0; j < HQ; ++j) {
+        m[j] = -INFINITY; l[j] = 0.0f;
+        for (uint i = 0; i < DPL; ++i) { o[j * DPL + i] = 0.0f; qr[j * DPL + i] = 0.0f; }
+        if (j < hq) {
+            device const float * qp = q + (ulong)(h0 + j) * HD + lane * DPL;
+            for (uint i = 0; i < DPL; ++i) { qr[j * DPL + i] = qp[i]; }
+        }
+    }
+    attn_group_run_online<HD, KVW>(kc, vc, kvw, kvh, lo, s0, s1, ring_mask, pt, lane, hq, qr, m, l, o);
+    // Fold head by head (the slots hold one head's states; `red` is the block's row).
+#pragma unroll
+    for (uint j = 0; j < HQ; ++j) {
+        if (j < hq) {
+            for (uint base = nsg - MEGA_ATTN_SLOTS; base >= MEGA_ATTN_SLOTS; base -= MEGA_ATTN_SLOTS) {
+                if (sgid >= base && sgid < base + MEGA_ATTN_SLOTS) {
+                    attn_store_slot<HD>(red + (sgid - base) * (HD + 2u), lane, m[j], l[j], o + j * DPL);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sgid >= base - MEGA_ATTN_SLOTS && sgid < base) {
+                    attn_merge_slot<HD>(red + (sgid - (base - MEGA_ATTN_SLOTS)) * (HD + 2u), lane, m[j], l[j], o + j * DPL);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (sgid > 0u && sgid < MEGA_ATTN_SLOTS) { attn_store_slot<HD>(red + sgid * (HD + 2u), lane, m[j], l[j], o + j * DPL); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgid == 0u) {
+                float M, L, acc[DPL];
+                attn_fold_slots<HD>(red, MEGA_ATTN_SLOTS, lane, m[j], l[j], o + j * DPL, M, L, acc);
+                device float * pp = partials + ((ulong)(h0 + j) * slices + sl) * (HD + 2u);
+                for (uint i = 0; i < DPL; ++i) { pp[lane * DPL + i] = acc[i]; }
+                if (lane == 0u) { pp[HD] = M; pp[HD + 1u] = L; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);   // red is reused by the next head
+        }
+    }
+}
+
+// The same row partial with the input row in threadgroup memory (a row every threadgroup
+// formed for itself). Same arithmetic in the same order; only the load address space differs.
+inline float mega_q4_row_partial_tg(device const uchar * row, threadgroup const float4 * xs,
+                                    uint blocks, uint sub) {
+    ulong off[8] = { 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul };
+    float acc[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    q4_rows_partial(row, off, xs, blocks, sub, acc);
+    return acc[0];
+}
+
+kernel void imparo_mega_ffn(
+    device const uchar * w_gate [[buffer(0)]],
+    device const uchar * w_up   [[buffer(1)]],
+    device const uchar * w_down [[buffer(2)]],
+    device const float * x      [[buffer(3)]],   // n_in: the FFN input row
+    device float       * g      [[buffer(4)]],   // n_mid scratch: gate, then act(gate) * up
+    device float       * u      [[buffer(5)]],   // n_mid scratch: up
+    device float       * y      [[buffer(6)]],   // n_out: the down projection
+    device atomic_uint * sync   [[buffer(7)]],   // [0] barrier 1, [1] barrier 2, [2] exit, [3] error
+    constant ulong & gate_off [[buffer(8)]],  constant ulong & up_off [[buffer(9)]],
+    constant ulong & down_off [[buffer(10)]],
+    constant uint & n_in  [[buffer(11)]], constant uint & n_mid [[buffer(12)]],
+    constant uint & n_out [[buffer(13)]], constant uint & n_tg  [[buffer(14)]],
+    uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint sgid [[simdgroup_index_in_threadgroup]],
+    uint nsg  [[simdgroups_per_threadgroup]])
+{
+    const uint rows_per_simd = 32u / LANES_PER_ROW;
+    const uint sub  = lane % LANES_PER_ROW;
+    const uint slot = lane / LANES_PER_ROW;
+    const uint sg_global = tgid * nsg + sgid;
+    const uint sg_total  = n_tg * nsg;
+    const uint tcount    = nsg * 32u;
+
+    // ---- phase 1: gate rows [0, n_mid) and up rows [n_mid, 2 n_mid) from x ----
+    {
+        const uint blocks = n_in / QK4_0;
+        device const float4 * xs = (device const float4 *)x;
+        for (uint r = sg_global * rows_per_simd + slot; r < 2u * n_mid; r += sg_total * rows_per_simd) {
+            const bool is_up = r >= n_mid;
+            const uint rr = is_up ? r - n_mid : r;
+            device const uchar * row = (is_up ? (w_up + up_off) : (w_gate + gate_off))
+                                     + (ulong)rr * blocks * Q4_0_BYTES;
+            float acc = mega_q4_row_partial(row, xs, blocks, sub);
+            acc = lane_group_sum(acc);
+            if (sub == 0u) { if (is_up) { u[rr] = acc; } else { g[rr] = acc; } }
+        }
+    }
+    mega_barrier(sync, n_tg, sync + 3, tid);
+
+    // ---- phase 2: g = act(g) * u (imparo_act_mul's expression) ----
+    for (uint i = tgid * tcount + tid; i < n_mid; i += n_tg * tcount) {
+        g[i] = imparo_act_f(g[i]) * u[i];
+    }
+    mega_barrier(sync + 1, n_tg, sync + 3, tid);
+
+    // ---- phase 3: down rows [0, n_out) from g ----
+    {
+        const uint blocks = n_mid / QK4_0;
+        device const float4 * xs = (device const float4 *)g;
+        for (uint r = sg_global * rows_per_simd + slot; r < n_out; r += sg_total * rows_per_simd) {
+            device const uchar * row = w_down + down_off + (ulong)r * blocks * Q4_0_BYTES;
+            float acc = mega_q4_row_partial(row, xs, blocks, sub);
+            acc = lane_group_sum(acc);
+            if (sub == 0u) { y[r] = acc; }
+        }
+    }
+
+    // ---- exit: the last threadgroup out resets the counters for the next dispatch ----
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0u) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(sync + 2, 1u, memory_order_relaxed) == n_tg - 1u) {
+            atomic_store_explicit(sync + 0, 0u, memory_order_relaxed);
+            atomic_store_explicit(sync + 1, 0u, memory_order_relaxed);
+            atomic_store_explicit(sync + 2, 0u, memory_order_relaxed);
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        }
+    }
+}
+#endif
+
+
+// ===================================================================================
+// MEGA FFN+PLE BLOCK (task #141, stage 2a): from the FFN input to the end of the layer as ONE
+// persistent dispatch -- gate|up, act*mul, down, post-FFN norm+add, PLE gate, act*row, PLE
+// proj, and the tail (post_norm + residual*scale, then the next layer's input norm). Ten
+// dispatches today, seven software barriers here. Same barrier/counter contract as
+// imparo_mega_ffn (words 4..15 of the sync buffer: barriers 4..12, exit 13, error 15).
+//
+// The two norm phases run on threadgroup 0 and reproduce imparo_rms_norm_add_row exactly:
+// that kernel is launched with `norm_t` threads for the width (the host's rule), each thread
+// summing float4 indices t, t+norm_t, ... then simd_sum per simdgroup then simd_sum over the
+// simdgroup partials. Here virtual simdgroup vg (0 <= vg < norm_t/32) is served by a real
+// simdgroup with the same lane -> index mapping, so every partial sum sees the same values in
+// the same order and the block stays bit-identical to the dispatch path. The staged row
+// (rounded normalised values before the add) lives in a free device scratch row instead of
+// threadgroup memory, so the dispatch's threadgroup-memory footprint stays small and its
+// residency is not reduced.
+#if __METAL_VERSION__ >= 320
+// THE BLOCK'S ENTRY AND EXIT (shared by every composed kernel; task #158 step 1).
+// mega_enter: true = leave. Uniform across the threadgroup by broadcast through `flag`. The
+// error word is sticky (FAIL-SAFE 1): once any dispatch of this process set it, every later
+// dispatch leaves here, so a failed region costs one spin cap, never barriers x cap (the form
+// that pinned the GPU for minutes on 2026-09-06); the host disables the route when it reads
+// the word after the region. A host/kernel disagreement on the entry layout fails loudly.
+inline bool mega_enter(device atomic_uint * err, uint entry_bytes, uint entry_size,
+                       threadgroup uint * flag, uint tid) {
+    if (tid == 0u) { *flag = atomic_load_explicit(err, memory_order_relaxed); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (*flag != 0u) { return true; }
+    if (entry_bytes != entry_size) {
+        if (tid == 0u) { atomic_store_explicit(err, 1u | (0xfffu << 4), memory_order_relaxed); }
+        return true;
+    }
+    return false;
+}
+// An entry this threadgroup cannot run (its n_tg is not the dispatch's, a zero width, a deep
+// entry on a plain pipeline, the heads per item not the kernel's): report which entry and
+// which threadgroup, sticky; the caller leaves.
+inline void mega_fail_entry(device atomic_uint * err, uint dbg_seq, uint tgid, uint tid) {
+    if (tid == 0u) { atomic_store_explicit(err, 1u | (0xeu << 28) | (dbg_seq << 16) | (tgid << 4), memory_order_relaxed); }
+}
+// The exit: the last threadgroup out resets the barrier and exit counters for the next dispatch.
+inline void mega_exit(device atomic_uint * ctr, device atomic_uint * exitc, uint n_tg, uint tid) {
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0u) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (atomic_fetch_add_explicit(exitc, 1u, memory_order_relaxed) == n_tg - 1u) {
+            atomic_store_explicit(ctr, 0u, memory_order_relaxed);
+            atomic_store_explicit(exitc, 0u, memory_order_relaxed);
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        }
+    }
+}
+
+// THE ATTENTION PHASE over the cache (shared by every composed kernel; task #158 step 1).
+// Vec body: n_heads x attn_split work items (head h, part), each folding its share of the
+// span to a partial in the block's own scratch. Items stride the grid on the pipelines that
+// run at one threadgroup per core (MEGA_STRIDE: a model may have more heads than
+// threadgroups, and with one part per head item h stays on threadgroup h % n_tg, which the
+// combine's stride matches); the f16 plain pipelines keep one item per threadgroup (the code
+// they were measured with). Grouped deep body (task #151): n_kv x sub-groups x attn_split
+// items (KV head, sub-group, slice), K/V once per item, only on a MEGA_DEEP pipeline whose
+// heads per item are the kernel's own rule. Returns false when the entry cannot run on this
+// pipeline (a deep entry on a plain pipeline, or attn_hq not the kernel's); the caller
+// reports and leaves.
+template <uint HD, uint KVW>
+inline bool mega_attn_phase(device const float * qin, device const half * kc, device const half * vc,
+                            device float * apart, uint n_heads, uint n_kv, uint kv_width, uint start_pos,
+                            uint window, uint ring, device const uint * kv_pt, threadgroup float * red,
+                            uint attn_body, uint attn_split, uint attn_hq, uint n_tg,
+                            device atomic_uint * sync, uint scratch, uint dbg_slot, uint dbg_seq,
+                            device atomic_uint * dbg_rec, uint tgid, uint tid, uint lane, uint sgid, uint nsg) {
+    if (attn_body == 0u) {
+        const uint n_items = n_heads * attn_split;
+        device atomic_uint * cap = sync + MEGA_SYNC_HDR + scratch + MEGA_DBG_REC_WORDS + dbg_slot * MEGA_DBG_CAP_WORDS;
+        if (MEGA_STRIDE) {
+            for (uint item = tgid; item < n_items; item += n_tg) {
+                mega_attn_vec<HD, KVW>(qin, kc, vc, apart, n_heads, n_kv, kv_width, start_pos, window, ring, kv_pt, red,
+                                       item / attn_split, item % attn_split, attn_split, lane, sgid, nsg,
+                                       dbg_rec + (ulong)item * MEGA_DBG_REC, cap, dbg_seq, tgid);
+            }
+        } else if (tgid < n_items) {
+            mega_attn_vec<HD, KVW>(qin, kc, vc, apart, n_heads, n_kv, kv_width, start_pos, window, ring, kv_pt, red,
+                                   tgid / attn_split, tgid % attn_split, attn_split, lane, sgid, nsg,
+                                   dbg_rec + (ulong)tgid * MEGA_DBG_REC, cap, dbg_seq, tgid);
+        }
+        return true;
+    }
+    constexpr uint HQ = attn_group_hq(HD);
+    if (!MEGA_DEEP || attn_hq != HQ) { return false; }
+    const uint n_sub = (n_heads / n_kv + HQ - 1u) / HQ;
+    // Debug builds keep an entered / finished mask of the deep body's threadgroups in sync
+    // words 11 / 12 (the host prints them with a timeout).
+    if (MEGA_DBG && tid == 0u) { atomic_fetch_or_explicit(sync + 11, 1u << (tgid & 31u), memory_order_relaxed); }
+    if (tgid < n_kv * n_sub * attn_split) {
+        mega_attn_group<HD, KVW>(qin, kc, vc, apart, n_heads, n_kv, kv_width, start_pos, window, ring, kv_pt, red,
+                                 tgid, attn_split, lane, sgid, nsg);
+    }
+    if (MEGA_DBG && tid == 0u) { atomic_fetch_or_explicit(sync + 12, 1u << (tgid & 31u), memory_order_relaxed); }
+    return true;
+}
+// Head h's combine on threadgroup h (striding the grid: the deep grid is smaller than the
+// plain one and a model may have more heads than threadgroups), simdgroup 0. The assignment
+// must stay threadgroup h: with one part per head the vec body wrote head h's partial from
+// this very threadgroup, which is what lets a caller skip the grid barrier before this.
+template <uint HD>
+inline void mega_attn_combine_phase(device const float * apart, device float * out, uint n_heads, uint attn_split,
+                                    uint had_v, uint n_tg, device atomic_uint * dbg_rec, uint tgid, uint sgid, uint lane) {
+    for (uint h = tgid; h < n_heads; h += n_tg) {
+        if (sgid == 0u) {
+            mega_attn_combine<HD>(apart, out, h, attn_split, had_v, lane, dbg_rec + (ulong)h * attn_split * MEGA_DBG_REC);
+        }
+    }
+}
+
+
+// THE ROW IN THREADGROUP MEMORY (shared by every composed kernel; task #158 step 1): every
+// threadgroup forms the same n_embd row in xn (the projection kernel's staged form, so the bits
+// match the standalone norm kernels). Each brick ends with the threadgroup barrier its consumer
+// needs; mega_tg_keep does not (its reader is past a later barrier).
+// xn = rms(src) * w: src a device row; the weight at any float offset (the float4 path when it is
+// 16-byte aligned, the scalar path otherwise -- the same arithmetic per element).
+inline void mega_norm_to_tg(threadgroup float4 * xn, device const float * src, device const uchar * w_b, ulong w_off,
+                            uint width, float eps, uint norm_t, threadgroup float * partial,
+                            uint tid, uint tcount, uint lane, uint sgid, uint nsg) {
+    const uint w4 = width / 4u;
+    device const float4 * s4 = (device const float4 *)src;
+    const float inv = rms_inv(s4, w4, width, eps, norm_t, partial, lane, sgid, nsg);
+    device const float * wn = (device const float *)(w_b + w_off);
+    if (((w_off / 4u) % 4u) == 0u) {
+        device const float4 * wn4 = (device const float4 *)wn;
+        for (uint i = tid; i < w4; i += tcount) { xn[i] = s4[i] * inv * wn4[i]; }
+    } else {
+        threadgroup float * xn1 = (threadgroup float *)xn;
+        for (uint i = tid; i < width; i += tcount) { xn1[i] = src[i] * inv * wn[i]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// xn = rms(xn) * w, in place.
+inline void mega_norm_tg(threadgroup float4 * xn, device const uchar * w_b, ulong w_off,
+                         uint width, float eps, uint norm_t, threadgroup float * partial,
+                         uint tid, uint tcount, uint lane, uint sgid, uint nsg) {
+    const uint w4 = width / 4u;
+    const float inv = rms_inv(xn, w4, width, eps, norm_t, partial, lane, sgid, nsg);
+    device const float * wn = (device const float *)(w_b + w_off);
+    if (((w_off / 4u) % 4u) == 0u) {
+        device const float4 * wn4 = (device const float4 *)wn;
+        for (uint i = tid; i < w4; i += tcount) { xn[i] = xn[i] * inv * wn4[i]; }
+    } else {
+        threadgroup float * xn1 = (threadgroup float *)xn;
+        for (uint i = tid; i < width; i += tcount) { xn1[i] = xn1[i] * inv * wn[i]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// xn = src.
+inline void mega_tg_load(threadgroup float4 * xn, device const float * src, uint w4, uint tid, uint tcount) {
+    device const float4 * s4 = (device const float4 *)src;
+    for (uint i = tid; i < w4; i += tcount) { xn[i] = s4[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// xn = a + xn (the residual joins the formed row).
+inline void mega_tg_add(threadgroup float4 * xn, device const float * a, uint w4, uint tid, uint tcount) {
+    device const float4 * a4 = (device const float4 *)a;
+    for (uint i = tid; i < w4; i += tcount) { xn[i] = a4[i] + xn[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// xn = a + b.
+inline void mega_tg_sum(threadgroup float4 * xn, device const float * a, device const float * b, uint w4, uint tid, uint tcount) {
+    device const float4 * a4 = (device const float4 *)a;
+    device const float4 * b4 = (device const float4 *)b;
+    for (uint i = tid; i < w4; i += tcount) { xn[i] = a4[i] + b4[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// Threadgroup 0 keeps the formed row in a device buffer (its reader is past a later barrier).
+inline void mega_tg_keep(device float * dst, threadgroup const float4 * xn, uint w4, uint tgid, uint tid, uint tcount) {
+    if (tgid == 0u) {
+        device float4 * d4 = (device float4 *)dst;
+        for (uint i = tid; i < w4; i += tcount) { d4[i] = xn[i]; }
+    }
+}
+
+// Q4 ROW PHASES from the row in threadgroup memory (shared; task #158 step 1): the decode GEMV's
+// fast path per row (mega_q4_row_partial_tg), the lane group's reduce, one store; rows striding
+// the grid's simdgroups (LANES_PER_ROW lanes per row, 32 / LANES_PER_ROW rows per simdgroup).
+// Up to three destinations in one balanced stripe: rows [0, n_a) -> a, [n_a, n_a + n_b) -> b,
+// then c (a destination with 0 rows is absent). The q/k/v projection.
+inline void mega_q4_rows3_tg(threadgroup const float4 * xs, uint blocks,
+                             device const uchar * wa, device float * a, uint n_a,
+                             device const uchar * wb, device float * b, uint n_b,
+                             device const uchar * wc, device float * c, uint n_c,
+                             uint sg_global, uint sg_total, uint sub, uint slot) {
+    const uint rows_per_simd = 32u / LANES_PER_ROW;
+    const uint total = n_a + n_b + n_c;
+    for (uint r = sg_global * rows_per_simd + slot; r < total; r += sg_total * rows_per_simd) {
+        device const uchar * w; device float * dst; uint rr;
+        if (r < n_a)            { w = wa; dst = a; rr = r; }
+        else if (r < n_a + n_b) { w = wb; dst = b; rr = r - n_a; }
+        else                    { w = wc; dst = c; rr = r - n_a - n_b; }
+        float acc = mega_q4_row_partial_tg(w + (ulong)rr * blocks * Q4_0_BYTES, xs, blocks, sub);
+        acc = lane_group_sum(acc);
+        if (sub == 0u) { dst[rr] = acc; }
+    }
+}
+// The gated pair: g[r] = act(gate_r . x) * (up_r . x), both rows by the same simdgroup (the
+// producer applies the activation, so no act*mul phase and no barrier follow).
+inline void mega_q4_gated_rows_tg(threadgroup const float4 * xs, uint blocks, device const uchar * wg, device const uchar * wu,
+                                  device float * g, uint n_rows, uint sg_global, uint sg_total, uint sub, uint slot) {
+    const uint rows_per_simd = 32u / LANES_PER_ROW;
+    for (uint r = sg_global * rows_per_simd + slot; r < n_rows; r += sg_total * rows_per_simd) {
+        float ag = mega_q4_row_partial_tg(wg + (ulong)r * blocks * Q4_0_BYTES, xs, blocks, sub);
+        float au = mega_q4_row_partial_tg(wu + (ulong)r * blocks * Q4_0_BYTES, xs, blocks, sub);
+        ag = lane_group_sum(ag);
+        au = lane_group_sum(au);
+        if (sub == 0u) { g[r] = imparo_act_f(ag) * au; }
+    }
+}
+// Scaled rows: dst[r] = act(w_r . x) * scale[r] (gemma4's per-layer gate).
+inline void mega_q4_scaled_rows_tg(threadgroup const float4 * xs, uint blocks, device const uchar * w, device float * dst,
+                                   uint n_rows, device const float * scale, uint sg_global, uint sg_total, uint sub, uint slot) {
+    const uint rows_per_simd = 32u / LANES_PER_ROW;
+    for (uint r = sg_global * rows_per_simd + slot; r < n_rows; r += sg_total * rows_per_simd) {
+        float acc = mega_q4_row_partial_tg(w + (ulong)r * blocks * Q4_0_BYTES, xs, blocks, sub);
+        acc = lane_group_sum(acc);
+        if (sub == 0u) { dst[r] = imparo_act_f(acc) * scale[r]; }
+    }
+}
+
+// Threadgroup 0: dst = a + b (device rows; the tail's residual).
+inline void mega_dev_sum_tg0(device float * dst, device const float * a, device const float * b, uint w4, uint tgid, uint tid, uint tcount) {
+    if (tgid == 0u) {
+        device const float4 * a4 = (device const float4 *)a;
+        device const float4 * b4 = (device const float4 *)b;
+        device float4 * d4 = (device float4 *)dst;
+        for (uint i = tid; i < w4; i += tcount) { d4[i] = a4[i] + b4[i]; }
+    }
+}
+// MEGA_DBG: a non-finite value in the row o_proj is about to read marks the head's part-0
+// debug record (flag 4).
+template <uint HD>
+inline void mega_dbg_nonfinite_row(device const float * row, uint n, uint attn_split, device atomic_uint * dbg_rec, uint tid, uint tcount) {
+    for (uint i = tid; i < n; i += tcount) {
+        if (mega_nonfinite(row[i])) {
+            atomic_fetch_or_explicit(dbg_rec + (ulong)(i / HD) * attn_split * MEGA_DBG_REC + 7, 4u, memory_order_relaxed);
+        }
+    }
+}
+
+
+// The row norms of the block are the rms_inv brick (imparo_rms_norm's reduction at the
+// virtual geometry norm_t, which the host derives from the row width as the kernel does).
+
+// dst = (addend + rms(src) * w1) * out_scale; dual: out = rms(dst) * w2. One threadgroup.
+inline void mega_norm_add_row(device const float * src, device const float * addend,
+                              device float * dst, device const uchar * w1b, ulong w1_off,
+                              uint width, float eps, float out_scale, bool dual,
+                              device const uchar * w2b, ulong w2_off, device float * out,
+                              uint norm_t, threadgroup float * partial, device float * stage,
+                              uint tid, uint tcount, uint lane, uint sgid, uint nsg) {
+    const uint w4 = width / 4u;
+    device const float4 * s4 = (device const float4 *)src;
+    device const float4 * a4 = (device const float4 *)addend;
+    device float4       * d4 = (device float4 *)dst;
+    device float4       * st4 = (device float4 *)stage;
+    const float inv = rms_inv(s4, w4, width, eps, norm_t, partial, lane, sgid, nsg);
+    device const float * w1 = (device const float *)(w1b + w1_off);
+    if (((w1_off / 4u) % 4u) == 0u) {
+        device const float4 * w14 = (device const float4 *)w1;
+        for (uint i = tid; i < w4; i += tcount) { st4[i] = s4[i] * inv * w14[i]; }
+    } else {
+        for (uint i = tid; i < width; i += tcount) { stage[i] = src[i] * inv * w1[i]; }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (out_scale == 1.0f) {
+        for (uint i = tid; i < w4; i += tcount) { d4[i] = a4[i] + st4[i]; }
+    } else {
+        for (uint i = tid; i < w4; i += tcount) { st4[i] = a4[i] + st4[i]; }
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint i = tid; i < w4; i += tcount) { d4[i] = st4[i] * out_scale; }
+    }
+    if (!dual) { return; }
+    threadgroup_barrier(mem_flags::mem_device);
+    const float inv2 = rms_inv(d4, w4, width, eps, norm_t, partial, lane, sgid, nsg);
+    device const float * w2 = (device const float *)(w2b + w2_off);
+    device float4 * o4 = (device float4 *)out;
+    if (((w2_off / 4u) % 4u) == 0u) {
+        device const float4 * w24 = (device const float4 *)w2;
+        for (uint i = tid; i < w4; i += tcount) { o4[i] = d4[i] * inv2 * w24[i]; }
+    } else {
+        for (uint i = tid; i < width; i += tcount) { out[i] = dst[i] * inv2 * w2[i]; }
+    }
+}
+
+// One GEMV phase over rows [0, n_out): the lane group's row, the decode fast path's
+// arithmetic, the lane-group reduce, one store.
+inline void mega_gemv_phase(device const uchar * w, ulong w_off, device const float * xin,
+                            device float * yout, uint n_in, uint n_out,
+                            uint sg_global, uint sg_total, uint sub, uint slot) {
+    const uint rows_per_simd = 32u / LANES_PER_ROW;
+    const uint blocks = n_in / QK4_0;
+    device const float4 * xs = (device const float4 *)xin;
+    for (uint r = sg_global * rows_per_simd + slot; r < n_out; r += sg_total * rows_per_simd) {
+        device const uchar * row = w + w_off + (ulong)r * blocks * Q4_0_BYTES;
+        float acc = mega_q4_row_partial(row, xs, blocks, sub);
+        acc = lane_group_sum(acc);
+        if (sub == 0u) { yout[r] = acc; }
+    }
+}
+
+// A head row into this layer's cache at slot `ps`: f16 as half4; q4_0 / q8_0 with
+// imparo_kv_store_q4 / _q8's arithmetic (llama.cpp's quantizers), one thread per 32-value
+// block, under the same safe math mode and without contraction so the bytes match the
+// dispatch path's store. The row's storage type is the pipeline's constant (KVT_K / KVT_V).
+template <uint HD>
+inline void mega_kv_store_row_f16(device half * cache, uint kv_width, uint ps, uint hidx,
+                                  device const float * row, uint tid, uint tcount) {
+    constexpr uint hw4 = HD / 4u;
+    device half4 * c4 = (device half4 *)(cache + (ulong)ps * kv_width + hidx * HD);
+    device const float4 * r4 = (device const float4 *)row;
+    for (uint i = tid; i < hw4; i += tcount) { c4[i] = half4(r4[i]); }
+}
+// The quantized forms, in their own function so the safe-math pragmas scope to them alone.
+template <uint HD>
+inline void mega_kv_store_row_q(uint kvt, device half * cache, uint kv_width, uint ps, uint hidx,
+                                device const float * row, uint tid, uint tcount) {
+#pragma METAL fp math_mode(safe)
+#pragma METAL fp contract(off)
+    if (kvt == 1u) { mega_kv_store_row_f16<HD>(cache, kv_width, ps, hidx, row, tid, tcount); return; }
+    constexpr uint blocks = HD / 32u;
+    device uchar * base = (device uchar *)cache + imparo_kv_row_off(kvt, kv_width, ps, hidx * HD);
+    for (uint b = tid; b < blocks; b += tcount) {
+        device const float * x = row + b * 32u;
+        if (kvt == 2u) {
+            device uchar * blk = base + b * 18u;
+            float amax = 0.0f, vmax = 0.0f;
+            for (uint j = 0; j < 32u; ++j) {
+                const float v = x[j];
+                if (amax < fabs(v)) { amax = fabs(v); vmax = v; }
+            }
+            const float d = vmax / -8.0f;
+            const float id = d != 0.0f ? 1.0f / d : 0.0f;
+            const half dh = half(d);
+            blk[0] = as_type<ushort>(dh) & 0xFFu;
+            blk[1] = (as_type<ushort>(dh) >> 8) & 0xFFu;
+            for (uint j = 0; j < 16u; ++j) {
+                const float x0 = x[j] * id;
+                const float x1 = x[16u + j] * id;
+                const uchar xi0 = (uchar)min(15, (int)(char)(x0 + 8.5f));
+                const uchar xi1 = (uchar)min(15, (int)(char)(x1 + 8.5f));
+                blk[2u + j] = xi0 | (xi1 << 4);
+            }
+        } else {
+            device uchar * blk = base + b * 34u;
+            float amax = 0.0f;
+            for (uint j = 0; j < 32u; ++j) { amax = max(amax, fabs(x[j])); }
+            const float d = amax / 127.0f;
+            const float id = d != 0.0f ? 1.0f / d : 0.0f;
+            const half dh = half(d);
+            blk[0] = as_type<ushort>(dh) & 0xFFu;
+            blk[1] = (as_type<ushort>(dh) >> 8) & 0xFFu;
+            for (uint j = 0; j < 32u; ++j) { blk[2u + j] = (uchar)(char)rint(x[j] * id); }
+        }
+    }
+}
+
+// OPERAND TABLE: every pointer the layer block reads or writes, as GPU addresses the host
+// writes (MTLBuffer.gpuAddress + offset; Metal's argument-buffer form). The block forms its
+// pointers from it, so a layer's tensors may sit in any segment or tier (memory-fit tiers) and
+// the 31-slot buffer limit is not a limit: the block binds this table, the sync buffer and
+// the params. Weight pointers are SEGMENT bases; the params' *_off are local to them.
+// THE HEAD ROW (shared by every composed kernel; task #158 step 1): one Q, K or V head row
+// after the projection. Q and K: rms(w) at the head-dim thread rule (imparo_rms_norm's form),
+// NEOX rope (imparo_rope_neox's rotation), the score scale when the model applies it to Q
+// (LFM2; 1.0 = none). V: an unweighted rms when the model has one (norm_v; gemma4), nothing
+// otherwise. Then the cache basis (task #156: Q/K rotated by had_k, V by had_v before a
+// quantized store, 0 = plain) and the cache row for K and V (imparo_kv_store's conversion; the
+// storage type is the pipeline's KVT_K / KVT_V). The caller owns the row loop and places any
+// barrier the next row needs (`partial` is reused).
+template <uint HD>
+inline void mega_head_row(bool is_q, bool is_k, uint hidx, device float * row,
+                          device const uchar * wn_b, ulong wn_off, bool norm_v, uint norm_t_head, float eps,
+                          uint n_rot, float rope_base, constant float * freqs, uint n_freqs, uint start_pos, float q_scale,
+                          uint had_k, uint had_v, device half * kc_w, device half * vc_w, uint kv_width, uint ring,
+                          device const uint * kv_pt, threadgroup float * partial,
+                          uint tid, uint tcount, uint lane, uint sgid, uint nsg) {
+    device float4 * r4 = (device float4 *)row;
+    constexpr uint hw4 = HD / 4u;
+    if (is_q || is_k || norm_v) {
+        const float inv = rms_inv((device const float4 *)row, hw4, HD, eps, norm_t_head, partial, lane, sgid, nsg);
+        if (is_q || is_k) {
+            device const float * wn = (device const float *)(wn_b + wn_off);
+            if (((wn_off / 4u) % 4u) == 0u) {
+                device const float4 * wn4 = (device const float4 *)wn;
+                for (uint i = tid; i < hw4; i += tcount) { r4[i] = r4[i] * inv * wn4[i]; }
+            } else {
+                for (uint i = tid; i < HD; i += tcount) { row[i] = row[i] * inv * wn[i]; }
+            }
+        } else {
+            for (uint i = tid; i < hw4; i += tcount) { r4[i] = r4[i] * inv; }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    if (is_q || is_k) {
+        const uint half_rot = n_rot / 2u;
+        for (uint i = tid; i < half_rot; i += tcount) {
+            rope_neox_pair(row, i, half_rot, n_rot, rope_base, freqs, n_freqs, start_pos);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (is_q && q_scale != 1.0f) {
+            for (uint i = tid; i < hw4; i += tcount) { r4[i] = r4[i] * q_scale; }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+    }
+    const uint had = (is_q || is_k) ? had_k : had_v;
+    if (MEGA_KVQ && had != 0u) { mega_hadamard_row<HD>(row, had, tid, tcount); }
+    if (!is_q) {
+        const uint ps = kv_slot(start_pos, ring, kv_pt);
+        if (MEGA_KVQ) { mega_kv_store_row_q<HD>(is_k ? KVT_K : KVT_V, is_k ? kc_w : vc_w, kv_width, ps, hidx, row, tid, tcount); }
+        else         { mega_kv_store_row_f16<HD>(is_k ? kc_w : vc_w, kv_width, ps, hidx, row, tid, tcount); }
+    }
+}
+
+
+// THE ENTRY: what one dispatch of the block needs -- its operand table (GPU addresses) and
+// the layer's params -- as one struct the host passes as a kernel argument, at a compile-time
+// offset in the constant address space. That is the form that fits two threadgroups per
+// core; read through a device pointer or a runtime index, the same fields are ordinary loads
+// the compiler keeps live and only one threadgroup fits (design doc, constraint 8). Per-token
+// values travel in MegaToken.
+// THE ENTRY (task #158 step 2): ONE shape for every architecture -- a table of GPU pointers
+// (weights as their segment base, activation rows, cache views, the page table), a table of
+// weight offsets local to the pointer's segment, a table of words and a table of floats,
+// indexed by the program's slot constants below. The indices are compile-time literals, so
+// every read is a constant-argument load at a compile-time offset (constraint 8), as the typed
+// structs were. Words 0..3 and float 0 are the header every program fills: the dispatch's
+// threadgroup count, n_embd, the scratch floats, the norm's virtual thread count; eps.
+// The slot constants (MEGA_NP.., MEGA_U_*, G4_*, L2_*) are emitted here by build.rs from mega_slots.rs.
+// @@MEGA_SLOTS@@
+struct MegaEntryG {
+    device const uchar * ptr[MEGA_NP];
+    ulong off[MEGA_NO];
+    uint  u[MEGA_NU];
+    float f[MEGA_NF];
+};
+struct MegaToken {
+    uint start_pos, dbg_slot, n_tg, entry_bytes;   // entry_bytes: the host's sizeof(entry), refused on drift
+    uint dbg_seq, entry_index, n_entries, pad3;    // dbg_seq: this dispatch's index in the region (debug records);
+                                                   // entry_index / n_entries: the program form's entry (task #153)
+};
+
+
+// THE PHASE BUNDLE (task #158 step 3): every phase of every architecture takes the same
+// arguments, so ONE frame (emitted from mega_program.rs) serves them all and a phase list is
+// something the host can write down.
+// THE GEMMA4 PROGRAM'S PHASES: one inline function per phase. A phase
+// never takes a grid barrier: the barriers belong to the sequence (MEGA_STEP), which is what
+// makes the sequence data rather than code. Each phase casts the operands it needs out of the
+// entry's pointer table, so the kernel frame carries no architecture-specific unpack.
+#define MEGA_PH_ARGS constant MegaEntryG & ent, constant float * freqs, constant MegaToken & tok, \
+    device atomic_uint * sync, device float * apart, device atomic_uint * dbg_rec, uint dbg_seq, \
+    threadgroup float4 * xn, threadgroup float * partial, uint tgid, uint tid, uint lane, uint sgid, \
+    uint nsg, uint tcount, uint sg_global, uint sg_total, uint sub, uint slot, uint w4
+#define MEGA_PH_CALL ent, freqs, tok, sync, apart, dbg_rec, dbg_seq, xn, partial, tgid, tid, lane, sgid, \
+    nsg, tcount, sg_global, sg_total, sub, slot, w4
+
+// PQ0 (every threadgroup): xn = rms(x) * w_in -- the layer's input norm, consumed from threadgroup
+// memory by the rows below. PQ1: the q rows -> qin, k rows -> kbuf, v rows -> vbuf, one balanced stripe.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_in_norm_qkv_rows(MEGA_PH_ARGS) {
+    mega_norm_to_tg(xn, (device float *)ent.ptr[G4_X], (device const uchar *)ent.ptr[G4_W_IN], ent.off[G4_O_IN_OFF],
+                    ent.u[G4_U_N_EMBD], ent.f[G4_F_EPS], ent.u[G4_U_NORM_T], partial, tid, tcount, lane, sgid, nsg);
+    mega_q4_rows3_tg(xn, ent.u[G4_U_N_EMBD] / QK4_0,
+                     (device const uchar *)ent.ptr[G4_W_Q] + ent.off[G4_O_WQ_OFF], (device float *)ent.ptr[G4_QIN], ent.u[G4_U_Q_ROWS],
+                     (device const uchar *)ent.ptr[G4_W_K] + ent.off[G4_O_WK_OFF], (device float *)ent.ptr[G4_KBUF], ent.u[G4_U_HAS_KV] != 0u ? ent.u[G4_U_KV_WIDTH] : 0u,
+                     (device const uchar *)ent.ptr[G4_W_V] + ent.off[G4_O_WV_OFF], (device float *)ent.ptr[G4_VBUF], ent.u[G4_U_HAS_KV] != 0u ? ent.u[G4_U_KV_WIDTH] : 0u,
+                     sg_global, sg_total, sub, slot);
+}
+// PQ2: one head row per threadgroup, grid stride (the shared head-row brick: rms(w_qn) / rms(w_kn)
+// then rope for Q / K, the unweighted rms for V, the cache basis, the cache row).
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_head_rows(MEGA_PH_ARGS) {
+    const uint n_rows = ent.u[G4_U_N_HEADS] + (ent.u[G4_U_HAS_KV] != 0u ? 2u * ent.u[G4_U_N_KV] : 0u);
+    for (uint r = tgid; r < n_rows; r += ent.u[G4_U_N_TG]) {
+        const bool is_q = r < ent.u[G4_U_N_HEADS];
+        const bool is_k = !is_q && r < ent.u[G4_U_N_HEADS] + ent.u[G4_U_N_KV];
+        const uint hidx = is_q ? r : (is_k ? r - ent.u[G4_U_N_HEADS] : r - ent.u[G4_U_N_HEADS] - ent.u[G4_U_N_KV]);
+        device float * row = (is_q ? (device float *)ent.ptr[G4_QIN] : (is_k ? (device float *)ent.ptr[G4_KBUF] : (device float *)ent.ptr[G4_VBUF])) + (ulong)hidx * HD;
+        mega_head_row<HD>(is_q, is_k, hidx, row, (device const uchar *)(is_q ? ent.ptr[G4_W_QN] : ent.ptr[G4_W_KN]),
+                          is_q ? ent.off[G4_O_QN_OFF] : ent.off[G4_O_KN_OFF], true, ent.u[G4_U_NORM_T_HEAD], ent.f[G4_F_EPS],
+                          ent.u[G4_U_N_ROT], ent.f[G4_F_ROPE_BASE], freqs, ent.u[G4_U_N_FREQS], tok.start_pos, 1.0f, ent.u[G4_U_HAD_K], ent.u[G4_U_HAD_V],
+                          (device half *)ent.ptr[G4_KC_W], (device half *)ent.ptr[G4_VC_W], ent.u[G4_U_KV_WIDTH], ent.u[G4_U_RING],
+                          (device const uint *)ent.ptr[G4_KV_PT], partial, tid, tcount, lane, sgid, nsg);
+    }
+}
+// PA: attention over the cache (the shared phase brick). False = this entry cannot run on this
+// pipeline (a deep entry on a plain one, or the heads per item disagree); the caller reports it.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) bool g4_ph_attn(MEGA_PH_ARGS) {
+    return mega_attn_phase<HD, KVW>((device float *)ent.ptr[G4_QIN], (device const half *)ent.ptr[G4_KC], (device const half *)ent.ptr[G4_VC], apart,
+                                    ent.u[G4_U_N_HEADS], ent.u[G4_U_N_KV], ent.u[G4_U_KV_WIDTH], tok.start_pos, ent.u[G4_U_WINDOW], ent.u[G4_U_RING],
+                                    (device const uint *)ent.ptr[G4_KV_PT], (threadgroup float *)xn, ent.u[G4_U_ATTN_BODY], ent.u[G4_U_ATTN_SPLIT],
+                                    ent.u[G4_U_ATTN_HQ], ent.u[G4_U_N_TG], sync, ent.u[G4_U_SCRATCH], tok.dbg_slot, dbg_seq, dbg_rec, tgid, tid, lane, sgid, nsg);
+}
+// Head h's combine on threadgroup h.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_attn_combine(MEGA_PH_ARGS) {
+    mega_attn_combine_phase<HD>(apart, (device float *)ent.ptr[G4_ATTN_OUT], ent.u[G4_U_N_HEADS], ent.u[G4_U_ATTN_SPLIT],
+                                ent.u[G4_U_HAD_V], ent.u[G4_U_N_TG], dbg_rec, tgid, sgid, lane);
+}
+// P0 (front): o = W_o . attn (the o_proj rows). MEGA_DBG first: what o_proj is about to read
+// through the const view; a non-finite value marks the head's part-0 record (flag 4).
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_oproj(MEGA_PH_ARGS) {
+    if (MEGA_DBG && tgid == 0u && ent.u[G4_U_ATTN_PHASE] != 0u) {
+        mega_dbg_nonfinite_row<HD>((device const float *)ent.ptr[G4_ATTN], ent.u[G4_U_ATTN_IN], ent.u[G4_U_ATTN_SPLIT], dbg_rec, tid, tcount);
+    }
+    mega_gemv_phase((device const uchar *)ent.ptr[G4_W_O], ent.off[G4_O_WO_OFF], (device const float *)ent.ptr[G4_ATTN],
+                    (device float *)ent.ptr[G4_O], ent.u[G4_U_ATTN_IN], ent.u[G4_U_N_EMBD], sg_global, sg_total, sub, slot);
+}
+// P0b (every threadgroup): the sandwich -- mid = x + rms(o) * w_npa in threadgroup memory (the dual
+// norm kernel's staged form), threadgroup 0 keeps mid in u for the post-FFN residual (u is read only
+// after two more barriers; o and x are only READ here), then xn = rms(mid) * w_nf is this layer's
+// FFN input, consumed from threadgroup memory.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_sandwich(MEGA_PH_ARGS) {
+    mega_norm_to_tg(xn, (device float *)ent.ptr[G4_O], (device const uchar *)ent.ptr[G4_W_NPA], ent.off[G4_O_NPA_OFF],
+                    ent.u[G4_U_N_EMBD], ent.f[G4_F_EPS], ent.u[G4_U_NORM_T], partial, tid, tcount, lane, sgid, nsg);
+    mega_tg_add(xn, (device float *)ent.ptr[G4_X], w4, tid, tcount);
+    mega_tg_keep((device float *)ent.ptr[G4_U], xn, w4, tgid, tid, tcount);
+    mega_norm_tg(xn, (device const uchar *)ent.ptr[G4_W_NF], ent.off[G4_O_NF_OFF], ent.u[G4_U_N_EMBD], ent.f[G4_F_EPS],
+                 ent.u[G4_U_NORM_T], partial, tid, tcount, lane, sgid, nsg);
+}
+// No front: the FFN input was formed by the previous dispatch; every threadgroup takes its own
+// copy so the gated rows have one form.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_ffn_input_copy(MEGA_PH_ARGS) {
+    mega_tg_load(xn, (device const float *)ent.ptr[G4_CUR], w4, tid, tcount);
+}
+// P1: g[r] = act(gate row r) * (up row r), both rows by the same simdgroup, from xn; the two
+// reductions are the dispatch GEMV's shuffle tree, the product is act_mul's expression.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_ffn_gated(MEGA_PH_ARGS) {
+    mega_q4_gated_rows_tg(xn, ent.u[G4_U_N_EMBD] / QK4_0, (device const uchar *)ent.ptr[G4_W_GATE] + ent.off[G4_O_GATE_OFF],
+                          (device const uchar *)ent.ptr[G4_W_UP] + ent.off[G4_O_UP_OFF], (device float *)ent.ptr[G4_G],
+                          ent.u[G4_U_N_MID], sg_global, sg_total, sub, slot);
+}
+// P3: down rows -> x (x's previous content, the layer's input residual, was consumed by the sandwich).
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_ffn_down(MEGA_PH_ARGS) {
+    mega_gemv_phase((device const uchar *)ent.ptr[G4_W_DOWN], ent.off[G4_O_DOWN_OFF], (device const float *)ent.ptr[G4_G],
+                    (device float *)ent.ptr[G4_X], ent.u[G4_U_N_MID], ent.u[G4_U_N_EMBD], sg_global, sg_total, sub, slot);
+}
+// P4+P5 (every threadgroup): xn = o + rms(x) * w_n1 in threadgroup memory -- the same staged form as
+// mega_norm_add_row, so the bits match -- then this threadgroup's PLE gate rows read xn:
+// gate[r] = act(row r . xn) * per_layer[pl_off + r]. No grid barrier between the norm and its
+// consumer; x (the down output) is only READ here, and the formed row is written back to x by
+// threadgroup 0 after the next barrier.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_ple_gate(MEGA_PH_ARGS) {
+    mega_norm_to_tg(xn, (device float *)ent.ptr[G4_X], (device const uchar *)ent.ptr[G4_W_N1], ent.off[G4_O_N1_OFF],
+                    ent.u[G4_U_N_EMBD], ent.f[G4_F_EPS], ent.u[G4_U_NORM_T], partial, tid, tcount, lane, sgid, nsg);
+    mega_tg_add(xn, (device float *)(ent.u[G4_U_FRONT] != 0u ? ent.ptr[G4_U] : ent.ptr[G4_O]), w4, tid, tcount);   // the post-attention residual
+    mega_q4_scaled_rows_tg(xn, ent.u[G4_U_N_EMBD] / QK4_0, (device const uchar *)ent.ptr[G4_W_PG] + ent.off[G4_O_PG_OFF],
+                           (device float *)ent.ptr[G4_GATE], ent.u[G4_U_PLE],
+                           (device const float *)ent.ptr[G4_PER_LAYER] + ent.u[G4_U_PL_OFF], sg_global, sg_total, sub, slot);
+}
+// P7: threadgroup 0 writes the formed row back to x (every reader of the down output has passed the
+// barrier); PLE proj rows [0, n_embd) from gate -> back.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_ple_proj(MEGA_PH_ARGS) {
+    mega_tg_keep((device float *)ent.ptr[G4_X], xn, w4, tgid, tid, tcount);
+    mega_gemv_phase((device const uchar *)ent.ptr[G4_W_PP], ent.off[G4_O_PP_OFF], (device const float *)ent.ptr[G4_GATE],
+                    (device float *)ent.ptr[G4_BACK], ent.u[G4_U_PLE], ent.u[G4_U_N_EMBD], sg_global, sg_total, sub, slot);
+}
+// P8 (threadgroup 0): x = (x + rms(back) * w_n2) * out_scale; cur = rms(x) * w_n3 (staged in g).
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void g4_ph_tail(MEGA_PH_ARGS) {
+    if (tgid == 0u) {
+        mega_norm_add_row((device const float *)ent.ptr[G4_BACK], (device float *)ent.ptr[G4_X], (device float *)ent.ptr[G4_X],
+                          (device const uchar *)ent.ptr[G4_W_N2], ent.off[G4_O_N2_OFF], ent.u[G4_U_N_EMBD], ent.f[G4_F_EPS],
+                          ent.f[G4_F_OUT_SCALE], ent.u[G4_U_HAS_NEXT] != 0u, (device const uchar *)ent.ptr[G4_W_N3], ent.off[G4_O_N3_OFF],
+                          (device float *)ent.ptr[G4_NXT], ent.u[G4_U_NORM_T], partial, (device float *)ent.ptr[G4_G], tid, tcount, lane, sgid, nsg);
+    }
+}
+
+// The gemma4 kernel is emitted from its program (task #158 step 3): see the marker below.
+// ===================================================================================
+// LFM2: one decode layer as one persistent dispatch (task #147) -- the bricks its phases are
+// built from, then the phases. The entry names the layer's operands; `mixer` says what
+// precedes the tail:
+//   MIXER_SHORTCONV  cur = rms(x) * w_op (every threadgroup, threadgroup memory); bcx = W_in . cur
+//                    | barrier | the conv step's row from bcx, the history and w_conv (every
+//                    threadgroup); o = W_out . row | barrier | threadgroup 0 shifts the history
+//                    and, with a checkpoint armed at this token, writes the same row to `snap`
+//   MIXER_ATTENTION  cur = rms(x) * w_op; the q/k/v rows (one tile-major unit per simdgroup, a
+//                    head row's units inside one threadgroup) then, threadgroup-locally, Q:
+//                    rms(w_qn), rope, the score scale, K: rms(w_kn), rope, the cache row, V: the
+//                    cache row | barrier | attention over the cache (the vec body, one
+//                    threadgroup per (head, part)), the parts merged in place when a head has
+//                    one | barrier | o = W_o . attn | barrier
+//   MIXER_NONE       o already holds the mixer's output (the dispatch path's)
+// then the tail: x' = x + o; cur = rms(x') * w_ffn (every threadgroup; threadgroup 0 keeps x'
+// in u); g = act(gate . cur) * (up . cur) | barrier | o = down . g | barrier | threadgroup 0:
+// x = x' + o. The next layer's block forms its own operator norm from x.
+// Weights are Q8_0 tile-major (Q8_TM on this pipeline); the activation is the model's (EPI_ACT
+// stamped at build); norm weights are float rows at 16-byte-aligned offsets (the host checks).
+// Same block rules as the gemma4 kernel: the entry is a constant-space kernel argument, the
+// error word is sticky, one monotonic barrier counter reset by the last threadgroup out.
+
+// One unit of a tile-major Q8_0 matrix (Q8_TM_UNIT_ROWS = 8 rows, every K block) by one
+// simdgroup: the decode GEMV's lane roles (u = block parity, rp = row pair, il = the quad of
+// 8 values in a block), its per-block arithmetic, reduced over il (xor 1, 2) and u (xor 16).
+// On return lanes with (lane & 19) == 0 hold rows r0 + 2 rp and r0 + 2 rp + 1 in (acca, accb).
+// XS4 is a float4 pointer into the x vector, threadgroup or device.
+template <typename XS4>
+inline void q8_tm_unit_rows(device const uchar * w, uint blocks, uint r0, XS4 x4,
+                            uint lane, thread float & acca, thread float & accb) {
+    const uint u = lane / 16u, rp = (lane / 4u) % 4u, il = lane % 4u;
+    const uint rowa = r0 + rp * 2u, rowb = rowa + 1u;
+    acca = 0.0f; accb = 0.0f;
+    for (uint ib = u; ib < blocks; ib += 2u) {
+        const uint i4 = ib * (QK8_0 / 4u) + il * 2u;
+        const float4 xa = x4[i4], xb4 = x4[i4 + 1u];
+        device const uchar * pa = w + q8_tm_payload(rowa, ib, blocks) + il * 8u;
+        device const uchar * pb = w + q8_tm_payload(rowb, ib, blocks) + il * 8u;
+        const float da = float(*(device const half *)(w + q8_tm_scale(rowa, ib, blocks, 0u)));
+        const float db = float(*(device const half *)(w + q8_tm_scale(rowb, ib, blocks, 0u)));
+        const char4 qa0 = as_type<char4>(*(device const uint *)pa);
+        const char4 qa1 = as_type<char4>(*(device const uint *)(pa + 4u));
+        const char4 qb0 = as_type<char4>(*(device const uint *)pb);
+        const char4 qb1 = as_type<char4>(*(device const uint *)(pb + 4u));
+        acca += (dot(float4(qa0), xa) + dot(float4(qa1), xb4)) * da;
+        accb += (dot(float4(qb0), xa) + dot(float4(qb1), xb4)) * db;
+    }
+    acca += simd_shuffle_xor(acca, 1u);  accb += simd_shuffle_xor(accb, 1u);
+    acca += simd_shuffle_xor(acca, 2u);  accb += simd_shuffle_xor(accb, 2u);
+    acca += simd_shuffle_xor(acca, 16u); accb += simd_shuffle_xor(accb, 16u);
+}
+// Rows [0, n_out) of a tile-major matrix: units strided over the grid's simdgroups.
+template <typename XS4>
+inline void mega_q8tm_phase(device const uchar * w, ulong w_off, XS4 x4, device float * y,
+                            uint n_in, uint n_out, uint sg_global, uint sg_total, uint lane) {
+    const uint blocks = n_in / QK8_0, units = n_out / Q8_TM_UNIT_ROWS;
+    device const uchar * wb = w + w_off;
+    for (uint un = sg_global; un < units; un += sg_total) {
+        float a, b;
+        q8_tm_unit_rows(wb, blocks, un * Q8_TM_UNIT_ROWS, x4, lane, a, b);
+        if ((lane & 19u) == 0u) {
+            const uint r = un * Q8_TM_UNIT_ROWS + ((lane / 4u) % 4u) * 2u;
+            y[r] = a; y[r + 1u] = b;
+        }
+    }
+}
+// The gated pair over one x: g[r] = act(gate_r . x) * (up_r . x).
+template <typename XS4>
+inline void mega_q8tm_gated_phase(device const uchar * wg, ulong g_off, device const uchar * wu, ulong u_off,
+                                  XS4 x4, device float * g, uint n_in, uint n_out,
+                                  uint sg_global, uint sg_total, uint lane) {
+    const uint blocks = n_in / QK8_0, units = n_out / Q8_TM_UNIT_ROWS;
+    device const uchar * gb = wg + g_off;
+    device const uchar * ub = wu + u_off;
+    for (uint un = sg_global; un < units; un += sg_total) {
+        float ga, gbv, ua, ubv;
+        q8_tm_unit_rows(gb, blocks, un * Q8_TM_UNIT_ROWS, x4, lane, ga, gbv);
+        q8_tm_unit_rows(ub, blocks, un * Q8_TM_UNIT_ROWS, x4, lane, ua, ubv);
+        if ((lane & 19u) == 0u) {
+            const uint r = un * Q8_TM_UNIT_ROWS + ((lane / 4u) % 4u) * 2u;
+            g[r] = imparo_act_f(ga) * ua; g[r + 1u] = imparo_act_f(gbv) * ubv;
+        }
+    }
+}
+
+// Rows of up to three tile-major matrices in one balanced stripe of units: units [0, u_a) -> a,
+// [u_a, u_a + u_b) -> b, then c (a destination with 0 units is absent). The q/k/v projection.
+template <typename XS4>
+inline void mega_q8tm_rows3(XS4 x4, uint blocks, device const uchar * wa, device float * a, uint u_a,
+                            device const uchar * wb, device float * b, uint u_b,
+                            device const uchar * wc, device float * c, uint u_c,
+                            uint sg_global, uint sg_total, uint lane) {
+    for (uint un = sg_global; un < u_a + u_b + u_c; un += sg_total) {
+        device const uchar * w; device float * dst; uint r0;
+        if (un < u_a)            { w = wa; dst = a; r0 = un * Q8_TM_UNIT_ROWS; }
+        else if (un < u_a + u_b) { w = wb; dst = b; r0 = (un - u_a) * Q8_TM_UNIT_ROWS; }
+        else                     { w = wc; dst = c; r0 = (un - u_a - u_b) * Q8_TM_UNIT_ROWS; }
+        float va, vb;
+        q8_tm_unit_rows(w, blocks, r0, x4, lane, va, vb);
+        if ((lane & 19u) == 0u) {
+            const uint r = r0 + ((lane / 4u) % 4u) * 2u;
+            dst[r] = va; dst[r + 1u] = vb;
+        }
+    }
+}
+
+// The conv step's row into threadgroup memory (one thread per channel; the standalone step
+// kernel's channel body), then the barrier its consumer needs.
+inline void mega_shortconv_row_tg(threadgroup float4 * xn, device const float * bcx, device const uchar * w_conv, ulong conv_off,
+                                  device const float * state, uint width, uint kern, uint tid, uint tcount) {
+    threadgroup float * xn1 = (threadgroup float *)xn;
+    device const float * cw = (device const float *)(w_conv + conv_off);
+    for (uint ch = tid; ch < width; ch += tcount) { xn1[ch] = shortconv_channel_out(bcx, cw, state, width, kern, ch); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// Threadgroup 0 advances the history (every threadgroup's reads of it ended at the barrier
+// before this); the checkpoint copy when one is armed.
+inline void mega_shortconv_shift(device const float * bcx, device float * state, device float * snap, bool has_snap,
+                                 uint width, uint history, uint tgid, uint tid, uint tcount) {
+    if (tgid == 0u) {
+        for (uint ch = tid; ch < width; ch += tcount) { shortconv_channel_shift(bcx, state, snap, has_snap, width, history, ch); }
+    }
+}
+
+constant uint MEGA_LFM2_MIXER_NONE = 0u;       // the tail alone: o holds the mixer's output
+constant uint MEGA_LFM2_MIXER_SHORTCONV = 1u;  // in_proj, the conv step, out_proj precede the tail
+constant uint MEGA_LFM2_MIXER_ATTENTION = 2u;  // q/k/v, head norm + rope, the cache row, attention, o_proj
+
+// THE LFM2 PROGRAM'S PHASES (task #158 step 3b): the same bundle as gemma4's, so the two
+// architectures share one emitted frame. The entry's mixer word selects the mixer phases; it is
+// an entry word, so every threadgroup of the dispatch takes the same branch and the sequence's
+// barriers stay uniform.
+#define L2_IS_CONV (ent.u[L2_U_MIXER] == MEGA_LFM2_MIXER_SHORTCONV)
+#define L2_IS_ATTN (ent.u[L2_U_MIXER] == MEGA_LFM2_MIXER_ATTENTION)
+
+// C0 / A0 (every threadgroup): cur = rms(x) * w_op in threadgroup memory -- the mixer's input.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_op_norm(MEGA_PH_ARGS) {
+    mega_tg_load(xn, (device const float *)ent.ptr[L2_X], w4, tid, tcount);
+    mega_norm_tg(xn, ent.ptr[L2_W_OP], ent.off[L2_O_OP_OFF], ent.u[L2_U_N_EMBD], ent.f[L2_F_EPS],
+                 ent.u[L2_U_NORM_T], partial, tid, tcount, lane, sgid, nsg);
+}
+// C1: bcx = W_in . cur   (3 n_embd rows: b, c, x).
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_conv_in(MEGA_PH_ARGS) {
+    mega_q8tm_phase(ent.ptr[L2_W_IN], ent.off[L2_O_IN_OFF], (threadgroup const float4 *)xn, (device float *)ent.ptr[L2_BCX],
+                    ent.u[L2_U_N_EMBD], 3u * ent.u[L2_U_N_EMBD], sg_global, sg_total, lane);
+}
+// C2 (every threadgroup): the conv step's row into threadgroup memory (the step kernel's channel
+// body, one thread per channel), then o = W_out . row.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_conv_step_out(MEGA_PH_ARGS) {
+    mega_shortconv_row_tg(xn, (device const float *)ent.ptr[L2_BCX], ent.ptr[L2_W_CONV], ent.off[L2_O_CONV_OFF],
+                          (device const float *)ent.ptr[L2_STATE], ent.u[L2_U_N_EMBD], ent.u[L2_U_KERN], tid, tcount);
+    mega_q8tm_phase(ent.ptr[L2_W_OUT], ent.off[L2_O_OUT_OFF], (threadgroup const float4 *)xn, (device float *)ent.ptr[L2_O],
+                    ent.u[L2_U_N_EMBD], ent.u[L2_U_N_EMBD], sg_global, sg_total, lane);
+}
+// C3 (threadgroup 0): shift the history -- every threadgroup's reads of it ended at the barrier
+// before this phase. A checkpoint armed at this token takes the same row (at one token the
+// boundary is this token, so the history as of the boundary is the advanced history).
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_conv_shift(MEGA_PH_ARGS) {
+    mega_shortconv_shift((device const float *)ent.ptr[L2_BCX], (device float *)ent.ptr[L2_STATE], (device float *)ent.ptr[L2_SNAP],
+                         ent.u[L2_U_HAS_SNAP] != 0u, ent.u[L2_U_N_EMBD], ent.u[L2_U_KERN] - 1u, tgid, tid, tcount);
+}
+// A1: the q/k/v rows from cur -- one tile-major unit per simdgroup, the grid's simdgroups striding
+// the units (nsg a multiple of the units per head row and the stride a multiple of nsg, so a head
+// row's units all sit in one threadgroup and the head phase below needs only a threadgroup barrier;
+// the deep grid is smaller than the plain one, task #151).
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_qkv_rows(MEGA_PH_ARGS) {
+    constexpr uint UPR = HD / Q8_TM_UNIT_ROWS;
+    const uint q_units = ent.u[L2_U_N_HEADS] * UPR, kv_units = ent.u[L2_U_N_KV] * UPR;
+    mega_q8tm_rows3((threadgroup const float4 *)xn, ent.u[L2_U_N_EMBD] / QK8_0,
+                    ent.ptr[L2_W_Q] + ent.off[L2_O_WQ_OFF], (device float *)ent.ptr[L2_QIN], q_units,
+                    ent.ptr[L2_W_K] + ent.off[L2_O_WK_OFF], (device float *)ent.ptr[L2_KBUF], kv_units,
+                    ent.ptr[L2_W_V] + ent.off[L2_O_WV_OFF], (device float *)ent.ptr[L2_VBUF], kv_units,
+                    sg_global, sg_total, lane);
+    threadgroup_barrier(mem_flags::mem_device);   // this threadgroup's units feed its own head rows
+}
+// A2 (this threadgroup's head rows, every pass of A1's stride; the shared head-row brick): Q:
+// rms(w_qn), rope, the score scale; K: rms(w_kn), rope, then the cache row; V: the cache row. A
+// threadgroup barrier between rows: the next row reuses `partial`.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_head_rows(MEGA_PH_ARGS) {
+    constexpr uint UPR = HD / Q8_TM_UNIT_ROWS;
+    const uint rows_per_tg = nsg / UPR;
+    const uint n_rows = ent.u[L2_U_N_HEADS] + 2u * ent.u[L2_U_N_KV];
+    for (uint r0 = tgid * rows_per_tg; r0 < n_rows; r0 += ent.u[L2_U_N_TG] * rows_per_tg)
+    for (uint r = r0; r < min(r0 + rows_per_tg, n_rows); ++r) {
+        const bool is_q = r < ent.u[L2_U_N_HEADS];
+        const bool is_k = !is_q && r < ent.u[L2_U_N_HEADS] + ent.u[L2_U_N_KV];
+        const uint hidx = is_q ? r : (is_k ? r - ent.u[L2_U_N_HEADS] : r - ent.u[L2_U_N_HEADS] - ent.u[L2_U_N_KV]);
+        device float * row = (device float *)(is_q ? ent.ptr[L2_QIN] : (is_k ? ent.ptr[L2_KBUF] : ent.ptr[L2_VBUF])) + (ulong)hidx * HD;
+        mega_head_row<HD>(is_q, is_k, hidx, row, is_q ? ent.ptr[L2_W_QN] : ent.ptr[L2_W_KN],
+                          is_q ? ent.off[L2_O_QN_OFF] : ent.off[L2_O_KN_OFF], false, ent.u[L2_U_NORM_T_HEAD], ent.f[L2_F_EPS],
+                          ent.u[L2_U_N_ROT], ent.f[L2_F_ROPE_BASE], freqs, 0u, tok.start_pos, ent.f[L2_F_Q_SCALE],
+                          ent.u[L2_U_HAD_K], ent.u[L2_U_HAD_V], (device half *)ent.ptr[L2_KC_W], (device half *)ent.ptr[L2_VC_W],
+                          ent.u[L2_U_KV_WIDTH], ent.u[L2_U_RING], (device const uint *)ent.ptr[L2_KV_PT],
+                          partial, tid, tcount, lane, sgid, nsg);
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+// A3: attention over the cache (the shared phase brick). False = this entry cannot run on this
+// pipeline; the caller reports it.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) bool l2_ph_attn(MEGA_PH_ARGS) {
+    return mega_attn_phase<HD, KVW>((device float *)ent.ptr[L2_QIN], (device const half *)ent.ptr[L2_KC], (device const half *)ent.ptr[L2_VC],
+                                    apart, ent.u[L2_U_N_HEADS], ent.u[L2_U_N_KV], ent.u[L2_U_KV_WIDTH], tok.start_pos, ent.u[L2_U_WINDOW],
+                                    ent.u[L2_U_RING], (device const uint *)ent.ptr[L2_KV_PT], (threadgroup float *)xn, ent.u[L2_U_ATTN_BODY],
+                                    ent.u[L2_U_ATTN_SPLIT], ent.u[L2_U_ATTN_HQ], ent.u[L2_U_N_TG], sync, ent.u[L2_U_SCRATCH],
+                                    tok.dbg_slot, dbg_seq, dbg_rec, tgid, tid, lane, sgid, nsg);
+}
+// Head h's parts merged by threadgroup h.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_attn_combine(MEGA_PH_ARGS) {
+    mega_attn_combine_phase<HD>(apart, (device float *)ent.ptr[L2_ATTN], ent.u[L2_U_N_HEADS], ent.u[L2_U_ATTN_SPLIT],
+                                ent.u[L2_U_HAD_V], ent.u[L2_U_N_TG], dbg_rec, tgid, sgid, lane);
+}
+// A4: o = W_o . attn
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_oproj(MEGA_PH_ARGS) {
+    mega_q8tm_phase(ent.ptr[L2_W_O], ent.off[L2_O_WO_OFF], (device const float4 *)ent.ptr[L2_ATTN], (device float *)ent.ptr[L2_O],
+                    ent.u[L2_U_N_HEADS] * HD, ent.u[L2_U_N_EMBD], sg_global, sg_total, lane);
+}
+// P0 (every threadgroup): xn = x + o; threadgroup 0 keeps x' in u; xn = rms(xn) * w_fn.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_ffn_norm(MEGA_PH_ARGS) {
+    mega_tg_sum(xn, (device const float *)ent.ptr[L2_X], (device const float *)ent.ptr[L2_O], w4, tid, tcount);
+    mega_tg_keep((device float *)ent.ptr[L2_U], xn, w4, tgid, tid, tcount);
+    mega_norm_tg(xn, ent.ptr[L2_W_FN], ent.off[L2_O_FN_OFF], ent.u[L2_U_N_EMBD], ent.f[L2_F_EPS],
+                 ent.u[L2_U_NORM_T], partial, tid, tcount, lane, sgid, nsg);
+}
+// P1: g = act(gate . cur) * (up . cur), cur from threadgroup memory.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_ffn_gated(MEGA_PH_ARGS) {
+    mega_q8tm_gated_phase(ent.ptr[L2_W_GATE], ent.off[L2_O_GATE_OFF], ent.ptr[L2_W_UP], ent.off[L2_O_UP_OFF],
+                          (threadgroup const float4 *)xn, (device float *)ent.ptr[L2_G],
+                          ent.u[L2_U_N_EMBD], ent.u[L2_U_N_FF], sg_global, sg_total, lane);
+}
+// P2: o = down . g   (every threadgroup finished reading o in P0, before the barrier above).
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_ffn_down(MEGA_PH_ARGS) {
+    mega_q8tm_phase(ent.ptr[L2_W_DOWN], ent.off[L2_O_DOWN_OFF], (device const float4 *)ent.ptr[L2_G], (device float *)ent.ptr[L2_O],
+                    ent.u[L2_U_N_FF], ent.u[L2_U_N_EMBD], sg_global, sg_total, lane);
+}
+// P3 (threadgroup 0): x = x' + o. The next layer's block forms its own operator norm from x.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2_ph_tail(MEGA_PH_ARGS) {
+    mega_dev_sum_tg0((device float *)ent.ptr[L2_X], (device const float *)ent.ptr[L2_U], (device const float *)ent.ptr[L2_O],
+                     w4, tgid, tid, tcount);
+}
+
+// The LFM2 kernel is emitted from its program (task #158 step 3b): see the marker below.
+
+// @@MEGA_KERNELS@@
+#endif

@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+*.cubin binary
+*.dll binary
+*.dylib binary
+*.exe binary
+*.gguf binary
+*.lib binary
+*.onnx binary
+*.pdb binary
+*.png binary
+*.safetensors binary
+*.so binary

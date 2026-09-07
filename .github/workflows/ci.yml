@@ -6,8 +6,14 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, v2]
   workflow_dispatch:
+    inputs:
+      require_triton_release:
+        description: Fail unless the formal Triton AOT release lanes are enabled
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -21,6 +27,315 @@ permissions:
 # and a real GPU and run on a dev machine via dev_harness. CUDA coverage is
 # compile-only until a CUDA box runs the gates.
 jobs:
+  public-boundary:
+    name: Public boundary (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Public exporter negative tests
+        run: >-
+          python -B -m unittest
+          dev_harness.test_public_export
+          dev_harness.test_program_pack_release
+          dev_harness.test_triton_pack_smoke
+          -v
+      - name: Program Pack schema and semantic tests
+        run: python -B -m unittest schemas.test_program_pack_schemas -v
+      - name: Verify exact fixed-tree public export
+        run: >-
+          python -B dev_harness/public_export.py
+          --source .
+          --tree HEAD
+          --allowlist dev_harness/public-export.allowlist
+          --dry-run
+          --json
+      - name: Materialize reviewed public tree
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          python -B dev_harness/public_export.py \
+            --source . \
+            --tree HEAD \
+            --allowlist dev_harness/public-export.allowlist \
+            --apply \
+            --dest "$RUNNER_TEMP/public-tree" \
+            --json > "$RUNNER_TEMP/public-export-report.json"
+          tar -C "$RUNNER_TEMP/public-tree" -czf "$RUNNER_TEMP/public-tree.tar.gz" .
+      - name: Upload detached public tree
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-tree-${{ github.sha }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/public-tree.tar.gz
+            ${{ runner.temp }}/public-export-report.json
+
+  public-tree-build:
+    name: Build detached public tree
+    needs: public-boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMPARO_CUDA_ARCHS: '86'
+    steps:
+      # Deliberately no checkout: private repository files cannot satisfy a missing
+      # source or path dependency in the exported artifact.
+      - uses: actions/download-artifact@v4
+        with:
+          name: public-tree-${{ github.sha }}
+          path: ${{ runner.temp }}/public-bundle
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify detached inventory and build without private repository
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/public-tree"
+          tar -C "$RUNNER_TEMP/public-tree" -xzf "$RUNNER_TEMP/public-bundle/public-tree.tar.gz"
+          python -B "$RUNNER_TEMP/public-tree/dev_harness/verify_public_export.py" \
+            --root "$RUNNER_TEMP/public-tree" \
+            --report "$RUNNER_TEMP/public-bundle/public-export-report.json"
+          cargo check --workspace --locked --all-targets \
+            --manifest-path "$RUNNER_TEMP/public-tree/Cargo.toml"
+          cargo check --locked --all-targets -p imparo-cuda --features cuda-dynamic \
+            --manifest-path "$RUNNER_TEMP/public-tree/Cargo.toml"
+          IMPARO_CUDA_SKIP_NVCC=1 cargo check --locked --all-targets \
+            -p imparo-cuda --features cuda-static \
+            --manifest-path "$RUNNER_TEMP/public-tree/Cargo.toml"
+          cargo check --locked --all-targets \
+            --manifest-path "$RUNNER_TEMP/public-tree/crates/imparo-program-pack/fuzz/Cargo.toml"
+          python -B "$RUNNER_TEMP/public-tree/dev_harness/verify_program_pack_release.py" \
+            cargo --repo "$RUNNER_TEMP/public-tree"
+
+  triton-aot-contract:
+    name: Triton AOT contract-only / readiness report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_ready: ${{ steps.lock.outputs.release_ready }}
+      builder_image: ${{ steps.lock.outputs.builder_image }}
+      image_sha256: ${{ steps.lock.outputs.image_sha256 }}
+      triton_revision: ${{ steps.lock.outputs.triton_revision }}
+      llvm_revision: ${{ steps.lock.outputs.llvm_revision }}
+      ptxas_version: ${{ steps.lock.outputs.ptxas_version }}
+      cuobjdump_version: ${{ steps.lock.outputs.cuobjdump_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.3'
+      - name: Builder golden and fail-closed tests (no Triton install)
+        run: |
+          python -B -m unittest discover -s tools/triton-pack/tests -v
+          python -B -m unittest dev_harness.test_program_pack_release dev_harness.test_triton_pack_smoke -v
+      - name: Resolve only a release-ready pinned builder
+        id: lock
+        shell: bash
+        env:
+          IMPARO_REQUIRE_TRITON_RELEASE: ${{ inputs.require_triton_release || false }}
+        run: |
+          python -B tools/triton-pack/lock_verify.py \
+            --lock tools/triton-pack/toolchain.lock
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          lock = json.loads(Path("tools/triton-pack/toolchain.lock").read_text(encoding="utf-8"))
+          digest = lock["builder"]["image_sha256"]
+          image_name = lock["builder"]["image"].split("@sha256:", 1)[0]
+          ready = (
+              lock["status"] == "release_ready"
+              and isinstance(digest, str)
+              and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+          )
+          require_release = os.environ.get("IMPARO_REQUIRE_TRITON_RELEASE") == "true"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"release_ready={'true' if ready else 'false'}", file=output)
+              print(f"builder_image={image_name}@sha256:{digest or 'not-release-ready'}", file=output)
+              print(f"image_sha256={digest or ''}", file=output)
+              print(f"triton_revision={lock['triton']['revision']}", file=output)
+              print(f"llvm_revision={lock['llvm']['revision']}", file=output)
+              print(f"ptxas_version={lock['cuda']['ptxas_version']}", file=output)
+              print(f"cuobjdump_version={lock['cuda']['cuobjdump_version']}", file=output)
+          if not ready:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("CONTRACT-ONLY PASS; formal Step 4 compile evidence is OPEN. The reviewed lock is not release_ready, so compile lanes were not run. A source-pin feasibility image or artifact is not release, hardware, or performance evidence.\n")
+              if require_release:
+                  raise SystemExit(
+                      "formal AOT release gate failed: toolchain.lock is not release_ready"
+                  )
+          PY
+
+  # Each exact SM is a separate compile-only evidence domain. This job intentionally
+  # stays skipped while toolchain.lock is source_pin_pre_release; it becomes runnable
+  # only after a separately reviewed builder image is pinned by digest. No hosted
+  # runner result from this job is hardware correctness or performance evidence.
+  triton-aot-compile:
+    name: Triton AOT compile-only (SM${{ matrix.sm }})
+    needs: triton-aot-contract
+    if: needs.triton-aot-contract.outputs.release_ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.triton-aot-contract.outputs.builder_image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sm: 80
+            target: cuda:80:32
+          - sm: 86
+            target: cuda:86:32
+    env:
+      IMPARO_BUILDER_IMAGE_SHA256: ${{ needs.triton-aot-contract.outputs.image_sha256 }}
+      IMPARO_TRITON_SOURCE_REVISION: ${{ needs.triton-aot-contract.outputs.triton_revision }}
+      IMPARO_TRITON_LLVM_REVISION: ${{ needs.triton-aot-contract.outputs.llvm_revision }}
+      IMPARO_PTXAS_VERSION: ${{ needs.triton-aot-contract.outputs.ptxas_version }}
+      IMPARO_CUOBJDUMP_VERSION: ${{ needs.triton-aot-contract.outputs.cuobjdump_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove builder has no PyTorch package/import
+        run: >-
+          python -I -c
+          "import importlib.util,sys,triton,triton.language;
+          assert importlib.util.find_spec('torch') is None;
+          assert 'torch' not in sys.modules"
+      - name: Two clean exact-SM builds
+        shell: bash
+        run: |
+          mkdir -p \
+            "$RUNNER_TEMP/home-a" "$RUNNER_TEMP/home-b" \
+            "$RUNNER_TEMP/cache-a" "$RUNNER_TEMP/cache-b" \
+            "$RUNNER_TEMP/tmp-a" "$RUNNER_TEMP/tmp-b"
+          HOME="$RUNNER_TEMP/home-a" \
+          XDG_CACHE_HOME="$RUNNER_TEMP/cache-a" \
+          TRITON_CACHE_DIR="$RUNNER_TEMP/cache-a/triton" \
+          TMPDIR="$RUNNER_TEMP/tmp-a" \
+            python tools/triton-pack/build.py \
+            --lock tools/triton-pack/toolchain.lock \
+            --target '${{ matrix.target }}' \
+            --source program-packs/community/cuda/smoke.py \
+            --out "$RUNNER_TEMP/pack-a"
+          HOME="$RUNNER_TEMP/home-b" \
+          XDG_CACHE_HOME="$RUNNER_TEMP/cache-b" \
+          TRITON_CACHE_DIR="$RUNNER_TEMP/cache-b/triton" \
+          TMPDIR="$RUNNER_TEMP/tmp-b" \
+            python tools/triton-pack/build.py \
+            --lock tools/triton-pack/toolchain.lock \
+            --target '${{ matrix.target }}' \
+            --source program-packs/community/cuda/smoke.py \
+            --out "$RUNNER_TEMP/pack-b"
+      - name: Sign, verify, scan, and compare exact bytes
+        shell: bash
+        run: |
+          openssl genpkey -algorithm Ed25519 -out "$RUNNER_TEMP/test-signing-key.pem"
+          openssl pkey -in "$RUNNER_TEMP/test-signing-key.pem" -pubout \
+            -out "$RUNNER_TEMP/test-signing-public.pem"
+          for pack in "$RUNNER_TEMP/pack-a" "$RUNNER_TEMP/pack-b"; do
+            python tools/triton-pack/sign.py \
+              --manifest "$pack/manifest.json" \
+              --private-key "$RUNNER_TEMP/test-signing-key.pem" \
+              --key-id imparo.ci.test
+            python tools/triton-pack/verify.py --require-signature \
+              --public-key "$RUNNER_TEMP/test-signing-public.pem" \
+              "$pack/manifest.json"
+            python dev_harness/verify_program_pack_release.py pack \
+              --root "$pack" --expected-sm '${{ matrix.sm }}'
+          done
+          diff --no-dereference --recursive "$RUNNER_TEMP/pack-a" "$RUNNER_TEMP/pack-b"
+          IMPARO_TRITON_SMOKE_PACK_A="$RUNNER_TEMP/pack-a" \
+          IMPARO_TRITON_SMOKE_PACK_B="$RUNNER_TEMP/pack-b" \
+          IMPARO_TRITON_EXPECT_FEASIBILITY=0 \
+            python -B -m unittest \
+              dev_harness.test_triton_pack_smoke.TritonPackArtifactTests -v
+          if [ '${{ matrix.sm }}' = '86' ]; then
+            openssl pkey -in "$RUNNER_TEMP/test-signing-key.pem" -pubout \
+              -outform DER -out "$RUNNER_TEMP/test-signing-public.der"
+            PUBLIC_DER="$RUNNER_TEMP/test-signing-public.der" \
+            PUBLIC_HEX="$RUNNER_TEMP/test-signing-public.hex" \
+              python -I -c \
+              "import os; from pathlib import Path; raw=Path(os.environ['PUBLIC_DER']).read_bytes(); assert len(raw)==44 and raw[:12].hex()=='302a300506032b6570032100'; Path(os.environ['PUBLIC_HEX']).write_text(raw[-32:].hex(),encoding='ascii',newline='\\n')"
+            mkdir "$RUNNER_TEMP/sm86-runtime-artifact"
+            cp -a "$RUNNER_TEMP/pack-a" "$RUNNER_TEMP/sm86-runtime-artifact/pack"
+            cp "$RUNNER_TEMP/test-signing-public.hex" \
+              "$RUNNER_TEMP/sm86-runtime-artifact/public-key.hex"
+            printf '%s\n' 'imparo.ci.test' \
+              > "$RUNNER_TEMP/sm86-runtime-artifact/key-id.txt"
+          fi
+      - name: Upload signed SM86 pack for the clean Windows runtime gate
+        if: matrix.sm == 86
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton-aot-sm86
+          path: ${{ runner.temp }}/sm86-runtime-artifact
+          if-no-files-found: error
+          retention-days: 1
+
+  # This formal lane consumes bytes built on Linux and launches them on the exact
+  # Windows/SM86 hardware domain. The custom labels are part of the evidence: a
+  # generic hosted Windows runner, a Python-equipped machine, or another SM cannot
+  # substitute for the reviewed clean runtime worker.
+  triton-sm86-windows-runtime:
+    name: Triton AOT Linux-to-clean-Windows SM86 runtime
+    needs: [triton-aot-contract, triton-aot-compile]
+    if: needs.triton-aot-contract.outputs.release_ready == 'true'
+    runs-on: [self-hosted, Windows, X64, imparo-cuda-sm86, imparo-no-python]
+    timeout-minutes: 30
+    env:
+      IMPARO_CUDA_ARCHS: '86'
+      IMPARO_CUDA_PROGRAM_SMOKE: '1'
+      IMPARO_REQUIRE_TRITON_SMOKE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the exact Linux-built signed SM86 pack
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-aot-sm86
+          path: ${{ runner.temp }}\triton-aot-sm86
+      - name: Prove this is a clean no-Python runtime and bind exact artifact inputs
+        shell: pwsh
+        run: |
+          $pythonCommands = @('python', 'python3', 'py') | ForEach-Object {
+            Get-Command $_ -ErrorAction SilentlyContinue
+          }
+          if ($pythonCommands) {
+            throw "formal clean-Windows runtime unexpectedly exposes Python"
+          }
+          $root = Join-Path $env:RUNNER_TEMP 'triton-aot-sm86'
+          $pack = Join-Path $root 'pack'
+          $publicKey = (Get-Content -Raw -LiteralPath (Join-Path $root 'public-key.hex')).Trim()
+          $keyId = (Get-Content -Raw -LiteralPath (Join-Path $root 'key-id.txt')).Trim()
+          if (-not (Test-Path -LiteralPath (Join-Path $pack 'manifest.sig') -PathType Leaf)) {
+            throw "downloaded SM86 artifact is missing manifest.sig"
+          }
+          if ($publicKey -cnotmatch '^[0-9a-f]{64}$') {
+            throw "downloaded Ed25519 public key is not canonical raw hex"
+          }
+          if ($keyId -cne 'imparo.ci.test') {
+            throw "downloaded signing key id is not the formal CI key"
+          }
+          "IMPARO_TRITON_SMOKE_PACK=$pack" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "IMPARO_TRITON_SMOKE_PUBLIC_KEY_HEX=$publicKey" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "IMPARO_TRITON_SMOKE_KEY_ID=$keyId" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Rust Installer admission and exact-SM86 CUDA launch (no Python/compiler)
+        shell: pwsh
+        run: >-
+          cargo test --release --locked -p imparo-cuda --features cuda-static triton_pack_
+          -- --nocapture --test-threads=1
+
   apple-silicon:
     # macos-14+ hosted runners are Apple arm64 (M series) -- required: this job
     # compiles the Metal backend for the machine the mac user actually has.
@@ -37,15 +352,22 @@ jobs:
         run: cargo test --release --locked
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
+      - name: Harness tests (pure Python, no GPU or model)
+        working-directory: dev_harness
+        run: python3 -m unittest test_harness test_det_gate test_seal_receipt test_speed_gate
 
   linux-nvidia:
     runs-on: ubuntu-latest
+    env:
+      IMPARO_CUDA_ARCHS: '86'
     steps:
       - uses: actions/checkout@v4
       # Caches ~/.cargo and target/ keyed by lockfile + toolchain; saves after the
       # first green run and cuts later runs to incremental-build time.
       - uses: Swatinem/rust-cache@v2
-      # Installs ONLY nvcc (network method; no GPU on runners -- compile coverage).
+      # Installs the minimal source-build toolchain (network method; no GPU on
+      # runners -- compile coverage). The opt-in cuBLAS kernel laboratory is part
+      # of source builds, so its development headers and link library are required.
       # The version is pinned so the compiler and the cache key are stable, and the
       # installer download is cached on GitHub's cache (use-github-cache, explicit
       # here though it is the action's default).
@@ -54,23 +376,40 @@ jobs:
           cuda: '12.9.1'
           method: network
           sub-packages: '["nvcc", "cudart"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
           use-github-cache: true
       - name: Build portable crates
         run: cargo build --release --locked
              -p imparo-gguf -p imparo-tokenize -p imparo-cpu -p imparo-backend -p imparo-kv
              -p imparo-host -p imparo-model -p imparo-server -p imparo-tune
+             -p imparo-program-pack
       - name: Tests
         run: cargo test --release --locked
              -p imparo-gguf -p imparo-tokenize -p imparo-cpu -p imparo-backend -p imparo-kv
              -p imparo-host -p imparo-model -p imparo-server
+             -p imparo-program-pack
+      - name: CUDA thin-runtime tests (no toolkit linkage)
+        run: cargo test --release --locked -p imparo-cuda --features cuda-dynamic
+      - name: Build CUDA thin server + tuner
+        run: cargo build --release --locked -p imparo-server -p imparo-tune --features cuda-dynamic
+      - name: Reject Python, PyTorch, or Triton runtime dependencies
+        run: |
+          python -B dev_harness/verify_program_pack_release.py cargo --repo .
+          python -B dev_harness/verify_program_pack_release.py binary \
+            target/release/imparo-server target/release/imparo-tune
       - name: Build CUDA-enabled server + tuner (nvcc compiles + links, no GPU to run)
         run: cargo build --release --locked -p imparo-server -p imparo-tune --features cuda
+      - name: Harness tests (pure Python, no GPU or model)
+        working-directory: dev_harness
+        run: python3 -m unittest test_harness test_det_gate test_seal_receipt test_speed_gate
 
   # Compile-only check against CUDA 13 (the newest major): 13 DROPPED
   # Maxwell/Pascal/Volta, so releases build with 12.x for hardware reach, while
   # this job keeps the kernels valid for the toolkit developers increasingly have.
   cuda-13-compat:
     runs-on: ubuntu-latest
+    env:
+      IMPARO_CUDA_ARCHS: '86'
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -79,6 +418,7 @@ jobs:
           cuda: '13.0.2'
           method: network
           sub-packages: '["nvcc", "cudart"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
           use-github-cache: true
       - name: Compile CUDA kernels under CUDA 13
         run: cargo build --release --locked -p imparo-cuda --features cuda
@@ -98,7 +438,22 @@ jobs:
         run: cargo build --release --locked
              -p imparo-gguf -p imparo-tokenize -p imparo-cpu -p imparo-backend -p imparo-kv
              -p imparo-host -p imparo-model -p imparo-server -p imparo-tune
+             -p imparo-program-pack
       - name: Tests
         run: cargo test --release --locked
              -p imparo-gguf -p imparo-tokenize -p imparo-cpu -p imparo-backend -p imparo-kv
              -p imparo-host -p imparo-model -p imparo-server
+             -p imparo-program-pack
+      - name: CUDA thin-runtime tests (no toolkit linkage)
+        run: cargo test --release --locked -p imparo-cuda --features cuda-dynamic
+      - name: Build CUDA thin server + tuner
+        run: cargo build --release --locked -p imparo-server -p imparo-tune --features cuda-dynamic
+      - name: Reject Python, PyTorch, or Triton runtime dependencies
+        shell: pwsh
+        run: |
+          python -B dev_harness/verify_program_pack_release.py cargo --repo .
+          python -B dev_harness/verify_program_pack_release.py binary `
+            target/release/imparo-server.exe target/release/imparo-tune.exe
+      - name: Harness tests (pure Python, no GPU or model)
+        working-directory: dev_harness
+        run: python -m unittest test_harness test_det_gate test_seal_receipt test_speed_gate

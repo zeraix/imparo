@@ -7,6 +7,11 @@ license.workspace = true
 
 [features]
 cuda = ["imparo-model/cuda", "dep:imparo-cuda"]
+cuda-dynamic = [
+    "imparo-model/cuda-dynamic",
+    "dep:imparo-cuda",
+    "imparo-cuda/cuda-dynamic",
+]
 
 [dependencies]
 imparo-cuda = { path = "../imparo-cuda", optional = true }

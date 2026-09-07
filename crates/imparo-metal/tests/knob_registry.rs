@@ -12,6 +12,8 @@ use imparo_metal::MetalBackend;
 /// Q8_0 = 2 on the wire, so its presence is bit 2 of the mask.
 const Q8_BIT: u32 = 1 << 2;
 const Q4_BIT: u32 = 1 << 1;
+/// Q8_0_TM (tile-major, imparo-repack) = 3 on the wire.
+const TM_BIT: u32 = 1 << 3;
 
 fn facts(weight_kinds: u32) -> ModelFacts {
     // gemma4 E4B's shape, which is the model this registry was tuned against; only
@@ -47,7 +49,27 @@ fn the_q8_family_applies_only_to_a_model_with_q8_weights() {
     assert!(!knobs.is_empty(), "no q8_ knobs in the registry");
     for d in &knobs {
         let applies = d.applies.expect("a q8 knob must declare `applies`");
-        assert!(applies(&facts(Q8_BIT)), "{} should apply to a Q8_0 model", d.name);
+        if d.name.starts_with("q8_tm_") {
+            // The tile-major sub-family governs kernels only a Q8_0_TM tensor dispatches:
+            // it must not be swept on a plain Q8_0 model (the workload would rank the
+            // row-major kernel), and must be on a converted one.
+            assert!(
+                applies(&facts(TM_BIT)),
+                "{} should apply to a Q8_0_TM (converted) model",
+                d.name
+            );
+            assert!(
+                !applies(&facts(Q8_BIT)),
+                "{} must NOT be swept on a row-major Q8_0 model",
+                d.name
+            );
+            continue;
+        }
+        assert!(
+            applies(&facts(Q8_BIT)),
+            "{} should apply to a Q8_0 model",
+            d.name
+        );
         assert!(
             applies(&facts(Q8_BIT | Q4_BIT)),
             "{} should apply to a mixed model that contains Q8_0",
@@ -56,6 +78,42 @@ fn the_q8_family_applies_only_to_a_model_with_q8_weights() {
         assert!(
             !applies(&facts(Q4_BIT)),
             "{} must NOT be swept on a Q4_0-only model",
+            d.name
+        );
+    }
+}
+
+#[test]
+fn the_q4_family_applies_only_to_a_model_with_q4_weights() {
+    // sgs / lanes / nr0 / nb8_* / gemv_max_tok / rt_shape select Q4 kernels the Q8 route never
+    // dispatches; on a Q8-only model they must be skipped, not swept and recorded.
+    for d in MetalBackend.knob_registry() {
+        if !matches!(
+            d.name,
+            "sgs"
+                | "lanes"
+                | "nr0"
+                | "nb8_shape"
+                | "nb8_max"
+                | "gemv_max_tok"
+                | "rt_shape"
+        ) {
+            continue;
+        }
+        let applies = d.applies.expect("a q4 knob must declare `applies`");
+        assert!(
+            applies(&facts(Q4_BIT)),
+            "{} must apply to a Q4 model",
+            d.name
+        );
+        assert!(
+            applies(&facts(Q4_BIT | Q8_BIT)),
+            "{} must apply to a mixed model",
+            d.name
+        );
+        assert!(
+            !applies(&facts(Q8_BIT)),
+            "{} must not apply to a Q8-only model",
             d.name
         );
     }
@@ -86,7 +144,12 @@ fn every_declared_candidate_round_trips_through_its_setter() {
             );
         }
         (d.apply)(saved);
-        assert_eq!((d.current)(), saved, "{}: failed to restore {saved}", d.name);
+        assert_eq!(
+            (d.current)(),
+            saved,
+            "{}: failed to restore {saved}",
+            d.name
+        );
     }
 }
 
@@ -102,7 +165,11 @@ fn a_boundary_knob_carries_no_candidate_list() {
                 d.name
             );
             assert!(!ladder.is_empty(), "{}: empty ladder", d.name);
-            assert_ne!(hi, lo, "{}: hi and lo must select different kernels", d.name);
+            assert_ne!(
+                hi, lo,
+                "{}: hi and lo must select different kernels",
+                d.name
+            );
         }
     }
 }
@@ -116,7 +183,8 @@ fn every_after_dependency_is_declared_earlier() {
     for (i, d) in reg.iter().enumerate() {
         for dep in d.after {
             let at = reg.iter().position(|o| o.name == *dep);
-            let at = at.unwrap_or_else(|| panic!("{}: `after` names unknown {dep}", d.name));
+            let at =
+                at.unwrap_or_else(|| panic!("{}: `after` names unknown {dep}", d.name));
             assert!(
                 at < i,
                 "{}: depends on {dep}, which is declared later ({at} >= {i})",

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://imparo.dev/schemas/program-pack-signature-v1.schema.json",
+  "title": "Imparo Program Pack v1 signature envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "domain",
+    "algorithm",
+    "key_id",
+    "manifest_bytes",
+    "manifest_sha256",
+    "signature"
+  ],
+  "properties": {
+    "schema": { "const": 1 },
+    "domain": { "const": "imparo-program-pack-v1" },
+    "algorithm": { "const": "ed25519" },
+    "key_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)+(?![\\s\\S])"
+    },
+    "manifest_bytes": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 1048576
+    },
+    "manifest_sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 86,
+      "maxLength": 86,
+      "pattern": "^[A-Za-z0-9_-]{86}$"
+    }
+  }
+}

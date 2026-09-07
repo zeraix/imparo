@@ -247,8 +247,10 @@ impl KvCache {
         );
         for t in 0..b {
             let pos = start_pos + t;
-            self.k[li][pos * w..(pos + 1) * w].copy_from_slice(&kbuf[t * w..(t + 1) * w]);
-            self.v[li][pos * w..(pos + 1) * w].copy_from_slice(&vbuf[t * w..(t + 1) * w]);
+            self.k[li][pos * w..(pos + 1) * w]
+                .copy_from_slice(&kbuf[t * w..(t + 1) * w]);
+            self.v[li][pos * w..(pos + 1) * w]
+                .copy_from_slice(&vbuf[t * w..(t + 1) * w]);
         }
     }
 }
@@ -300,9 +302,13 @@ impl RecurrentState {
     /// Bytes one conversation holds, for the footprint report.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.r.iter().chain(self.s.iter()).map(Vec::len).sum::<usize>() * 4
+        self.r
+            .iter()
+            .chain(self.s.iter())
+            .map(Vec::len)
+            .sum::<usize>()
+            * 4
     }
-
 }
 
 // ---------------------------------------------------------------------------------------
@@ -360,13 +366,7 @@ pub fn norm_and_rope(
             let off = t * row + h * s.head_dim;
             let x = &mut buf[off..off + s.head_dim];
             ops::rms_norm(x, norm, s.eps);
-            ops::rope_neox(
-                x,
-                (s.start_pos + t) as u32,
-                s.rope_dim,
-                s.rope_base,
-                freq,
-            );
+            ops::rope_neox(x, (s.start_pos + t) as u32, s.rope_dim, s.rope_base, freq);
         }
     }
 }
@@ -501,7 +501,10 @@ mod tests {
         // Token 1 sees both; scores 0 and 1 -> softmax weights that must sum to 1.
         let sum = out[2] + out[3];
         assert!((sum - 1.0).abs() < 1e-6, "weights sum to {sum}");
-        assert!(out[3] > out[2], "position 1 scores higher and must weigh more");
+        assert!(
+            out[3] > out[2],
+            "position 1 scores higher and must weigh more"
+        );
     }
 
     /// The window bounds the LOW end, so a window of 1 leaves each token attending to

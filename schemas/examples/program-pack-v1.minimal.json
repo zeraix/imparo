@@ -1,0 +1,175 @@
+{
+  "schema": 1,
+  "program_pack_abi": 1,
+  "pack_id": "com.zeraix.imparo.community.cuda.sm86",
+  "pack_version": "1.0.0",
+  "distribution": "community",
+  "release_channel": "imparo.community.stable",
+  "required_entitlement_features": [],
+  "backend": "cuda",
+  "engine_api": {
+    "min": 1,
+    "max_exclusive": 2
+  },
+  "backend_abi": {
+    "min": 26,
+    "max_exclusive": 27
+  },
+  "target": {
+    "sm": 86,
+    "warp_size": 32,
+    "driver_min": 12000,
+    "math_mode": "strict"
+  },
+  "required_extensions": [],
+  "optional_extensions": [],
+  "toolchain": {
+    "builder_image_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "build_recipe_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "producer": {
+      "kind": "triton",
+      "triton_revision": "1111111111111111111111111111111111111111",
+      "triton_version": "3.8.0",
+      "python": "3.12",
+      "cuda_toolkit": "13.0"
+    }
+  },
+  "modules": [
+    {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "file": "modules/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.cubin",
+      "format": "cubin",
+      "bytes": 4096,
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ],
+  "choice_groups": [
+    {
+      "choice_group_id": "imparo.cuda.noop.v1",
+      "contract": {
+        "id": "imparo.cuda.noop",
+        "revision": 1,
+        "sha256": "1dfdc9d9adccd9b7fa9f539126c51bd16d83d0c365134cbcc0f6e276588b3fc6"
+      },
+      "workload": {
+        "workload_id": "imparo.workload.attention_decode",
+        "revision": 1,
+        "parameters": {},
+        "parameters_sha256": "1aa54ff326d23ef77b0dd6db032f335ae5d32710cff814846b28b7a2fc3ad351",
+        "fixture_sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+      },
+      "screened": true,
+      "bit_affecting": false,
+      "joint_with": []
+    }
+  ],
+  "variants": [
+    {
+      "variant_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "config_id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "choice_group_id": "imparo.cuda.noop.v1",
+      "contract": {
+        "id": "imparo.cuda.noop",
+        "revision": 1,
+        "sha256": "1dfdc9d9adccd9b7fa9f539126c51bd16d83d0c365134cbcc0f6e276588b3fc6"
+      },
+      "module_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "symbol": "ip_3333333333333333333333333333333333333333333333333333333333333333",
+      "constraints": {
+        "shapes": [],
+        "dtypes": [
+          {
+            "slot": "input",
+            "allowed": ["f16"]
+          }
+        ],
+        "quantizations": [
+          {
+            "slot": "input",
+            "allowed": ["none"]
+          }
+        ],
+        "layouts": [
+          {
+            "slot": "input",
+            "allowed": ["contiguous"]
+          }
+        ],
+        "alignments": [
+          {
+            "slot": "input",
+            "bytes": 16
+          }
+        ]
+      },
+      "effects": [
+        {
+          "slot": "input",
+          "access": "read",
+          "aliasing": []
+        }
+      ],
+      "scratch": {
+        "max_bytes": 0,
+        "alignment": 16,
+        "zero_initialized": false
+      },
+      "launch": {
+        "arguments": [
+          {
+            "kind": "slot",
+            "slot": "input",
+            "wire_type": "tensor_ptr"
+          }
+        ],
+        "grid": {
+          "x": {
+            "kind": "const",
+            "value": 1
+          },
+          "y": {
+            "kind": "const",
+            "value": 1
+          },
+          "z": {
+            "kind": "const",
+            "value": 1
+          }
+        },
+        "block": {
+          "x": 32,
+          "y": 1,
+          "z": 1
+        },
+        "dynamic_shared_bytes": {
+          "kind": "const",
+          "value": 0
+        }
+      },
+      "resources": {
+        "registers_per_thread_max": 64,
+        "static_shared_bytes_max": 0,
+        "dynamic_shared_bytes_max": 0,
+        "local_memory_bytes_max": 0,
+        "threads_per_block_max": 32
+      },
+      "graph_capture": "forbidden",
+      "graph_update_slots": [],
+      "numerical_class": {
+        "kind": "gate_bounded",
+        "gate_suite": "imparo.cuda.gates.v1",
+        "contract_version": 1
+      },
+      "determinism": "required",
+      "bit_affecting": false,
+      "required_entitlement_features": [],
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "joint_with": []
+    }
+  ],
+  "notices_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+  "sbom_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "provenance_sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+}

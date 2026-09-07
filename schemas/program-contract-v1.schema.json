@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://imparo.dev/schemas/program-contract-v1.schema.json",
+  "title": "Imparo Program Pack operation contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_abi",
+    "contract_id",
+    "revision",
+    "engine_adapter",
+    "stream_semantics",
+    "state_reset",
+    "slots",
+    "kernel_arguments",
+    "allowed_workloads",
+    "allowed_numerical_classes",
+    "allowed_graph_capture",
+    "scratch_max_bytes",
+    "scratch_zero_initialized",
+    "resource_ceilings"
+  ],
+  "properties": {
+    "contract_abi": { "const": 1 },
+    "contract_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)+(?![\\s\\S])"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "engine_adapter": { "$ref": "#/$defs/engineAdapter" },
+    "stream_semantics": { "const": "current_backend_stream" },
+    "state_reset": { "$ref": "#/$defs/stateReset" },
+    "slots": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/slot" }
+    },
+    "kernel_arguments": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/kernelArgument" }
+    },
+    "allowed_workloads": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/workloadAuthority" }
+    },
+    "allowed_numerical_classes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "enum": ["bit_exact", "gate_bounded", "diagnostic_only"] }
+    },
+    "allowed_graph_capture": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "enum": ["forbidden", "capture_only", "replay_update_safe"] }
+    },
+    "scratch_max_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2147483648
+    },
+    "scratch_zero_initialized": { "type": "boolean" },
+    "resource_ceilings": { "$ref": "#/$defs/resourceCeilings" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "namespacedId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)+(?![\\s\\S])"
+    },
+    "workloadAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workload_id", "revision", "fixture_sha256"],
+      "properties": {
+        "workload_id": {
+          "enum": [
+            "imparo.workload.decode_mix",
+            "imparo.workload.narrow_mix",
+            "imparo.workload.attention_decode",
+            "imparo.workload.attention_decode_deep",
+            "imparo.workload.attention_prefill",
+            "imparo.workload.attention_prefill_deep",
+            "imparo.workload.decode_attention_step",
+            "imparo.workload.attention_prefill_reuse",
+            "imparo.workload.prefill_gemm"
+          ]
+        },
+        "revision": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "fixture_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "engineAdapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "sha256"],
+      "properties": {
+        "id": { "$ref": "#/$defs/namespacedId" },
+        "revision": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "stateReset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "revision"],
+      "properties": {
+        "authority": { "const": "engine_adapter" },
+        "revision": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+      }
+    },
+    "slotId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*(?![\\s\\S])"
+    },
+    "alias": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "target_slot"],
+      "properties": {
+        "mode": { "enum": ["forbidden", "may_alias", "must_alias"] },
+        "target_slot": { "$ref": "#/$defs/slotId" }
+      }
+    },
+    "slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slot_id",
+        "abi_index",
+        "kind",
+        "wire_type",
+        "role",
+        "access",
+        "lifetime",
+        "graph_mutability",
+        "rank",
+        "extent_authority",
+        "stride_authority",
+        "alignment",
+        "state_initialization",
+        "allowed_dtypes",
+        "allowed_quantizations",
+        "allowed_layouts",
+        "aliasing"
+      ],
+      "properties": {
+        "slot_id": { "$ref": "#/$defs/slotId" },
+        "abi_index": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "kind": {
+          "enum": [
+            "tensor_ptr",
+            "state_ptr",
+            "scratch_ptr",
+            "scalar_i32",
+            "scalar_u32",
+            "scalar_u64",
+            "scalar_f32"
+          ]
+        },
+        "wire_type": {
+          "enum": ["device_u64", "i32", "u32", "u64", "f32_bits"]
+        },
+        "role": { "enum": ["input", "output", "state", "scratch", "shape"] },
+        "access": { "enum": ["read", "write", "read_write"] },
+        "lifetime": { "enum": ["invocation", "graph", "conversation", "model"] },
+        "graph_mutability": { "enum": ["capture_static", "replay_update"] },
+        "rank": { "type": "integer", "minimum": 0, "maximum": 8 },
+        "extent_authority": { "const": "engine_adapter" },
+        "stride_authority": { "const": "engine_adapter" },
+        "alignment": {
+          "enum": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+        },
+        "state_initialization": {
+          "enum": ["none", "zero", "engine_initialized", "contract_defined"]
+        },
+        "allowed_dtypes": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "enum": ["f16", "bf16", "f32", "i32", "u32", "u64"] }
+        },
+        "allowed_quantizations": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "enum": ["none", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0"] }
+        },
+        "allowed_layouts": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "contiguous",
+              "row_major",
+              "column_major",
+              "paged_kv",
+              "head_major"
+            ]
+          }
+        },
+        "aliasing": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/alias" }
+        }
+      }
+    },
+    "kernelArgument": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["abi_index", "kind", "slot", "wire_type"],
+          "properties": {
+            "abi_index": { "type": "integer", "minimum": 0, "maximum": 65535 },
+            "kind": { "const": "slot" },
+            "slot": { "$ref": "#/$defs/slotId" },
+            "wire_type": {
+              "enum": [
+                "tensor_ptr",
+                "state_ptr",
+                "scratch_ptr",
+                "scalar_i32",
+                "scalar_u32",
+                "scalar_u64",
+                "scalar_f32"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["abi_index", "kind", "name", "min", "max"],
+          "properties": {
+            "abi_index": { "type": "integer", "minimum": 0, "maximum": 65535 },
+            "kind": { "const": "manifest_u32" },
+            "name": { "$ref": "#/$defs/slotId" },
+            "min": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "max": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          }
+        }
+      ]
+    },
+    "resourceCeilings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registers_per_thread_max",
+        "static_shared_bytes_max",
+        "dynamic_shared_bytes_max",
+        "local_memory_bytes_max",
+        "threads_per_block_max"
+      ],
+      "properties": {
+        "registers_per_thread_max": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "static_shared_bytes_max": { "type": "integer", "minimum": 0, "maximum": 262144 },
+        "dynamic_shared_bytes_max": { "type": "integer", "minimum": 0, "maximum": 262144 },
+        "local_memory_bytes_max": { "type": "integer", "minimum": 0, "maximum": 1073741824 },
+        "threads_per_block_max": { "type": "integer", "minimum": 1, "maximum": 1024 }
+      }
+    }
+  }
+}

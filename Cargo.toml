@@ -6,6 +6,7 @@ members = [
     "crates/imparo-host",
     "crates/imparo-metal",
     "crates/imparo-model",
+    "crates/imparo-program-pack",
     "crates/imparo-kv",
     "crates/imparo-server",
     "crates/imparo-tokenize",

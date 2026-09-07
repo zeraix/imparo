@@ -16,6 +16,9 @@
 //! is deliberately COARSE -- if it is wrong the cost is a re-benchmark, never a wrong
 //! answer, which is what separates it from the correctness key.
 
+pub mod correctness;
+pub mod receipted_config;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -88,12 +91,41 @@ pub fn fingerprint_for(device: &str, space: u32, kv: &str) -> String {
     format!("{}|dev={device}|space=v{space}|kv={kv}", fingerprint())
 }
 
-/// Host identity a stored tuning is valid for: CPU brand, core count, memory, OS
-/// version, and the search-space version. Per-OS collection; every branch degrades to
-/// empty strings rather than failing, because a wrong fingerprint only costs a
-/// re-benchmark, never a wrong answer.
+/// Canonical cache-type component of every host-config key and correctness receipt.
+/// Equal K/V types retain the historic short spelling; mixed types use one comma.
+/// Backends and tools must call this helper instead of choosing their own separator.
+#[must_use]
+pub fn canonical_kv_tag(k: &str, v: &str) -> String {
+    if k == v {
+        k.to_owned()
+    } else {
+        format!("{k},{v}")
+    }
+}
+
+/// Host identity a stored tuning is valid for: CPU brand, core count, memory.
+///
+/// THE OS VERSION IS DELIBERATELY NOT HERE, and it used to be. What a tuning measures is
+/// the hardware; the OS string was standing in for the Metal toolchain, and it is a bad
+/// proxy in both directions -- a security patch moves it when codegen did not, and a
+/// toolchain update need not move it at all. macOS 15.7.7 -> 15.7.9 discarded both the
+/// tune config and the measured device profile on this machine, silently, and the engine
+/// ran on compiled defaults until someone measured it.
+///
+/// The asymmetry decides it: a key that is too LOOSE costs a re-benchmark, while a key
+/// that is too STRICT costs the whole tuning with one log line to say so. The OS version
+/// is recorded inside the file instead (see `toolchain`), where a mismatch warns and
+/// keeps the values.
+///
+/// Per-OS collection; every branch degrades to empty strings rather than failing.
 #[must_use]
 pub fn fingerprint() -> String {
+    let (cpu, cores, mem, os) = host_facts();
+    let _ = &os;
+    format!("{cpu}|cores={cores}|mem={mem}")
+}
+
+fn host_facts() -> (String, String, String, String) {
     #[cfg(target_os = "macos")]
     let (cpu, cores, mem, os) = {
         let sysctl = |k: &str| -> String {
@@ -145,8 +177,10 @@ pub fn fingerprint() -> String {
         let cpu = read("/proc/cpuinfo")
             .lines()
             .find_map(|l| {
-                l.strip_prefix("model name")
-                    .map(|r| r.trim_start_matches([' ', ':']).to_string())
+                l.strip_prefix("model name").map(|r| {
+                    r.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ':')
+                        .to_string()
+                })
             })
             .unwrap_or_default();
         let mem = read("/proc/meminfo")
@@ -165,7 +199,21 @@ pub fn fingerprint() -> String {
             .unwrap_or_default();
         (cpu, cores, mem, os)
     };
-    format!("{cpu}|cores={cores}|mem={mem}|os={os}")
+    (cpu, cores, mem, os)
+}
+
+/// The toolchain the stored numbers were produced under -- the OS version, which is the
+/// available proxy for the shader compiler that turns our Metal source into GPU code.
+///
+/// ADVISORY, NOT PART OF ANY KEY. A mismatch means "these numbers were measured under a
+/// different compiler, they may have drifted", which is a reason to warn and suggest a
+/// re-tune, not a reason to throw them away. The value that is genuinely a compiler
+/// property is the register spill cliff, and re-measuring that is one command:
+/// `imparo-tune MODEL --discover-only`.
+#[must_use]
+pub fn toolchain() -> String {
+    let (_cpu, _cores, _mem, os) = host_facts();
+    os
 }
 
 #[must_use]
@@ -176,13 +224,166 @@ pub fn slug(fp: &str) -> String {
         .to_lowercase()
 }
 
+/// One shared root for tuner writers and runtime readers.
+///
+/// Windows commonly has no `HOME`; `USERPROFILE` is the required fallback there.
 #[must_use]
-pub fn path_for(fp: &str) -> PathBuf {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
-    let dir = home
-        .map_or_else(|_| PathBuf::from("."), PathBuf::from)
-        .join(".imparo");
-    dir.join(format!("tune-{}.txt", slug(fp)))
+pub fn config_dir() -> PathBuf {
+    config_dir_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+fn config_dir_from(
+    home: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+) -> PathBuf {
+    home.or(user_profile)
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join(".imparo")
+}
+
+/// THE MODEL IS PART OF THE TUNE FILE'S KEY.
+///
+/// A tuning is measured on one model's shapes, and the reader has always refused a file
+/// whose `model_bytes=` line names another model. But until 2026-09-01 the file's NAME
+/// carried only host, backend, space and cache type, so two models tuned on one host took
+/// turns overwriting the same file, and the loser ran on compiled defaults with one log
+/// line saying so: every E4B run from Aug 31 to Sep 1 was untuned because LFM2 had been
+/// tuned last. The byte count is the key (it is what the reader checks and the tuner has
+/// before it opens the model); the model's name stays inside the file for people.
+#[must_use]
+pub fn path_for(fp: &str, model_bytes: u64) -> PathBuf {
+    config_dir().join(format!("tune-{}-model-{model_bytes}.txt", slug(fp)))
+}
+
+/// The pre-2026-09-01 name: one file per host, backend, space and cache type, whichever
+/// model was tuned last. Read as a fallback so a tuning measured before the model joined
+/// the key is not lost; never written.
+#[must_use]
+pub fn legacy_path_for(fp: &str) -> PathBuf {
+    config_dir().join(format!("tune-{}.txt", slug(fp)))
+}
+
+/// THE DEVICE PROFILE IS KEYED BY THE HOST AND THE BACKEND, AND BY NOTHING ELSE.
+///
+/// What a GPU's register file, cache and DRAM do is a property of the machine. It was
+/// stored in the tune file, which is additionally keyed by the knob-space version, the
+/// KV cache type and the model -- so a measurement that was still true got discarded by
+/// three things that cannot change it:
+///
+///   add a knob        -> space v12 -> v13 -> file not found
+///   tune f16, run q4  -> kv tag differs        -> file not found
+///   tune E4B, run LFM -> model_bytes differs   -> mismatch
+///
+/// and every shape derived from the measurement silently reverted to its compiled
+/// fallback, which is the literal that deriving it was meant to replace.
+#[must_use]
+pub fn device_fingerprint_for(device: &str) -> String {
+    format!("{}|dev={device}", fingerprint())
+}
+
+#[must_use]
+pub fn device_path_for(device: &str) -> PathBuf {
+    config_dir().join(format!(
+        "device-{}.txt",
+        slug(&device_fingerprint_for(device))
+    ))
+}
+
+/// Reads this host's measured device profile, or `None` when there is none for this
+/// host. A file written on another machine is REFUSED, not adapted: these numbers are
+/// the ground truth other values are derived from, so a wrong one is worse than absent.
+#[must_use]
+pub fn read_device_profile(device: &str) -> Option<Vec<(String, u64)>> {
+    let want = device_fingerprint_for(device);
+    let body = std::fs::read_to_string(device_path_for(device)).ok()?;
+    let mut fp = String::new();
+    let mut stored_toolchain = String::new();
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        if k == "fingerprint" {
+            fp = v.to_string();
+        } else if k == "toolchain" {
+            stored_toolchain = v.to_string();
+        } else if k.starts_with("device_") {
+            if let Ok(n) = v.parse::<u64>() {
+                out.push((k.to_string(), n));
+            }
+        }
+    }
+    if fp != want {
+        eprintln!(
+            "[imparo] device profile at {} was measured on another host; ignored",
+            device_path_for(device).display()
+        );
+        return None;
+    }
+    // The spill cliff IS a compiler property, so this is the profile most exposed to a
+    // toolchain change -- and still not a reason to discard a measurement and silently
+    // ship a compiled fallback in its place. Warn; `--discover-only` re-measures in
+    // seconds.
+    let now = toolchain();
+    if !stored_toolchain.is_empty() && stored_toolchain != now {
+        eprintln!(
+            "[imparo] device profile was measured under {stored_toolchain}, running \
+             {now}; values kept -- re-run `imparo-tune MODEL --discover-only` to refresh"
+        );
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Writes this host's measured device profile. The tuner calls this once per machine;
+/// `discover` measures it in seconds and a process start cannot afford to at all.
+///
+/// # Errors
+/// Propagates any filesystem error from creating the directory or writing the file.
+pub fn write_device_profile(
+    device: &str,
+    values: &[(&str, u64)],
+) -> std::io::Result<()> {
+    let mut body = String::new();
+    {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            body,
+            "# imparo device profile -- MEASURED properties of this machine's {device} GPU."
+        );
+        let _ = writeln!(
+            body,
+            "# Not a tuning: no knob, model or cache type is part of this file's key,"
+        );
+        let _ = writeln!(
+            body,
+            "# because none of them changes what the hardware does."
+        );
+        let _ = writeln!(body, "fingerprint={}", device_fingerprint_for(device));
+        let _ = writeln!(body, "toolchain={}", toolchain());
+    }
+    for (k, v) in values {
+        use std::fmt::Write as _;
+        let _ = writeln!(body, "{k}={v}");
+    }
+    let path = device_path_for(device);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    receipted_config::write_atomic(&path, body.as_bytes())
+}
+
+/// Resolve an explicit candidate/config path or this host's canonical default.
+/// `IMPARO_HOST_CONFIG` is shared by the receipt sealer and runtime loader.
+#[must_use]
+pub fn selected_config_path(fp: &str, model_bytes: u64) -> PathBuf {
+    std::env::var_os("IMPARO_HOST_CONFIG")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| path_for(fp, model_bytes), PathBuf::from)
 }
 
 /// Every value a stored file can carry, parsed but NOT applied.
@@ -205,19 +406,10 @@ pub fn path_for(fp: &str) -> PathBuf {
 pub struct Stored {
     /// Backend knob values, in file order. Interpretation belongs to the backend.
     pub knobs: Vec<(String, u32)>,
-    /// MEASURED device ground truth, `device_`-prefixed in the file.
-    ///
-    /// Cached because measuring it costs seconds -- a spill-cliff sweep and a cache-knee
-    /// sweep -- which the tuner can afford once and an engine start cannot afford at all.
-    /// The engine needs these before it compiles its kernel library, because shape values
-    /// are DERIVED from them and injected as preprocessor defines. Without the cache a
-    /// derivation would have to fall back to a literal, which is the thing deriving it
-    /// was for.
-    ///
-    /// Keyed by the same host fingerprint as the knobs, so a profile measured on another
-    /// machine is never read here.
-    pub device: Vec<(String, u64)>,
     pub batch: Option<usize>,
+    /// The file the knobs were read from (the exact space's file, or an older space's
+    /// carried forward).
+    pub path: PathBuf,
 }
 
 /// Reads this host's stored configuration for one backend without applying any of it.
@@ -240,22 +432,117 @@ pub fn read_for_device(
     device: (&str, u32, &str),
 ) -> Option<Stored> {
     let fp = fingerprint_for(device.0, device.1, device.2);
-    let path = path_for(&fp);
-    let Ok(body) = std::fs::read_to_string(&path) else {
-        // Say so. A missing file once returned silently, so an untuned engine looked
-        // exactly like a tuned one in a benchmark. The search-space version is part of
-        // the FILENAME, so bumping it lands here rather than in the mismatch branch.
-        if !quiet {
-            eprintln!(
-                "[imparo] no host config at {}; using defaults (run imparo-tune)",
-                path.display()
-            );
+    let path = path_for(&fp, model_bytes);
+    // THE OVERRIDE FIRST, AND LOUDLY. `IMPARO_HOST_CONFIG` names one file to run; it is what
+    // a written-file A/B and the receipt sealer use. Until 2026-09-02 only
+    // `selected_config_path` (the untuned check) read it and this loader went straight to
+    // the canonical lookup, so an "A/B of the written file" ran the stored file on both
+    // arms and could only ever tie (review #116, #120). A set-but-unusable override is
+    // reported and NOT silently replaced by the lookup: that is the same trap again.
+    if let Some(over) = std::env::var_os("IMPARO_HOST_CONFIG").filter(|v| !v.is_empty())
+    {
+        // Logged as the ABSOLUTE path: a relative override in a log line cannot be checked
+        // against the file that actually ran once the working directory is gone.
+        let over = PathBuf::from(over);
+        let over = std::fs::canonicalize(&over).unwrap_or(over);
+        match std::fs::read_to_string(&over) {
+            Ok(body) => {
+                if let Some(mut c) = parse_stored(&body, &fp, &over, model_bytes, quiet)
+                {
+                    c.path.clone_from(&over);
+                    if !quiet {
+                        eprintln!(
+                            "[imparo] host config loaded from IMPARO_HOST_CONFIG ({})",
+                            over.display()
+                        );
+                    }
+                    return Some(c);
+                }
+                eprintln!(
+                    "[imparo] IMPARO_HOST_CONFIG={} does not parse for this device/space/model; \
+                     running compiled defaults, NOT the stored file",
+                    over.display()
+                );
+                return None;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[imparo] IMPARO_HOST_CONFIG={} unreadable ({e}); running compiled \
+                     defaults, NOT the stored file",
+                    over.display()
+                );
+                return None;
+            }
         }
-        return None;
-    };
+    }
+    // CANDIDATES, NEWEST SPACE FIRST, THE MODEL-KEYED NAME BEFORE THE LEGACY ONE.
+    //
+    // Carry forward across a space bump: the search-space version is part of the
+    // filename, so adding one knob used to make every measured value on this host vanish
+    // at once -- the engine ran compiled defaults (st_gemm_large_shape 7 -> 3 was a
+    // measured -4% on LFM2) and nothing but one log line said so. A knob that was
+    // measured is still measured after another knob joins the space. So the newest OLDER
+    // space's file for the same host, cache type and model is read instead; its knobs
+    // apply through the registry as before (a key the build no longer has is reported and
+    // ignored there), and the knobs added since keep their compiled defaults until
+    // imparo-tune seats them.
+    //
+    // The legacy (un-keyed) name is content-checked like any other candidate: it may hold
+    // another model's tuning, which is a miss, not an error, and the search goes on.
+    for space in (1..=device.1).rev() {
+        let space_fp = fingerprint_for(device.0, space, device.2);
+        for candidate in [path_for(&space_fp, model_bytes), legacy_path_for(&space_fp)]
+        {
+            let Ok(body) = std::fs::read_to_string(&candidate) else {
+                continue;
+            };
+            let Some(mut c) =
+                parse_stored(&body, &space_fp, &candidate, model_bytes, true)
+            else {
+                continue;
+            };
+            c.path.clone_from(&candidate);
+            if !quiet {
+                // Re-run the parse loudly for its advisory lines (toolchain drift).
+                let _ = parse_stored(&body, &space_fp, &candidate, model_bytes, false);
+                if space != device.1 {
+                    eprintln!(
+                        "[imparo] host config carried forward from search space v{space} \
+                         ({}); knobs added since keep their compiled defaults -- run \
+                         imparo-tune to seat them and write the v{} file",
+                        candidate.display(),
+                        device.1
+                    );
+                }
+            }
+            return Some(c);
+        }
+    }
+    // Say so. A missing file once returned silently, so an untuned engine looked exactly
+    // like a tuned one in a benchmark.
+    if !quiet {
+        eprintln!(
+            "[imparo] no host config at {} (nor an older space's, nor a pre-model-key file \
+             measured on this model); using defaults (run imparo-tune)",
+            path.display()
+        );
+    }
+    None
+}
+
+/// One stored file: the knob lines it carries, if it was written for this host, this
+/// search space (`expected_fp`) and this model.
+fn parse_stored(
+    body: &str,
+    expected_fp: &str,
+    path: &std::path::Path,
+    model_bytes: u64,
+    quiet: bool,
+) -> Option<Stored> {
     let mut c = Stored::default();
     let mut stored_fp = String::new();
     let mut stored_model: Option<u64> = None;
+    let mut stored_toolchain = String::new();
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -270,12 +557,14 @@ pub fn read_for_device(
             "model" => {}
             "model_bytes" => stored_model = v.parse().ok(),
             "batch" => c.batch = v.parse().ok(),
+            // ADVISORY: what the numbers were measured under, not part of the key.
+            "toolchain" => stored_toolchain = v.to_string(),
             _ if k.starts_with("measured_") => {}
-            _ if k.starts_with("device_") => {
-                if let Ok(n) = v.parse::<u64>() {
-                    c.device.push((k.to_string(), n));
-                }
-            }
+            // Legacy: device measurements used to live here. They are a property of the
+            // machine, not of a knob space, a cache type or a model, so they moved to
+            // their own file -- see `read_device_profile`. Old files still carry the
+            // lines; ignore them rather than reading a copy that may be older.
+            _ if k.starts_with("device_") => {}
             _ => {
                 // Every remaining key is a backend knob. An unparsable value is DROPPED
                 // (the backend keeps its compiled default), never guessed.
@@ -284,6 +573,17 @@ pub fn read_for_device(
                 }
             }
         }
+    }
+    // TOOLCHAIN DRIFT WARNS, IT DOES NOT DISCARD. These numbers were measured under a
+    // different shader compiler, which may have changed codegen -- or may not have. The
+    // one value that really is a compiler property is the register spill cliff, and
+    // re-measuring it is `imparo-tune MODEL --discover-only`, seconds of work.
+    let now = toolchain();
+    if !stored_toolchain.is_empty() && stored_toolchain != now && !quiet {
+        eprintln!(
+            "[imparo] host config was tuned under {stored_toolchain}, running {now}; \
+             values kept -- re-run imparo-tune if you suspect drift"
+        );
     }
     if stored_model.is_some_and(|m| m != model_bytes) {
         if !quiet {
@@ -297,7 +597,7 @@ pub fn read_for_device(
         }
         return None;
     }
-    if stored_fp != fp {
+    if stored_fp != expected_fp {
         if !quiet {
             eprintln!(
                 "[imparo] host config at {} is for a different host or search \
@@ -390,5 +690,28 @@ pub fn release_free_heap() {
                 malloc_zone_pressure_relief(zone, 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod config_identity_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_kv_tags_have_one_unambiguous_spelling() {
+        assert_eq!(canonical_kv_tag("q4_0", "q4_0"), "q4_0");
+        assert_eq!(canonical_kv_tag("q4_0", "f16"), "q4_0,f16");
+        assert_ne!(canonical_kv_tag("q4_0", "f16"), "q4_0-f16");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_without_home_uses_userprofile() {
+        let profile = std::env::temp_dir()
+            .join(format!("imparo-userprofile-test-{}", std::process::id()));
+        assert_eq!(
+            config_dir_from(None, Some(profile.clone().into_os_string())),
+            profile.join(".imparo")
+        );
     }
 }

@@ -30,7 +30,7 @@
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use imparo_backend::{Backend, BufId, Epilogue, NO_WEIGHT, PoolCaps, WeightKindWire};
-use imparo_gguf::weights::{GGML_F32, GGML_Q4_0, GGML_Q8_0};
+use imparo_gguf::weights::{GGML_F32, GGML_Q4_0, GGML_Q8_0, GGML_Q8_0_TM};
 
 use crate::ops;
 
@@ -44,6 +44,7 @@ fn ggml_type(wkind: WeightKindWire) -> u32 {
         0 => GGML_F32,
         1 => GGML_Q4_0,
         2 => GGML_Q8_0,
+        3 => GGML_Q8_0_TM,
         other => panic!("cpu backend: unknown weight kind wire value {other}"),
     }
 }
@@ -176,7 +177,14 @@ impl Ctx {
     }
     /// `row` is the layer's bytes per position, which is what turns the region's byte
     /// offset into slots. Ringed layers only: a pooled layer's region is always zero.
-    fn slot(&self, layer: usize, pos: usize, ring: u32, is_v: bool, row: usize) -> usize {
+    fn slot(
+        &self,
+        layer: usize,
+        pos: usize,
+        ring: u32,
+        is_v: bool,
+        row: usize,
+    ) -> usize {
         if ring > 0 {
             let reg = if is_v { &self.kv_reg_v } else { &self.kv_reg_k };
             let base = reg.get(layer).copied().unwrap_or(0) as usize / row.max(1);
@@ -285,7 +293,10 @@ impl Backend for CpuBackend {
         let mut c = ctx();
         let b = c.buf(id);
         let lo = off as usize;
-        assert!(b.len() >= lo + dst.len(), "cpu backend: read past buffer end");
+        assert!(
+            b.len() >= lo + dst.len(),
+            "cpu backend: read past buffer end"
+        );
         dst.copy_from_slice(&b[lo..lo + dst.len()]);
     }
     fn read_kv_bytes(&self, layer: u32, is_v: bool, off: u64, dst: &mut [u8]) {
@@ -353,13 +364,17 @@ impl Backend for CpuBackend {
         n_tok: u32,
         src_row: u32,
     ) {
-        let (kind, n_in, n_out, n_tok) =
-            (ggml_type(wkind), n_in as usize, n_out as usize, n_tok as usize);
-        let mut c = ctx();
-        let blob = c.weights.expect("cpu backend: no weights").at(
-            w_off,
-            ops::row_bytes_len(kind, n_in) * n_out,
+        let (kind, n_in, n_out, n_tok) = (
+            ggml_type(wkind),
+            n_in as usize,
+            n_out as usize,
+            n_tok as usize,
         );
+        let mut c = ctx();
+        let blob = c
+            .weights
+            .expect("cpu backend: no weights")
+            .at(w_off, ops::row_bytes_len(kind, n_in) * n_out);
         let lo = src_row as usize * n_in;
         let x = c.buf(src)[lo..lo + n_in * n_tok].to_vec();
         let mut y = vec![0.0_f32; n_out * n_tok];
@@ -384,6 +399,9 @@ impl Backend for CpuBackend {
     }
     fn set_epilogue(&self, epi: Epilogue) {
         ctx().epilogue = epi;
+    }
+    fn supports_epilogue(&self, _epi: Epilogue) -> bool {
+        true
     }
     fn set_activation(&self, act: Epilogue) {
         ctx().activation = act;
@@ -609,19 +627,25 @@ impl Backend for CpuBackend {
         n_kv: u32,
         kv_width: u32,
         start_pos: u32,
+        scale: f32,
         window: u32,
         n_tok: u32,
         _max_scores: u32,
         ring: u32,
     ) {
-        let (hd, heads, kvh, kvw, l) = (
+        // The op applies its scale: Q is scaled in place before the kernel reads it. The
+        // same dispatch the workflow used to issue, now where the contract lives.
+        if scale.to_bits() != 1.0_f32.to_bits() {
+            self.scale(BufId::Q, scale, n_tok * n_heads * head_dim);
+        }
+        let (hd, heads, kv_heads, kv_width_usize, l) = (
             head_dim as usize,
             n_heads as usize,
             n_kv as usize,
             kv_width as usize,
             kv_layer as usize,
         );
-        let per_kv = heads / kvh;
+        let per_kv = heads / kv_heads;
         let qw = heads * hd;
         let mut c = ctx();
         let q = c.buf(BufId::Q)[..qw * n_tok as usize].to_vec();
@@ -639,8 +663,8 @@ impl Backend for CpuBackend {
                 let qoff = t * qw + h * hd;
                 let sc = &mut scores[..pos + 1 - lo];
                 for (si, pp) in (lo..=pos).enumerate() {
-                    let slot = c.slot(l, pp, ring, false, kvw * 2);
-                    let base = slot * kvw + kh * hd;
+                    let slot = c.slot(l, pp, ring, false, kv_width_usize * 2);
+                    let base = slot * kv_width_usize + kh * hd;
                     let k = &c.kv_k[l][base..base + hd];
                     sc[si] = (0..hd)
                         .map(|i| q[qoff + i] * f32_from_f16(k[i]))
@@ -649,8 +673,8 @@ impl Backend for CpuBackend {
                 ops::softmax(sc);
                 let o = &mut out[qoff..qoff + hd];
                 for (si, pp) in (lo..=pos).enumerate() {
-                    let slot = c.slot(l, pp, ring, true, kvw * 2);
-                    let base = slot * kvw + kh * hd;
+                    let slot = c.slot(l, pp, ring, true, kv_width_usize * 2);
+                    let base = slot * kv_width_usize + kh * hd;
                     let v = &c.kv_v[l][base..base + hd];
                     let wgt = sc[si];
                     for (oo, vv) in o.iter_mut().zip(v) {
@@ -703,6 +727,17 @@ impl Backend for CpuBackend {
             d.resize(s.len(), 0.0);
         }
         d[..s.len()].copy_from_slice(&s);
+    }
+    fn copy_range(&self, dst: BufId, dst_off: u32, src: BufId, src_off: u32, n: u32) {
+        let mut c = ctx();
+        let (so, n) = (src_off as usize, n as usize);
+        let s = c.buf(src)[so..so + n].to_vec();
+        let d = c.buf(dst);
+        let doff = dst_off as usize;
+        if d.len() < doff + n {
+            d.resize(doff + n, 0.0);
+        }
+        d[doff..doff + n].copy_from_slice(&s);
     }
     fn mul_strided(
         &self,
@@ -815,9 +850,15 @@ impl Backend for CpuBackend {
     }
     fn pool_caps(&self) -> PoolCaps {
         PoolCaps {
-            // The same 64-cell block the shaders index, because the pool's unit and
-            // the resume grid are the engine's, not a device's.
-            block_cells: 64,
+            // The same page the shaders index: a store written by one backend is read
+            // by the other, so the block table has to mean the same thing in both.
+            page_cells: 64,
+            // The host reference path has no tiled prefill attention -- it scans every
+            // position for every query in one order -- so a cut anywhere reproduces a
+            // cold pass and 1 would be honest. It declares 16 to match Metal: the gate
+            // is a divisibility rule, and a backend declaring a FINER grid than the
+            // store was cut on would invite reuse the writer never proved.
+            finest_cut_tokens: 16,
             // Every read goes through `Ctx::slot`, which applies the page table --
             // the same rule the shaders' `kv_slot` applies.
             paged_reads: true,
@@ -837,8 +878,18 @@ mod tests {
     #[test]
     fn f16_round_trips_the_awkward_values() {
         for x in [
-            0.0_f32, -0.0, 1.0, -1.0, 0.5, 65504.0, -65504.0, 6.1e-5, 5.96e-8, 1e-9,
-            0.333_333_34, -2.717_5,
+            0.0_f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            65504.0,
+            -65504.0,
+            6.1e-5,
+            5.96e-8,
+            1e-9,
+            0.333_333_34,
+            -2.717_5,
         ] {
             let back = f32_from_f16(f16_from_f32(x));
             let err = (back - x).abs();

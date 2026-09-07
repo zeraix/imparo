@@ -12,6 +12,8 @@
 //! trait: knobs are a backend's private business, applied from the shared
 //! imparo-host store by the backend's own apply_host_config.
 
+pub mod numerical;
+
 /// Named activation/scratch slots. Each backend maps a slot to its own allocation;
 /// the ids are the cross-backend vocabulary the workflows speak.
 ///
@@ -73,6 +75,15 @@ pub enum BufId {
     /// values the batch already computed -- so it is written aside by one small dispatch
     /// while the batch runs to its natural end.
     RecurSnap = 26,
+    /// PIPELINED DECODE (docs/decode-turnaround.md): the greedy pick of each queued step,
+    /// two u32 slots. Step N writes slot N % 2 and step N+1's gather reads `Tokens[0]`,
+    /// which the same kernel wrote; the host reads slot N % 2 after step N retires and
+    /// before it queues step N+2, the next writer of that slot.
+    Pick = 27,
+    /// PIPELINED DECODE: the recurrent state as it was BEFORE the newest queued step, so a
+    /// step discarded after a stop rolls its in-place state advance back on the device.
+    /// Same shape as `Recur`; unused by a model without recurrent layers.
+    RecurPrev = 28,
 }
 
 impl BufId {
@@ -86,7 +97,7 @@ impl BufId {
     ///
     /// Three declarations of one number is how NO_WEIGHT ended up with two different
     /// values in this codebase, so there is one declaration and a check.
-    pub const COUNT: usize = 27;
+    pub const COUNT: usize = 29;
 }
 
 /// Fail loudly when a backend's buffer table cannot hold every `BufId`.
@@ -116,6 +127,145 @@ pub type WeightKindWire = u32;
 /// which is what the Metal kernel's IMPARO_NO_WEIGHT now is too.
 pub const NO_WEIGHT: u64 = u64::MAX;
 
+/// The mixer of an LFM2 decode layer, for [`Backend::mega_lfm2_layer`].
+#[derive(Clone, Copy, Debug)]
+pub enum Lfm2MegaMixer {
+    /// The tail alone: `add` already holds the mixer's output.
+    None,
+    /// The short convolution: the operator norm of `x`, `in_proj` (3 x n_embd rows) into
+    /// `bcx`, the conv step over the `kernel`-tap history at `state[state_off..]`
+    /// (elements), `out_proj` into `add`; the history advances in place, and `snap`
+    /// (buffer, element offset) receives the advanced history too when a checkpoint is
+    /// armed at this token.
+    ShortConv {
+        op_norm_off: u64,
+        in_kind: WeightKindWire,
+        in_off: u64,
+        conv_off: u64,
+        out_kind: WeightKindWire,
+        out_off: u64,
+        kernel: u32,
+        bcx: BufId,
+        state: BufId,
+        state_off: u32,
+        snap: Option<(BufId, u32)>,
+    },
+    /// Full attention at one token: the operator norm of `x`, the q/k/v projections, per-head
+    /// `rms(w_qn)` + NEOX rope + the score scale on Q, `rms(w_kn)` + rope on K, K and V into
+    /// layer `kv_layer`'s cache at `start_pos`, attention over the cache into `attn`, then
+    /// `wo` into `add`. `q`, `k`, `v` receive the rows (scratch afterwards).
+    Attention {
+        op_norm_off: u64,
+        wq_kind: WeightKindWire,
+        wq_off: u64,
+        wk_kind: WeightKindWire,
+        wk_off: u64,
+        wv_kind: WeightKindWire,
+        wv_off: u64,
+        wo_kind: WeightKindWire,
+        wo_off: u64,
+        q_norm_off: u64,
+        k_norm_off: u64,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv: u32,
+        kv_width: u32,
+        kv_layer: u32,
+        start_pos: u32,
+        window: u32,
+        ring: u32,
+        rope_dim: u32,
+        rope_base: f32,
+        q_scale: f32,
+        q: BufId,
+        k: BufId,
+        v: BufId,
+        attn: BufId,
+        /// The cache basis (see [`MegaAttn::had_k`] / [`MegaAttn::had_v`]).
+        had_k: u32,
+        had_v: u32,
+    },
+}
+
+/// The operands of one LFM2 decode layer, one variant of [`MegaLayer`]: the mixer (which
+/// forms the layer's operator norm from `x` itself), then the tail `x = x + add;
+/// cur = rms(x) * w_ffn; x = x + down(act(gate*cur) * (up*cur))`. `g` and `u` are scratch.
+#[derive(Clone, Copy, Debug)]
+pub struct Lfm2MegaLayer {
+    pub mixer: Lfm2MegaMixer,
+    pub gate_kind: WeightKindWire,
+    pub gate_off: u64,
+    pub up_kind: WeightKindWire,
+    pub up_off: u64,
+    pub down_kind: WeightKindWire,
+    pub down_off: u64,
+    pub ffn_norm_off: u64,
+    pub n_embd: u32,
+    pub n_ff: u32,
+    pub eps: f32,
+    pub x: BufId,
+    pub add: BufId,
+    pub g: BufId,
+    pub u: BufId,
+}
+
+/// The operands of one gemma4 decode layer, one variant of [`MegaLayer`]. The tail runs from
+/// the FFN input `src`: `x = add + rms(down(act(gate*src) * (up*src))) * w1`, then the
+/// per-layer block `back = pp(act(pg * x) * per_layer[per_layer_off..])`, then
+/// `x = (x + rms(back) * w2) * out_scale` and, when `next_norm_off` is a weight,
+/// `next_out = rms(x) * w3`. `front` moves the entry's start earlier in the layer.
+/// `g`, `u`, `gate`, `back` are scratch.
+#[derive(Clone, Copy, Debug)]
+pub struct Gemma4MegaLayer<'a> {
+    pub gate_kind: WeightKindWire,
+    pub gate_off: u64,
+    pub up_kind: WeightKindWire,
+    pub up_off: u64,
+    pub down_kind: WeightKindWire,
+    pub down_off: u64,
+    pub post_ffw_norm_off: u64,
+    pub pg_kind: WeightKindWire,
+    pub pg_off: u64,
+    pub pp_kind: WeightKindWire,
+    pub pp_off: u64,
+    pub post_norm_off: u64,
+    pub next_norm_off: u64,
+    pub out_scale: f32,
+    pub n_embd: u32,
+    pub n_ff: u32,
+    pub ple: u32,
+    pub per_layer_off: u32,
+    pub eps: f32,
+    pub src: BufId,
+    pub x: BufId,
+    pub add: BufId,
+    pub g: BufId,
+    pub u: BufId,
+    pub gate: BufId,
+    pub per_layer: BufId,
+    pub back: BufId,
+    pub next_out: BufId,
+    pub front: Option<MegaFront<'a>>,
+}
+
+/// What one decode layer IS, per architecture. A backend that runs the whole layer as one
+/// operation reads the variant it knows; a new architecture is a new variant, never a new
+/// `Backend` method.
+#[derive(Clone, Copy, Debug)]
+pub enum MegaLayer<'a> {
+    Gemma4(Gemma4MegaLayer<'a>),
+    Lfm2(Lfm2MegaLayer),
+}
+
+/// One decode layer offered to the backend as a MEGA ENTRY (see [`Backend::mega_layer`]).
+#[derive(Clone, Copy, Debug)]
+pub struct MegaEntry<'a> {
+    pub layer: MegaLayer<'a>,
+    /// Tokens in this forward. The mega route is a decode route: a backend refuses anything
+    /// but 1 rather than growing a batched form.
+    pub n_tok: u32,
+}
+
 /// One execution backend. Method-for-method the surface `gemma4_metal.rs` actually
 /// calls; buffer arguments are `BufId`, weights are addressed by byte offset into
 /// the backend's mapped weight blob.
@@ -143,9 +293,402 @@ pub enum Epilogue {
     Silu = 2,
 }
 
-pub trait Backend {
+/// Stable, typed policy for resolving the block width of the orthonormal
+/// Hadamard rotation used before quantized KV storage.
+///
+/// This is a numerical-route property, not a performance knob: changing it changes
+/// persisted cache bytes and can change recurrent decode. Backends may select a route
+/// compatible with their reference implementation without leaking backend cfgs into a
+/// model workflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HadamardWidth {
+    Disabled,
+    FullHead,
+    Fixed(u32),
+}
+
+impl HadamardWidth {
+    /// Resolve and validate the route for one attention head.
+    ///
+    /// Zero disables the transform. Any enabled width must be a power of two that
+    /// divides the head dimension, matching the kernel contract.
+    pub fn resolve(self, head_dim: u32) -> Result<u32, &'static str> {
+        let width = match self {
+            Self::Disabled => return Ok(0),
+            Self::FullHead => head_dim,
+            Self::Fixed(width) => width,
+        };
+        if width == 0 || !width.is_power_of_two() || head_dim % width != 0 {
+            return Err(
+                "Hadamard width must be a nonzero power-of-two divisor of head_dim",
+            );
+        }
+        Ok(width)
+    }
+}
+
+/// Key/value rotation widths are kept together because they jointly define the cache
+/// representation. The default exactly preserves the pre-CUDA shared workflow/Metal
+/// route; CUDA overrides it with its separately gated reference-compatible route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvQuantizationRoute {
+    pub key: HadamardWidth,
+    pub value: HadamardWidth,
+}
+
+impl Default for KvQuantizationRoute {
+    fn default() -> Self {
+        Self {
+            key: HadamardWidth::FullHead,
+            value: HadamardWidth::Fixed(128),
+        }
+    }
+}
+
+/// Stable byte codec used to encode one KV side after any model-owned basis transform.
+///
+/// This is a durable-format contract, not a backend name. Backends may advertise the
+/// same value only when they produce byte-identical blocks for every finite input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvByteCodec {
+    /// IEEE-754 binary16 values stored little-endian with round-to-nearest-even.
+    F16LeRneV1,
+    /// llama.cpp q4_0: one f16 scale and 32 unsigned nibbles per block.
+    Q4_0LlamaV1,
+    /// q8_0 with halfway cases rounded to the nearest even integer.
+    Q8_0RintEvenV1,
+    /// q8_0 with halfway cases rounded away from zero.
+    Q8_0RoundAwayV1,
+    /// Reserved for rejected profiles; no backend may write this format.
+    Rejected,
+}
+
+/// Codec declarations for the three supported KV wire types. The model layer selects
+/// the entry for K and V independently after resolving their configured types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvByteCodecRoute {
+    pub f16: KvByteCodec,
+    pub q4_0: KvByteCodec,
+    pub q8_0: KvByteCodec,
+}
+
+impl Default for KvByteCodecRoute {
+    fn default() -> Self {
+        Self {
+            f16: KvByteCodec::F16LeRneV1,
+            q4_0: KvByteCodec::Q4_0LlamaV1,
+            q8_0: KvByteCodec::Q8_0RintEvenV1,
+        }
+    }
+}
+
+/// Logical KV geometry passed to backends that maintain a device page table.
+///
+/// This descriptor deliberately carries slots and the independent K/V byte strides.
+/// A backend must never infer either from an allocation byte count: mixed cache types,
+/// window regions and alignment can all make that inference ambiguous. The fields use
+/// fixed-width integers so CUDA can mirror the contract in its versioned C ABI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct KvLayout {
+    pub layer: u32,
+    pub reserved: u32,
+    pub logical_slots: u64,
+    pub k_stride: u64,
+    pub v_stride: u64,
+}
+
+impl KvLayout {
+    /// Number of page-table entries needed to address this layer.
+    ///
+    /// TAKES the page rather than naming it. There was a `KV_PAGE_CELLS = 64` here,
+    /// which made a fourth independent copy of a number the backend already declares
+    /// as `PoolCaps::page_cells` and the pool already holds as
+    /// `imparo_kv::identity::page_cells()`. A page that only one of the four knows
+    /// about is how a device page table and the placement addressing it drift apart
+    /// silently. Pass `pool_caps().page_cells`.
+    pub fn page_count(self, page_cells: u32) -> Result<u32, &'static str> {
+        if self.reserved != 0 {
+            return Err("KV layout reserved field must be zero");
+        }
+        if self.logical_slots > 0 && (self.k_stride == 0 || self.v_stride == 0) {
+            return Err("non-empty KV layout requires nonzero K/V strides");
+        }
+        if page_cells == 0 || !page_cells.is_power_of_two() {
+            return Err("KV page must be a non-zero power of two");
+        }
+        let page = u64::from(page_cells);
+        let pages =
+            self.logical_slots / page + u64::from(self.logical_slots % page != 0);
+        u32::try_from(pages).map_err(|_| "KV page count exceeds u32")
+    }
+
+    /// Largest legal physical page entry, or `None` for an empty layer.
+    pub fn max_page_entry(self, page_cells: u32) -> Result<Option<u32>, &'static str> {
+        Ok(self.page_count(page_cells)?.checked_sub(1))
+    }
+}
+
+/// Semantic phase of one model batch. This is execution identity, not a performance knob.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum BatchPhase {
+    Prefill = 0,
+    Decode = 1,
+}
+
+/// Absolute geometry shared by every op in one device batch.
+///
+/// Backends whose numerical routes depend on canonical token cells use this descriptor
+/// instead of inferring position from whichever layer happened to run most recently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchGeometry {
+    pub absolute_start: u64,
+    pub active_tokens: u32,
+    pub phase: BatchPhase,
+}
+
+impl BatchGeometry {
+    /// Constructs a non-empty range whose exclusive end is representable.
+    pub fn try_new(
+        absolute_start: u64,
+        active_tokens: u32,
+        phase: BatchPhase,
+    ) -> Result<Self, &'static str> {
+        if active_tokens == 0 {
+            return Err("batch geometry must contain at least one token");
+        }
+        absolute_start
+            .checked_add(u64::from(active_tokens))
+            .ok_or("batch geometry end overflows u64")?;
+        Ok(Self {
+            absolute_start,
+            active_tokens,
+            phase,
+        })
+    }
+
+    #[must_use]
+    pub fn canonical_offset(self, cell_tokens: u32, local_token: u32) -> Option<u32> {
+        if cell_tokens == 0 || local_token >= self.active_tokens {
+            return None;
+        }
+        let absolute = self.absolute_start.checked_add(u64::from(local_token))?;
+        Some((absolute % u64::from(cell_tokens)) as u32)
+    }
+}
+
+#[cfg(test)]
+mod batch_geometry_tests {
+    use super::{BatchGeometry, BatchPhase, StreamedWeightSpan};
+
+    #[test]
+    fn cold_and_split_rows_share_canonical_offsets() {
+        let cold = BatchGeometry::try_new(512, 232, BatchPhase::Prefill).unwrap();
+        let split = BatchGeometry::try_new(704, 40, BatchPhase::Prefill).unwrap();
+        assert_eq!(cold.canonical_offset(512, 192), Some(192));
+        assert_eq!(split.canonical_offset(512, 0), Some(192));
+        assert_eq!(cold.canonical_offset(512, 231), Some(231));
+        assert_eq!(split.canonical_offset(512, 39), Some(231));
+    }
+
+    #[test]
+    fn invalid_geometry_fails_closed() {
+        assert!(BatchGeometry::try_new(0, 0, BatchPhase::Prefill).is_err());
+        assert!(BatchGeometry::try_new(u64::MAX, 1, BatchPhase::Decode).is_err());
+    }
+
+    #[test]
+    fn phase_is_part_of_geometry_identity() {
+        let prefill = BatchGeometry::try_new(7, 1, BatchPhase::Prefill).unwrap();
+        let decode = BatchGeometry::try_new(7, 1, BatchPhase::Decode).unwrap();
+        assert_ne!(prefill, decode);
+    }
+    #[test]
+    fn streamed_weight_span_has_stable_wire_layout() {
+        assert_eq!(core::mem::size_of::<StreamedWeightSpan>(), 16);
+        assert_eq!(core::mem::align_of::<StreamedWeightSpan>(), 8);
+        let span = StreamedWeightSpan {
+            offset: 7,
+            bytes: 11,
+        };
+        assert_eq!(span, span);
+    }
+}
+
+/// A byte range in the mapped model that the backend may keep outside its hot
+/// device-resident weight allocation. Offsets are absolute within the mapping.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamedWeightSpan {
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// Where one contiguous byte range of the weight file LIVES (docs/memory-tiers-and-fit.md).
+/// The tier names the place, not a transport: how a slow-tier layer is executed (fetched
+/// into a fast-tier slot ahead of use, or computed where it lies) is the backend's per-layer
+/// decision, measured by the tuner, and not part of the placement.
+///
+/// `Fast`: wired unified memory on Metal, the VRAM copy on CUDA.
+/// `Slow { layer }`: a whole layer the fast tier could not hold; the pageable mapping on
+/// Metal, host RAM on CUDA. `HostStaged`: a row-gathered tensor (an embedding table read by token
+/// id) that lives in no tier: the host gathers the rows a batch needs into a small
+/// fast-tier staging buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WeightTier {
+    Fast,
+    Slow {
+        layer: u32,
+    },
+    /// Never bound: a row-gathered tensor (rows indexed by token id, e.g. gemma4's
+    /// per-layer token embeddings) whose rows the host copies into a small device buffer
+    /// per batch (`Backend::stage_rows`). The smallest wired set, and the reason a decode
+    /// step on such a model needs the next token on the host before it is encoded.
+    HostStaged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WeightSegment {
+    pub offset: u64,
+    pub bytes: u64,
+    pub tier: WeightTier,
+}
+
+/// The arithmetic behind a placement, kept so the startup line and a later reader can see
+/// why the split came out as it did. All bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TierBudget {
+    /// The fast tier the backend reported (None: unknown, everything resident as before).
+    pub total: Option<u64>,
+    pub reserve_kv: u64,
+    pub reserve_activations: u64,
+    pub reserve_scratch: u64,
+    pub margin: u64,
+    /// `total - reserve`, or u64::MAX when `total` is unknown.
+    pub weight_budget: u64,
+}
+
+/// One load-time repack job: a tensor's file span, its dimensions and the types it moves
+/// between (see `Backend::transform_weights`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WeightTransform {
+    pub offset: u64,
+    pub bytes: u64,
+    pub from_type: u32,
+    pub to_type: u32,
+    pub n_in: u32,
+    pub n_out: u32,
+}
+
+/// The common runtime's placement of a model's weights across the tiers: segments sorted by
+/// file offset, non-overlapping, covering every tensor. Computed once at load from the plan,
+/// the configured context and the backend's budget; a backend implements each tier its own
+/// way and must not second-guess the split.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WeightPlacement {
+    pub segments: Vec<WeightSegment>,
+    pub budget: TierBudget,
+    pub fast_layers: u32,
+    pub total_layers: u32,
+}
+
+impl WeightPlacement {
+    #[must_use]
+    pub fn bytes_in(&self, pick: impl Fn(WeightTier) -> bool) -> u64 {
+        self.segments
+            .iter()
+            .filter(|s| pick(s.tier))
+            .map(|s| s.bytes)
+            .sum()
+    }
+    /// Every segment outside the fast tier as a span: the shape the CUDA backend's existing
+    /// residency entry consumes (tables and slow-tier layers alike go through its bounded
+    /// staging cache until it implements the ring).
+    #[must_use]
+    pub fn slow_spans(&self) -> Vec<StreamedWeightSpan> {
+        self.segments
+            .iter()
+            .filter(|s| s.tier != WeightTier::Fast)
+            .map(|s| StreamedWeightSpan {
+                offset: s.offset,
+                bytes: s.bytes,
+            })
+            .collect()
+    }
+}
+
+/// One immutable quantized matrix that a backend may transform into a persistent,
+/// architecture-owned execution layout during model admission. The common engine
+/// supplies only wire facts; unsupported backends return `Ok(false)` and retain their
+/// established weight representation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuantizedWeightPrepack {
+    pub offset: u64,
+    pub n_in: u32,
+    pub n_out: u32,
+    pub kind: WeightKindWire,
+    pub reserved: u32,
+}
+
+/// Process-wide backend handle.
+///
+/// The composition root publishes one static handle and the server may move a
+/// serialized engine containing that handle between connection threads. Backend
+/// implementations must therefore make shared access safe; per-request mutation
+/// remains serialized by the engine owner.
+pub trait Backend: Sync {
     // --- session ---
     fn begin(&self);
+    /// Begins a forward pass while allowing the backend to select decode-specific
+    /// lifecycle machinery. The default deliberately preserves the established
+    /// `begin` behavior for backends without a distinct decode path.
+    fn begin_forward(&self, _decode: bool) {
+        self.begin();
+    }
+    /// Prepares one single-token decode. `Ok(true)` means the backend has already
+    /// submitted a reusable execution graph, so the semantic operations for this
+    /// forward must not be encoded again. Backends without replay support retain
+    /// the normal encode path through this conservative default.
+    fn decode_prepare(
+        &self,
+        _token: u32,
+        _start_pos: u32,
+        _argmax: bool,
+    ) -> Result<bool, i32> {
+        Ok(false)
+    }
+    /// Prepares an exact-shape multi-token prefill. `Ok(true)` means the backend
+    /// has already submitted a reusable execution graph for the supplied token
+    /// payload and the semantic operations must not be encoded again. The
+    /// conservative default keeps every non-CUDA backend on its existing path.
+    fn prefill_prepare(
+        &self,
+        _tokens: &[u32],
+        _start_pos: u32,
+        _argmax: bool,
+    ) -> Result<bool, i32> {
+        Ok(false)
+    }
+    /// Marks the boundary after request-dependent token embedding and any
+    /// per-layer-input embedding have been materialized. `Ok(true)` means the
+    /// backend submitted a reusable graph for the remaining model body. The
+    /// default keeps Metal and every backend without split-Prefill replay on the
+    /// established workflow.
+    fn prefill_body_prepare(
+        &self,
+        _tokens: &[u32],
+        _start_pos: u32,
+        _argmax: bool,
+    ) -> Result<bool, i32> {
+        Ok(false)
+    }
+    /// Sets the immutable absolute geometry for the next device batch. Backends that
+    /// do not use position-dependent numerical routes deliberately inherit this no-op.
+    fn set_batch_geometry(&self, _geometry: BatchGeometry) -> Result<(), i32> {
+        Ok(())
+    }
     /// Commit what is encoded and return WITHOUT waiting, so the GPU runs it while the
     /// CPU encodes what follows. A read after this sees whatever was there before.
     fn flush(&self);
@@ -154,11 +697,102 @@ pub trait Backend {
     /// # Errors
     /// Returns the command buffer's error code.
     fn end(&self) -> Result<(), i32>;
+    /// Commit WITHOUT waiting and keep the region outstanding, so the next region can be
+    /// encoded and committed behind it while this one runs (pipelined decode:
+    /// docs/decode-turnaround.md). `wait_outstanding` retires the oldest such region;
+    /// a `read` of what it wrote is meaningful only after that. A backend without the
+    /// capability (`decode_pipelining` false) ends synchronously here.
+    ///
+    /// # Errors
+    /// Returns the command buffer's error code.
+    fn end_async(&self) -> Result<(), i32> {
+        self.end()
+    }
+    /// Wait for the OLDEST region committed by `end_async` and retire it. A no-op when
+    /// none is outstanding.
+    ///
+    /// # Errors
+    /// Returns that region's command buffer error code.
+    fn wait_outstanding(&self) -> Result<(), i32> {
+        Ok(())
+    }
+    /// After a region failed (a mega-kernel barrier timeout) and the engine has retired
+    /// every outstanding region and rolled the failed step's state back: make the backend
+    /// ready to run the step again. The Metal backend resets its kernel's sync words and
+    /// keeps the persistent route closed for a backoff of regions, so the re-run takes the
+    /// dispatch path. A backend without such a route has nothing to do.
+    ///
+    /// # Errors
+    /// The backend's own code when it cannot recover (a region still outstanding).
+    /// Reserves the persistent kernel's scratch once at load, so no region ever regrows it
+    /// (Metal: the sync buffer that carries the sticky error): the model's widest FFN row
+    /// and the deep attention body's partials for `attn_heads` query heads at the widest
+    /// head `attn_hd`.
+    fn mega_reserve(
+        &self,
+        _n_mid: u32,
+        _attn_heads: u32,
+        _attn_hd: u32,
+    ) -> Result<(), i32> {
+        Ok(())
+    }
+    fn mega_recover(&self) -> Result<(), i32> {
+        Ok(())
+    }
+    /// Whether `end_async` / `wait_outstanding` overlap regions on this backend, and
+    /// `argmax_feed` writes the pick where the next step's gather reads it.
+    fn decode_pipelining(&self) -> bool {
+        false
+    }
+    /// Whether this backend stages any row-gathered table on the host per token
+    /// (`stage_rows` will answer true for it). A staged table needs the token id on the
+    /// host at encode time, which pipelined decode does not have.
+    fn stages_rows(&self) -> bool {
+        false
+    }
+    /// Enter or leave an isolated tuning session. Backends with reusable execution
+    /// caches must prevent capture/replay while enabled and invalidate any cached
+    /// executable when the mode changes. The conservative default is a no-op.
+    fn set_tuner_mode(&self, _enabled: bool) -> Result<(), i32> {
+        Ok(())
+    }
+    /// Whether tuning this backend must fail closed when device-event timing is absent.
+    /// CPU and legacy backends may use wall time; CUDA overrides this because sub-ms
+    /// launch ranking is otherwise dominated by host scheduling jitter.
+    fn tuner_requires_device_timing(&self) -> bool {
+        false
+    }
+    /// Validate that all backend-specific discovery evidence needed to write a tuning
+    /// result was established. CUDA fails closed here; legacy backends may accept the
+    /// explicit zero sentinels they already used.
+    fn validate_tuner_profile(&self, _profile: &DeviceProfile) -> Result<(), String> {
+        Ok(())
+    }
+    /// Reset proof for one measured region. CUDA records the choice epoch observed by
+    /// the actual kernel entry, so changing a knob without reaching its workload cannot
+    /// be mistaken for a measured candidate.
+    fn reset_tuner_dispatch_proof(&self) {}
+    /// Declare which named choices the next measured workload must actually consult.
+    /// Backends without dispatch instrumentation keep the conservative no-op default;
+    /// CUDA maps names to stable native slots and fails closed on an unknown name.
+    fn set_tuner_dispatch_expectation(&self, _knobs: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+    fn validate_tuner_dispatch_proof(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// GPU microseconds of the last `begin`/`end` region, or 0.0 if this backend cannot
     /// report it. Timing a candidate with a wall clock also charges submission latency;
     /// where the device can report its own busy time, the tuner uses that instead.
     fn last_gpu_us(&self) -> f64 {
         0.0
+    }
+    /// Backend-owned proof that every component of a coupled tuner workload reached
+    /// its intended implementation in the last completed submission. Zero is the
+    /// conservative default; it prevents a shared tuner from mistaking equal timings
+    /// or a silent fallback for candidate execution.
+    fn tuner_route_evidence(&self, _workload: Workload) -> u32 {
+        0
     }
     /// Queried and measured device limits, for the derivations. Default is all zero --
     /// "nothing established" -- so a backend that has not implemented it cannot have a
@@ -178,11 +812,19 @@ pub trait Backend {
     /// TFLOPS with the prefill attention score loop's own operand mix. This is what the
     /// score phase's measured rate should be compared against. 0.0 where a backend has no
     /// such probe.
-    fn scoremix_rate(&self, _tgs: u32, _sgs: u32, _iters: u32, _stride: u32, _kspan: u32) -> f64 {
+    fn scoremix_rate(
+        &self,
+        _tgs: u32,
+        _sgs: u32,
+        _iters: u32,
+        _stride: u32,
+        _kspan: u32,
+    ) -> f64 {
         0.0
     }
-    /// Microseconds to SUBMIT an empty command buffer without waiting (or the backend's
-    /// equivalent submission unit). 0.0 where a backend has no such probe.
+    /// Microseconds one extra command-buffer boundary costs the DEVICE: the idle gap
+    /// between consecutive back-to-back buffers, which is what a mid-graph flush exposes
+    /// when the host runs ahead (it does at decode). 0.0 where a backend has no such probe.
     fn commit_overhead(&self, _n: u32) -> f64 {
         0.0
     }
@@ -199,12 +841,36 @@ pub trait Backend {
     fn kv_tag(&self) -> String {
         "f16".to_string()
     }
+    /// Correctness-defining rotation route for quantized KV storage.
+    ///
+    /// The default is the existing shared workflow route, which keeps Metal and the
+    /// host backend byte-for-byte unchanged. A backend override must be covered by its
+    /// own correctness receipt before it is admitted as a tuned route.
+    fn kv_quantization_route(&self) -> KvQuantizationRoute {
+        KvQuantizationRoute::default()
+    }
+    /// Optional backend-owned rotation for workflows whose established cache basis is
+    /// canonical. `None` preserves that workflow byte-for-byte; an accelerator may opt
+    /// in only when its route has independent numerical evidence.
+    fn kv_quantization_route_override(&self) -> Option<KvQuantizationRoute> {
+        None
+    }
+    /// Durable byte codecs implemented by this backend's KV store kernels.
+    fn kv_byte_codec_route(&self) -> KvByteCodecRoute {
+        KvByteCodecRoute::default()
+    }
     /// Microseconds the host spends ENCODING one dispatch, with no execution in it.
     fn encode_cost(&self, _n: u32) -> f64 {
         0.0
     }
     /// Command-buffer length policy: layers per flush at decode / prefill.
     fn flush_layers(&self, decode: bool) -> u32;
+
+    /// Rows retained after the last state-writing operator when all remaining
+    /// work is row-local and only the final logit row is observable.
+    fn row_local_prefill_tail_rows(&self) -> u32 {
+        64
+    }
 
     // --- buffers and arena ---
     fn alloc(&self, id: BufId, bytes: u64) -> Result<(), i32>;
@@ -213,6 +879,18 @@ pub trait Backend {
     fn page_round(&self, n: u64) -> u64;
     fn alloc_kv(&self, bytes: &[u64]) -> Result<(), i32>;
     fn grow_kv(&self, bytes: &[u64]) -> Result<(), i32>;
+    /// Allocate KV with explicit logical geometry for backends that own page tables.
+    ///
+    /// The default preserves existing CPU/Metal behavior. CUDA overrides this method so
+    /// arena replacement and page-table allocation are one transaction.
+    fn alloc_kv_layout(&self, bytes: &[u64], _layouts: &[KvLayout]) -> Result<(), i32> {
+        self.alloc_kv(bytes)
+    }
+    /// Grow KV while preserving both bytes and any installed page-table prefix.
+    /// The default keeps non-paged backends byte-for-byte unchanged.
+    fn grow_kv_layout(&self, bytes: &[u64], _layouts: &[KvLayout]) -> Result<(), i32> {
+        self.grow_kv(bytes)
+    }
     fn write(&self, id: BufId, off: u64, src: &[f32]);
     fn write_u32(&self, id: BufId, off: u64, src: &[u32]);
     fn read(&self, id: BufId, off: u64, dst: &mut [f32]);
@@ -242,6 +920,62 @@ pub trait Backend {
     /// written again). Default: no-op.
     fn kv_advise_reuse(&self, _layer: u32, _is_v: bool, _off: u64, _len: u64) {}
 
+    /// Allocate persistent host-resident KV storage owned by the backend.
+    ///
+    /// A discrete backend uses page-locked memory here. The opaque handle keeps raw
+    /// host pointers out of the common pool and lets the backend reject stale or
+    /// double-freed allocations. Shared-address backends deliberately keep the
+    /// unsupported default: manufacturing a Host copy there would be pure overhead.
+    fn kv_host_alloc(&self, _bytes: u64) -> Result<KvHostHandle, i32> {
+        Err(KV_HOST_UNSUPPORTED)
+    }
+    /// Release one persistent host allocation. Implementations must reject stale
+    /// handles and double free.
+    fn kv_host_free(&self, _handle: KvHostHandle) -> Result<(), i32> {
+        Err(KV_HOST_UNSUPPORTED)
+    }
+    /// Copy a complete set of physical KV spans from device storage into one
+    /// persistent host allocation. The batch is one transaction: on error neither
+    /// allocator ownership nor the caller-visible host contents may change.
+    fn kv_demote(&self, _spans: &[KvTransferSpan]) -> Result<(), i32> {
+        Err(KV_HOST_UNSUPPORTED)
+    }
+    /// Copy a complete set of spans from persistent host storage into device KV.
+    /// The caller owns already-recommitted destination placements; on error it rolls
+    /// those placements back while the Host copy remains valid for retry.
+    fn kv_promote(&self, _spans: &[KvTransferSpan]) -> Result<(), i32> {
+        Err(KV_HOST_UNSUPPORTED)
+    }
+    /// Copy bytes between a persistent backend-owned Host allocation and ordinary
+    /// CPU memory. These are for canonical disk interchange and diagnostics, never
+    /// the per-token decode path.
+    fn kv_host_read(
+        &self,
+        _handle: KvHostHandle,
+        _off: u64,
+        _dst: &mut [u8],
+    ) -> Result<(), i32> {
+        Err(KV_HOST_UNSUPPORTED)
+    }
+    fn kv_host_write(
+        &self,
+        _handle: KvHostHandle,
+        _off: u64,
+        _src: &[u8],
+    ) -> Result<(), i32> {
+        Err(KV_HOST_UNSUPPORTED)
+    }
+    /// Bytes currently retained in backend-owned persistent Host allocations.
+    fn kv_host_allocated_bytes(&self) -> u64 {
+        0
+    }
+    /// Once-per-machine facts used by the common pool's Host-tier auto-fit.
+    /// Unknown or failed measurements return `None`; callers must not invent
+    /// bandwidth or headroom in their place.
+    fn kv_host_profile(&self) -> Option<HostTierProfile> {
+        None
+    }
+
     // --- compute ---
     fn matmat(
         &self,
@@ -264,11 +998,149 @@ pub trait Backend {
         n_tok: u32,
         src_row: u32,
     );
+    /// Try the state-selected gated projection
+    /// `dst = activation(gate * src) * (up * src)` as one backend operation.
+    ///
+    /// Returning `false` promises no writes and asks the workflow to issue the two
+    /// projections plus `act_mul`. The activation is the process-wide value selected by
+    /// `set_activation`; a backend must reject unsupported activation or layout pairs.
+    #[allow(clippy::too_many_arguments)]
+    fn matmat_gated(
+        &self,
+        _gate_kind: WeightKindWire,
+        _gate_off: u64,
+        _up_kind: WeightKindWire,
+        _up_off: u64,
+        _n_in: u32,
+        _n_out: u32,
+        _src: BufId,
+        _dst: BufId,
+        _tmp: BufId,
+        _n_tok: u32,
+    ) -> bool {
+        false
+    }
+    /// Try the complete gated FFN projection
+    /// `dst = down * (activation(gate * src) * (up * src))` as one backend
+    /// operation.
+    ///
+    /// Returning `true` promises that the final `dst` has been written completely.
+    /// The backend may use `gated_tmp` as scratch, but callers must not assume that
+    /// it contains a valid gated intermediate after a successful call. Returning
+    /// `false` promises that no public buffer has been written and asks the workflow
+    /// to execute its established gated-projection and down-projection sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_gated_down(
+        &self,
+        _gate_kind: WeightKindWire,
+        _gate_off: u64,
+        _up_kind: WeightKindWire,
+        _up_off: u64,
+        _down_kind: WeightKindWire,
+        _down_off: u64,
+        _n_in: u32,
+        _n_mid: u32,
+        _n_out: u32,
+        _src: BufId,
+        _gated_tmp: BufId,
+        _dst: BufId,
+        _n_tok: u32,
+    ) -> bool {
+        false
+    }
+    /// Whether `mega_layer` should be offered a gemma4 layer's FRONT as well (o_proj and
+    /// the sandwich norm), i.e. called before the o_proj projection with `front = Some(..)`.
+    fn mega_front_wanted(&self) -> bool {
+        false
+    }
+    /// Whether the decode attention step should be offered to the mega entry as well
+    /// (`MegaFront::attention = Some(..)`, called before `attention`).
+    fn mega_attn_wanted(&self) -> bool {
+        false
+    }
+    /// Run one whole decode layer as ONE backend operation (see [`MegaEntry`]). Returning
+    /// `true` promises the layer's outputs are written -- for gemma4 `x` and, with a next
+    /// norm, `next_out`; for LFM2 `x` and its mixer state advanced -- and that the scratch
+    /// buffers the variant names are the only others touched. Returning `false` promises no
+    /// public buffer has been written and asks for the established dispatch sequence.
+    fn mega_layer(&self, _entry: &MegaEntry<'_>) -> bool {
+        false
+    }
+    /// The mega program (task #153): the model's layer loop has ended; a backend that records
+    /// the layers into one dispatch per token encodes the pending run now. Default: nothing.
+    fn mega_program_end(&self) {}
+    /// Whether the q/k/v front should be offered to the mega block as well
+    /// (`MegaFront::qkv = Some(..)`, called before the layer's input norm).
+    fn mega_qkv_wanted(&self) -> bool {
+        false
+    }
+    /// Two independent equal-shape projections from one activation. Quantized
+    /// backends may share activation conversion and launch setup; the default is the
+    /// exact two-matmul sequence in call order.
+    #[allow(clippy::too_many_arguments)]
+    fn matmat_pair(
+        &self,
+        first_kind: WeightKindWire,
+        first_off: u64,
+        first_dst: BufId,
+        second_kind: WeightKindWire,
+        second_off: u64,
+        second_dst: BufId,
+        n_in: u32,
+        n_out: u32,
+        src: BufId,
+        n_tok: u32,
+    ) {
+        self.matmat(first_kind, first_off, n_in, n_out, src, first_dst, n_tok);
+        self.matmat(second_kind, second_off, n_in, n_out, src, second_dst, n_tok);
+    }
+    /// Per-layer embedding projection. The default preserves the established
+    /// projection, process activation, layer-vector multiply, projection sequence.
+    /// Backends may fuse its intermediates without exposing scheduling to the model.
+    #[allow(clippy::too_many_arguments)]
+    fn ple_project(
+        &self,
+        gate_kind: WeightKindWire,
+        gate_off: u64,
+        proj_kind: WeightKindWire,
+        proj_off: u64,
+        n_embd: u32,
+        ple_width: u32,
+        src: BufId,
+        gate: BufId,
+        per_layer: BufId,
+        per_layer_off: u32,
+        per_layer_stride: u32,
+        back: BufId,
+        n_tok: u32,
+    ) {
+        self.matmat(gate_kind, gate_off, n_embd, ple_width, src, gate, n_tok);
+        self.act(gate, n_tok * ple_width);
+        self.mul_strided(
+            gate,
+            per_layer,
+            ple_width,
+            per_layer_off,
+            per_layer_stride,
+            ple_width,
+            n_tok,
+        );
+        self.matmat(proj_kind, proj_off, ple_width, n_embd, gate, back, n_tok);
+    }
     /// Which gated activation the matmul kernels fuse into their write-back, or None.
     ///
     /// Sticky: it applies to every `matmat`/`matvec` until set again, so a caller sets it,
     /// dispatches, and sets it back.
+    ///
+    /// Workflows must consult `supports_epilogue` before selecting a fused route. This
+    /// separate capability prevents an unsupported nonzero wire value from being
+    /// mistaken for whichever activation a native backend happened to implement first.
     fn set_epilogue(&self, epi: Epilogue);
+    /// Whether `set_epilogue(epi)` followed by a projection is numerically implemented.
+    /// `None` is mandatory; activation-specific fusion is opt-in.
+    fn supports_epilogue(&self, epi: Epilogue) -> bool {
+        epi == Epilogue::None
+    }
 
     /// LFM2's gated short convolution, for `n_tok` tokens of `width` channels.
     ///
@@ -368,6 +1240,187 @@ pub trait Backend {
         row_stride: u32,
         base_off: u32,
     );
+    /// Whether one-token projection boundaries should publish a backend-private
+    /// prepared activation. The default keeps existing backends on their established
+    /// normalization path; a backend may enable this only through its tuned policy.
+    fn use_decode_projection_preparation(&self) -> bool {
+        false
+    }
+    /// Whether batched projection boundaries should publish the backend's prepared
+    /// activation layout. This is separate from Decode because the producer layout,
+    /// consumers and end-to-end crossover differ.
+    fn use_prefill_projection_preparation(&self) -> bool {
+        false
+    }
+    /// Normalize an activation that will feed one or more projections. The default is
+    /// exactly `rms_norm_from`; discrete quantized backends may also prepare a reusable
+    /// activation representation while producing the same public f32 buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_projection(
+        &self,
+        buf: BufId,
+        src: BufId,
+        w_off: u64,
+        width: u32,
+        eps: f32,
+        n_row: u32,
+        row_stride: u32,
+        base_off: u32,
+    ) {
+        self.rms_norm_from(buf, src, w_off, width, eps, n_row, row_stride, base_off);
+    }
+    /// Normalize projected heads, apply RoPE, and optionally apply the orthonormal
+    /// block transform used by quantized KV. The default preserves the established
+    /// three-operation sequence; backends may fuse only the implementation.
+    #[allow(clippy::too_many_arguments)]
+    fn head_norm_rope_hadamard(
+        &self,
+        buf: BufId,
+        w_off: u64,
+        head_dim: u32,
+        eps: f32,
+        n_heads: u32,
+        start_pos: u32,
+        n_tok: u32,
+        rope_dim: u32,
+        rope_base: f32,
+        freqs: Option<&[f32]>,
+        hadamard_nrot: u32,
+    ) {
+        self.rms_norm(buf, w_off, head_dim, eps, n_tok * n_heads, head_dim, 0);
+        self.rope(
+            buf, rope_dim, rope_base, head_dim, n_heads, start_pos, n_tok, freqs,
+        );
+        if hadamard_nrot != 0 {
+            self.hadamard(buf, n_tok * n_heads * head_dim, hadamard_nrot);
+        }
+    }
+    /// Postprocess paired K/V tensors while preserving the existing five-operation
+    /// ordering. The default keeps Metal and other backends byte-for-byte on their
+    /// established path; CUDA may fuse memory traffic behind the same contract.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_head_postprocess(
+        &self,
+        k: BufId,
+        v: BufId,
+        k_norm_off: u64,
+        head_dim: u32,
+        eps: f32,
+        n_kv: u32,
+        start_pos: u32,
+        n_tok: u32,
+        rope_dim: u32,
+        rope_base: f32,
+        freqs: Option<&[f32]>,
+        k_hadamard_nrot: u32,
+        v_hadamard_nrot: u32,
+    ) {
+        self.rms_norm(k, k_norm_off, head_dim, eps, n_tok * n_kv, head_dim, 0);
+        self.rms_norm(v, NO_WEIGHT, head_dim, eps, n_tok * n_kv, head_dim, 0);
+        self.rope(
+            k, rope_dim, rope_base, head_dim, n_kv, start_pos, n_tok, freqs,
+        );
+        if k_hadamard_nrot != 0 {
+            self.hadamard(k, n_tok * n_kv * head_dim, k_hadamard_nrot);
+        }
+        if v_hadamard_nrot != 0 {
+            self.hadamard(v, n_tok * n_kv * head_dim, v_hadamard_nrot);
+        }
+    }
+    /// Try to evaluate `dst = rms_norm(src, weight) + add` in one backend operation.
+    ///
+    /// This is an optional, model-agnostic fusion. Returning `false` promises that no
+    /// buffers were modified; the caller must then issue `rms_norm_from` and `add`
+    /// separately. Backends must also return `false` for layouts they cannot fuse.
+    /// Keeping the fallback at this seam lets CUDA match its native reduction/add
+    /// association without changing Metal or forcing every backend to expose a
+    /// model-named entry point.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_add(
+        &self,
+        _dst: BufId,
+        _src: BufId,
+        _w_off: u64,
+        _width: u32,
+        _eps: f32,
+        _n_row: u32,
+        _row_stride: u32,
+        _base_off: u32,
+        _add: BufId,
+        _output_scale: f32,
+    ) -> bool {
+        false
+    }
+    /// Try `dst = rms_norm(resid + other) * w` with `resid += other` as one operation:
+    /// the PRE-norm residual order (LFM2), where every residual add is followed by the
+    /// next norm reading the sum. Returning `false` promises that no buffers were
+    /// modified; the caller then issues `add` and `rms_norm_from` separately. Bits must
+    /// match that two-step form (same float adds, same reduction over the same values).
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm(
+        &self,
+        _dst: BufId,
+        _resid: BufId,
+        _other: BufId,
+        _w_off: u64,
+        _width: u32,
+        _eps: f32,
+        _n_row: u32,
+        _row_stride: u32,
+        _base_off: u32,
+    ) -> bool {
+        false
+    }
+    /// Try the in-place RMSNorm+residual operation while also preparing the
+    /// quantized activation representation consumed by an immediate projection.
+    /// Returning `false` promises no mutation; the caller retains the ordinary
+    /// `rms_norm_add` fallback. Backends without a discrete projection layout do
+    /// not need to implement this capability.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_add_projection(
+        &self,
+        _dst: BufId,
+        _src: BufId,
+        _w_off: u64,
+        _width: u32,
+        _eps: f32,
+        _n_row: u32,
+        _row_stride: u32,
+        _base_off: u32,
+        _add: BufId,
+    ) -> bool {
+        false
+    }
+    /// Try the adjacent transformer boundary as one backend operation:
+    ///
+    /// mid = rms(src, first_weight) + residual
+    /// out = rms(mid, second_weight)
+    ///
+    /// Returning false promises no writes. This optional seam lets a backend
+    /// keep mid on chip while still materializing it for the later residual;
+    /// backends without a proven implementation retain the two established
+    /// operations unchanged.
+    #[allow(clippy::too_many_arguments)]
+    /// `mid = (residual + norm(src) * w1) * output_scale`, then `out = norm(mid) * w2`:
+    /// a norm-and-residual followed by the NEXT consumer's input norm, one dispatch. The
+    /// scale is the layer's output scalar (1.0 where a model has none).
+    fn rms_norm_add_dual_projection(
+        &self,
+        _src: BufId,
+        _residual: BufId,
+        _first_w_off: u64,
+        _mid: BufId,
+        _second_w_off: u64,
+        _out: BufId,
+        _width: u32,
+        _eps: f32,
+        _n_row: u32,
+        _row_stride: u32,
+        _base_off: u32,
+        _output_scale: f32,
+    ) -> bool {
+        false
+    }
     fn rope(
         &self,
         buf: BufId,
@@ -398,6 +1451,13 @@ pub trait Backend {
         n_kv: u32,
         kv_width: u32,
         start_pos: u32,
+        // THE SCORE SCALE IS THE OP'S: softmax(scale * q.k). Each backend applies it inside
+        // this entry (a scale of Q before the kernel -- softmax((scale q).k) is the same
+        // function), so a model cannot forget it: forgetting is a missing argument, not
+        // logits that are right at n = 1 and wrong at n >= 2 (a softmax over one position
+        // is 1 whatever the scale). 1.0 where the file folds it into the weights, as
+        // gemma4's q_norm does; 1/sqrt(head_dim) otherwise.
+        scale: f32,
         window: u32,
         n_tok: u32,
         max_scores: u32,
@@ -413,6 +1473,26 @@ pub trait Backend {
     /// arithmetic: with the value still GELU, a runtime branch in the epilogue moved
     /// gemma4's n=16 logits from 25.582184 to 25.582018, reproducibly.
     fn set_activation(&self, act: Epilogue);
+    /// The attention head dims THIS model uses, distinct, before `init_weights`.
+    ///
+    /// A specialised attention kernel is compiled per head dim because the dim sizes a
+    /// REGISTER array, which the Metal compiler requires to be a constant expression
+    /// (`simdgroup_float8x8 o[n]` is rejected: "array size is not a constant expression").
+    /// The backend compiles its shader from source on the device at every start, so the
+    /// right set to compile is the one the MODEL actually uses -- not a list written in
+    /// the shader, which both misses dims nobody wrote down and compiles dims this model
+    /// can never dispatch.
+    ///
+    /// Must be called before `init_weights`, for the same reason `set_activation` must:
+    /// the value is baked in when the library is built, so setting it afterwards is a
+    /// silent no-op. Default does nothing -- a backend that does not specialise on the
+    /// dim ignores it.
+    fn set_attention_head_dims(&self, _dims: &[u32]) {}
+    /// The K/V row width (kv heads x head dim, in elements) for each head dim passed to
+    /// `set_attention_head_dims`, same order. A backend that specialises its attention
+    /// kernels at library compile takes the row stride as a compile-time constant from it
+    /// (every K/V tile load carries that stride); a backend that does not, ignores it.
+    fn set_attention_kv_widths(&self, _widths: &[u32]) {}
     /// `a = act(a)`, elementwise.
     fn act(&self, a: BufId, n: u32);
     /// `a = act(a) * b`, elementwise -- the DECODE form of the fused epilogue.
@@ -425,6 +1505,9 @@ pub trait Backend {
     fn add_scale(&self, a: BufId, b: BufId, k: f32, n: u32);
     fn scale(&self, a: BufId, k: f32, n: u32);
     fn copy(&self, dst: BufId, src: BufId, n: u32);
+    /// `n` floats from `src[src_off..]` to `dst[dst_off..]` (element offsets). `dst` may
+    /// be `src` when the two ranges do not overlap; the caller guarantees that.
+    fn copy_range(&self, dst: BufId, dst_off: u32, src: BufId, src_off: u32, n: u32);
     fn mul_strided(
         &self,
         a: BufId,
@@ -437,6 +1520,21 @@ pub trait Backend {
     );
     fn softcap(&self, a: BufId, cap: f32, n: u32);
     fn argmax(&self, src: BufId, dst: BufId, n: u32);
+    /// The greedy pick stored twice: into `tokens[0]`, where the next decode step's
+    /// embedding gather reads it, and into `pick[pick_slot]` for the host to read one step
+    /// later. Same rule as `argmax`. Reached only when `decode_pipelining` is true; the
+    /// default writes `pick[0]` alone so a backend that never claims the capability is
+    /// not silently half-wired.
+    fn argmax_feed(
+        &self,
+        src: BufId,
+        _tokens: BufId,
+        pick: BufId,
+        _pick_slot: u32,
+        n: u32,
+    ) {
+        self.argmax(src, pick, n);
+    }
     fn ple_gather_combine(
         &self,
         proj: BufId,
@@ -447,6 +1545,33 @@ pub trait Backend {
         comb_scale: f32,
         n_tok: u32,
     );
+    /// Host-staged tier: copy row `ids[t]` of the row-gathered tensor at file offset
+    /// `file_off` (rows of `row_bytes`) into `dst` at `t * row_bytes`, for every t. The
+    /// host does the gather, so the device never maps the table. Returns false when this
+    /// backend reads tables itself (the caller then uses `ple_gather_combine`).
+    fn stage_rows(
+        &self,
+        _file_off: u64,
+        _row_bytes: u32,
+        _ids: &[u32],
+        _dst: BufId,
+    ) -> bool {
+        false
+    }
+    /// `ple_gather_combine` over rows already staged by `stage_rows`: row t is token t.
+    fn ple_gather_combine_staged(
+        &self,
+        _proj: BufId,
+        _rows: BufId,
+        _width: u32,
+        _emb_scale: f32,
+        _comb_scale: f32,
+        _n_tok: u32,
+    ) {
+        unreachable!(
+            "ple_gather_combine_staged on a backend whose stage_rows returned false"
+        )
+    }
 
     // --- weights + config + identity ---
     /// Make the mapped weight blob available to the backend (Metal: share the mmap;
@@ -456,6 +1581,98 @@ pub trait Backend {
     /// # Safety
     /// `base` must point to `len` readable bytes that outlive every kernel.
     unsafe fn init_weights(&self, base: *const u8, len: u64) -> Result<(), i32>;
+
+    /// Initialize weights with optional model-owned residency hints. Backends with a
+    /// unified address space or no separate device memory deliberately ignore them.
+    ///
+    /// # Safety
+    /// `base` must point to `len` readable bytes that outlive every kernel, and every
+    /// span must lie wholly within that mapping.
+    unsafe fn init_weights_with_residency(
+        &self,
+        base: *const u8,
+        len: u64,
+        _streamed: &[StreamedWeightSpan],
+    ) -> Result<(), i32> {
+        unsafe { self.init_weights(base, len) }
+    }
+
+    /// The fast tier's size in bytes, when the backend can report one: Metal's recommended
+    /// working set, CUDA's VRAM. `None` means unknown and the common runtime places every
+    /// weight in the fast tier, as it did before placement existed.
+    fn fast_tier_budget(&self) -> Option<u64> {
+        None
+    }
+
+    /// Initialize weights under the common runtime's placement. The default hands every
+    /// segment outside the fast tier to `init_weights_with_residency` as a span, which is
+    /// exactly what a backend without per-tier support did before; a backend that
+    /// implements the tiers overrides this.
+    ///
+    /// # Safety
+    /// As `init_weights`; every segment lies inside `[base, base + len)`.
+    unsafe fn init_weights_with_placement(
+        &self,
+        base: *const u8,
+        len: u64,
+        placement: &WeightPlacement,
+    ) -> Result<(), i32> {
+        let slow = placement.slow_spans();
+        unsafe { self.init_weights_with_residency(base, len, &slow) }
+    }
+
+    /// Load-time repack of fast-tier tensors into a backend-private copy
+    /// (docs/memory-tiers-and-fit.md section 7). Each job names one tensor by its file
+    /// span and its row-major and tile-major ggml types; the rule for the bytes is
+    /// `imparo_gguf::weights::TM_RULES`. Returns one flag per job: true when the backend
+    /// now serves that tensor in the `to` layout (the caller then rewrites the tensor's
+    /// type so dispatch routes to the tile-major kernels), false when it left the tensor
+    /// as it was (no readers for `to`, or the tensor is not in its fast tier). The default
+    /// transforms nothing, which is what a backend without tile-major kernels wants.
+    ///
+    /// # Errors
+    /// A backend failure while transforming (allocation, GPU error); the weights are then
+    /// in an undefined state and the load must fail.
+    fn transform_weights(&self, jobs: &[WeightTransform]) -> Result<Vec<bool>, String> {
+        Ok(vec![false; jobs.len()])
+    }
+    /// Whether this backend has kernels for a weight ggml type. Checked for every tensor at
+    /// load: a file carrying a layout this backend cannot read (a tile-major kind without
+    /// readers here) is refused with the tensor's name instead of dispatched to a kernel
+    /// built for another layout. The default is the row-major set every backend reads.
+    fn serves_weight_type(&self, ggml_type: u32) -> bool {
+        matches!(ggml_type, 0 | 2 | 8) // F32, Q4_0, Q8_0
+    }
+    /// Read `dst.len()` weight bytes as the backend will serve them at file offset
+    /// `file_off` (after any load-time transform). For verification only; false when the
+    /// backend cannot read back (default).
+    fn read_weight_bytes(&self, _file_off: u64, _dst: &mut [u8]) -> bool {
+        false
+    }
+
+    /// Whether the selected per-model/per-device policy wants admission-time
+    /// transformed weights. False keeps common model loading allocation-free.
+    fn quantized_weight_cache_enabled(&self) -> bool {
+        false
+    }
+
+    /// Which model-owned projection spans the selected backend policy needs at
+    /// admission. The common workflow supplies offsets and shapes; it never names a
+    /// device format or interprets backend tuning state.
+    fn quantized_weight_cache_plan(&self) -> QuantizedWeightCachePlan {
+        QuantizedWeightCachePlan::default()
+    }
+
+    /// Prepare a complete persistent weight-cache transaction after activation and KV
+    /// admission. `Ok(true)` means every requested matrix is ready; `Ok(false)` is the
+    /// conservative unsupported/insufficient-memory fallback. Partial publication is
+    /// forbidden so a request never discovers half of a model-specific hot set.
+    fn prepare_quantized_weight_cache(
+        &self,
+        _weights: &[QuantizedWeightPrepack],
+    ) -> Result<bool, i32> {
+        Ok(false)
+    }
 
     /// Configure KV cache storage types (f16=1, q4_0=2, q8_0=8) before build.
     fn set_kv_types(&self, k: u32, v: u32);
@@ -474,6 +1691,13 @@ pub trait Backend {
     fn pool_caps(&self) -> PoolCaps;
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QuantizedWeightCachePlan {
+    pub include_down: bool,
+    pub include_full_ffn: bool,
+    pub include_head: bool,
+}
+
 /// One storage tier a backend can place KV state in, nearest-compute first.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tier {
@@ -487,6 +1711,45 @@ pub enum Tier {
     Disk,
 }
 
+/// Default error for a backend that does not implement an explicit Host mover.
+pub const KV_HOST_UNSUPPORTED: i32 = -38;
+
+/// Opaque, generation-checked handle to backend-owned persistent Host storage.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct KvHostHandle(pub u64);
+
+/// One contiguous physical KV range in a Device <-> Host batch.
+///
+/// `device_offset` addresses the selected layer/side's raw allocation and
+/// `host_offset` addresses `host_handle`. A single batch may name independent
+/// content-unit handles, so a whole conversation promotes with one completion
+/// barrier without coupling those units' lifetimes. Every byte range is checked by
+/// the backend; the common pool derives it from actual geometry and
+/// `UnitPlacement`, never from a model-specific constant.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvTransferSpan {
+    pub host_handle: u64,
+    pub layer: u32,
+    pub is_v: u32,
+    pub device_offset: u64,
+    pub host_offset: u64,
+    pub len: u64,
+}
+
+/// Measured facts for deciding whether a discrete Host tier is useful and safe.
+/// Policy (speed margin and retained OS headroom) remains in the common pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostTierProfile {
+    /// Currently available pageable+page-lockable host memory reported by the OS.
+    pub available_host_bytes: u64,
+    /// Measured pinned Host -> Device transfer throughput.
+    pub pinned_h2d_bytes_per_second: u64,
+    /// Measured Device -> pinned Host transfer throughput.
+    pub pinned_d2h_bytes_per_second: u64,
+}
+
 /// The pool's capability descriptor (docs/unified-kv-pool.md "Backend capability
 /// descriptor").
 ///
@@ -497,23 +1760,60 @@ pub enum Tier {
 /// paged_reads      enforced. The server refuses to run the pool without it: a block
 ///                  table installed for a kernel that ignores it reads somebody else's
 ///                  rows, and nothing would fail.
-/// block_cells      enforced by the engine gate, not by code -- it is the byte-identity
-///                  resume grid, proven per backend at every split point.
-/// shared_address   DECLARED ONLY. Nothing reads it yet. It exists so the first mover
-///                  between tiers consults it instead of assuming a unified address
-///                  space, which is what a Metal-shaped pool would do on a discrete GPU.
-/// tiers            DECLARED ONLY, same reason. Tier::Host has no mover today.
+/// page_cells       Paged attention's PAGE: `kv_slot` maps through the block table one
+///                  page at a time. NOT checked against the identity grid, because the
+///                  grid takes its VALUE from it -- one block per placement entry means
+///                  one extent per page, so the two agree by construction.
+/// finest_cut_tokens    enforced by the same gate, and a DIFFERENT question -- where a
+///                  prefill may be cut, set by the attention kernel's query group.
+///                  grid_tokens() must be a multiple of it. See docs/kv-identity-grid.md.
+/// shared_address   enforced together with tiers when a caller enters the common pool.
+///                  Shared backends start at Unified; discrete backends must expose an
+///                  explicit Device -> Host path.
+/// tiers            implemented capabilities, not aspirations. A backend adds Host only
+///                  when its explicit transfer path is ready.
 /// ```
 ///
-/// The intent behind the last two is that a "copy" between CPU and GPU is a change of
+/// The reason for the last two is that a "copy" between CPU and GPU is a change of
 /// reader on a shared address space and a PCIe transfer on a discrete one; a tier list
-/// that omits Host on Metal is how the wasteful case is meant to become unrepresentable.
-/// It is not unrepresentable yet -- there is simply no code that moves between tiers.
+/// that omits Host on Metal makes the wasteful case unrepresentable. Call
+/// [`PoolCaps::validate_for_pool`] before constructing the common pool.
 #[derive(Clone, Copy, Debug)]
 pub struct PoolCaps {
-    /// Smallest block the attention kernel can index independently, derived from
-    /// that kernel's tile geometry. Must divide the pool's unit size.
-    pub block_cells: u32,
+    /// PAGED ATTENTION'S PAGE, in KV cells: the span one block-table entry maps.
+    ///
+    /// `imparo_kv`'s identity grid TAKES ITS VALUE from this, so an extent is exactly one
+    /// page -- which is what the placement structure requires (`BTreeMap<layer,
+    /// BlockIdx>`, one block per layer). A backend with a different page therefore works
+    /// unchanged: it gets a grid of that size, and its store is a different root anyway
+    /// (`config_root` hashes `device_tag`).
+    ///
+    /// MUST NOT BECOME TUNER-OWNED. The disk grid is cut on it, so a swept page would
+    /// re-cut the layout under every stored conversation on each retune
+    /// (docs/unified-kv-pool.md).
+    ///
+    /// Windowed layers do not page -- they address through a ring -- but the pool
+    /// allocates every layer on this quantum.
+    pub page_cells: u32,
+    /// The FINEST spacing at which a prefill may be CUT -- resumed, or split across
+    /// requests -- and still reproduce a cold pass byte for byte.
+    ///
+    /// A FLOOR, not a grid, which is why it is not named like one: the engine picks its
+    /// own quantum and this says how fine that may go. Any multiple of it also
+    /// reproduces, so the gate is `grid_tokens() % finest_cut_tokens == 0`.
+    ///
+    /// A different question from `page_cells`, and a different number: this one comes
+    /// from the attention prefill kernel, whose KV scan bounds are taken from a query
+    /// GROUP rather than a query, and whose position blocks split into whole 8-runs
+    /// plus a scalar remainder. Measured at 8 and at 16 on Metal while `page_cells`
+    /// stayed 64 (docs/kv-identity-grid.md).
+    ///
+    /// Report a CEILING over every kernel this backend may select, not the value of
+    /// the current selection: the selection varies per layer (head_dim picks different
+    /// instantiations), per request (the window engages with length), per device (a
+    /// threadgroup limit) and per KV type. Too coarse costs reuse depth; too fine is a
+    /// wrong answer.
+    pub finest_cut_tokens: u32,
     /// Whether attention accepts a block table; without it the pool uses the
     /// gather-into-scratch or contiguous fallback.
     pub paged_reads: bool,
@@ -521,6 +1821,102 @@ pub struct PoolCaps {
     pub shared_address: bool,
     /// Ordered, nearest compute first. Disk last everywhere.
     pub tiers: &'static [Tier],
+}
+
+/// How the common pool may make KV bytes visible to the compute device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolAddressing {
+    /// CPU and GPU see the same allocation; residency changes never emit a copy.
+    Shared,
+    /// Device and host are distinct tiers; residency changes require an explicit mover.
+    ExplicitHostTransfers,
+}
+
+/// One independent reason a backend cannot safely enter the common KV pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolCapsIssue {
+    PagedReadsUnavailable,
+    InvalidPageCells { declared: u32 },
+    IncompatibleFinestCut { declared: u32, grid_tokens: u32 },
+    SharedAddressNeedsUnifiedDisk,
+    DiscreteAddressNeedsDeviceHostDisk,
+}
+
+impl core::fmt::Display for PoolCapsIssue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::PagedReadsUnavailable => write!(f, "paged_reads=false"),
+            Self::InvalidPageCells { declared } => {
+                write!(f, "page_cells={declared}, required a non-zero power of two")
+            }
+            Self::IncompatibleFinestCut {
+                declared,
+                grid_tokens,
+            } => write!(
+                f,
+                "finest_cut_tokens={declared} does not divide grid_tokens={grid_tokens}"
+            ),
+            Self::SharedAddressNeedsUnifiedDisk => {
+                write!(f, "shared_address=true requires exactly [Unified, Disk]")
+            }
+            Self::DiscreteAddressNeedsDeviceHostDisk => write!(
+                f,
+                "shared_address=false requires exactly implemented [Device, Host, Disk]"
+            ),
+        }
+    }
+}
+
+impl PoolCaps {
+    /// Validate every property needed before the common pool may install block tables.
+    ///
+    /// All issues are returned together so a backend under bring-up cannot appear to be
+    /// one flag flip away from safety. `tiers` is deliberately treated as an
+    /// implemented-capability list: advertising Host on a discrete backend promises that
+    /// the explicit mover exists. `grid_tokens` is the caller's selected identity grid;
+    /// the page feeds that grid today, while the explicit argument keeps the cut contract
+    /// testable if copy-on-write later makes the grid finer than a page.
+    pub fn validate_for_pool(
+        &self,
+        grid_tokens: u32,
+    ) -> Result<PoolAddressing, Vec<PoolCapsIssue>> {
+        let mut issues = Vec::new();
+        if !self.paged_reads {
+            issues.push(PoolCapsIssue::PagedReadsUnavailable);
+        }
+        if self.page_cells == 0 || !self.page_cells.is_power_of_two() {
+            issues.push(PoolCapsIssue::InvalidPageCells {
+                declared: self.page_cells,
+            });
+        }
+        if self.finest_cut_tokens == 0
+            || grid_tokens == 0
+            || grid_tokens % self.finest_cut_tokens != 0
+        {
+            issues.push(PoolCapsIssue::IncompatibleFinestCut {
+                declared: self.finest_cut_tokens,
+                grid_tokens,
+            });
+        }
+
+        let addressing = if self.shared_address {
+            if self.tiers != [Tier::Unified, Tier::Disk] {
+                issues.push(PoolCapsIssue::SharedAddressNeedsUnifiedDisk);
+            }
+            PoolAddressing::Shared
+        } else {
+            if self.tiers != [Tier::Device, Tier::Host, Tier::Disk] {
+                issues.push(PoolCapsIssue::DiscreteAddressNeedsDeviceHostDisk);
+            }
+            PoolAddressing::ExplicitHostTransfers
+        };
+
+        if issues.is_empty() {
+            Ok(addressing)
+        } else {
+            Err(issues)
+        }
+    }
 }
 
 /// A backend-agnostic profiling snapshot (the wrapper in the model layer prints it
@@ -531,27 +1927,51 @@ pub struct ProfStats {
     pub wall_s: f64,
     pub cbs: u64,
     pub dispatches: u64,
+    /// Buffer barriers the encoder emitted. One per dispatch means concurrent encoding
+    /// buys nothing -- every kernel's tail waits for the next one's head.
+    pub barriers: u64,
     /// (category name, ticks, calls) since the last read.
     pub categories: Vec<(String, f64, u64)>,
 }
 
-/// The four-category knob taxonomy (see imparo-tune's knobs.rs for the doctrine):
-/// only `Benched` knobs are swept; the others are computed or profiled once.
+/// The five-category knob taxonomy (see imparo-tune's knobs.rs for the doctrine):
+/// `Benched` knobs are micro-swept, `EndToEnd` knobs require a whole-engine admission
+/// bracket, and the others are computed or profiled once.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KnobCategory {
     ModelShape,
     DeviceProfile,
     Arithmetic,
     Benched,
+    EndToEnd,
 }
-
+/// The widest token tile any backend's prefill GEMM uses, and therefore how far a
+/// half-activation mirror has to be PADDED.
+///
+/// A GEMM walks whole token tiles, so a conversion pass fills `ceil(n_tok/tile)*tile`
+/// rows and a kernel reading its operand straight from the mirror loads whole 8-row
+/// fragments. Sizing the mirror at exactly `batch` rows makes both of those read or write
+/// past the end: for LFM2's down projection at 455 tokens, `n_in` is 10752 and the
+/// conversion writes 480 rows into a buffer holding 455 -- 537 KB past it, landing in
+/// whatever the arena packed next.
+///
+/// The Metal table's widest tile is 128 (shape 8, 32x128); `q8_token_tiles_fit_the_mirror`
+/// in imparo-metal asserts this constant covers it, so the two cannot drift apart.
+pub const MAX_GEMM_TOKEN_TILE: usize = 128;
 
 /// The stage-1 workload a Micro knob is judged on, spoken in Backend-trait ops so the
 /// shared tuner builds it for any backend from the model's shapes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Workload {
     /// The decode-step matmuls at n_tok=1, at the model's real weight offsets, summed.
     DecodeMix,
+    /// One complete single-token dense gated-FFN transaction. Unlike `DecodeMix`, this
+    /// reaches `matmat_gated`, so Decode-only projection fusion is ranked on the path it
+    /// actually changes instead of being diluted by unrelated standalone matmuls.
+    DecodeFfnTransaction,
+    /// One single-token short-convolution state transition. The tuner restores the
+    /// model-sized recurrent state before every timed repetition.
+    DecodeShortconvTransaction,
     /// A narrow batch through the layer's big matmuls (the MTP verification shape).
     NarrowMix(u32),
     /// Single-query attention against a long context.
@@ -596,6 +2016,17 @@ pub enum Workload {
     /// until now no workload measured it, so no knob was ever chosen for the turn shape
     /// the engine most often sees.
     AttentionPrefillReuse,
+    /// The geometry MOST layers run, as a second regime for the prefill-attention knobs:
+    /// the deep workload ranks them at `deep_head_dim` with no window (E4B's few global
+    /// layers), while most of E4B's layers are head dim 256 inside a sliding window. A
+    /// model with one geometry gets the same geometry at the short position instead, so
+    /// the cross-check is always a different regime from the primary.
+    AttentionPrefillMajor,
+    /// The full-chunk GEMM the large st_gemm shape actually serves: the pair projection
+    /// at the prefill chunk width (512 tokens), not the 128-token pair tile. Ranking the
+    /// large shape at 128 tokens read shape 11 as 0.8% faster while the engine's 512-token
+    /// chunks measured it 2% slower (2026-09-02).
+    PrefillGemmChunk,
     /// The layer's two widest matmuls at the PREFILL tile: n_embd->n_ff and n_ff->n_embd
     /// at 512 tokens. This is the shape the GEMM tile knobs actually govern. Judging them
     /// on DecodeMix instead -- n_tok=1 matvecs -- is measuring a different kernel path,
@@ -603,6 +2034,155 @@ pub enum Workload {
     /// real prefill. That was read as "micro-benchmarks cannot rank GEMM tiles, move the
     /// knob end-to-end"; it actually meant the workload was wrong.
     PrefillGemm,
+    /// The same two matmuls at a MIX of ubatch widths, which is what a real prefill sends.
+    ///
+    /// PrefillGemm times ONE token count. That is enough to rank a knob whose answer is
+    /// the same for every dispatch, and not enough for one whose answer depends on the
+    /// dispatch's own token count -- which is why the second prefill tile could never be
+    /// ranked and its threshold was excluded from the registry entirely. A prefill sends
+    /// full ubatches and one remainder, so this sends both: the widths a request actually
+    /// produces, each let through the engine's own per-dispatch tile rule.
+    PrefillGemmWidths,
+    /// The same two matmuls over the model's FULL projection at the fewest tokens that
+    /// exercise every candidate (the widest token tile in the shape table). For the SECOND
+    /// tile of the prefill pair, which the dispatch selects only where it pads no worse
+    /// than the first; a remainder width never runs it, so on `PrefillGemmWidths` half of
+    /// every measurement of that knob was dilution, and that workload's cache-resident
+    /// slice hid the re-read trade besides. Measured on LFM2 (Q8, M3 Pro): end to end by
+    /// env pin the 64x64 second tile is worth +3.1% / +3.0% at 5963 / 17123 tokens; on
+    /// PrefillGemmWidths it read -0.1% to +1.8%, always inside the noise floor; here
+    /// +10.4% on a 2.3% floor at 128 tokens (+4.0% on 2.0% at 512, same order).
+    PrefillGemmUbatch,
+    /// One complete dense gated-FFN transaction at a tunable token width:
+    /// gate/up projection, activation-product, then down projection. This is distinct
+    /// from `PrefillGemm`: fusion and private intermediate layouts can only be ranked by
+    /// timing the whole semantic operation against its established unfused fallback.
+    PrefillFfnTransaction,
+    /// The exact 128-token SM86 route bundle. This is intentionally separate from
+    /// the general FFN threshold: one value owns D256 Attention, PLE, ready-Q8 and
+    /// Down together, so the tuner must time and prove every controlled stage rather
+    /// than persist an untested mixture or rank the bundle on FFN alone.
+    PrefillFfnExact128,
+}
+
+/// Stable identity of the frozen dynamic-program search surface. The three catalog
+/// hashes remain zero until their canonical encoding is activated by the receipt work;
+/// consumers must check `identity_ready` before persisting them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProgramCatalogIdentity {
+    pub program_pack_abi: u32,
+    pub identity_ready: bool,
+    pub pack_set_sha256: [u8; 32],
+    pub candidate_catalog_sha256: [u8; 32],
+    pub eligible_candidate_set_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramProvider {
+    BuiltIn,
+    ProgramPack,
+}
+
+/// One opaque implementation of an engine-owned operation contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramCandidateDecl {
+    pub variant_id: [u8; 32],
+    pub config_id: [u8; 32],
+    pub provider: ProgramProvider,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramChoiceDecl {
+    pub choice_group_id: String,
+    pub candidates: Vec<ProgramCandidateDecl>,
+    pub workload: Workload,
+    pub cross_check: Option<Workload>,
+    pub screened: bool,
+    pub bit_affecting: bool,
+    pub joint_with: Vec<String>,
+}
+
+/// Backend-generic dynamic program surface. Static backends inherit an inert default,
+/// so adding CUDA Program Packs cannot add a Metal/model workflow branch.
+pub trait BackendPrograms: Sync {
+    fn program_catalog_identity(&self) -> ProgramCatalogIdentity {
+        ProgramCatalogIdentity::default()
+    }
+
+    fn program_choices(
+        &self,
+        _facts: &ModelFacts,
+        _profile: &DeviceProfile,
+    ) -> Vec<ProgramChoiceDecl> {
+        Vec::new()
+    }
+
+    fn bind_program_choice(
+        &self,
+        _group: &str,
+        _variant: &[u8; 32],
+    ) -> Result<(), String> {
+        Err("backend has no dynamic program catalog".into())
+    }
+
+    fn current_program_choice(&self, _group: &str) -> Option<[u8; 32]> {
+        None
+    }
+
+    fn freeze_program_catalog(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TunerScratchRegion {
+    BufferF32 {
+        id: BufId,
+        off: u64,
+        elements: usize,
+    },
+    KvBytes {
+        layer: u32,
+        is_v: bool,
+        off: u64,
+        bytes: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkloadEffects {
+    ReadOnly,
+    Mutable(&'static [TunerScratchRegion]),
+    /// Mutable recurrent state whose exact size comes from the model plan rather than
+    /// a backend-global constant.
+    ModelRecurrentState,
+}
+
+impl Workload {
+    /// Every mutable tuning workload must declare the exact device ranges it changes.
+    /// Adding a workload forces this exhaustive match to be updated instead of silently
+    /// benchmarking state left behind by the previous candidate.
+    pub const fn effects(self) -> WorkloadEffects {
+        match self {
+            Self::DecodeMix
+            | Self::DecodeFfnTransaction
+            | Self::NarrowMix(_)
+            | Self::AttentionDecode
+            | Self::AttentionDecodeDeep
+            | Self::AttentionPrefill
+            | Self::AttentionPrefillDeep
+            | Self::DecodeAttentionStep
+            | Self::AttentionPrefillReuse
+            | Self::AttentionPrefillMajor
+            | Self::PrefillGemm
+            | Self::PrefillGemmChunk
+            | Self::PrefillGemmWidths
+            | Self::PrefillGemmUbatch
+            | Self::PrefillFfnTransaction
+            | Self::PrefillFfnExact128 => WorkloadEffects::ReadOnly,
+            Self::DecodeShortconvTransaction => WorkloadEffects::ModelRecurrentState,
+        }
+    }
 }
 
 /// How a Benched knob's value is found.
@@ -611,6 +2191,10 @@ pub enum SweepKind {
     /// Not swept at all -- see `KnobDecl::derive`. Present so a derived knob can sit in
     /// the registry beside the benched ones instead of hiding in backend init.
     Derived,
+    /// A policy whose effect exists only across a whole workflow/graph boundary. The
+    /// micro tuner records the current value without timing it. Promotion requires an
+    /// external whole-engine bracket plus the normal versioned correctness receipt.
+    External,
     /// Interleaved sweep over `values` with a per-axis noise floor.
     Values,
     /// A routing boundary: at each rung `n` of `ladder`, a matmat of `n` tokens is timed
@@ -618,6 +2202,16 @@ pub enum SweepKind {
     /// The pick is the last width where the hi-side kernel keeps winning; scans run three
     /// times and must agree within one rung, else the compiled default stands.
     Crossing {
+        ladder: &'static [u32],
+        hi: u32,
+        lo: u32,
+    },
+    /// A token-count routing boundary whose candidate loses at small batches and wins
+    /// from some minimum width onward. At every rung the candidate is forced with `hi`
+    /// and the safe route with `lo`; the first stable winning rung becomes the stored
+    /// minimum. This is deliberately separate from `Crossing`, whose `hi` route owns
+    /// the small side of the boundary.
+    TokenMinCrossing {
         ladder: &'static [u32],
         hi: u32,
         lo: u32,
@@ -642,11 +2236,12 @@ pub enum SweepKind {
 /// a backend developer adds knobs HERE (their crate), never in shared code. REGISTRY
 /// ORDER IS SWEEP ORDER: a knob whose measurement depends on another's pick (nb8_max's
 /// crossing runs against the nb8_shape winner) is declared after it.
-/// There is no `stage` field and no end-to-end search. Every knob here is chosen by math
-/// or by a per-kernel micro-bench; a knob that can only be judged by running the whole
-/// engine does not belong in this registry. Command-buffer length is the one property
-/// with no per-kernel proxy by construction, and it is DERIVED from measured encode cost
-/// and buffer turnaround rather than swept -- see the note above KNOBS in the backend.
+/// There is no implicit `stage` field. Most knobs are chosen by math or a per-kernel
+/// micro-bench. A policy that can only be judged by running the whole engine must declare
+/// `EndToEnd` + `External`; the micro tuner then preserves its incumbent instead of
+/// manufacturing a no-op timing decision. Command-buffer length remains DERIVED from
+/// measured encode cost and buffer turnaround because it has an explicit arithmetic
+/// model; Graph/workflow policies without such a model require external admission.
 /// What the tuner knows about the model in front of it, for deciding whether a knob
 /// APPLIES at all. Shapes come from the GGUF header, so this costs no tensor mapping.
 ///
@@ -765,6 +2360,69 @@ pub struct ModelFacts {
     /// tensor of that quant: the workload would dispatch a different kernel family and
     /// rank the candidates on noise. `applies` reads this.
     pub weight_kinds: u32,
+}
+
+/// The front of a gemma4 layer offered to `mega_layer` (when `mega_front_wanted`):
+/// `o = W_o . attn`, then the sandwich `mid = x + rms(o) * w_post_attn`,
+/// `ffn_in = rms(mid) * w_ffn_norm`. With it the block starts at the attention output; `src`
+/// (the FFN input buffer) is then unused and `add` receives o_proj's output.
+#[derive(Clone, Copy, Debug)]
+pub struct MegaFront<'a> {
+    pub wo_kind: WeightKindWire,
+    pub wo_off: u64,
+    pub attn: BufId,
+    pub attn_in: u32,
+    pub post_attn_norm_off: u64,
+    pub ffn_norm_off: u64,
+    /// The layer's attention head dim (selects the block's instantiation).
+    pub head_dim: u32,
+    /// With `mega_attn_wanted`: the decode attention over the cache joins the block too;
+    /// the call then replaces `attention` as well and `attn` receives its output.
+    pub attention: Option<MegaAttn>,
+    /// With `mega_qkv_wanted` (and `attention` given): the layer's input norm, the q/k/v
+    /// projections, head norm + rope and the KV store join too -- the call then replaces the
+    /// whole layer from the residual `x` on, and `attention.q`, `k`, `v` receive the rows.
+    pub qkv: Option<MegaQkv<'a>>,
+}
+
+/// The q/k/v front offered to the mega block: `cur = rms(x) * w_in`, the three projections,
+/// per-head `rms(w_qn)` + rope on Q, `rms(w_kn)` + rope on K, unweighted rms on V, then K
+/// and V into this layer's cache at `start_pos`. `wk`/`wv` are None for a shared-KV layer.
+#[derive(Clone, Copy, Debug)]
+pub struct MegaQkv<'a> {
+    pub wq_kind: WeightKindWire,
+    pub wq_off: u64,
+    pub wk: Option<(WeightKindWire, u64)>,
+    pub wv: Option<(WeightKindWire, u64)>,
+    pub q_norm_off: u64,
+    pub k_norm_off: u64,
+    pub in_norm_off: u64,
+    pub rope_dim: u32,
+    pub rope_base: f32,
+    pub freqs: Option<&'a [f32]>,
+    pub k: BufId,
+    pub v: BufId,
+    /// This layer's index (the cache written is this layer's; must equal `attention.kv_layer`).
+    pub layer: u32,
+}
+
+/// The decode attention step offered to the mega block: the same arguments `attention`
+/// takes at one token (scale 1.0 -- the query is pre-scaled where a model scales).
+#[derive(Clone, Copy, Debug)]
+pub struct MegaAttn {
+    pub kv_layer: u32,
+    pub n_heads: u32,
+    pub n_kv: u32,
+    pub kv_width: u32,
+    pub start_pos: u32,
+    pub window: u32,
+    pub ring: u32,
+    pub q: BufId,
+    /// The cache basis: the Hadamard block width the workflow rotates Q and K by before a
+    /// quantized K store (0 = none). The block rotates the rows it forms the same way.
+    pub had_k: u32,
+    /// The same for V (0 = none); the block rotates its attention output back by it.
+    pub had_v: u32,
 }
 
 pub struct KnobDecl {
@@ -909,4 +2567,244 @@ pub struct KnobDecl {
 pub trait BackendKnobs {
     fn knob_registry(&self) -> &'static [KnobDecl];
     fn space_version(&self) -> u32;
+}
+
+#[cfg(test)]
+mod kv_quantization_route_tests {
+    use super::{HadamardWidth, KvByteCodec, KvByteCodecRoute, KvQuantizationRoute};
+
+    #[test]
+    fn shared_default_preserves_established_metal_route() {
+        let route = KvQuantizationRoute::default();
+        assert_eq!(route.key.resolve(256), Ok(256));
+        assert_eq!(route.key.resolve(512), Ok(512));
+        assert_eq!(route.value.resolve(256), Ok(128));
+        assert_eq!(route.value.resolve(512), Ok(128));
+    }
+
+    #[test]
+    fn fixed_width_must_be_power_of_two_divisor() {
+        assert!(HadamardWidth::Fixed(0).resolve(256).is_err());
+        assert!(HadamardWidth::Fixed(96).resolve(256).is_err());
+        assert!(HadamardWidth::Fixed(512).resolve(256).is_err());
+        assert_eq!(HadamardWidth::Disabled.resolve(256), Ok(0));
+        assert_eq!(HadamardWidth::Fixed(64).resolve(256), Ok(64));
+    }
+
+    #[test]
+    fn shared_default_declares_the_common_f16_q4_and_rint_q8_codecs() {
+        let route = KvByteCodecRoute::default();
+        assert_eq!(route.f16, KvByteCodec::F16LeRneV1);
+        assert_eq!(route.q4_0, KvByteCodec::Q4_0LlamaV1);
+        assert_eq!(route.q8_0, KvByteCodec::Q8_0RintEvenV1);
+    }
+}
+
+#[cfg(test)]
+mod kv_layout_tests {
+    use super::KvLayout;
+
+    /// The page a backend declares in `PoolCaps::page_cells`. Named once here so the
+    /// test cannot become a second place that decides what a page is.
+    const PAGE: u32 = 64;
+
+    fn layout(slots: u64) -> KvLayout {
+        KvLayout {
+            layer: 3,
+            reserved: 0,
+            logical_slots: slots,
+            k_stride: 16,
+            v_stride: 32,
+        }
+    }
+
+    #[test]
+    fn page_count_covers_boundaries_without_becoming_a_knob() {
+        assert_eq!(core::mem::size_of::<KvLayout>(), 32);
+        assert_eq!(core::mem::align_of::<KvLayout>(), 8);
+        for (slots, pages, max) in [
+            (0, 0, None),
+            (63, 1, Some(0)),
+            (64, 1, Some(0)),
+            (127, 2, Some(1)),
+        ] {
+            assert_eq!(layout(slots).page_count(PAGE), Ok(pages));
+            assert_eq!(layout(slots).max_page_entry(PAGE), Ok(max));
+        }
+    }
+
+    #[test]
+    fn non_empty_layout_rejects_missing_stride_and_reserved_bits() {
+        for invalid in [
+            KvLayout {
+                k_stride: 0,
+                ..layout(1)
+            },
+            KvLayout {
+                v_stride: 0,
+                ..layout(1)
+            },
+            KvLayout {
+                reserved: 1,
+                ..layout(1)
+            },
+        ] {
+            assert!(invalid.page_count(PAGE).is_err());
+        }
+    }
+
+    #[test]
+    fn a_page_that_is_not_a_power_of_two_is_refused_rather_than_rounded() {
+        for page in [0, 24, 100] {
+            assert!(layout(128).page_count(page).is_err());
+        }
+        assert_eq!(layout(128).page_count(128), Ok(1));
+    }
+}
+
+#[cfg(test)]
+mod pool_caps_tests {
+    use super::{PoolAddressing, PoolCaps, PoolCapsIssue, Tier};
+
+    const GRID: u32 = 64;
+
+    #[test]
+    fn unified_caps_remain_eligible_without_transfer_tiers() {
+        let caps = PoolCaps {
+            page_cells: GRID,
+            finest_cut_tokens: GRID,
+            paged_reads: true,
+            shared_address: true,
+            tiers: &[Tier::Unified, Tier::Disk],
+        };
+        assert_eq!(caps.validate_for_pool(GRID), Ok(PoolAddressing::Shared));
+    }
+
+    #[test]
+    fn current_cuda_shape_is_rejected_for_both_independent_reasons() {
+        let caps = PoolCaps {
+            page_cells: GRID,
+            finest_cut_tokens: GRID,
+            paged_reads: false,
+            shared_address: false,
+            tiers: &[Tier::Device],
+        };
+        assert_eq!(
+            caps.validate_for_pool(GRID),
+            Err(vec![
+                PoolCapsIssue::PagedReadsUnavailable,
+                PoolCapsIssue::DiscreteAddressNeedsDeviceHostDisk,
+            ])
+        );
+    }
+
+    #[test]
+    fn page_shape_and_numerical_cut_are_independent_gates() {
+        let invalid = PoolCaps {
+            page_cells: 0,
+            finest_cut_tokens: 24,
+            paged_reads: true,
+            shared_address: true,
+            tiers: &[Tier::Unified, Tier::Disk],
+        };
+        assert_eq!(
+            invalid.validate_for_pool(GRID),
+            Err(vec![
+                PoolCapsIssue::InvalidPageCells { declared: 0 },
+                PoolCapsIssue::IncompatibleFinestCut {
+                    declared: 24,
+                    grid_tokens: GRID,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn discrete_caps_require_the_complete_unique_ordered_ladder() {
+        for tiers in [
+            &[Tier::Device, Tier::Disk][..],
+            &[Tier::Host, Tier::Device, Tier::Disk][..],
+            &[Tier::Device, Tier::Host][..],
+            &[Tier::Device, Tier::Host, Tier::Disk, Tier::Disk][..],
+            &[Tier::Device, Tier::Host, Tier::Disk, Tier::Unified][..],
+        ] {
+            let caps = PoolCaps {
+                page_cells: GRID,
+                finest_cut_tokens: GRID,
+                paged_reads: true,
+                shared_address: false,
+                tiers,
+            };
+            assert!(
+                caps.validate_for_pool(GRID)
+                    .unwrap_err()
+                    .contains(&PoolCapsIssue::DiscreteAddressNeedsDeviceHostDisk)
+            );
+        }
+
+        let ready = PoolCaps {
+            page_cells: GRID,
+            finest_cut_tokens: GRID,
+            paged_reads: true,
+            shared_address: false,
+            tiers: &[Tier::Device, Tier::Host, Tier::Disk],
+        };
+        assert_eq!(
+            ready.validate_for_pool(GRID),
+            Ok(PoolAddressing::ExplicitHostTransfers)
+        );
+    }
+
+    #[test]
+    fn shared_caps_require_the_complete_unique_disk_last_ladder() {
+        for tiers in [
+            &[Tier::Unified][..],
+            &[Tier::Unified, Tier::Disk, Tier::Disk][..],
+            &[Tier::Disk, Tier::Unified][..],
+            &[Tier::Unified, Tier::Host, Tier::Disk][..],
+        ] {
+            let caps = PoolCaps {
+                page_cells: GRID,
+                finest_cut_tokens: GRID,
+                paged_reads: true,
+                shared_address: true,
+                tiers,
+            };
+            assert_eq!(
+                caps.validate_for_pool(GRID),
+                Err(vec![PoolCapsIssue::SharedAddressNeedsUnifiedDisk])
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod kv_host_transfer_tests {
+    use super::{KvHostHandle, KvTransferSpan};
+
+    #[test]
+    fn transfer_span_wire_layout_matches_native_abi_23() {
+        assert_eq!(size_of::<KvHostHandle>(), 8);
+        assert_eq!(size_of::<KvTransferSpan>(), 40);
+        assert_eq!(std::mem::offset_of!(KvTransferSpan, host_handle), 0);
+        assert_eq!(std::mem::offset_of!(KvTransferSpan, layer), 8);
+        assert_eq!(std::mem::offset_of!(KvTransferSpan, is_v), 12);
+        assert_eq!(std::mem::offset_of!(KvTransferSpan, device_offset), 16);
+        assert_eq!(std::mem::offset_of!(KvTransferSpan, host_offset), 24);
+        assert_eq!(std::mem::offset_of!(KvTransferSpan, len), 32);
+    }
+
+    #[test]
+    fn opaque_host_handle_is_not_a_pointer_contract() {
+        let handle = KvHostHandle(0x0000_0007_0000_0003);
+        let span = KvTransferSpan {
+            host_handle: handle.0,
+            layer: 9,
+            is_v: 1,
+            device_offset: 128,
+            host_offset: 256,
+            len: 64,
+        };
+        assert_eq!(span.host_handle, handle.0);
+    }
 }

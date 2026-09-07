@@ -4,7 +4,8 @@
 //! the tuner and dev binaries use them without the trait.
 
 use imparo_backend::{
-    Backend, BackendKnobs, BufId, KnobCategory, KnobDecl, WeightKindWire,
+    Backend, BackendKnobs, BufId, Gemma4MegaLayer, KnobCategory, KnobDecl,
+    Lfm2MegaLayer, Lfm2MegaMixer, NO_WEIGHT, WeightKindWire,
 };
 
 /// The Metal backend as a trait object. Zero-sized: all state lives in the
@@ -36,7 +37,14 @@ impl Backend for MetalBackend {
     fn bw_read(&self, bytes: u64, reps: u32, tgs: u32, tpg: u32) -> f64 {
         crate::bw_read(bytes, reps, tgs, tpg)
     }
-    fn scoremix_rate(&self, tgs: u32, sgs: u32, iters: u32, stride: u32, kspan: u32) -> f64 {
+    fn scoremix_rate(
+        &self,
+        tgs: u32,
+        sgs: u32,
+        iters: u32,
+        stride: u32,
+        kspan: u32,
+    ) -> f64 {
         crate::scoremix_rate(tgs, sgs, iters, stride, kspan)
     }
     fn commit_overhead(&self, n: u32) -> f64 {
@@ -84,6 +92,10 @@ impl Backend for MetalBackend {
     }
     fn page_round(&self, n: u64) -> u64 {
         crate::page_round(n)
+    }
+    fn fast_tier_budget(&self) -> Option<u64> {
+        let b = crate::working_set_budget();
+        (b > 0).then_some(b)
     }
     fn alloc_kv(&self, bytes: &[u64]) -> Result<(), i32> {
         crate::alloc_kv(bytes)
@@ -145,8 +157,69 @@ impl Backend for MetalBackend {
     ) {
         crate::matmat_from(wkind, w_off, n_in, n_out, b(src), b(dst), n_tok, src_row);
     }
+    fn matmat_gated(
+        &self,
+        gate_kind: WeightKindWire,
+        gate_off: u64,
+        up_kind: WeightKindWire,
+        up_off: u64,
+        n_in: u32,
+        n_out: u32,
+        src: BufId,
+        dst: BufId,
+        _tmp: BufId,
+        n_tok: u32,
+    ) -> bool {
+        crate::matmat_gated(
+            gate_kind,
+            gate_off,
+            up_kind,
+            up_off,
+            n_in,
+            n_out,
+            b(src),
+            b(dst),
+            n_tok,
+        )
+    }
+    fn end_async(&self) -> Result<(), i32> {
+        crate::end_async()
+    }
+    fn wait_outstanding(&self) -> Result<(), i32> {
+        crate::wait_outstanding()
+    }
+    fn mega_reserve(
+        &self,
+        n_mid: u32,
+        attn_heads: u32,
+        attn_hd: u32,
+    ) -> Result<(), i32> {
+        crate::mega_reserve(n_mid, attn_heads, attn_hd)
+    }
+    fn mega_recover(&self) -> Result<(), i32> {
+        crate::mega_recover()
+    }
+    fn decode_pipelining(&self) -> bool {
+        crate::decode_pipelining()
+    }
+    fn stages_rows(&self) -> bool {
+        crate::stages_rows()
+    }
+    fn argmax_feed(
+        &self,
+        src: BufId,
+        tokens: BufId,
+        pick: BufId,
+        pick_slot: u32,
+        n: u32,
+    ) {
+        crate::argmax_feed(b(src), b(tokens), b(pick), pick_slot, n);
+    }
     fn set_epilogue(&self, epi: imparo_backend::Epilogue) {
         crate::set_epilogue(epi as u32);
+    }
+    fn supports_epilogue(&self, _epi: imparo_backend::Epilogue) -> bool {
+        true
     }
     fn row(
         &self,
@@ -196,6 +269,92 @@ impl Backend for MetalBackend {
     ) {
         crate::rms_norm(b(buf), w_off, width, eps, n_row, row_stride, base_off);
     }
+    /// The sandwich boundary at ONE ROW as one dispatch (decode): norm + residual add, and
+    /// for the attention side the following ffn_norm too. Prefill rows keep the separate
+    /// dispatches (the fused kernel's per-row loop lost 0.8-1.0 % there on 2026-09-02).
+    /// IMPARO_NORM_ROW=0 keeps the separate dispatches at decode too (the A/B arm).
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_add(
+        &self,
+        dst: BufId,
+        src: BufId,
+        w_off: u64,
+        width: u32,
+        eps: f32,
+        n_row: u32,
+        row_stride: u32,
+        base_off: u32,
+        add: BufId,
+        output_scale: f32,
+    ) -> bool {
+        let scaled = output_scale.to_bits() != 1.0_f32.to_bits();
+        if !norm_row_fusion_on()
+            || !norm_row_mask(if scaled { 2 } else { 1 })
+            || n_row != 1
+            || row_stride != width
+            || base_off != 0
+            || width % 4 != 0
+            || w_off == imparo_backend::NO_WEIGHT
+        {
+            return false;
+        }
+        crate::rms_norm_add_row(
+            b(dst),
+            b(src),
+            b(add),
+            w_off,
+            width,
+            eps,
+            n_row,
+            output_scale,
+            false,
+            0,
+            b(dst),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_add_dual_projection(
+        &self,
+        src: BufId,
+        residual: BufId,
+        first_w_off: u64,
+        mid: BufId,
+        second_w_off: u64,
+        out: BufId,
+        width: u32,
+        eps: f32,
+        n_row: u32,
+        row_stride: u32,
+        base_off: u32,
+        output_scale: f32,
+    ) -> bool {
+        if !norm_row_fusion_on()
+            || !norm_row_mask(0)
+            || n_row != 1
+            || row_stride != width
+            || base_off != 0
+            || width % 4 != 0
+            || first_w_off == imparo_backend::NO_WEIGHT
+            || second_w_off == imparo_backend::NO_WEIGHT
+            || out == mid
+            || out == residual
+        {
+            return false;
+        }
+        crate::rms_norm_add_row(
+            b(mid),
+            b(src),
+            b(residual),
+            first_w_off,
+            width,
+            eps,
+            n_row,
+            output_scale,
+            true,
+            second_w_off,
+            b(out),
+        )
+    }
     fn rms_norm_from(
         &self,
         buf: BufId,
@@ -217,6 +376,37 @@ impl Backend for MetalBackend {
             row_stride,
             base_off,
         );
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm(
+        &self,
+        dst: BufId,
+        resid: BufId,
+        other: BufId,
+        w_off: u64,
+        width: u32,
+        eps: f32,
+        n_row: u32,
+        row_stride: u32,
+        base_off: u32,
+    ) -> bool {
+        // Contiguous full-width rows only: that is the layout the kernel's pre-add mode
+        // and the mirror rule were written for, and the only one LFM2 uses.
+        if base_off != 0 || row_stride != width {
+            return false;
+        }
+        crate::add_rms_norm(
+            b(dst),
+            b(resid),
+            b(other),
+            w_off,
+            width,
+            eps,
+            n_row,
+            row_stride,
+            base_off,
+        );
+        true
     }
     fn rope(
         &self,
@@ -243,6 +433,108 @@ impl Backend for MetalBackend {
     fn hadamard(&self, buf: BufId, n: u32, nrot: u32) {
         crate::hadamard(b(buf), n, nrot);
     }
+    /// gemma4's per-head norm + rope as one dispatch; a Hadamard rotation (quantized KV)
+    /// keeps the default three-dispatch sequence, which this reproduces verbatim.
+    #[allow(clippy::too_many_arguments)]
+    fn head_norm_rope_hadamard(
+        &self,
+        buf: BufId,
+        w_off: u64,
+        head_dim: u32,
+        eps: f32,
+        n_heads: u32,
+        start_pos: u32,
+        n_tok: u32,
+        rope_dim: u32,
+        rope_base: f32,
+        freqs: Option<&[f32]>,
+        hadamard_nrot: u32,
+    ) {
+        if hadamard_nrot != 0 {
+            self.rms_norm(buf, w_off, head_dim, eps, n_tok * n_heads, head_dim, 0);
+            self.rope(
+                buf, rope_dim, rope_base, head_dim, n_heads, start_pos, n_tok, freqs,
+            );
+            self.hadamard(buf, n_tok * n_heads * head_dim, hadamard_nrot);
+            return;
+        }
+        crate::head_norm_rope(
+            b(buf),
+            w_off,
+            head_dim,
+            eps,
+            n_heads,
+            start_pos,
+            n_tok,
+            rope_dim,
+            rope_base,
+            freqs,
+        );
+    }
+    /// K: norm + rope fused; V: its weightless norm as before. K and V are different
+    /// buffers, so the order K-then-V (the default runs K norm, V norm, K rope) changes
+    /// no value. Any Hadamard rotation keeps the default sequence verbatim.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_head_postprocess(
+        &self,
+        k: BufId,
+        v: BufId,
+        k_norm_off: u64,
+        head_dim: u32,
+        eps: f32,
+        n_kv: u32,
+        start_pos: u32,
+        n_tok: u32,
+        rope_dim: u32,
+        rope_base: f32,
+        freqs: Option<&[f32]>,
+        k_hadamard_nrot: u32,
+        v_hadamard_nrot: u32,
+    ) {
+        if k_hadamard_nrot != 0 || v_hadamard_nrot != 0 {
+            self.rms_norm(k, k_norm_off, head_dim, eps, n_tok * n_kv, head_dim, 0);
+            self.rms_norm(
+                v,
+                imparo_backend::NO_WEIGHT,
+                head_dim,
+                eps,
+                n_tok * n_kv,
+                head_dim,
+                0,
+            );
+            self.rope(
+                k, rope_dim, rope_base, head_dim, n_kv, start_pos, n_tok, freqs,
+            );
+            if k_hadamard_nrot != 0 {
+                self.hadamard(k, n_tok * n_kv * head_dim, k_hadamard_nrot);
+            }
+            if v_hadamard_nrot != 0 {
+                self.hadamard(v, n_tok * n_kv * head_dim, v_hadamard_nrot);
+            }
+            return;
+        }
+        crate::head_norm_rope(
+            b(k),
+            k_norm_off,
+            head_dim,
+            eps,
+            n_kv,
+            start_pos,
+            n_tok,
+            rope_dim,
+            rope_base,
+            freqs,
+        );
+        self.rms_norm(
+            v,
+            imparo_backend::NO_WEIGHT,
+            head_dim,
+            eps,
+            n_tok * n_kv,
+            head_dim,
+            0,
+        );
+    }
     fn kv_store(
         &self,
         src: BufId,
@@ -263,11 +555,17 @@ impl Backend for MetalBackend {
         n_kv: u32,
         kv_width: u32,
         start_pos: u32,
+        scale: f32,
         window: u32,
         n_tok: u32,
         max_scores: u32,
         ring: u32,
     ) {
+        // The op applies its scale: Q is scaled in place before the kernel reads it. The
+        // same dispatch the workflow used to issue, now where the contract lives.
+        if scale.to_bits() != 1.0_f32.to_bits() {
+            self.scale(BufId::Q, scale, n_tok * n_heads * head_dim);
+        }
         crate::attention(
             kv_layer, head_dim, n_heads, n_kv, kv_width, start_pos, window, n_tok,
             max_scores, ring,
@@ -319,6 +617,62 @@ impl Backend for MetalBackend {
             n_tok,
         );
     }
+    /// One decode layer as one entry of the mega kernel: the architecture's variant names the
+    /// operands, the entry function below turns them into the program's slots and words.
+    fn mega_layer(&self, e: &imparo_backend::MegaEntry<'_>) -> bool {
+        match &e.layer {
+            imparo_backend::MegaLayer::Gemma4(l) => mega_gemma4_entry(l, e.n_tok),
+            imparo_backend::MegaLayer::Lfm2(l) => mega_lfm2_entry(l, e.n_tok),
+        }
+    }
+    fn mega_qkv_wanted(&self) -> bool {
+        crate::mega_qkv_wanted()
+    }
+    fn mega_program_end(&self) {
+        crate::mega_program_end()
+    }
+    fn mega_front_wanted(&self) -> bool {
+        crate::mega_front_wanted()
+    }
+    fn mega_attn_wanted(&self) -> bool {
+        crate::mega_attn_wanted()
+    }
+    /// The whole gated FFN as one persistent dispatch: the mega FFN block (IMPARO_MEGA_FFN=1, #141).
+    /// Decode only, Q4_0 only. `BufId::U` is the second scratch row -- the row the
+    /// dispatch path this replaces writes its up projection into.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_gated_down(
+        &self,
+        gate_kind: WeightKindWire,
+        gate_off: u64,
+        up_kind: WeightKindWire,
+        up_off: u64,
+        down_kind: WeightKindWire,
+        down_off: u64,
+        n_in: u32,
+        n_mid: u32,
+        n_out: u32,
+        src: BufId,
+        gated_tmp: BufId,
+        dst: BufId,
+        n_tok: u32,
+    ) -> bool {
+        if n_tok != 1 || gate_kind != 1 || up_kind != 1 || down_kind != 1 {
+            return false;
+        }
+        crate::ffn_persistent(
+            gate_off,
+            up_off,
+            down_off,
+            n_in,
+            n_mid,
+            n_out,
+            b(src),
+            b(gated_tmp),
+            b(BufId::U),
+            b(dst),
+        )
+    }
     fn act(&self, a: BufId, n: u32) {
         crate::act(b(a), n);
     }
@@ -339,6 +693,9 @@ impl Backend for MetalBackend {
     }
     fn copy(&self, dst: BufId, src: BufId, n: u32) {
         crate::copy(b(dst), b(src), n);
+    }
+    fn copy_range(&self, dst: BufId, dst_off: u32, src: BufId, src_off: u32, n: u32) {
+        crate::copy_range(b(dst), dst_off, b(src), src_off, n);
     }
     fn mul_strided(
         &self,
@@ -378,20 +735,89 @@ impl Backend for MetalBackend {
             n_tok,
         );
     }
+    fn transform_weights(
+        &self,
+        jobs: &[imparo_backend::WeightTransform],
+    ) -> Result<Vec<bool>, String> {
+        let wire: Vec<crate::WXformWire> = jobs
+            .iter()
+            .map(|j| crate::WXformWire {
+                off: j.offset,
+                bytes: j.bytes,
+                from_type: j.from_type,
+                to_type: j.to_type,
+                n_in: j.n_in,
+                n_out: j.n_out,
+            })
+            .collect();
+        crate::transform_weights(&wire)
+    }
+    fn serves_weight_type(&self, ggml_type: u32) -> bool {
+        // F32, Q4_0, Q8_0 and the tile-major Q8_0 (fc 15 pipelines). Q4_0_TM has no kernels.
+        matches!(ggml_type, 0 | 2 | 8 | 1000)
+    }
+    fn read_weight_bytes(&self, file_off: u64, dst: &mut [u8]) -> bool {
+        crate::read_weight_bytes(file_off, dst)
+    }
+    fn stage_rows(
+        &self,
+        file_off: u64,
+        row_bytes: u32,
+        ids: &[u32],
+        dst: BufId,
+    ) -> bool {
+        crate::stage_rows(file_off, row_bytes, ids, b(dst))
+    }
+    fn ple_gather_combine_staged(
+        &self,
+        proj: BufId,
+        rows: BufId,
+        width: u32,
+        emb_scale: f32,
+        comb_scale: f32,
+        n_tok: u32,
+    ) {
+        crate::ple_gather_combine_staged(
+            b(proj),
+            b(rows),
+            width,
+            emb_scale,
+            comb_scale,
+            n_tok,
+        );
+    }
+    fn set_attention_head_dims(&self, dims: &[u32]) {
+        crate::set_attention_head_dims(dims);
+    }
+    fn set_attention_kv_widths(&self, widths: &[u32]) {
+        crate::set_attention_kv_widths(widths);
+    }
     unsafe fn init_weights(&self, base: *const u8, len: u64) -> Result<(), i32> {
         // Metal shares the CPU mmap with the GPU (unified memory, no copy).
+        unsafe { crate::init_tuned(base, len) }
+    }
+    unsafe fn init_weights_with_placement(
+        &self,
+        base: *const u8,
+        len: u64,
+        placement: &imparo_backend::WeightPlacement,
+    ) -> Result<(), i32> {
+        crate::set_placement(&placement.segments, placement.budget.total.unwrap_or(0));
         unsafe { crate::init_tuned(base, len) }
     }
     fn set_kv_types(&self, k: u32, v: u32) {
         crate::set_kv_types(k, v);
     }
     fn prof_stats(&self) -> imparo_backend::ProfStats {
+        // Barriers first: prof_read() resets the whole window, this counter included.
+        let barriers = crate::prof_barriers();
         let p = crate::prof_read();
         imparo_backend::ProfStats {
             gpu_s: p.gpu_s,
             wall_s: p.wall_s,
             cbs: p.cbs,
             dispatches: p.dispatches,
+            barriers,
             categories: crate::prof_categories(),
         }
     }
@@ -407,9 +833,23 @@ impl Backend for MetalBackend {
     fn pool_caps(&self) -> imparo_backend::PoolCaps {
         use imparo_backend::Tier;
         imparo_backend::PoolCaps {
-            // The engine's token-tile width: the measured byte-identical resume
-            // grid (dev_harness/kv_gate.py), and what the paged read will index.
-            block_cells: 64,
+            // READ BACK from the engine, never typed again here: the shader is
+            // compiled with this value as a preprocessor macro, so the page the block
+            // table maps and the page this declares are one number by construction.
+            page_cells: crate::kv_page_cells(),
+            // The CEILING over every prefill attention kernel this backend can select,
+            // not the value of the current selection -- which varies per layer, per
+            // request length, per device and per KV type.
+            //
+            // 16 is `qb0 = q0 & ~15u`, the query group both prefill families take their
+            // KV scan bounds from; the 8-run split inside a position block contributes
+            // 8, which 16 already covers. MEASURED: the grid moved to 8 only when the
+            // group was forced to 8, and did not move for the GEMM tile (32/64/128),
+            // tail-split, nb8 or half-A staging. docs/kv-identity-grid.md.
+            //
+            // Raise this if a kernel with a wider query group is added, or the pool
+            // will cut prefills where that kernel does not reproduce a cold pass.
+            finest_cut_tokens: 16,
             // every full-attention KV access goes through the 64-cell block
             // table (kv paging 24a/24b; scattered placement gate-proven)
             paged_reads: true,
@@ -421,6 +861,25 @@ impl Backend for MetalBackend {
 
 /// The Metal knob registry: THE definition of the metal search space. Every Benched
 /// knob is declared here once -- stage, sweep, workload, hooks -- and the shared tuner,
+/// Powers of two from `lo` up to the DEVICE's threadgroup thread limit.
+///
+/// A thread-count ladder is a consequence of the hardware, not a choice. Written out, it
+/// was right on the machine it was written on: `1024` is this Mac's limit and an ILLEGAL
+/// dispatch on one whose limit is 512, and a machine with a wider limit never gets the
+/// rungs it allows. `max_threads` comes from the queried device profile.
+fn threads_upto(lo: u32, max_threads: u32) -> Vec<u32> {
+    let cap = max_threads.max(lo);
+    core::iter::successors(Some(lo), |t| t.checked_mul(2))
+        .take_while(|t| *t <= cap)
+        .collect()
+}
+
+/// The same ladder in SIMDGROUPS: a simdgroup is 32 threads, so the device's thread limit
+/// caps how many of them one threadgroup may hold.
+fn simdgroups_upto(lo: u32, max_threads: u32) -> Vec<u32> {
+    threads_upto(lo, max_threads / 32)
+}
+
 /// the stored-file reader (apply_host_config) and the stage-2 descent all iterate this
 /// table. Adding a knob is ONE entry here plus its engine global, then a space bump.
 /// REGISTRY ORDER IS SWEEP ORDER (nb8_shape before the crossings that fight its winner).
@@ -493,10 +952,20 @@ use imparo_backend::{SweepKind as Sw, Workload as Wl};
 /// The same arithmetic the backend runs at init, so the registry and the kernel cannot
 /// disagree about what fits. Inverts the threadgroup layout: subtract the fixed regions,
 /// divide what is left by the query-tile height, round down to a whole work unit.
-const fn derive_pt(qt: u64, hd: u64, half_q: bool, device_spill: bool, blk: u64,
-                   budget_bytes: u64) -> u32 {
+const fn derive_pt(
+    qt: u64,
+    hd: u64,
+    half_q: bool,
+    device_spill: bool,
+    blk: u64,
+    budget_bytes: u64,
+) -> u32 {
     let floats = budget_bytes / 4;
-    let sq = if half_q && qt == 16 { qt * hd / 2 } else { qt * hd };
+    let sq = if half_q && qt == 16 {
+        qt * hd / 2
+    } else {
+        qt * hd
+    };
     let spill = if device_spill { 0 } else { qt * hd };
     let fixed = sq + 2 * qt + (qt / 8) * 64 + spill;
     if fixed >= floats {
@@ -523,8 +992,17 @@ const fn derive_pt(qt: u64, hd: u64, half_q: bool, device_spill: bool, blk: u64,
 ///
 ///   N = sqrt(L x commit / encode_per_layer)
 ///
-/// MEASURED HERE: commit ~3.7 us, encode ~0.128 us per dispatch, 21 dispatches per layer,
-/// 42 layers -> N = sqrt(42 x 3.7 / 2.69) = 7.6, deriving to 7 -- the compiled value.
+/// MEASURED HERE (first form): commit ~3.7 us, encode ~0.128 us per dispatch, 21
+/// dispatches per layer, 42 layers -> N = sqrt(42 x 3.7 / 2.69) = 7.6, deriving to 7 --
+/// the compiled value. BOTH INPUTS WERE THE WRONG QUANTITY (docs/decode-turnaround.md,
+/// 2026-09-04): the commit was the host's submission time, which is never on the
+/// critical path at decode (the host encodes a token in ~0.4 ms against ~22 ms of GPU
+/// work), and the encode was a trivial kernel's, 0.1 us, where the engine's real
+/// dispatch binds three buffers and eight constants and costs ~1.1 us. Measured on a
+/// live token the seat of 7 exposed 174 us of first-block encode per token; a flush of 3
+/// exposed 32. The inputs are now what the step pays: the GPU-side gap between
+/// consecutive buffers (`commit_overhead`) and a real GEMV's encode (`encode_cost`), and
+/// the same formula derives the small value the measurement asks for.
 ///
 /// AGREEING WITH THE OLD CONSTANT IS NOT THE POINT, and a derivation that only ever
 /// reproduces constants would be worth nothing. What agreement buys is one less thing to
@@ -540,21 +1018,22 @@ const fn derive_pt(qt: u64, hd: u64, half_q: bool, device_spill: bool, blk: u64,
 ///                                                  bracketed end to end -> the CONSTANT
 ///                                                  was wrong, 48 stands
 ///
-/// BOTH COSTS DRIFT WITH HOST STATE and the derived value does not, which is the property
-/// that makes this usable. Across runs the submission cost read 1.9 to 4.8 us and the
-/// encode cost 0.079 to 0.183 us -- but they are both host-side work, so they move
-/// together, their RATIO holds, and N stayed at 6-7. Reading each one once instead of
-/// taking a median gave 7 on one run and 9 on the next.
+/// The inputs drift with host state and the derived value should not: each is a median
+/// of five readings (`submission_costs`), and the ratio is what the square root sees.
 ///
-/// The knob barely matters here regardless: at N=7 the per-token total is about 81 us, at
-/// N=10 about 77 us, on a token that takes 28 000 us. It matters on a machine where
-/// submission is expensive -- at a 100 us commit the same formula gives N = 32, and the
-/// difference between that and 7 is no longer noise.
+/// What the knob is worth: the exposed first-block encode, N x encode_per_layer, against
+/// (L / N) GPU gaps of a few microseconds. On this machine that is ~150 us per token
+/// between 7 and 3, under 1% of a 22 ms token -- real, and only visible on the probe.
 ///
 /// A guard the arithmetic does not carry: 0 means "never flush mid-graph", which is a
 /// legal setting and not what this returns. The derivation is only asked for a positive
 /// answer, so it clamps to [1, L].
-const fn derive_flush(commit_ns: u32, encode_ns: u32, dispatches: u32, layers: u32) -> u32 {
+const fn derive_flush(
+    commit_ns: u32,
+    encode_ns: u32,
+    dispatches: u32,
+    layers: u32,
+) -> u32 {
     if commit_ns == 0 || encode_ns == 0 || dispatches == 0 || layers == 0 {
         return 0; // unprobed: the compiled value stands
     }
@@ -650,10 +1129,12 @@ static METAL_KNOBS: &[KnobDecl] = &[
         legal: None,
         bit_affecting: false,
         derive: None,
-        candidates: None,
+        candidates: Some(|_m, d| simdgroups_upto(2, d.max_threads)),
         after: &[],
         cross_check: None,
-        applies: None,
+        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
+        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
         // JOINS the gemv tuple. sgs, lanes and nr0 all appear in ONE expression
         // governing the decode GEMV's threadgroup geometry --
         //   rows_per_tg = sgs * (32 / lanes) * nr0
@@ -663,7 +1144,7 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // product while holding the others at whatever they happened to be.
         tuple: Some("gemv"),
         category: KnobCategory::Benched,
-        values: &[2, 4, 8, 16],
+        values: &[],
         apply: |v| crate::tune(v, 0),
         current: crate::sgs_current,
         screened: false,
@@ -675,16 +1156,26 @@ static METAL_KNOBS: &[KnobDecl] = &[
         legal: None,
         bit_affecting: false,
         derive: None,
-        candidates: None,
+        candidates: Some(|_m, _d| {
+            // COUNTED FROM THE PIPELINE TABLE, not written beside it. The build loop and
+            // this ladder were the same four numbers in two places; extend the loop and
+            // the new rung would never be swept, with nothing to say so.
+            let (lo, hi) = crate::lanes_built();
+            core::iter::successors(Some(lo), |t| t.checked_mul(2))
+                .take_while(|t| *t <= hi.max(lo))
+                .collect()
+        }),
         after: &[],
         cross_check: None,
-        applies: None,
+        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
+        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
         tuple: Some("gemv"),
         // lanes and nr0 index ONE pipeline table together:
         // p_q4mm_lanes[g_lanes_log2][nr_log2]. They select a single kernel jointly,
         // so neither has a best value on its own.
         category: KnobCategory::Benched,
-        values: &[4, 8, 16, 32],
+        values: &[],
         apply: crate::set_lanes,
         current: crate::lanes_current,
         screened: false,
@@ -699,7 +1190,9 @@ static METAL_KNOBS: &[KnobDecl] = &[
         candidates: None,
         after: &[],
         cross_check: None,
-        applies: None,
+        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
+        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
         tuple: Some("narrow"),
         // nb8_shape picks WHICH narrow tile; nb8_max picks the batch size at which
         // it engages. The right boundary depends on which tile sits behind it, so the
@@ -724,7 +1217,9 @@ static METAL_KNOBS: &[KnobDecl] = &[
         candidates: None,
         after: &[],
         cross_check: None,
-        applies: None,
+        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
+        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
         tuple: Some("narrow"),
         category: KnobCategory::Benched,
         values: &[],
@@ -751,7 +1246,9 @@ static METAL_KNOBS: &[KnobDecl] = &[
         candidates: None,
         after: &[],
         cross_check: None,
-        applies: None,
+        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
+        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
         // JOINS the gemv tuple, as its BOUNDARY. Where the GEMV gives way to the GEMM
         // depends on how good the GEMV is, and that is what the tuple's other three
         // knobs decide -- so the crossover has to be searched AFTER them, against the
@@ -790,19 +1287,43 @@ static METAL_KNOBS: &[KnobDecl] = &[
         legal: None,
         bit_affecting: false,
         derive: None,
-        candidates: None,
+        candidates: Some(|_m, d| simdgroups_upto(1, d.max_threads)),
         after: &[],
         cross_check: None,
-        applies: Some(|m| m.weight_kinds & (1 << 2) != 0),
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
         // The decode pair is a TUPLE: rows says how many outputs a threadgroup carries
         // and sgs how many simdgroups share them, and the cross-simdgroup reduction at
         // the end costs rows*sgs floats of threadgroup memory. Neither value means
         // anything without the other.
         tuple: Some("q8_decode"),
         category: KnobCategory::Benched,
-        values: &[1, 2, 4, 8, 16, 32],
+        values: &[],
         apply: crate::set_q8_decode_sgs,
         current: crate::q8_decode_sgs,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::DecodeMix,
+    },
+    KnobDecl {
+        // The TILE-MAJOR decode GEMV's simdgroups. The 256-byte unit fixes 8 rows per
+        // threadgroup, so unlike the row-major pair this is a single knob, and it is
+        // separate from q8_decode_sgs because the two layouts measured different winners
+        // (8 vs 4: the converted file's deep-leg decode read +1.8/+2.5% at 8, the
+        // isolated row-major GEMV prefers 4) -- one shared value would make the tune
+        // file fight itself across layouts of the same model.
+        name: "q8_tm_decode_sgs",
+        legal: None,
+        bit_affecting: false,
+        derive: None,
+        candidates: Some(|_m, d| simdgroups_upto(1, d.max_threads)),
+        after: &[],
+        cross_check: None,
+        applies: Some(|m| m.weight_kinds & (1 << 3) != 0),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_q8_tm_decode_sgs,
+        current: crate::q8_tm_decode_sgs,
         screened: false,
         sweep: Sw::Values,
         workload: Wl::DecodeMix,
@@ -815,7 +1336,7 @@ static METAL_KNOBS: &[KnobDecl] = &[
         candidates: None,
         after: &["q8_decode_sgs"],
         cross_check: None,
-        applies: Some(|m| m.weight_kinds & (1 << 2) != 0),
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
         tuple: Some("q8_decode"),
         category: KnobCategory::Benched,
         // ROWS, not log2, so the stored config reads as the thing the kernel does. Only
@@ -833,13 +1354,13 @@ static METAL_KNOBS: &[KnobDecl] = &[
         legal: None,
         bit_affecting: false,
         derive: None,
-        candidates: None,
+        candidates: Some(|_m, d| simdgroups_upto(1, d.max_threads)),
         after: &[],
         cross_check: None,
-        applies: Some(|m| m.weight_kinds & (1 << 2) != 0),
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
         tuple: Some("q8_narrow"),
         category: KnobCategory::Benched,
-        values: &[1, 2, 4, 8, 16, 32],
+        values: &[],
         apply: crate::set_q8_batch_sgs,
         current: crate::q8_batch_sgs,
         screened: false,
@@ -854,7 +1375,7 @@ static METAL_KNOBS: &[KnobDecl] = &[
         candidates: None,
         after: &["q8_batch_sgs"],
         cross_check: None,
-        applies: Some(|m| m.weight_kinds & (1 << 2) != 0),
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
         tuple: Some("q8_narrow"),
         category: KnobCategory::Benched,
         // How many tokens reuse one dequantised weight byte. A function constant, so each
@@ -867,29 +1388,81 @@ static METAL_KNOBS: &[KnobDecl] = &[
         workload: Wl::NarrowMix(4),
     },
     KnobDecl {
-        name: "q8_gemm_shape",
+        name: "st_gemm_shape",
         // Shape indices only; the bridge ignores anything past the table, which would
-        // otherwise select a pipeline that was never built.
-        legal: Some(|v, _m, _d| v < 10),
+        // otherwise select a pipeline that was never built. COUNTED, not written: this
+        // said `v < 10` and the table has twelve entries, so the two shapes added for the
+        // deeper K chunk were illegal to store while being legal to sweep.
+        legal: Some(|v, _m, _d| v < crate::st_gemm_shapes()),
         bit_affecting: false,
         derive: None,
-        candidates: None,
+        // COUNTED from ST_GEMM_CANDIDATES, which the .mm exports for exactly this. Same
+        // reasoning as rt_shape: a written ladder goes stale the moment a shape is added,
+        // and nothing reports it.
+        candidates: Some(|_m, _d| (0..crate::st_gemm_shapes()).collect()),
         after: &[],
         cross_check: None,
-        applies: Some(|m| m.weight_kinds & (1 << 2) != 0),
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
         tuple: None,
         category: KnobCategory::Benched,
-        values: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-        apply: crate::set_q8_gemm_shape,
-        current: crate::q8_gemm_shape,
+        values: &[],
+        apply: crate::set_st_gemm_shape,
+        current: crate::st_gemm_shape,
         // SCREENED, like rt_shape and for the same reason: the shapes span 128 to 512
         // threads and 32x16 to 128x32 output tiles, so the wide ones spill and read
         // orders of magnitude slow on the tiny-size screen. Shape 9 (128x32) is in the
         // list because the branch that introduced it measured it exact and SLOWER, and a
         // rejected candidate that stays reachable is evidence rather than folklore.
+        //
+        // PrefillGemmWidths, not PrefillGemm. What a tile trades is weight RE-READS
+        // against padding, and PrefillGemm's slice made the weight tile cache-resident --
+        // 2.23 MB against this device's measured 2.10 MB knee -- so the re-reads were
+        // free in the harness and expensive in the engine, and the smallest tile won by
+        // default. The ranking workload clears the knee 4x and sends two token widths.
         screened: true,
         sweep: Sw::Values,
-        workload: Wl::PrefillGemm,
+        workload: Wl::PrefillGemmWidths,
+    },
+    KnobDecl {
+        // THE SECOND TILE OF THE PREFILL PAIR. Not a threshold: the dispatch decides
+        // between the two by comparing their padded token counts (see `q8_matmat`), which
+        // is arithmetic and stores nothing. What is genuinely per-machine, and therefore
+        // here, is WHICH second tile is worth having.
+        //
+        // Its workload is PrefillGemmUbatch: the whole-ubatch width at the model's full
+        // projection. The dispatch selects this tile only where it pads no worse than the
+        // first -- whole ubatches -- so a remainder width never runs it, and ranking it on
+        // the two-width PrefillGemmWidths made half of every measurement dilution; the
+        // sliced weight tile that workload used sat inside the last-level cache besides.
+        // Measured on LFM2 (Q8): end to end by env pin 64x64 is worth +3.1% / +3.0% at
+        // 5963 / 17123 tokens and -0.1% at 455 (one chunk, padded, the rule takes the
+        // narrow tile). On PrefillGemmWidths it read -0.1% to +1.8%, inside the floor
+        // every time, and the tuner wrote 3 over a stored 7; on PrefillGemmUbatch it
+        // reads +4.0% on a 2.0% floor and the tuner picks 7 by itself.
+        //
+        // Equal to `st_gemm_shape` means one shape, which is the untuned path exactly. A
+        // stored config from an earlier space has no line for this key and therefore
+        // keeps that default, so an old file is not silently mis-tuned -- it is simply
+        // the single-shape engine it has always been. That is why the space version does
+        // not move for this knob: bumping it discards every OTHER knob's measured value
+        // (task #85), and on this host that regressed E4B's deep prefill 535.0 -> 530.8
+        // the last time it happened.
+        name: "st_gemm_large_shape",
+        legal: Some(|v, _m, _d| v < crate::st_gemm_shapes()),
+        bit_affecting: false,
+        derive: None,
+        candidates: Some(|_m, _d| (0..crate::st_gemm_shapes()).collect()),
+        after: &["st_gemm_shape"],
+        cross_check: None,
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_st_gemm_large_shape,
+        current: crate::st_gemm_large_shape,
+        screened: true,
+        sweep: Sw::Values,
+        workload: Wl::PrefillGemmChunk,
     },
     KnobDecl {
         name: "q8_full_tiles",
@@ -897,9 +1470,9 @@ static METAL_KNOBS: &[KnobDecl] = &[
         bit_affecting: false,
         derive: None,
         candidates: None,
-        after: &["q8_gemm_shape"],
+        after: &["st_gemm_shape"],
         cross_check: None,
-        applies: Some(|m| m.weight_kinds & (1 << 2) != 0),
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
         tuple: None,
         category: KnobCategory::Benched,
         // May the host use the edge-predicate-free entry point when the grid is exact?
@@ -907,12 +1480,52 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // be free when legal -- but the branch that added it kept it selectable rather
         // than always-on, which means it did not measure as strictly better. One kernel
         // at one shape answers that, so it stays a knob here.
+        //
+        // THE OLD ANSWER WAS A TWO-VARIABLE A/B. Until `imparo_st_gemm_N_full_h` existed,
+        // the predicate-free entry point had no f16-activation twin and the host's mirror
+        // condition carried `!full`, so selecting it also took the activations back to
+        // f32. Measured that way it read 769.1 against 789.5 tok/s on LFM2 at 17123
+        // tokens -- a preference for the mirror, recorded as a verdict on the predicates.
         values: &[0, 1],
         apply: crate::set_q8_full_tiles,
         current: crate::q8_full_tiles,
         screened: false,
         sweep: Sw::Values,
-        workload: Wl::PrefillGemm,
+        workload: Wl::PrefillGemmWidths,
+    },
+    KnobDecl {
+        // WHICH GEMM DESIGN SERVES Q8_0 PREFILL. 0 = st_gemm, the staged design (both
+        // operands copied to threadgroup memory, K chunk 32), with the tiles the two
+        // knobs above chose; k >= 1 = rt_gemm<Q8> at RT_SHAPES[k - 1], the register-tiled
+        // design the Q4 family runs (weights staged, activations through a register
+        // prefetch pipeline, K chunk 64). One knob carries design AND rt shape because
+        // the shape only exists under rt: swept as its own knob it would read flat under
+        // st and the tuner would record a meaningless pick.
+        //
+        // Both designs stage identical half operands and accumulate in the same k order,
+        // so moving this knob is not bit-affecting; the pins say so.
+        name: "q8_design",
+        // rt_gemm<Q8> reads the row-major layout only: on a Q8_0_TM (tile-major) model the
+        // staged design is the one legal answer.
+        legal: Some(|v, m, _d| {
+            crate::q8_design_legal(v) && (v == 0 || m.weight_kinds & (1 << 3) == 0)
+        }),
+        bit_affecting: false,
+        derive: None,
+        candidates: Some(|_m, _d| (0..crate::q8_designs()).collect()),
+        after: &["st_gemm_shape", "st_gemm_large_shape"],
+        cross_check: None,
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_q8_design,
+        current: crate::q8_design,
+        // SCREENED for the reason rt_shape is: the wide shapes spill and read orders of
+        // magnitude slow on the tiny-size screen.
+        screened: true,
+        sweep: Sw::Values,
+        workload: Wl::PrefillGemmWidths,
     },
     KnobDecl {
         name: "q8_gemv_max_tok",
@@ -920,9 +1533,9 @@ static METAL_KNOBS: &[KnobDecl] = &[
         bit_affecting: false,
         derive: None,
         candidates: None,
-        after: &["q8_token_tile", "q8_batch_sgs", "q8_gemm_shape"],
+        after: &["q8_token_tile", "q8_batch_sgs", "st_gemm_shape"],
         cross_check: None,
-        applies: Some(|m| m.weight_kinds & (1 << 2) != 0),
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
         // The boundary between the narrow token-tile kernel and the wide GEMM, searched
         // AFTER both sides are settled -- the same relationship gemv_max_tok has to the
         // gemv tuple. hi = 64 keeps every rung on the token tile; lo = 1 sends every rung
@@ -942,17 +1555,24 @@ static METAL_KNOBS: &[KnobDecl] = &[
     },
     // NOT DECLARED, and each for a stated reason rather than by omission:
     //
-    //   q8_gemm_large_shape / q8_gemm_large_min_tok
-    //       A second wide geometry taking over at a token boundary. PrefillGemm measures
-    //       ONE token count, so no micro workload here can tell the two tiers apart, and
-    //       a knob this registry cannot answer does not belong in it. The engine keeps
-    //       the globals with large_min_tok = 0, which is the single-shape path exactly.
+    //   st_gemm_large_shape
+    //       The SECOND tile of the prefill pair. There is no boundary knob any more: the
+    //       dispatch picks between the two by comparing their PADDED token counts, which
+    //       is arithmetic and needs nothing stored (see `q8_matmat`, and "What math
+    //       decides" in docs/tuner-design.md). What remains genuinely tunable is WHICH
+    //       second tile is worth building, and PrefillGemm still times one token count,
+    //       so it cannot rank that yet -- the workload has to cover more than one ubatch
+    //       width first. Until it does, the engine keeps large_shape equal to
+    //       st_gemm_shape, which is the single-shape path exactly.
     //
-    //   q8_grid_token_x / q8_typed_scale
-    //       Threadgroup enumeration order and a typed two-byte scale load. Each doubles
-    //       the built pipelines and the branch that added them tuned both end to end.
-    //       The function constants are in imparo.metal with a false default, so adding
-    //       either later is a host-side change and costs nothing until then.
+    //   q8_grid_token_x / q8_typed_scale / q8_dev_a
+    //       All three MEASURED WORSE end to end and stay reachable as evidence, the way
+    //       shape 9 does. Grid order: 861.4/878.3 short, 783.3/790.8 deep. Typed scale:
+    //       874.2/871.6 short, 811.8/827.2 deep. Device-side activations, at prefetch
+    //       depth 0/2/5: 839.1/846.7/836.4 short against 869.2, 795.5/793.3/729.7 deep
+    //       against 827.2. Each was verified to reach the dispatch and to give
+    //       bit-identical logits before it was timed; none is a knob because a knob
+    //       carries a value some machine wants, and no measurement here wants these.
     //
     //   q8_shared_proj / q8_shared_half
     //       Select a fused two-projection kernel. That is GRAPH fusion -- which two
@@ -976,7 +1596,7 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // nothing objecting -- which is why the caller has to opt in.
         bit_affecting: true,
         derive: None,
-        candidates: None,
+        candidates: Some(|_m, d| threads_upto(128, d.max_threads)),
         after: &[],
         cross_check: None,
         applies: None,
@@ -986,7 +1606,7 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // it, 6144. A knob that changes another knob's answer belongs in its tuple.
         tuple: Some("decode_stream"),
         category: KnobCategory::Benched,
-        values: &[128, 256, 512, 1024],
+        values: &[],
         apply: crate::set_attn_threads,
         current: crate::attn_threads_current,
         screened: false,
@@ -1012,9 +1632,9 @@ static METAL_KNOBS: &[KnobDecl] = &[
         legal: None,
         bit_affecting: false,
         derive: None,
-        candidates: None,
+        candidates: Some(|_m, d| threads_upto(128, d.max_threads)),
         after: &[],
-        cross_check: Some(Wl::AttentionPrefillReuse),
+        cross_check: Some(Wl::AttentionPrefillMajor),
         applies: None,
         tuple: Some("prefill_attn"),
         // Thread count and BLK shape the same prefill attention dispatch: threads
@@ -1022,7 +1642,7 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // against NSG. #37 records ten attempts across two sessions failing because
         // these terms only move together.
         category: KnobCategory::Benched,
-        values: &[128, 256, 512],
+        values: &[],
         apply: crate::set_attn_threads_prefill,
         current: crate::attn_threads_pf_current,
         screened: false,
@@ -1037,13 +1657,18 @@ static METAL_KNOBS: &[KnobDecl] = &[
         legal: Some(|v, _m, _d| crate::rt_shape_legal(v)),
         bit_affecting: false,
         derive: None,
-        candidates: None,
+        // COUNTED, not written. The shape table lives in the .mm and already exports its
+        // size; a literal ladder here is the same number in two places, and the failure is
+        // silent -- add a shape and the tuner simply never tries it.
+        candidates: Some(|_m, _d| (0..crate::rt_shape_count()).collect()),
         after: &[],
         cross_check: None,
-        applies: None,
+        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
+        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
         tuple: None,
         category: KnobCategory::Benched,
-        values: &[0, 1, 2, 3, 4, 5, 6, 7],
+        values: &[],
         apply: |v| {
             let _ = crate::set_rt_shape(v);
         },
@@ -1077,7 +1702,9 @@ static METAL_KNOBS: &[KnobDecl] = &[
         candidates: None,
         after: &[],
         cross_check: None,
-        applies: None,
+        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
+        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
         tuple: Some("gemv"),
         // Was stage 2. Its WORKLOAD was already right -- NR0 applies to the decode
         // fast path only -- so it was end-to-end for no reason. Grouped with lanes,
@@ -1161,6 +1788,295 @@ static METAL_KNOBS: &[KnobDecl] = &[
     // step against 7% run-to-run spread. The compiled default (3072, measured
     // on the reference M3 Pro) stands when the scans disagree.
     KnobDecl {
+        // THE POSITION TILE, tuned inside a derived bound. `qcomb_derive_pt` gives the
+        // widest tile that FITS this device; it is not the fastest -- measured on E4B
+        // q4_0 prefill the derived 480 was 1.3% slower than 128, because a wider tile
+        // costs threadgroup occupancy. Values above what fits are clamped, so a ladder
+        // written here cannot ask for a shape the device cannot hold.
+        //
+        // bit_affecting: a different tile changes where the online softmax rescales.
+        // SIMDGROUPS PER QCOMB THREADGROUP, and the reason this is a knob at all.
+        //
+        // qcomb_derive_nsg answers "does this nsg FIT" -- NDB whole, room for a second
+        // threadgroup, accumulator budget. That is a LIMIT. It was also being used to
+        // answer "which nsg is FASTEST", by returning the first fit scanning up from a
+        // written floor of 8, and at head_dim 64 that floor hid nsg 4: legal, bit-identical
+        // (det_gate pin EXACT at every length) and 2.9% faster on the 17123-token leg,
+        // 790.5 against 768.2. A limit doing a value's job.
+        //
+        // Do NOT replace this with a lower floor. First-fit does not rank, it only orders:
+        // at qt 8 every legal nsg fits the accumulator rule, so a floor of 1 would pick
+        // nsg 1 -- 32 threads per threadgroup, never measured, chosen by loop order. The
+        // candidates are derived and the value is measured; that is the whole point.
+        //
+        // bit_affecting: false. It moves which simdgroup owns which dim slice, not the
+        // order any output is summed in -- confirmed EXACT at all eight lengths.
+        name: "attn_qcomb_nsg",
+        legal: None,
+        bit_affecting: false,
+        derive: None,
+        candidates: Some(|m, _d| {
+            // ASKED OF THE BACKEND, which owns the rule. It answers only once the device
+            // profile has been measured; before that -- and in the pre-init registry test
+            // -- it returns nothing, and the honest ladder is the compiled default alone,
+            // exactly as attn_qcomb_pt falls back to its own. A knob may never resolve to
+            // an EMPTY ladder: that reads as "swept" while sweeping nothing, which is the
+            // failure this registry has a test for.
+            let v = crate::qcomb_nsg_candidates(m.head_dim);
+            if v.is_empty() { vec![8] } else { v }
+        }),
+        after: &[],
+        cross_check: Some(Wl::AttentionPrefillReuse),
+        applies: Some(|m| crate::qcomb_has_hd(m.head_dim)),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_qcomb_nsg,
+        current: crate::qcomb_nsg,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::AttentionPrefillDeep,
+    },
+    KnobDecl {
+        // SIMDGROUPS PER FA THREADGROUP. The FA op (the prefill default at head dim <= 128)
+        // splits a block's column tiles, the queries and the output tiles over its
+        // simdgroups; more simdgroups mean less work and fewer registers per simdgroup and
+        // more barrier participants. The LIMIT is derived (fa_nsg_candidates: the kernel's
+        // divisibility rules and the device's thread cap); the VALUE is measured: on the
+        // reference M3 Pro at hd 64, 4 beat 8 by 29% (17.9 vs 23.0 ms at 16896 keys).
+        //
+        // bit_affecting: false. Which simdgroup owns which tile does not change the order
+        // any score or output is summed in (det_gate pins EXACT at nsg 4 and 8).
+        name: "attn_fa_nsg",
+        legal: None,
+        bit_affecting: false,
+        derive: None,
+        candidates: Some(|m, _d| {
+            let v = crate::fa_nsg_candidates(m.head_dim);
+            if v.is_empty() {
+                vec![crate::fa_nsg()]
+            } else {
+                v
+            }
+        }),
+        after: &[],
+        cross_check: Some(Wl::AttentionPrefillReuse),
+        applies: Some(|m| crate::fa_has_hd(m.head_dim)),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_fa_nsg,
+        current: crate::fa_nsg,
+        // Screened on an attention dispatch (a spilling count reads 10x): the sweep then
+        // never runs the deep workload on it.
+        screened: true,
+        sweep: Sw::Values,
+        workload: Wl::AttentionPrefillDeep,
+    },
+    KnobDecl {
+        // KEYS PER FLASH-DECODING SLICE (the decode attention route at head dim <= 128,
+        // grouped by KV head). One threadgroup takes one chunk: a smaller chunk means more
+        // threadgroups streaming in parallel and more partials for the combine; a larger one
+        // fewer, longer streams. The LIMIT is derived (the slice's scores must fit the
+        // device's threadgroup memory); the VALUE is measured: on the reference M3 Pro the
+        // sweep read 128 / 256 / 512 / 1024 at 2532 / 2366 / 2510 / 3546 us and 256 is the
+        // seat. bit_affecting: the split changes the order the combine sums the slices in.
+        name: "attn_fd_chunk",
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: Some(|m, _d| {
+            let share = m.n_head.checked_div(m.n_kv).unwrap_or(0);
+            let v = crate::attn_fd_chunk_candidates(m.head_dim, share);
+            if v.is_empty() {
+                vec![crate::attn_fd_chunk()]
+            } else {
+                v
+            }
+        }),
+        after: &[],
+        cross_check: None,
+        applies: Some(|m| {
+            let share = m.n_head.checked_div(m.n_kv).unwrap_or(0);
+            !crate::attn_fd_chunk_candidates(m.head_dim, share).is_empty()
+        }),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_attn_fd_chunk,
+        current: crate::attn_fd_chunk,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::DecodeAttentionStep,
+    },
+    KnobDecl {
+        // The vector decode kernel reads K/V once per QUERY head, so it wins while a span's
+        // K/V is cache-resident and loses to the K-once-per-KV-head routes past that. The
+        // crossover is measured per model on the deep decode step (1024 on both reference
+        // models: at 16k keys the unsliced kernel loses 11% of the step on 512-dim heads,
+        // the isolated probe notwithstanding); the ladder runs past the deep span for a
+        // sliced form of the kernel. bit_affecting: the route changes the summation order.
+        name: "attn_vec_max_keys",
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: Some(|_m, _d| vec![512, 1024, 2048, 4096, 8192, 16384, 65536]),
+        after: &[],
+        cross_check: None,
+        applies: Some(|m| m.head_dim % 32 == 0),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_attn_vec_max_keys,
+        current: crate::attn_vec_max_keys,
+        screened: false,
+        sweep: Sw::Values,
+        // NOTE: this workload runs one decode-attention step at depth, where every
+        // candidate below the span is inert and the tuner keeps the default; a short-span
+        // workload that crosses the ladder is the tuner follow-up (task #122).
+        workload: Wl::DecodeAttentionStep,
+    },
+    KnobDecl {
+        // MEGA BLOCK GRID (task #141). The persistent FFN(+PLE) dispatch's threadgroups all
+        // wait on each other, so the grid is bounded by a DERIVED limit -- gpu_cores x the
+        // pipeline's maxTotalThreadsPerThreadgroup (see the host) -- and the shape inside
+        // it is a tuned value: the barrier cost grows with the number of arrivers, the
+        // GEMV phases want simdgroups in flight, 1024-thread groups leave cores idle.
+        // Candidates are per core: one, two-minus-slack, two per core.
+        name: "mega_tgs",
+        legal: Some(|v, _m, _d| {
+            let lim = crate::mega_threads_limit();
+            lim == 0 || v * crate::mega_nsg_current() * 32 <= lim
+        }),
+        bit_affecting: false,
+        derive: None,
+        candidates: Some(|_m, _d| {
+            let c = crate::gpu_cores();
+            if c == 0 {
+                return vec![8, 16];
+            }
+            let mut v: Vec<u32> = [c, 2 * c - 4, 2 * c - 2, 2 * c]
+                .into_iter()
+                .filter(|&t| t > 0)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        }),
+        after: &[],
+        cross_check: None,
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0 && crate::mega_level() >= 1),
+        tuple: Some("mega"),
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_mega_tgs,
+        current: crate::mega_tgs_current,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::DecodeMix,
+    },
+    KnobDecl {
+        // Simdgroups per mega threadgroup; with mega_tgs the product is the grid.
+        name: "mega_nsg",
+        legal: Some(|v, _m, d| {
+            let lim = crate::mega_threads_limit();
+            v * 32 <= d.max_threads
+                && (lim == 0 || crate::mega_tgs_current() * v * 32 <= lim)
+        }),
+        bit_affecting: false,
+        derive: None,
+        candidates: Some(|_m, d| {
+            [8u32, 16, 32]
+                .into_iter()
+                .filter(|&n| n * 32 <= d.max_threads)
+                .collect()
+        }),
+        after: &[],
+        cross_check: None,
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0 && crate::mega_level() >= 1),
+        tuple: Some("mega"),
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_mega_nsg,
+        current: crate::mega_nsg_current,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::DecodeMix,
+    },
+    KnobDecl {
+        name: "attn_qcomb_pt",
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: Some(|m, _d| {
+            // DERIVE THE LIMIT, TUNE THE VALUE. The ladder used to end at 512, which is
+            // neither this device's limit nor a measured best -- it was a round number.
+            // The widest tile the threadgroup budget allows is arithmetic; every power of
+            // two below it is a rung, and the limit itself is the last one because the
+            // widest legal tile is the interesting end of the range.
+            let lim = crate::qcomb_pt_limit(m.head_dim);
+            if lim == 0 {
+                return vec![128];
+            }
+            let mut v: Vec<u32> =
+                core::iter::successors(Some(64u32), |t| t.checked_mul(2))
+                    .take_while(|t| *t <= lim)
+                    .collect();
+            if v.last() != Some(&lim) {
+                v.push(lim);
+            }
+            v
+        }),
+        after: &[],
+        cross_check: Some(Wl::AttentionPrefillReuse),
+        applies: Some(|m| crate::qcomb_has_hd(m.head_dim)),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_qcomb_pt,
+        current: crate::qcomb_pt,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::AttentionPrefillDeep,
+    },
+    KnobDecl {
+        // WHICH OF THIS MODEL'S HEAD DIMS TAKE QCOMB: one bit per dim it uses. A mask and
+        // not a threshold, because a threshold assumes qcomb-worthiness rises with the dim
+        // and nothing measured that; a mask asks the question the engine faces, per dim.
+        //
+        // bit_affecting: the two kernels sum in different orders, so the tuner reaches this
+        // only under --allow-bit-changes and a default build routes as it does today.
+        name: "attn_qcomb_mask",
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: Some(|_m, _d| {
+            // ONE BIT PER COMPILED SLOT, so a model with one head dim gets two masks and
+            // one with three gets eight. The comment above this line described exactly
+            // this and the hook was never written: the ladder resolved to `values`, which
+            // is empty, so the knob had NOTHING to sweep and could never be chosen.
+            (0..(1u32 << crate::qcomb_slot_count())).collect()
+        }),
+        after: &[],
+        cross_check: Some(Wl::AttentionPrefillReuse),
+        // Only where a second kernel exists for this model's head dim. A model at hd 128
+        // has no qcomb instantiation, so every floor value routes it to qtile and the
+        // coordinate is inert -- and an inert knob still costs a sweep and still reports
+        // a winner, which is how a number that means nothing gets stored.
+        applies: Some(|m| crate::qcomb_has_hd(m.head_dim)),
+        tuple: None,
+        category: KnobCategory::Benched,
+        // DERIVED, not written: 2^slots candidates, so a model with one head dim gets
+        // two and one with three gets eight. A literal ladder would be a list of numbers
+        // meaningless for any model it was not written against.
+        values: &[],
+        apply: crate::set_qcomb_mask,
+        current: crate::qcomb_mask,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::AttentionPrefillDeep,
+    },
+    KnobDecl {
         // BLK for the QT-8 qcomb prefill attention kernels -- the ones q4 and q8 prefill
         // run on. The score phase splits a PT-128 tile into ceil(PT/(8*BLK)) work units,
         // one per simdgroup, so the shipped BLK 4 gives 4 units over NSG 8 and leaves half
@@ -1181,7 +2097,7 @@ static METAL_KNOBS: &[KnobDecl] = &[
         derive: None,
         candidates: None,
         after: &[],
-        cross_check: Some(Wl::AttentionPrefillReuse),
+        cross_check: Some(Wl::AttentionPrefillMajor),
         applies: None,
         tuple: Some("prefill_attn"),
         category: KnobCategory::Benched,
@@ -1372,7 +2288,12 @@ static METAL_KNOBS: &[KnobDecl] = &[
         legal: None,
         bit_affecting: false,
         derive: Some(|m, d| {
-            derive_flush(d.commit_overhead_ns, d.encode_cost_ns, m.layer_dispatches, m.n_layers)
+            derive_flush(
+                d.commit_overhead_ns,
+                d.encode_cost_ns,
+                m.layer_dispatches,
+                m.n_layers,
+            )
         }),
         candidates: None,
         after: &[],
@@ -1416,7 +2337,12 @@ static METAL_KNOBS: &[KnobDecl] = &[
             if encode / work < NEGLIGIBLE {
                 return 0; // the GPU is never waiting on the host; do not pay a commit
             }
-            derive_flush(d.commit_overhead_ns, d.encode_cost_ns, m.layer_dispatches, m.n_layers)
+            derive_flush(
+                d.commit_overhead_ns,
+                d.encode_cost_ns,
+                m.layer_dispatches,
+                m.n_layers,
+            )
         }),
         candidates: None,
         after: &[],
@@ -1442,13 +2368,401 @@ impl BackendKnobs for MetalBackend {
     /// gemv_max_tok, v12 attn_stream_min_pos).
     ///
     /// v13: ADDED the Q8_0 weight family -- q8_decode_sgs, q8_decode_rows,
-    /// q8_batch_sgs, q8_token_tile, q8_gemm_shape, q8_full_tiles, q8_gemv_max_tok. The
+    /// q8_batch_sgs, q8_token_tile, st_gemm_shape, q8_full_tiles, q8_gemv_max_tok. The
     /// knob SET changed, which is what this version exists to invalidate: a v12 file has
     /// no line for any of them, so it would leave a Q8_0 model on compiled defaults while
     /// reporting itself as tuned. Same release: attn_stream_min_pos stopped being stored
     /// at all (the engine derives it from the cache type), so a v12 file's value for it
     /// would be applied as an explicit override of that derive.
+    ///
+    /// v14: the knob SET is unchanged, and this still has to move, because every
+    /// attention value a v13 file holds was measured against the WRONG KERNELS. The tuner
+    /// never injected the model's head dims, so its Metal library compiled no qcomb
+    /// attention slots at all: its prefill workload dispatched qtile while the engine
+    /// dispatched qcomb, and both qcomb knobs reported "N/A to this model". A v13 file is
+    /// not stale, it is a measurement of a library this engine does not build.
+    ///
+    /// Also in v14, and harmless by comparison: the thread and simdgroup ladders are
+    /// derived from the device's own limit rather than written down, and
+    /// `attn_qcomb_mask` gained the `2^slots` candidate hook its comment had always
+    /// described -- without it the mask resolved to an empty ladder and was never swept.
     fn space_version(&self) -> u32 {
-        13
+        // 19: mega_tgs / mega_nsg join the space (the persistent mega block's grid shape).
+        // 18: q8_tm_decode_sgs joins the space (the tile-major decode GEMV's simdgroups).
+        // 18: attn_fd_chunk joins the space (keys per flash-decoding slice).
+        // 16: attn_fa_nsg joins the space (the FA op's simdgroup count; its query tile is a
+        //     structural 8, see the kernel).
+        // 15: attn_qcomb_nsg joins the space. The knob set changed, so a v14 tune file
+        // must not be read as if it described this space -- it has no value for the new
+        // knob, and the derivation it silently fell back to is the thing being replaced.
+        19
     }
+}
+
+/// IMPARO_NORM_ROW=0 disables the one-row norm+residual fusion (A/B arm on one binary).
+/// IMPARO_NORM_ROW_MASK (test instrument): bit 0 the dual attention-side seam, bit 1 the
+/// unscaled norm+add, bit 2 the scaled norm+add; default all.
+fn norm_row_fusion_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IMPARO_NORM_ROW").map_or(true, |v| v != "0"))
+}
+fn norm_row_mask(bit: u32) -> bool {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let m = *M.get_or_init(|| {
+        std::env::var("IMPARO_NORM_ROW_MASK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7)
+    });
+    m & (1 << bit) != 0
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::{simdgroups_upto, threads_upto};
+
+    /// The ladders that used to be written out must come back unchanged on the machine
+    /// they were written on -- otherwise this change is a retune wearing a refactor's
+    /// clothes, and the pinned numbers would move for a reason nobody recorded.
+    #[test]
+    fn the_written_ladders_are_reproduced_at_1024_threads() {
+        assert_eq!(threads_upto(128, 1024), vec![128, 256, 512, 1024]);
+        assert_eq!(simdgroups_upto(1, 1024), vec![1, 2, 4, 8, 16, 32]);
+    }
+
+    /// The point of deriving them: a device with half the budget must not be offered a
+    /// dispatch it cannot run. 1024 threads was in the registry as a literal.
+    #[test]
+    fn a_narrower_device_is_never_offered_an_illegal_dispatch() {
+        assert_eq!(threads_upto(128, 512), vec![128, 256, 512]);
+        assert_eq!(simdgroups_upto(1, 512), vec![1, 2, 4, 8, 16]);
+        for max in [256u32, 512, 1024, 2048] {
+            assert!(threads_upto(128, max).iter().all(|t| *t <= max));
+            assert!(simdgroups_upto(1, max).iter().all(|s| s * 32 <= max));
+        }
+    }
+
+    /// A ladder is never empty: the lowest rung is the compiled default, and a device
+    /// that cannot run it is one this backend cannot run at all.
+    #[test]
+    fn the_lowest_rung_survives_an_absurd_limit() {
+        assert_eq!(threads_upto(128, 0), vec![128]);
+        assert_eq!(simdgroups_upto(1, 0), vec![1]);
+    }
+}
+
+/// One gemma4 layer (from the FFN input, or from the residual with the fronts) as one entry of
+/// the mega kernel (task #158 step 2): the program's slots and words, the architecture's own
+/// rules here, the Metal rules in the bridge.
+fn mega_gemma4_entry(l: &Gemma4MegaLayer<'_>, n_tok: u32) -> bool {
+    let &Gemma4MegaLayer {
+        gate_kind,
+        gate_off,
+        up_kind,
+        up_off,
+        down_kind,
+        down_off,
+        post_ffw_norm_off,
+        pg_kind,
+        pg_off,
+        pp_kind,
+        pp_off,
+        post_norm_off,
+        next_norm_off,
+        out_scale,
+        n_embd,
+        n_ff,
+        ple,
+        per_layer_off,
+        eps,
+        src,
+        x,
+        add,
+        g,
+        u,
+        gate,
+        per_layer,
+        back,
+        next_out,
+        front,
+    } = l;
+    use crate::mega_slots::*;
+    use crate::{MEGA_SLOT_BUF_R as R, MEGA_SLOT_BUF_RW as RW, MEGA_SLOT_BUF_W as W};
+    use crate::{mega_slot_buf as sbuf, mega_slot_kv as skv, mega_slot_weight as sw};
+    let qkv = front.and_then(|f| f.qkv);
+    let attention = front.and_then(|f| f.attention);
+    if n_tok != 1
+        || gate_kind != 1
+        || up_kind != 1
+        || down_kind != 1
+        || pg_kind != 1
+        || pp_kind != 1
+        || front.is_some_and(|f| f.wo_kind != 1)
+        || qkv.is_some_and(|q| {
+            q.wq_kind != 1
+                || q.wk.is_some_and(|(k, _)| k != 1)
+                || q.wv.is_some_and(|(k, _)| k != 1)
+                || q.wk.is_some() != q.wv.is_some()
+        })
+    {
+        return false;
+    }
+    // gemma4's own rules: Q4 row widths, the norm rows staged in the n_mid scratch, the
+    // attention phase needs the front in the same dispatch, the q/k/v front needs the
+    // attention phase (Q never leaves the block otherwise), the head geometry.
+    if n_embd % 32 != 0 || n_ff % 32 != 0 || ple % 32 != 0 || n_ff < n_embd {
+        return false;
+    }
+    if (attention.is_some() && front.is_none())
+        || (qkv.is_some() && attention.is_none())
+    {
+        return false;
+    }
+    if front.is_some_and(|f| f.attn_in % 32 != 0) {
+        return false;
+    }
+    if let (Some(q), Some(f), Some(a)) = (qkv, front, attention) {
+        if q.rope_dim == 0 || q.rope_dim % 2 != 0 || q.rope_dim > f.head_dim {
+            return false;
+        }
+        if q.wk.is_some() && a.kv_layer != q.layer {
+            return false;
+        }
+        if a.n_heads * f.head_dim != f.attn_in {
+            return false;
+        }
+    }
+    let has_next = next_norm_off != NO_WEIGHT && next_norm_off != 0;
+    let has_kv = qkv.is_some_and(|q| q.wk.is_some());
+    let mut e = crate::MegaEntryFfi::new(0);
+    e.min_level = if qkv.is_some() {
+        5
+    } else if attention.is_some() {
+        4
+    } else if front.is_some() {
+        3
+    } else {
+        2
+    };
+    e.head_dim = front.map_or(0, |f| f.head_dim);
+    e.attn_on = u32::from(attention.is_some());
+    e.kv_write = u32::from(qkv.is_some() && has_kv);
+    e.layer = qkv.map_or(0, |q| q.layer);
+    e.scratch_rows = n_ff;
+    if let Some(fr) = qkv.and_then(|q| q.freqs) {
+        e.freqs = fr.as_ptr();
+        e.n_freqs = fr.len() as u32;
+    }
+    e.slots[G4_W_GATE] = sw(gate_off, G4_O_GATE_OFF);
+    e.slots[G4_W_UP] = sw(up_off, G4_O_UP_OFF);
+    e.slots[G4_W_DOWN] = sw(down_off, G4_O_DOWN_OFF);
+    e.slots[G4_W_PG] = sw(pg_off, G4_O_PG_OFF);
+    e.slots[G4_W_PP] = sw(pp_off, G4_O_PP_OFF);
+    e.slots[G4_W_N1] = sw(post_ffw_norm_off, G4_O_N1_OFF);
+    e.slots[G4_W_N2] = sw(post_norm_off, G4_O_N2_OFF);
+    if has_next {
+        e.slots[G4_W_N3] = sw(next_norm_off, G4_O_N3_OFF);
+        e.slots[G4_NXT] = sbuf(W, b(next_out), 0);
+    }
+    e.slots[G4_X] = sbuf(RW, b(x), 0);
+    e.slots[G4_O] = sbuf(if front.is_some() { RW } else { R }, b(add), 0);
+    e.slots[G4_CUR] = sbuf(R, b(src), 0);
+    e.slots[G4_G] = sbuf(W, b(g), 0);
+    e.slots[G4_U] = sbuf(W, b(u), 0);
+    e.slots[G4_GATE] = sbuf(W, b(gate), 0);
+    e.slots[G4_PER_LAYER] = sbuf(R, b(per_layer), 0);
+    e.slots[G4_BACK] = sbuf(W, b(back), 0);
+    if let Some(f) = front {
+        e.slots[G4_W_O] = sw(f.wo_off, G4_O_WO_OFF);
+        e.slots[G4_W_NPA] = sw(f.post_attn_norm_off, G4_O_NPA_OFF);
+        e.slots[G4_W_NF] = sw(f.ffn_norm_off, G4_O_NF_OFF);
+        e.slots[G4_ATTN] = sbuf(R, b(f.attn), 0);
+        if attention.is_some() {
+            e.slots[G4_ATTN_OUT] = sbuf(W, b(f.attn), 0);
+        }
+        e.u[G4_U_ATTN_IN] = f.attn_in;
+        e.u[G4_U_Q_ROWS] = f.attn_in;
+        e.u[G4_U_FRONT] = 1;
+    }
+    if let Some(a) = attention {
+        e.kv_layer = a.kv_layer;
+        e.start_pos = a.start_pos;
+        e.slots[G4_QIN] = sbuf(if qkv.is_some() { RW } else { R }, b(a.q), 0);
+        e.slots[G4_KC] = skv(crate::MEGA_SLOT_KV_K_R);
+        e.slots[G4_VC] = skv(crate::MEGA_SLOT_KV_V_R);
+        e.slots[G4_KV_PT] = skv(crate::MEGA_SLOT_KV_PT);
+        e.u[MEGA_U_N_HEADS] = a.n_heads;
+        e.u[MEGA_U_N_KV] = a.n_kv;
+        e.u[MEGA_U_KV_WIDTH] = a.kv_width;
+        e.u[MEGA_U_WINDOW] = a.window;
+        e.u[MEGA_U_RING] = a.ring;
+        e.u[MEGA_U_HAD_K] = a.had_k;
+        e.u[MEGA_U_HAD_V] = a.had_v;
+        e.u[G4_U_ATTN_PHASE] = 1;
+    }
+    if let Some(q) = qkv {
+        e.slots[G4_W_Q] = sw(q.wq_off, G4_O_WQ_OFF);
+        e.slots[G4_W_QN] = sw(q.q_norm_off, G4_O_QN_OFF);
+        e.slots[G4_W_IN] = sw(q.in_norm_off, G4_O_IN_OFF);
+        if let (Some((_, wk)), Some((_, wv))) = (q.wk, q.wv) {
+            e.slots[G4_W_K] = sw(wk, G4_O_WK_OFF);
+            e.slots[G4_W_V] = sw(wv, G4_O_WV_OFF);
+            e.slots[G4_W_KN] = sw(q.k_norm_off, G4_O_KN_OFF);
+            e.slots[G4_KC_W] = skv(crate::MEGA_SLOT_KV_K_W);
+            e.slots[G4_VC_W] = skv(crate::MEGA_SLOT_KV_V_W);
+        }
+        e.slots[G4_KBUF] = sbuf(W, b(q.k), 0);
+        e.slots[G4_VBUF] = sbuf(W, b(q.v), 0);
+        e.u[G4_U_QKV_PHASE] = 1;
+        e.u[G4_U_HAS_KV] = u32::from(has_kv);
+        e.u[MEGA_U_N_ROT] = q.rope_dim;
+        e.u[G4_U_N_FREQS] = e.n_freqs;
+        e.f[MEGA_F_ROPE_BASE] = q.rope_base;
+    }
+    e.u[MEGA_U_N_EMBD] = n_embd;
+    e.u[G4_U_N_MID] = n_ff;
+    e.u[G4_U_PLE] = ple;
+    e.u[G4_U_PL_OFF] = per_layer_off;
+    e.u[G4_U_HAS_NEXT] = u32::from(has_next);
+    e.f[MEGA_F_EPS] = eps;
+    e.f[G4_F_OUT_SCALE] = out_scale;
+    crate::mega_layer(&e)
+}
+
+/// One LFM2 layer as one persistent dispatch (task #147). Decode only, tile-major Q8_0
+/// only (the kind the load-time repack produces).
+fn mega_lfm2_entry(l: &Lfm2MegaLayer, n_tok: u32) -> bool {
+    use crate::mega_slots::*;
+    use crate::{MEGA_SLOT_BUF_RW as RW, MEGA_SLOT_BUF_W as W};
+    use crate::{mega_slot_buf as sbuf, mega_slot_kv as skv, mega_slot_weight as sw};
+    if n_tok != 1 || l.gate_kind != 3 || l.up_kind != 3 || l.down_kind != 3 {
+        return false;
+    }
+    // LFM2's own rules: Q8 tile-major units of 8 rows, the conv taps within the kernel's
+    // history, the head geometry of the attention mixer.
+    if l.n_embd % 32 != 0 || l.n_ff % 32 != 0 || l.n_embd % 8 != 0 || l.n_ff % 8 != 0 {
+        return false;
+    }
+    let mut e = crate::MegaEntryFfi::new(1);
+    e.min_level = 2;
+    e.slots[L2_W_GATE] = sw(l.gate_off, L2_O_GATE_OFF);
+    e.slots[L2_W_UP] = sw(l.up_off, L2_O_UP_OFF);
+    e.slots[L2_W_DOWN] = sw(l.down_off, L2_O_DOWN_OFF);
+    e.slots[L2_W_FN] = sw(l.ffn_norm_off, L2_O_FN_OFF);
+    e.slots[L2_X] = sbuf(RW, b(l.x), 0);
+    e.slots[L2_O] = sbuf(RW, b(l.add), 0);
+    e.slots[L2_G] = sbuf(W, b(l.g), 0);
+    e.slots[L2_U] = sbuf(W, b(l.u), 0);
+    e.u[MEGA_U_N_EMBD] = l.n_embd;
+    e.u[L2_U_N_FF] = l.n_ff;
+    e.f[MEGA_F_EPS] = l.eps;
+    e.f[L2_F_Q_SCALE] = 1.0;
+    match l.mixer {
+        Lfm2MegaMixer::None => {}
+        Lfm2MegaMixer::ShortConv {
+            op_norm_off,
+            in_kind,
+            in_off,
+            conv_off,
+            out_kind,
+            out_off,
+            kernel,
+            bcx,
+            state,
+            state_off,
+            snap,
+        } => {
+            if in_kind != 3 || out_kind != 3 || kernel == 0 || kernel - 1 > 8 {
+                return false;
+            }
+            e.u[L2_U_MIXER] = 1;
+            e.u[L2_U_KERN] = kernel;
+            e.slots[L2_W_OP] = sw(op_norm_off, L2_O_OP_OFF);
+            e.slots[L2_W_IN] = sw(in_off, L2_O_IN_OFF);
+            e.slots[L2_W_CONV] = sw(conv_off, L2_O_CONV_OFF);
+            e.slots[L2_W_OUT] = sw(out_off, L2_O_OUT_OFF);
+            e.slots[L2_BCX] = sbuf(RW, b(bcx), 0);
+            e.slots[L2_STATE] = sbuf(RW, b(state), state_off);
+            if let Some((sb, so)) = snap {
+                e.slots[L2_SNAP] = sbuf(RW, b(sb), so);
+                e.u[L2_U_HAS_SNAP] = 1;
+            }
+        }
+        Lfm2MegaMixer::Attention {
+            op_norm_off,
+            wq_kind,
+            wq_off,
+            wk_kind,
+            wk_off,
+            wv_kind,
+            wv_off,
+            wo_kind,
+            wo_off,
+            q_norm_off,
+            k_norm_off,
+            head_dim,
+            n_heads,
+            n_kv,
+            kv_width,
+            kv_layer,
+            start_pos,
+            window,
+            ring,
+            rope_dim,
+            rope_base,
+            q_scale,
+            q,
+            k,
+            v,
+            attn,
+            had_k,
+            had_v,
+        } => {
+            if wq_kind != 3 || wk_kind != 3 || wv_kind != 3 || wo_kind != 3 {
+                return false;
+            }
+            if head_dim % 32 != 0
+                || kv_width != n_kv * head_dim
+                || rope_dim == 0
+                || rope_dim % 2 != 0
+                || rope_dim > head_dim
+            {
+                return false;
+            }
+            e.u[L2_U_MIXER] = 2;
+            e.head_dim = head_dim;
+            e.attn_on = 1;
+            e.kv_write = 1;
+            e.kv_layer = kv_layer;
+            e.start_pos = start_pos;
+            e.scratch_rows = l.n_ff;
+            e.slots[L2_W_OP] = sw(op_norm_off, L2_O_OP_OFF);
+            e.slots[L2_W_Q] = sw(wq_off, L2_O_WQ_OFF);
+            e.slots[L2_W_K] = sw(wk_off, L2_O_WK_OFF);
+            e.slots[L2_W_V] = sw(wv_off, L2_O_WV_OFF);
+            e.slots[L2_W_O] = sw(wo_off, L2_O_WO_OFF);
+            e.slots[L2_W_QN] = sw(q_norm_off, L2_O_QN_OFF);
+            e.slots[L2_W_KN] = sw(k_norm_off, L2_O_KN_OFF);
+            e.slots[L2_QIN] = sbuf(RW, b(q), 0);
+            e.slots[L2_KBUF] = sbuf(RW, b(k), 0);
+            e.slots[L2_VBUF] = sbuf(RW, b(v), 0);
+            e.slots[L2_ATTN] = sbuf(RW, b(attn), 0);
+            e.slots[L2_KC_W] = skv(crate::MEGA_SLOT_KV_K_W);
+            e.slots[L2_VC_W] = skv(crate::MEGA_SLOT_KV_V_W);
+            e.slots[L2_KC] = skv(crate::MEGA_SLOT_KV_K_R);
+            e.slots[L2_VC] = skv(crate::MEGA_SLOT_KV_V_R);
+            e.slots[L2_KV_PT] = skv(crate::MEGA_SLOT_KV_PT);
+            e.u[MEGA_U_N_HEADS] = n_heads;
+            e.u[MEGA_U_N_KV] = n_kv;
+            e.u[MEGA_U_KV_WIDTH] = kv_width;
+            e.u[MEGA_U_WINDOW] = window;
+            e.u[MEGA_U_RING] = ring;
+            e.u[MEGA_U_HAD_K] = had_k;
+            e.u[MEGA_U_HAD_V] = had_v;
+            e.u[MEGA_U_N_ROT] = rope_dim;
+            e.f[MEGA_F_ROPE_BASE] = rope_base;
+            e.f[L2_F_Q_SCALE] = q_scale;
+        }
+    }
+    crate::mega_layer(&e)
 }

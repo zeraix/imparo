@@ -65,6 +65,12 @@ pub(crate) fn kvq_mask_on() -> bool {
 pub(crate) fn gpu_probe_layer() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
+        // No probe means NO layer is special. Returning 0 here used to disable fused
+        // semantic operations on layer 0 even though every gprobe call immediately
+        // returned; E4B therefore ran the sidecar on 41/42 layers in ordinary builds.
+        if std::env::var_os("IMPARO_GPU_PROBE").is_none() {
+            return usize::MAX;
+        }
         std::env::var("IMPARO_GPU_PROBE_LAYER")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -109,7 +115,7 @@ pub(crate) fn gprobe_half(name: &str, buf: BufId, off_halves: u64, n: usize) {
     be().begin();
 }
 
-/// Syncs and dumps a GPU buffer.
+/// Syncs, reads, and reports a GPU buffer without modifying it or writing a file.
 ///
 /// Gated on IMPARO_GPU_PROBE; it slices the command buffer, so it is a debugging tool and
 /// not something to leave on.
@@ -143,9 +149,13 @@ pub(crate) fn gprobe(name: &str, buf: BufId, off: u64, n: usize) {
         .sum::<f32>()
         / n as f32)
         .sqrt();
+    // Keep the fold order identical to llama.cpp's eval callback. This makes a
+    // compact probe useful across backends even when dumping a multi-million-
+    // element activation would be too expensive.
+    let sum = v.iter().copied().fold(0.0_f32, |acc, value| acc + value);
     let head: Vec<String> = v.iter().take(5).map(|x| format!("{x:.5}")).collect();
     eprintln!(
-        "[gpu] {name:<20} n={n:<7} finite={finite:<7} rms={rms:.5} [{}]",
+        "[gpu] {name:<20} n={n:<7} finite={finite:<7} rms={rms:.5} sum={sum:.6} [{}]",
         head.join(", ")
     );
     be().begin();
@@ -199,6 +209,103 @@ pub struct BufferRequirement {
     pub id: BufId,
     pub bytes: u64,
     pub placement: Placement,
+}
+
+/// Backend-owned half scratch used while a quantized KV cache is consumed.
+///
+/// This is a GPU execution contract, not a Gemma-specific buffer: every model
+/// workflow that calls `Backend::attention` with quantized K or V must declare the
+/// corresponding slot.  Centralizing the capacity formula prevents a new workflow
+/// from compiling successfully and then launching a dequant kernel at a null buffer.
+pub fn kv_dequant_scratch_requirements(
+    plan: &crate::ModelPlan,
+    capacity: usize,
+    k_needed: bool,
+    v_needed: bool,
+) -> Vec<BufferRequirement> {
+    if !k_needed && !v_needed {
+        return Vec::new();
+    }
+    let head_max = plan
+        .layers
+        .iter()
+        .map(|layer| layer.attention.head_dim() as usize)
+        .max()
+        .unwrap_or(0);
+    let bytes = (capacity.max(crate::kv::KV_FIRST_SLOTS)
+        * plan.config.n_kv_heads as usize
+        * head_max
+        * std::mem::size_of::<u16>()) as u64;
+    let mut requirements = Vec::with_capacity(2);
+    if k_needed {
+        requirements.push(BufferRequirement {
+            id: BufId::Kdq,
+            bytes,
+            placement: Placement::Dedicated,
+        });
+    }
+    if v_needed {
+        requirements.push(BufferRequirement {
+            id: BufId::Vdq,
+            bytes,
+            placement: Placement::Dedicated,
+        });
+    }
+    requirements
+}
+
+/// Backend-owned half-precision mirrors of the activation.
+///
+/// This is a GPU execution contract, not a Gemma-specific buffer.  The Metal backend's
+/// activation PRODUCERS -- `rms_norm` for CUR, `attention` for ATTN, the residual `add`
+/// for X, and the fused up-projection epilogue for G -- write a half copy of their output
+/// into these slots, and the weight matmuls
+/// then read that copy instead of converting f32 to half again in every threadgroup that
+/// re-reads the same row.  Nothing about the arithmetic changes: both paths multiply as
+/// `simdgroup_half8x8` into an f32 accumulator, so the mirror moves only WHERE the one
+/// f32 -> f16 rounding happens.  Without the slots the backend converts inline, which is
+/// correct and slower.
+///
+/// Every gate on that path reads `bufs[Xh] != nil`, so a workflow that does not declare
+/// these compiles, runs, produces right answers, and silently never takes the faster path
+/// -- with nothing in any log to say so.  LFM2 shipped that way: one missing declaration
+/// disabled the producer writes and both matmul readers at once.
+///
+/// Two slots rather than one: the fused up epilogue writes G's mirror while the SAME
+/// dispatch is still reading CUR's mirror out of the first slot, so they cannot share
+/// bytes.  Both ALIAS `host`'s pages and cost zero memory, which is why `host` must be a
+/// buffer that is dead during prefill -- `U` on a SwiGLU feed-forward, because the fused
+/// epilogue writes G and leaves U untouched.  That is a REQUIREMENT, not a nicety: with
+/// the epilogue unfused the up projection writes U while the mirror of its own input
+/// still lives in U's pages, and the dispatch reads and writes the same bytes.  A slot
+/// that does not fit inside `host` is skipped, and the backend keeps converting inline.
+///
+/// `widest_elems` is the largest per-token activation any matmul stages through the
+/// mirror, which is `n_ff` on a SwiGLU feed-forward -- wider than the model itself.
+pub fn half_activation_mirror_requirements(
+    batch: usize,
+    widest_elems: usize,
+    host: BufId,
+) -> Vec<BufferRequirement> {
+    // PADDED to a whole token tile, not sized at `batch`. A prefill GEMM walks whole
+    // tiles: the conversion pass fills `ceil(n_tok/tile)*tile` rows, and a kernel reading
+    // the operand straight from the mirror loads whole 8-row fragments off the end of the
+    // last one. At 455 tokens and n_in 10752 the conversion wrote 537 KB past a mirror
+    // sized for 455 rows, into whatever the arena had packed after it.
+    let rows = batch.next_multiple_of(imparo_backend::MAX_GEMM_TOKEN_TILE);
+    let bytes = (rows * widest_elems * std::mem::size_of::<u16>()) as u64;
+    [BufId::Xh, BufId::Xh2]
+        .into_iter()
+        .enumerate()
+        .map(|(slot, id)| BufferRequirement {
+            id,
+            bytes,
+            placement: Placement::Within {
+                host,
+                slot: slot as u8,
+            },
+        })
+        .collect()
 }
 
 /// Where each arena-placed buffer ended up, for a model that needs to place something
@@ -260,6 +367,32 @@ pub fn batch_floor(b_req: usize) -> usize {
 /// Groups share bytes: the arena is sized to the LARGEST group, and every group starts at
 /// offset zero. IMPARO_NO_ARENA_OVERLAP lays them end to end instead, which is the A/B for
 /// whether an aliasing bug is an aliasing bug.
+/// The bytes `place_buffers` would allocate for `reqs`, without allocating: the arena (the
+/// largest group when groups overlap, their sum when they do not) plus every dedicated
+/// buffer, page-rounded the way the backend rounds. The activation term of the fast-tier
+/// reserve (docs/memory-tiers-and-fit.md section 2) is this number at the largest batch.
+#[must_use]
+pub fn layout_bytes(reqs: &[BufferRequirement]) -> u64 {
+    let overlap = std::env::var("IMPARO_NO_ARENA_OVERLAP").is_err();
+    let mut group_bytes: BTreeMap<u8, u64> = BTreeMap::new();
+    let mut dedicated = 0_u64;
+    for r in reqs {
+        match r.placement {
+            Placement::Group(g) => {
+                *group_bytes.entry(g).or_insert(0) += be().page_round(r.bytes);
+            }
+            Placement::Dedicated => dedicated += be().page_round(r.bytes),
+            Placement::Within { .. } => {}
+        }
+    }
+    let arena = if overlap {
+        group_bytes.values().copied().max().unwrap_or(0)
+    } else {
+        group_bytes.values().sum()
+    };
+    arena + dedicated
+}
+
 pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
     let overlap = std::env::var("IMPARO_NO_ARENA_OVERLAP").is_err();
     let mut group_bytes: BTreeMap<u8, u64> = BTreeMap::new();
@@ -273,7 +406,8 @@ pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
     } else {
         group_bytes.values().sum()
     };
-    be().arena(arena).map_err(|rc| format!("metal arena rc={rc}"))?;
+    be().arena(arena)
+        .map_err(|rc| format!("metal arena rc={rc} (asked for {arena} bytes)"))?;
 
     // Where each group starts: zero when they share, cumulative when they do not.
     let mut group_start: BTreeMap<u8, u64> = BTreeMap::new();
@@ -330,9 +464,7 @@ pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
         if crate::log_on() {
             eprintln!(
                 "[imparo] alias {:?} slot {slot} at {}+{skip} ({} bytes) inside {host:?}",
-                r.id,
-                host_off,
-                r.bytes
+                r.id, host_off, r.bytes
             );
         }
         regions.insert(r.id as u32, (host_off + skip, r.bytes));
@@ -388,6 +520,17 @@ impl<A: Architecture> Workflow<A> {
         )
     }
 
+    /// Explicit logical slots and independent K/V strides matching `kv_bytes_for`.
+    #[must_use]
+    pub fn kv_layout_for(&self, positions: usize) -> Vec<imparo_backend::KvLayout> {
+        crate::kv::kv_layout_for(
+            &self.plan,
+            positions,
+            self.state.kv_rt.capacity,
+            self.state.kv_ring_batch,
+        )
+    }
+
     /// Reports what the backend holds for each KV layer, grouped.
     ///
     /// Grouped rather than totalled because the total does not say WHICH layers own it,
@@ -399,12 +542,16 @@ impl<A: Architecture> Workflow<A> {
         let mut groups: std::collections::BTreeMap<(u32, usize), (usize, u64)> =
             std::collections::BTreeMap::new();
         for layer in &self.plan.layers {
-            if layer.kv_source != crate::KvSource::Own || !layer.attention.is_attention() {
+            if layer.kv_source != crate::KvSource::Own
+                || !layer.attention.is_attention()
+            {
                 continue;
             }
             let hd = layer.attention.head_dim();
-            let slots = match crate::kv::ring_slots(layer.attention, self.state.kv_ring_batch)
-            {
+            let slots = match crate::kv::ring_slots(
+                layer.attention,
+                self.state.kv_ring_batch,
+            ) {
                 0 => self.state.kv_rt.capacity,
                 r => r.min(self.state.kv_rt.capacity),
             };
@@ -497,6 +644,25 @@ impl<A: Architecture> Workflow<A> {
         // resized -- it is constant in context. Outside `buffer_requirements` on purpose:
         // that list is re-placed on every batch-width change, and this buffer holds
         // conversation state that must survive one.
+        // The persistent kernel's scratch, sized once from the widest FFN, before any region
+        // runs: a regrow inside a region would swap the buffer that carries its error word.
+        let n_mid = self
+            .plan
+            .layers
+            .iter()
+            .map(|l| l.ffn.max_hidden())
+            .max()
+            .unwrap_or(self.plan.config.n_ff)
+            .max(self.plan.config.n_ff);
+        let attn_hd = self
+            .plan
+            .layers
+            .iter()
+            .map(|l| l.attention.head_dim())
+            .max()
+            .unwrap_or(0);
+        be().mega_reserve(n_mid, self.plan.config.n_heads, attn_hd)
+            .map_err(|rc| format!("metal mega scratch reserve rc={rc}"))?;
         let recur = self.plan.recurrent_elems();
         if recur > 0 {
             be().alloc(BufId::Recur, u64::from(recur) * 4)
@@ -505,6 +671,11 @@ impl<A: Architecture> Workflow<A> {
             // is written. See `arm_recurrent_snapshot`.
             be().alloc(BufId::RecurSnap, u64::from(recur) * 4)
                 .map_err(|rc| format!("metal alloc recurrent snapshot rc={rc}"))?;
+            // The pre-step copies a decode step is rolled back from: one per pipe slot,
+            // since two steps can be in flight and a failed one is rolled back to the
+            // state before IT, not before the one queued behind it.
+            be().alloc(BufId::RecurPrev, u64::from(recur) * 4 * 2)
+                .map_err(|rc| format!("metal alloc recurrent rollback rc={rc}"))?;
             self.zero_recurrent();
             if crate::log_on() {
                 eprintln!(
@@ -515,11 +686,17 @@ impl<A: Architecture> Workflow<A> {
         }
 
         let kv_bytes = self.kv_bytes_for(crate::kv::KV_FIRST_SLOTS);
+        let kv_layout = self.kv_layout_for(crate::kv::KV_FIRST_SLOTS);
         self.log_kv_groups(&kv_bytes);
         crate::host::log_footprint("gpu activations");
-        be().alloc_kv(&kv_bytes)
+        be().alloc_kv_layout(&kv_bytes, &kv_layout)
             .map_err(|rc| format!("metal kv alloc failed rc={rc}"))?;
         crate::host::log_footprint("gpu kv");
+
+        // Persistent transformed weights are admitted only after higher-priority
+        // activation and KV allocations. Architectures without such a cache inherit a
+        // no-op, and each backend retains fail-closed authority over memory fit.
+        A::device_prepare(self)?;
 
         // Account for what the engine ACTUALLY allocates, from the layout that did it.
         // Footprint once read 452 MiB against a hand estimate of ~138, and guessing at
@@ -546,7 +723,8 @@ impl<A: Architecture> Workflow<A> {
             return Ok(());
         }
         let bytes = self.kv_bytes_for(want);
-        be().grow_kv(&bytes)
+        let layout = self.kv_layout_for(want);
+        be().grow_kv_layout(&bytes, &layout)
             .map_err(|rc| format!("metal kv grow failed rc={rc}"))?;
         if crate::log_on() {
             eprintln!("[imparo] kv slots {} -> {want}", self.state.kv_rt.slots);
@@ -601,7 +779,7 @@ impl<A: Architecture> Workflow<A> {
         self.state.recur_snap = (self.plan.recurrent_elems() > 0
             && last > at
             && last <= at + n
-            && last % imparo_kv::UNIT_TOKENS == 0)
+            && last % imparo_kv::grid_tokens() == 0)
             .then(|| u32::try_from(last - at).expect("chunk fits u32"));
     }
 
@@ -623,4 +801,40 @@ impl<A: Architecture> Workflow<A> {
     pub fn kv_scan(&self, positions: usize) {
         crate::kv::scan(be(), &self.plan, positions);
     }
+}
+
+/// Split a Prefill chunk so only its final 64-or-more aligned rows continue
+/// through work that contributes to the requested logits.
+pub(crate) fn tail_split(b: u32, align: u32) -> Option<(u32, u32)> {
+    tail_split_min_rows(b, align, 64)
+}
+
+/// Variant for a backend-selected row-local tail. The workflow may use this
+/// only after its final state write, when discarded rows cannot affect KV or
+/// recurrent state.
+pub(crate) fn tail_split_min_rows(
+    b: u32,
+    align: u32,
+    min_rows: u32,
+) -> Option<(u32, u32)> {
+    let align = align.max(1);
+    let min_rows = min_rows.max(1);
+    let r0 = (b.checked_sub(min_rows)? / align) * align;
+    let rows = b - r0;
+    (rows >= min_rows).then_some((r0, rows))
+}
+
+/// Row alignment required by the current attention query tiles. This remains a
+/// probe rather than a tuned kernel choice.
+pub(crate) fn tail_align() -> u32 {
+    std::env::var("IMPARO_TAIL_ALIGN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16)
+}
+
+/// `IMPARO_LAYER_SKIP_LOG=1`: print, per prefill chunk, how many layers ran (#127).
+/// A probe, not a knob: it changes nothing but stderr.
+pub(crate) fn layer_skip_log() -> bool {
+    std::env::var("IMPARO_LAYER_SKIP_LOG").is_ok_and(|v| v == "1")
 }

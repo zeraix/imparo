@@ -96,6 +96,10 @@ pub struct Tokenizer {
     /// Exact spellings of CONTROL / USER_DEFINED tokens, longest first. Chat templates
     /// contain these literally, so encode must map them to their ids rather than to bytes.
     specials: Vec<(String, u32)>,
+    /// `special_ids[id]`: whether `id` is a CONTROL / USER_DEFINED spelling. `decode` used to
+    /// scan `specials` linearly for EVERY id of the whole generated prefix on every token --
+    /// quadratic in generation length (0.093 ms per token at 1024 generated, review #116).
+    special_ids: Vec<bool>,
     /// Which algorithm the file's discriminator tuple admitted.
     pre_kind: PreTokenizer,
 }
@@ -197,10 +201,10 @@ impl Tokenizer {
             Err(_) => scan::Metadata::read(path)?,
         };
         // scalars first: the array takes below need &mut, so no closure may hold a borrow
-        let bos = scan.u32_at("tokenizer.ggml.bos_token_id");
-        let eos = scan.u32_at("tokenizer.ggml.eos_token_id");
-        let eot = scan.u32_at("tokenizer.ggml.eot_token_id");
-        let unk = scan.u32_at("tokenizer.ggml.unknown_token_id");
+        let begin_token = scan.u32_at("tokenizer.ggml.bos_token_id");
+        let stop_token = scan.u32_at("tokenizer.ggml.eos_token_id");
+        let turn_token = scan.u32_at("tokenizer.ggml.eot_token_id");
+        let unknown_token = scan.u32_at("tokenizer.ggml.unknown_token_id");
         // WHICH ALGORITHM, admitted by the file's complete discriminator tuple rather
         // than guessed from any one field. An unknown tuple is an ERROR: running a GPT-2
         // byte-level vocabulary through the SentencePiece path produces tokens, and they
@@ -297,7 +301,7 @@ impl Tokenizer {
                 ) {
                     debug_assert!(a < (1 << 18) && b < (1 << 18) && rank < (1 << 20));
                     pairs.push((
-                        ((u64::from(a) << 18) | u64::from(b)) << 20 | rank as u64,
+                        (((u64::from(a) << 18) | u64::from(b)) << 20) | rank as u64,
                         (),
                     ));
                 }
@@ -322,18 +326,28 @@ impl Tokenizer {
             })
             .collect();
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(&b.1)));
+        let special_ids = {
+            let mut v = vec![false; text.len()];
+            for &(_, id) in &specials {
+                if (id as usize) < v.len() {
+                    v[id as usize] = true;
+                }
+            }
+            v
+        };
         Ok(Self {
             text,
             id_slots,
             id_mask,
             ranks,
-            bos,
-            eos,
-            eot,
-            unk,
+            bos: begin_token,
+            eos: stop_token,
+            eot: turn_token,
+            unk: unknown_token,
             add_bos,
             add_space_prefix,
             specials,
+            special_ids,
             pre_kind: algo.kind,
         })
     }
@@ -551,6 +565,14 @@ impl Tokenizer {
     #[must_use]
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut bytes: Vec<u8> = Vec::new();
+        self.decode_bytes_into(ids, &mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The byte stream `decode` builds, appended to `out` -- so a caller that decodes a
+    /// growing sequence one id at a time keeps the bytes and pays for the new id only;
+    /// `String::from_utf8_lossy(&out)` is then exactly `decode(&all_ids_so_far)`.
+    pub fn decode_bytes_into(&self, ids: &[u32], bytes: &mut Vec<u8>) {
         for &id in ids {
             if id as usize >= self.vocab_size() {
                 continue;
@@ -559,7 +581,7 @@ impl Tokenizer {
             if self.pre_kind == PreTokenizer::Lfm2 {
                 // CONTROL / USER_DEFINED spellings are literal markup; every other piece
                 // is in the reversible GPT-2 byte alphabet.
-                if self.specials.iter().any(|(_, sid)| *sid == id) {
+                if self.special_ids.get(id as usize).copied().unwrap_or(false) {
                     bytes.extend_from_slice(t.as_bytes());
                 } else {
                     for ch in t.chars() {
@@ -567,7 +589,8 @@ impl Tokenizer {
                             bytes.push(byte);
                         } else {
                             let mut buf = [0_u8; 4];
-                            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            bytes
+                                .extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                         }
                     }
                 }
@@ -588,7 +611,6 @@ impl Tokenizer {
                 }
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// Token id for an exact literal piece, e.g. a control token spelling.
@@ -771,9 +793,41 @@ fn gpt2_byte_encode(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Incremental decode (bytes appended one id at a time) must equal the whole-prefix
+    /// decode at every step, including special ids and multi-byte pieces. Runs on the GGUFs
+    /// named by `IMPARO_TOKENIZE_GGUFS`, a `:`-separated list of paths; skips (passes) when
+    /// the variable is unset or a path is not a file, so the test names no machine's own
+    /// directories.
+    #[test]
+    fn incremental_decode_matches_whole_prefix_decode() {
+        let Ok(list) = std::env::var("IMPARO_TOKENIZE_GGUFS") else {
+            return;
+        };
+        for path in list.split(':').filter(|s| !s.is_empty()) {
+            let p = std::path::Path::new(path);
+            if !p.is_file() {
+                continue;
+            }
+            let tok = super::Tokenizer::from_gguf(p).expect("tokenizer");
+            let vocab = tok.vocab_size() as u32;
+            let specials: Vec<u32> =
+                tok.specials.iter().map(|(_, id)| *id).take(4).collect();
+            let mut ids: Vec<u32> =
+                (0..600u32).map(|i| (i * 7919 + 13) % vocab).collect();
+            ids.extend_from_slice(&specials);
+            ids.extend((0..64u32).map(|i| 1000 + i % 500));
+            let mut bytes = Vec::new();
+            for n in 1..=ids.len() {
+                tok.decode_bytes_into(&ids[n - 1..n], &mut bytes);
+                let incremental = String::from_utf8_lossy(&bytes).into_owned();
+                assert_eq!(incremental, tok.decode(&ids[..n]), "{path} at n={n}");
+            }
+        }
+    }
+
     use super::{
-        PreTokenizer, gpt2_byte_char, gpt2_byte_encode, gpt2_char_to_byte, llama3_pieces,
-        select_tokenizer_algorithm,
+        PreTokenizer, gpt2_byte_char, gpt2_byte_encode, gpt2_char_to_byte,
+        llama3_pieces, select_tokenizer_algorithm,
     };
 
     #[test]

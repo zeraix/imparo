@@ -1,0 +1,118 @@
+{
+  "builder": {
+    "image_id": "sha256:357ea84b8e099d8b1884bde98172feef40a1acd9dc91f6b256dd16245573a1cf",
+    "image_identity_kind": "local_image_store_digest",
+    "python": "3.12.3",
+    "torch": "absent",
+    "triton": "3.8.0-source-pin"
+  },
+  "candidate": "rms_norm_q8_1_mmq",
+  "launch_abi": [
+    {
+      "alignment": 16,
+      "name": "src",
+      "type": "*fp32"
+    },
+    {
+      "alignment": 16,
+      "name": "dst",
+      "type": "*fp32"
+    },
+    {
+      "alignment": 16,
+      "name": "mul",
+      "type": "*fp32"
+    },
+    {
+      "alignment": 16,
+      "name": "q8_bytes",
+      "type": "*i8"
+    },
+    {
+      "alias": "q8_bytes+128",
+      "alignment": 16,
+      "name": "q8_scales",
+      "type": "*fp32"
+    },
+    {
+      "name": "eps",
+      "type": "fp32"
+    }
+  ],
+  "phase": "A2",
+  "production_enabled": false,
+  "q8_layout": {
+    "qs_bytes": 128,
+    "qs_offset": 0,
+    "record_bytes": 144,
+    "record_index": "(block32/4)*n_tok+tok",
+    "scales": 4,
+    "scales_offset": 128
+  },
+  "schema": 1,
+  "shape": {
+    "n_tok": 512,
+    "width": 2560
+  },
+  "source": {
+    "path": "rms_q8.py",
+    "sha256": "589f41a0ee77c5941a9bbd373e5bbb51586b147567cc097a5d6a7eeb99e235cc"
+  },
+  "target": "cuda:86:32",
+  "variants": [
+    {
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "compile_seconds": 1.476259003,
+      "dynamic_shared_bytes": 2048,
+      "grid": [
+        512,
+        1,
+        1
+      ],
+      "module": "modules/ip_1f7730341ef8debbde72f83b24bc35b271fa3422b4bf10c8b7de43dded918834.cubin",
+      "module_bytes": 41584,
+      "module_sha256": "ed52e1d59988e69463b95c4ff4b02828288c489f45efece22b961051b8d3eacf",
+      "num_stages": 1,
+      "num_warps": 4,
+      "resources": {
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 72
+      },
+      "symbol": "ip_1f7730341ef8debbde72f83b24bc35b271fa3422b4bf10c8b7de43dded918834",
+      "variant_id": "w4-s1"
+    },
+    {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "compile_seconds": 0.13906841699999983,
+      "dynamic_shared_bytes": 4096,
+      "grid": [
+        512,
+        1,
+        1
+      ],
+      "module": "modules/ip_fd28e32eb73acb9f96ea19a08c73529e5cdeea92d60f3ec29ac80a43a0d0efcc.cubin",
+      "module_bytes": 27120,
+      "module_sha256": "3f28b5cdb7c73837642142464368af8df06f819fec0e0a3bf31b9b5da6d9d8c8",
+      "num_stages": 1,
+      "num_warps": 8,
+      "resources": {
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 48
+      },
+      "symbol": "ip_fd28e32eb73acb9f96ea19a08c73529e5cdeea92d60f3ec29ac80a43a0d0efcc",
+      "variant_id": "w8-s1"
+    }
+  ]
+}

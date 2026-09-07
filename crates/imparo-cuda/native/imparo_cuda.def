@@ -2,38 +2,100 @@
 ; declspec scatter). Every extern "C" in imparo_cuda.cu that the Rust side calls.
 LIBRARY imparo_cuda
 EXPORTS
+    imparo_cuda_abi_version
+    imparo_cuda_runtime_identity
     imparo_cuda_init
+    imparo_cuda_prepare_quantized_weight_cache
+    imparo_cuda_memory_info
+    imparo_cuda_host_profile
+    imparo_cuda_weights_resident
+    imparo_cuda_verify_max_tokens
+    imparo_cuda_verify_tile_tokens
+    imparo_cuda_set_kv_types
+    imparo_cuda_device_tag
     imparo_cuda_begin
+    imparo_cuda_begin_forward
+    imparo_cuda_set_batch_geometry
+    imparo_cuda_decode_prepare
+    imparo_cuda_prefill_prepare
     imparo_cuda_flush
     imparo_cuda_end
+    imparo_cuda_last_gpu_us
+    imparo_cuda_set_tuner_mode
+    imparo_cuda_device_profile
+    imparo_cuda_probe
+    imparo_cuda_dispatch_proof_reset
+    imparo_cuda_dispatch_expectation
+    imparo_cuda_dispatch_proof
     imparo_cuda_alloc
     imparo_cuda_arena
     imparo_cuda_place
     imparo_cuda_page_round
     imparo_cuda_alloc_kv
     imparo_cuda_grow_kv
+    imparo_cuda_alloc_kv_layout
+    imparo_cuda_grow_kv_layout
+    imparo_cuda_set_kv_pages
     imparo_cuda_write
     imparo_cuda_write_u32
     imparo_cuda_read
     imparo_cuda_read_kv
+    imparo_cuda_write_kv
+    imparo_cuda_host_alloc
+    imparo_cuda_host_free
+    imparo_cuda_host_read
+    imparo_cuda_host_write
+    imparo_cuda_host_allocated_bytes
+    imparo_cuda_kv_demote
+    imparo_cuda_kv_promote
+    imparo_cuda_kv_advise_free
+    imparo_cuda_kv_advise_reuse
+    imparo_cuda_kv_live_bytes
     imparo_cuda_set_epilogue
     imparo_cuda_set_knob
     imparo_cuda_knob
-    imparo_cuda_set_kv_types
+    imparo_cuda_buf_count
     imparo_cuda_matmat
+    imparo_cuda_matmat_gated
+    imparo_cuda_ffn_gated_down
+    imparo_cuda_matmat_pair
+    imparo_cuda_ple_project
     imparo_cuda_rms_norm
+    imparo_cuda_rms_norm_project
+    imparo_cuda_rms_norm_add
+    imparo_cuda_rms_norm_add_project
+    imparo_cuda_add_rms_norm_project
+    imparo_cuda_rms_norm_add_dual_project
     imparo_cuda_rope
     imparo_cuda_hadamard
+    imparo_cuda_hadamard_project
+    imparo_cuda_head_norm_rope_hadamard
+    imparo_cuda_kv_head_postprocess
     imparo_cuda_kv_store
     imparo_cuda_kv_dequant
     imparo_cuda_attention
+    imparo_cuda_shortconv
+    imparo_cuda_shortconv_snapshot
+    imparo_cuda_silu
+    imparo_cuda_silu_mul
     imparo_cuda_gelu
     imparo_cuda_gelu_mul
     imparo_cuda_add
     imparo_cuda_add_scale
     imparo_cuda_scale
     imparo_cuda_copy
+    imparo_cuda_copy_range
     imparo_cuda_mul_strided
     imparo_cuda_softcap
     imparo_cuda_argmax
+    imparo_cuda_argmax_rows
     imparo_cuda_row
+    imparo_cuda_rows
+    imparo_cuda_ple_gather_combine
+    imparo_cuda_ple_norm_gather_combine
+    imparo_cuda_program_pack_install
+    imparo_cuda_program_catalog_identity
+    imparo_cuda_program_bind
+    imparo_cuda_program_freeze
+    imparo_cuda_program_launch
+    imparo_cuda_program_reset

@@ -1,0 +1,62 @@
+{
+  "contract_abi": 1,
+  "contract_id": "imparo.cuda.noop",
+  "revision": 1,
+  "engine_adapter": {
+    "id": "imparo.cuda.adapter.noop",
+    "revision": 1,
+    "sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+  },
+  "stream_semantics": "current_backend_stream",
+  "state_reset": {
+    "authority": "engine_adapter",
+    "revision": 1
+  },
+  "slots": [
+    {
+      "slot_id": "input",
+      "abi_index": 0,
+      "kind": "tensor_ptr",
+      "wire_type": "device_u64",
+      "role": "input",
+      "access": "read",
+      "lifetime": "invocation",
+      "graph_mutability": "capture_static",
+      "rank": 1,
+      "extent_authority": "engine_adapter",
+      "stride_authority": "engine_adapter",
+      "alignment": 16,
+      "state_initialization": "none",
+      "allowed_dtypes": ["f16"],
+      "allowed_quantizations": ["none"],
+      "allowed_layouts": ["contiguous"],
+      "aliasing": []
+    }
+  ],
+  "kernel_arguments": [
+    {
+      "abi_index": 0,
+      "kind": "slot",
+      "slot": "input",
+      "wire_type": "tensor_ptr"
+    }
+  ],
+  "allowed_workloads": [
+    {
+      "workload_id": "imparo.workload.attention_decode",
+      "revision": 1,
+      "fixture_sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+    }
+  ],
+  "allowed_numerical_classes": ["gate_bounded"],
+  "allowed_graph_capture": ["forbidden"],
+  "scratch_max_bytes": 0,
+  "scratch_zero_initialized": false,
+  "resource_ceilings": {
+    "registers_per_thread_max": 64,
+    "static_shared_bytes_max": 0,
+    "dynamic_shared_bytes_max": 0,
+    "local_memory_bytes_max": 0,
+    "threads_per_block_max": 32
+  }
+}

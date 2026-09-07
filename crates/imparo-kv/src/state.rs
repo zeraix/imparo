@@ -20,6 +20,72 @@ pub enum StateKind {
     Window { window: usize, ring: usize },
 }
 
+/// How a model's UNPOOLED state is checkpointed. The two rows of the design's
+/// state-kinds table (docs/unified-kv-pool.md, "State kinds"), named:
+///
+/// ```text
+///   SWA window       checkpointed as DELTAS -- min(gap, window) rows -- chained,
+///                    re-anchored when a gap exceeds the window
+///   recurrent / GDN  checkpoint is a whole-state SNAPSHOT; advances only by replay
+/// ```
+///
+/// A MODEL, NOT A LAYER, because a checkpoint covers every layer at once and
+/// `KvState` carries both a `window` and a `recurrent` section. A hybrid that has
+/// windowed layers AND recurrent state is `WindowDeltas`: the window rows still have
+/// to accumulate, and the recurrent blob rides in each link.
+///
+/// This exists because the alternative -- asking `win_max == 0` at each decision --
+/// was tried and is how five separate policies came to read "there is no window" as
+/// "there is nothing to do" rather than "there is a different thing to do": the
+/// ancestor walk, the step collapse, a checkpoint's predecessor, the spill boundary's
+/// grid, and the persistence stop. One name, asked five times, cannot drift.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointShape {
+    /// The widest window any layer keeps; how far back a chain must reach.
+    WindowDeltas { win_max: usize },
+    /// Every checkpoint is complete on its own.
+    Snapshots,
+}
+
+impl CheckpointShape {
+    /// Read the shape off the layer geometry: windowed layers mean deltas.
+    #[must_use]
+    pub fn of(geom: &[LayerStateGeom]) -> Self {
+        match geom
+            .iter()
+            .filter_map(|g| match g.kind {
+                StateKind::Window { window, .. } => Some(window),
+                StateKind::Full => None,
+            })
+            .max()
+        {
+            Some(win_max) => Self::WindowDeltas { win_max },
+            None => Self::Snapshots,
+        }
+    }
+
+    /// How far back a chain must reach from `boundary`, or `None` when checkpoints do
+    /// not chain and there is no walk to do.
+    ///
+    /// `None` rather than `boundary`, so a caller branches instead of running the
+    /// window's arithmetic on a value chosen to neutralise it. A snapshot path that
+    /// reads as "the window walk, disabled" is how a walk that should not have run at
+    /// all kept running: `floor == boundary` silently stopped it after one link.
+    #[must_use]
+    pub fn chain_floor(self, boundary: usize) -> Option<usize> {
+        match self {
+            Self::WindowDeltas { win_max } => Some(boundary.saturating_sub(win_max)),
+            Self::Snapshots => None,
+        }
+    }
+
+    /// Whether a checkpoint may name a predecessor at all.
+    #[must_use]
+    pub fn chains(self) -> bool {
+        matches!(self, Self::WindowDeltas { .. })
+    }
+}
+
 /// One layer's capture geometry, derived by the model from its plan + KV types.
 #[derive(Clone, Copy, Debug)]
 pub struct LayerStateGeom {
@@ -41,6 +107,55 @@ pub struct KvLayerState {
     pub positions: usize,
     pub k: Vec<u8>,
     pub v: Vec<u8>,
+}
+
+/// The three numbers a pool member tracks, together because they are one fact in three
+/// parts: what the cache can ever hold, what it has allocated, and what it holds now.
+///
+/// They used to be two fields inside KvCache -- which otherwise holds the CPU backend's
+/// actual cache arrays -- and one field beside it. That is why exposing three numbers took
+/// four accessors: the CPU arrays and the device counters are different things and had been
+/// merged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvRuntime {
+    /// The context bound: the cache can never hold more.
+    pub capacity: usize,
+    /// Slots currently allocated on the device.
+    pub slots: usize,
+    /// Positions currently held.
+    pub filled: usize,
+}
+
+/// The bounded set, which is what gets captured rather than pooled.
+#[must_use]
+pub fn bounded_geometry(geom: &[LayerStateGeom]) -> Vec<LayerStateGeom> {
+    geom.iter()
+        .filter(|g| !matches!(g.kind, StateKind::Full))
+        .copied()
+        .collect()
+}
+
+/// The tightest ring slack across windowed layers: a boundary is capturable from the rings
+/// while `filled - boundary <= slack`. The pool uses it to decide whether a checkpoint can
+/// be DEFERRED to switch-out or has to be taken eagerly mid-prefill.
+#[must_use]
+pub fn window_slack(geom: &[LayerStateGeom]) -> usize {
+    geom.iter()
+        .filter_map(|g| match g.kind {
+            StateKind::Window { window, ring } => Some(ring - window),
+            StateKind::Full => None,
+        })
+        .min()
+        .unwrap_or(usize::MAX)
+}
+
+/// The pooled set: layers whose state grows with context.
+#[must_use]
+pub fn full_layers(geom: &[LayerStateGeom]) -> Vec<u32> {
+    geom.iter()
+        .filter(|g| matches!(g.kind, StateKind::Full))
+        .map(|g| g.layer)
+        .collect()
 }
 
 /// Captured cache state at a unit-aligned boundary.
@@ -88,7 +203,11 @@ pub fn capture_recurrent(be: &dyn Backend, elems: usize, from: BufId) -> Vec<u8>
 /// A blob whose length disagrees with the buffer is REFUSED rather than truncated: it
 /// means the checkpoint came from a different model, and half a state restored is a
 /// conversation that continues with plausible wrong numbers.
-pub fn restore_recurrent(be: &dyn Backend, elems: usize, blob: &[u8]) -> Result<(), String> {
+pub fn restore_recurrent(
+    be: &dyn Backend,
+    elems: usize,
+    blob: &[u8],
+) -> Result<(), String> {
     if elems == 0 && blob.is_empty() {
         return Ok(());
     }
@@ -194,21 +313,23 @@ pub struct KvDelta {
     /// boundary is unit-aligned, which is every checkpoint the engine takes on its
     /// own.
     ///
-    /// WHY A CHECKPOINT CARRIES ANY FULL-ATTENTION ROWS AT ALL, when the whole
-    /// point of the pool is that full KV is written once and never copied: a turn
-    /// boundary lands wherever the user's message starts, not on the 256-token
-    /// content grid. Units stay the unit of SHARING; these rows are the remainder,
-    /// at most 255 positions:
+    /// WHY A CHECKPOINT CARRIES ANY FULL-ATTENTION ROWS AT ALL, when the whole point
+    /// of the pool is that full KV is written once and never copied: a turn boundary
+    /// lands wherever the user's message starts, and extents are cut where REQUESTS
+    /// ended. Extents stay the unit of SHARING; these rows are whatever lies above the
+    /// last one:
     ///
     /// ```text
-    ///   units [0, u)        pooled, shared by hash, never rewritten     u = B / 256
-    ///   rows  [u*256, B)    <= 255 positions, carried here, written into the
-    ///                       borrower's OWN tail blocks when it resumes
+    ///   extents [0, ue)   pooled, shared by hash, never rewritten
+    ///   rows [ue, B)      carried here, written into the borrower's OWN tail blocks
+    ///                     when it resumes
     /// ```
     ///
-    /// The alternative is rounding the boundary down to u*256, which reprocesses
-    /// those positions on every restore -- up to 255 tokens, and for a recurrent
-    /// model they have to go back through the mixer.
+    /// `ue` is the last cut at or below `B`, which is why `UEND` is recorded in the
+    /// blob: no constant divides it. Under the shipped layout a checkpoint lands ON a
+    /// cut and this is empty -- which is the point of cutting where the request ends.
+    /// The alternative is rounding `B` down to `ue`, which reprocesses those positions
+    /// on every restore, and for a recurrent model they must go back through the mixer.
     pub tail: Vec<KvLayerState>,
     /// The whole recurrent buffer AT `boundary`, little-endian f32; empty for a model
     /// with none.
@@ -378,7 +499,6 @@ pub fn restore(
 }
 
 // --- canonical blob serialization (unit blobs + checkpoint blob) ---
-use crate::identity::UNIT_TOKENS;
 
 const UNIT_MAGIC: u32 = 0x494B_5655; // "IKVU"
 const CKPT_MAGIC: u32 = 0x494B_5643; // "IKVC"
@@ -409,7 +529,7 @@ const CKPT_MAGIC: u32 = 0x494B_5643; // "IKVC"
 // the SAME token id, so two different pictures at the same span hash identically and
 // would dedup onto each other's KV. Under this frame that is one new tag and no
 // version change; under the old one it was a third bump.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// One section: `tag`, length, payload.
 fn push_section(out: &mut Vec<u8>, tag: [u8; 4], payload: &[u8]) {
@@ -484,35 +604,72 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Slices a captured state's full-attention layers into per-unit blobs
-/// (`boundary / UNIT_TOKENS` of them, in position order).
+/// Slices a captured state's full-attention layers into one blob per extent.
+///
+/// `cuts` are absolute end positions, ascending, the last at most `state.boundary`.
+/// Extent `i` covers `[cuts[i - 1], cuts[i])`, counting from 0 for the first. Each
+/// blob names its own extent, so the reader does not have to know the cut to put
+/// the rows back where they came from -- which is the point: the cut is where the
+/// requests ended, not a constant.
+#[must_use]
+pub fn unit_blobs_at(state: &KvState, cuts: &[usize]) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(cuts.len());
+    // Where these rows actually begin. A write-through of ONE extent holds only that
+    // extent, so assuming 0 makes every blob claim to start at the beginning of the
+    // conversation -- which reads back as extents that all overlap.
+    // From the first layer, and every layer is then sliced by it. A capture puts all
+    // full layers at the same base, so this holds -- but it is an assumption the type
+    // does not carry, and a layer that disagreed would be sliced at another layer's
+    // offset and write the wrong rows under the right hash. Cheap to check, silent to
+    // get wrong.
+    debug_assert!(
+        state
+            .full
+            .windows(2)
+            .all(|w| w[0].base_pos == w[1].base_pos),
+        "full layers disagree about where their rows start"
+    );
+    let mut start = state.full.first().map_or(0, |ls| ls.base_pos);
+    for &end in cuts {
+        if end <= start || end > state.boundary {
+            break;
+        }
+        let mut full = Vec::new();
+        push_u32(&mut full, state.full.len() as u32);
+        for ls in &state.full {
+            let ks = ls.k.len() / ls.positions;
+            let vs = ls.v.len() / ls.positions;
+            let lo = start - ls.base_pos;
+            let hi = end - ls.base_pos;
+            push_u32(&mut full, ls.layer);
+            push_u64(&mut full, ks as u64);
+            push_u64(&mut full, vs as u64);
+            full.extend_from_slice(&ls.k[lo * ks..hi * ks]);
+            full.extend_from_slice(&ls.v[lo * vs..hi * vs]);
+        }
+        let mut blob = Vec::new();
+        push_u32(&mut blob, UNIT_MAGIC);
+        push_u32(&mut blob, FORMAT);
+        let mut extent = Vec::new();
+        push_u64(&mut extent, start as u64);
+        push_u64(&mut extent, end as u64);
+        push_section(&mut blob, *b"EXTN", &extent);
+        push_section(&mut blob, *b"FULL", &full);
+        out.push(blob);
+        start = end;
+    }
+    out
+}
+
+/// `unit_blobs_at` on the resident tiling. TEST ONLY.
+///
+/// Nothing on the disk side cuts blobs on that tiling: every writer passes the
+/// extents its requests produced. Kept because the round-trip tests want a whole
+/// state sliced somehow and do not care where.
+#[cfg(test)]
 #[must_use]
 pub fn unit_blobs(state: &KvState) -> Vec<Vec<u8>> {
-    let units = state.boundary / UNIT_TOKENS;
-    (0..units)
-        .map(|u| {
-            let mut full = Vec::new();
-            push_u32(&mut full, state.full.len() as u32);
-            for ls in &state.full {
-                let ks = ls.k.len() / ls.positions;
-                let vs = ls.v.len() / ls.positions;
-                push_u32(&mut full, ls.layer);
-                push_u64(&mut full, ks as u64);
-                push_u64(&mut full, vs as u64);
-                full.extend_from_slice(
-                    &ls.k[u * UNIT_TOKENS * ks..(u + 1) * UNIT_TOKENS * ks],
-                );
-                full.extend_from_slice(
-                    &ls.v[u * UNIT_TOKENS * vs..(u + 1) * UNIT_TOKENS * vs],
-                );
-            }
-            let mut out = Vec::new();
-            push_u32(&mut out, UNIT_MAGIC);
-            push_u32(&mut out, FORMAT);
-            push_section(&mut out, *b"FULL", &full);
-            out
-        })
-        .collect()
+    unit_blobs_at(state, &crate::identity::resident_bounds(state.boundary))
 }
 
 /// One link of the chain, as the disk holds it: the window rows this delta OWNS --
@@ -573,36 +730,46 @@ pub fn delta_from_blob(blob: &[u8]) -> Result<KvDelta, String> {
     })
 }
 
-/// The windowed layers' checkpoint blob at `state.boundary`, plus whatever
-/// full-attention rows lie above the last whole unit (`state.full`).
+/// A whole captured state, expressed as the ONE blob format: an anchor link.
+///
+/// There used to be a second format here -- `checkpoint_blob`, a whole-window blob with
+/// a `UEND` section -- written by `--spill` and the server's non-pool commit, while the
+/// pool wrote chain links. Both landed in `ckpt/<hash>` and both were named by
+/// `Manifest::ckpts[].blob`, so a reader was handed one and could not ask which it got.
+/// The chain IS the format now, and a whole state is simply the degenerate chain: one
+/// link, `from = 0`, covering its whole window.
+///
+/// `UEND` is not needed and is not written. The reader derives the cut from the tail's
+/// own `base_pos`, which `tail_rows` sets to exactly `unit_end`; an empty tail means the
+/// boundary IS the cut, which is the common case under the shipped layout.
 #[must_use]
-pub fn checkpoint_blob(state: &KvState) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_u32(&mut out, CKPT_MAGIC);
-    push_u32(&mut out, FORMAT);
-    push_section(&mut out, *b"BNDY", &(state.boundary as u64).to_le_bytes());
-    let mut win = Vec::new();
-    push_layers(&mut win, &state.window);
-    push_section(&mut out, *b"WNDW", &win);
-    push_section(&mut out, *b"RECU", &state.recurrent);
-    // Only the part ABOVE the last whole unit. `state.full` may describe the whole
-    // prefix (that is what a non-pool capture produces) and the units already carry
-    // everything below `unit_end`; writing it twice would put the same rows in the
-    // blob and in the unit files.
-    let mut tail = Vec::new();
-    push_layers(&mut tail, &tail_of(&state.full, state.boundary));
-    push_section(&mut out, *b"TAIL", &tail);
-    out
+pub fn anchor_link(state: &KvState, unit_end: usize) -> KvDelta {
+    KvDelta {
+        boundary: state.boundary,
+        // An anchor owes nothing to an older link.
+        from: 0,
+        window: state.window.clone(),
+        // Only the part ABOVE the last extent. `state.full` may describe the whole
+        // prefix (that is what a non-pool capture produces) and the extents already
+        // carry everything below `unit_end`; writing it twice would put the same rows
+        // in the blob and in the extent files.
+        tail: tail_rows(&state.full, state.boundary, unit_end),
+        recurrent: state.recurrent.clone(),
+    }
 }
 
-/// The rows of `full` that lie above the last whole unit below `boundary`.
+/// The rows of `full` between `unit_end` and `boundary` -- what the units below do
+/// not already carry.
+///
+/// `unit_end` is passed in rather than derived: the cut is where a stream's requests
+/// ended, so no constant divides it. Under the disk layout it EQUALS `boundary` and
+/// this returns nothing, which is the point of cutting where the checkpoint lands.
 #[must_use]
-pub fn tail_rows(full: &[KvLayerState], boundary: usize) -> Vec<KvLayerState> {
-    tail_of(full, boundary)
-}
-
-fn tail_of(full: &[KvLayerState], boundary: usize) -> Vec<KvLayerState> {
-    let unit_end = boundary / UNIT_TOKENS * UNIT_TOKENS;
+pub fn tail_rows(
+    full: &[KvLayerState],
+    boundary: usize,
+    unit_end: usize,
+) -> Vec<KvLayerState> {
     full.iter()
         .filter_map(|ls| {
             let lo = unit_end.max(ls.base_pos);
@@ -675,7 +842,11 @@ pub fn state_from_units_and_chain(
 ) -> Result<KvState, String> {
     let newest = chain.first().ok_or("checkpoint chain is empty")?;
     let boundary = newest.boundary;
-    let full = full_from_units(units, boundary)?;
+    // Where this link counts its tail from, which is where the extents must reach.
+    // A tail names its own start; an EMPTY tail means the cut IS the boundary, which
+    // is what the disk layout produces once extents end where checkpoints land.
+    let unit_end = newest.tail.first().map_or(boundary, |ls| ls.base_pos);
+    let full = full_from_units(units, unit_end)?;
     let mut st = assemble_chain(geom, chain)
         .ok_or("checkpoint chain does not reach back a whole window")?;
     st.full = full;
@@ -683,19 +854,30 @@ pub fn state_from_units_and_chain(
     Ok(st)
 }
 
-/// Units -> one contiguous run per layer covering `[0, units * 256)`.
-fn full_from_units(units: &[Vec<u8>], boundary: usize) -> Result<Vec<KvLayerState>, String> {
-    let unit_end = units.len() * UNIT_TOKENS;
-    if boundary < unit_end || boundary >= unit_end + UNIT_TOKENS {
-        return Err(format!(
-            "checkpoint boundary {boundary} disagrees with {} units",
-            units.len()
-        ));
-    }
+/// Extents -> one contiguous run per layer covering `[0, last cut)`.
+///
+/// Each blob names the extent it holds, so this checks they abut from 0 rather than
+/// multiplying a count by a constant. Returns the rows and the position they reach.
+fn full_from_units(
+    units: &[Vec<u8>],
+    unit_end: usize,
+) -> Result<Vec<KvLayerState>, String> {
     let mut full: Vec<KvLayerState> = Vec::new();
+    let mut at = 0_usize;
     for (u, blob) in units.iter().enumerate() {
-        let usec = sections(blob, UNIT_MAGIC, &format!("unit {u}"))?;
-        let mut r = Reader(need(&usec, *b"FULL", &format!("unit {u}"))?);
+        let what = format!("unit {u}");
+        let usec = sections(blob, UNIT_MAGIC, &what)?;
+        let mut er = Reader(need(&usec, *b"EXTN", &what)?);
+        let (from, to) = (er.u64()? as usize, er.u64()? as usize);
+        if from != at {
+            return Err(format!(
+                "unit {u} covers [{from}, {to}) but the extents before it reach {at}"
+            ));
+        }
+        let rows = to.checked_sub(from).filter(|r| *r > 0).ok_or_else(|| {
+            format!("unit {u} covers [{from}, {to}), which is not a forward extent")
+        })?;
+        let mut r = Reader(need(&usec, *b"FULL", &what)?);
         let n_layers = r.u32()? as usize;
         if u == 0 {
             full = Vec::with_capacity(n_layers);
@@ -706,8 +888,8 @@ fn full_from_units(units: &[Vec<u8>], boundary: usize) -> Result<Vec<KvLayerStat
             let layer = r.u32()?;
             let ks = r.u64()? as usize;
             let vs = r.u64()? as usize;
-            let k = r.bytes(UNIT_TOKENS * ks)?.to_vec();
-            let v = r.bytes(UNIT_TOKENS * vs)?.to_vec();
+            let k = r.bytes(rows * ks)?.to_vec();
+            let v = r.bytes(rows * vs)?.to_vec();
             if u == 0 {
                 full.push(KvLayerState {
                     layer,
@@ -721,8 +903,14 @@ fn full_from_units(units: &[Vec<u8>], boundary: usize) -> Result<Vec<KvLayerStat
             }
             full[li].k.extend_from_slice(&k);
             full[li].v.extend_from_slice(&v);
-            full[li].positions += UNIT_TOKENS;
+            full[li].positions += rows;
         }
+        at = to;
+    }
+    if at != unit_end {
+        return Err(format!(
+            "the extents reach {at}, the checkpoint counts its tail from {unit_end}"
+        ));
     }
     Ok(full)
 }
@@ -753,25 +941,35 @@ fn append_tail(full: &mut [KvLayerState], tail: &[KvLayerState]) -> Result<(), S
     Ok(())
 }
 
-/// Rebuilds a restorable state from unit blobs plus one whole-window checkpoint blob.
+/// Rebuilds a restorable state from extent blobs plus a CHAIN of link blobs.
+///
+/// `links` newest first, as `Manifest::ckpts` names them descending. One link with
+/// `from == 0` is an anchor and covers its window alone; that is what `--spill` and the
+/// server's non-pool commit write, and it is the same format the pool writes per turn.
+/// Blobs written before links carried a `FROM` are still read: `delta_from_blob`
+/// defaults it to 0, which is what an anchor means.
 ///
 /// # Errors
 /// Refuses malformed blobs, version mismatches, and geometry that disagrees
 /// between units.
-pub fn state_from_blobs(units: &[Vec<u8>], checkpoint: &[u8]) -> Result<KvState, String> {
+pub fn state_from_blobs(
+    units: &[Vec<u8>],
+    checkpoint: &[u8],
+) -> Result<KvState, String> {
     let sec = sections(checkpoint, CKPT_MAGIC, "checkpoint")?;
     let boundary = u64::from_le_bytes(
         need(&sec, *b"BNDY", "checkpoint")?
             .try_into()
             .map_err(|_| "checkpoint: BNDY is not 8 bytes")?,
     ) as usize;
-    // The units cover the whole 256-token part of the prefix; the rest -- up to 255
-    // positions, the distance from the last unit to a turn boundary -- rides in the
-    // checkpoint's own tail rows.
+    // The units cover the prefix up to the last GRID step; the rest -- the distance
+    // from that step to the boundary, under grid_tokens() positions -- rides in the
+    // checkpoint's own tail rows. (Said 256 here, from the retired unit grid.)
     let window = read_layers(&mut Reader(need(&sec, *b"WNDW", "checkpoint")?))?;
     let recurrent = need(&sec, *b"RECU", "checkpoint")?.to_vec();
     let tail = read_layers(&mut Reader(need(&sec, *b"TAIL", "checkpoint")?))?;
-    let mut full = full_from_units(units, boundary)?;
+    let unit_end = tail.first().map_or(boundary, |layer| layer.base_pos);
+    let mut full = full_from_units(units, unit_end)?;
     append_tail(&mut full, &tail)?;
     Ok(KvState {
         boundary,
@@ -781,9 +979,137 @@ pub fn state_from_blobs(units: &[Vec<u8>], checkpoint: &[u8]) -> Result<KvState,
     })
 }
 
+/// Refuses malformed blobs, a chain that does not reach back a whole window, and
+/// extents that disagree with the cut the tail names.
+pub fn state_from_links(
+    geom: &[LayerStateGeom],
+    units: &[Vec<u8>],
+    links: &[Vec<u8>],
+) -> Result<KvState, String> {
+    let parsed: Vec<KvDelta> = links
+        .iter()
+        .map(|b| delta_from_blob(b))
+        .collect::<Result<_, _>>()?;
+    let newest = parsed.first().ok_or("restore: no checkpoint links")?;
+    // The cut comes from the tail's own `base_pos` -- `tail_rows` sets it to exactly
+    // `unit_end` -- so no `UEND` section is needed. An empty tail means the boundary IS
+    // the cut, which is what cutting extents at request ends buys.
+    let unit_end = newest.tail.first().map_or(newest.boundary, |l| l.base_pos);
+    let refs: Vec<&KvDelta> = parsed.iter().collect();
+    let mut st = assemble_chain(geom, &refs)
+        .ok_or("restore: the link chain does not cover a whole window")?;
+    st.full = full_from_units(units, unit_end)?;
+    append_tail(&mut st.full, &newest.tail)?;
+    Ok(st)
+}
+
 #[cfg(test)]
 mod tests {
+    /// ONE BLOB FORMAT. A whole state and a chain link are the same bytes.
+    ///
+    /// They were two: `checkpoint_blob` (whole window, with `UEND`) from `--spill` and
+    /// the server's non-pool commit, and `delta_blob` (a link) from the pool -- both in
+    /// `ckpt/<hash>`, both named by `Manifest::ckpts[].blob`, so a reader was handed one
+    /// and could not ask which it got. A whole state is now the degenerate chain: one
+    /// link with `from = 0`.
+    #[test]
+    fn a_whole_state_is_a_link_with_no_ancestor() {
+        let s = state(2 * grid_tokens());
+        let a = anchor_link(&s, s.boundary);
+        assert_eq!(a.from, 0, "an anchor owes nothing to an older link");
+        assert_eq!(a.boundary, s.boundary);
+        // Written and read by the SAME pair the pool uses.
+        let blob = delta_blob(&a);
+        let back = delta_from_blob(&blob).expect("an anchor reads as a link");
+        assert_eq!((back.boundary, back.from), (s.boundary, 0));
+        assert_eq!(
+            back.recurrent, s.recurrent,
+            "the recurrent half must survive"
+        );
+        // And a real chain link goes through the very same reader.
+        let d = delta(1, grid_tokens(), 2 * grid_tokens(), 128);
+        assert_eq!(
+            delta_from_blob(&delta_blob(&d)).unwrap().from,
+            grid_tokens()
+        );
+    }
+
     use super::*;
+    use crate::identity::grid_tokens;
+
+    /// The one blob format, written from a whole captured state.
+    fn ck_blob(s: &KvState, unit_end: usize) -> Vec<u8> {
+        delta_blob(&anchor_link(s, unit_end))
+    }
+
+    /// A state's own capture geometry, so a test can read back what it wrote without a
+    /// model. `assemble_chain` only walks Window layers; full ones ride in the extents.
+    fn geom_of(s: &KvState) -> Vec<LayerStateGeom> {
+        s.window
+            .iter()
+            .map(|l| LayerStateGeom {
+                layer: l.layer,
+                kind: StateKind::Window {
+                    window: l.positions,
+                    ring: l.positions.next_power_of_two(),
+                },
+                k_stride: l.k.len() / l.positions,
+                v_stride: l.v.len() / l.positions,
+            })
+            .collect()
+    }
+
+    /// WHAT THE OLD READER COULD NOT DO: restore from a CHAIN, which is what a store
+    /// the pool wrote actually holds.
+    ///
+    /// `state_from_blobs` wanted one whole-window blob with a `UEND` section. Handed a
+    /// link it failed on the missing section -- so `imparo-forward --restore` could not
+    /// read a pool-written store at all. One format means the chain reader is the only
+    /// reader, and the extents still come from the extent blobs.
+    #[test]
+    fn a_multi_link_chain_and_its_extents_rebuild_the_whole_state() {
+        let b = 2 * grid_tokens();
+        let s = state(b);
+        let units = unit_blobs(&s);
+        let geom = vec![LayerStateGeom {
+            layer: 1,
+            kind: StateKind::Window {
+                window: b,
+                ring: b.next_power_of_two(),
+            },
+            k_stride: 4,
+            v_stride: 4,
+        }];
+        // Newest owns [b/2, b); its ancestor owns [0, b/2). Neither covers the window
+        // alone, which is the whole point -- an anchor would hide the defect.
+        let newest = delta(1, b / 2, b, b / 2);
+        let older = delta(1, 0, b / 2, b / 2);
+        let links = vec![delta_blob(&newest), delta_blob(&older)];
+        let back = state_from_links(&geom, &units, &links)
+            .expect("a chain plus its extents must rebuild the state");
+        assert_eq!(back.boundary, b);
+        let w = &back.window[0];
+        assert_eq!(
+            (w.base_pos, w.positions),
+            (0, b),
+            "the window must be whole"
+        );
+        // Row value is its absolute position, so a mis-ordered assembly shows here.
+        for p in 0..b {
+            assert_eq!(
+                w.k[p * 4],
+                (p % 256) as u8,
+                "position {p} came from the wrong link"
+            );
+        }
+        // And the full-attention rows came from the extents, not from the links.
+        assert_eq!(back.full.len(), s.full.len());
+        assert_eq!(back.full[0].positions, b);
+    }
+
+    fn read_back(s: &KvState, units: &[Vec<u8>], ck: &[u8]) -> Result<KvState, String> {
+        state_from_links(&geom_of(s), units, &[ck.to_vec()])
+    }
 
     fn state(boundary: usize) -> KvState {
         let mk =
@@ -806,11 +1132,11 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let s = state(2 * UNIT_TOKENS);
+        let s = state(2 * grid_tokens());
         let units = unit_blobs(&s);
         assert_eq!(units.len(), 2);
-        let ck = checkpoint_blob(&s);
-        let back = state_from_blobs(&units, &ck).unwrap();
+        let ck = ck_blob(&s, s.boundary / grid_tokens() * grid_tokens());
+        let back = read_back(&s, &units, &ck).unwrap();
         assert_eq!(back.boundary, s.boundary);
         for (a, b) in s.full.iter().zip(&back.full) {
             assert_eq!((a.layer, &a.k, &a.v), (b.layer, &b.k, &b.v));
@@ -827,11 +1153,16 @@ mod tests {
     /// [0, 512) and the blob's tail carries [512, 600), and what comes back is one
     /// contiguous run of 600 positions per layer.
     #[test]
-    fn blob_round_trip_off_the_unit_grid() {
+    fn blob_round_trip_off_the_grid() {
         let s = state(600);
         let units = unit_blobs(&s);
-        assert_eq!(units.len(), 2, "600 tokens is two whole units plus 88");
-        let back = state_from_blobs(&units, &checkpoint_blob(&s)).unwrap();
+        assert_eq!(units.len(), 9, "600 tokens is nine whole 64-blocks plus 24");
+        let back = read_back(
+            &s,
+            &units,
+            &ck_blob(&s, s.boundary / grid_tokens() * grid_tokens()),
+        )
+        .unwrap();
         assert_eq!(back.boundary, 600);
         for (a, b) in s.full.iter().zip(&back.full) {
             assert_eq!(b.positions, 600);
@@ -846,11 +1177,11 @@ mod tests {
     fn a_v2_shaped_blob_is_refused() {
         let s = state(600);
         let units = unit_blobs(&s);
-        let mut ck = checkpoint_blob(&s);
+        let mut ck = ck_blob(&s, s.boundary / grid_tokens() * grid_tokens());
         // v2 wrote no tail; simulate one by truncating the layer count to zero.
         let n = ck.len();
         ck.truncate(n - 4);
-        assert!(state_from_blobs(&units, &ck).is_err());
+        assert!(read_back(&s, &units, &ck).is_err());
     }
 
     fn delta(layer: u32, from: usize, boundary: usize, win: usize) -> KvDelta {
@@ -898,7 +1229,11 @@ mod tests {
         let ls = &s.window[0];
         assert_eq!((ls.base_pos, ls.positions), (741 - 128, 128));
         for (i, p) in (741 - 128..741).enumerate() {
-            assert_eq!(ls.k[i * 4], (p % 256) as u8, "position {p} came from the wrong link");
+            assert_eq!(
+                ls.k[i * 4],
+                (p % 256) as u8,
+                "position {p} came from the wrong link"
+            );
         }
     }
 
@@ -947,15 +1282,69 @@ mod tests {
         assert!(assemble_chain(&GEOM, &[&d2, &a]).is_none());
     }
 
+    /// The pool writes ONE extent at a time, from a state that holds only that
+    /// extent's rows. A blob built that way must name where those rows really are:
+    /// assuming 0 made every extent claim the start of the conversation, and the
+    /// reader then saw extents that all overlapped. Every disk restore failed and no
+    /// unit test noticed, because they all wrote the whole state at once.
+    #[test]
+    fn an_extent_written_on_its_own_names_where_its_rows_are() {
+        let whole = state(2 * grid_tokens());
+        let together = unit_blobs_at(&whole, &[grid_tokens(), 2 * grid_tokens()]);
+        assert_eq!(together.len(), 2);
+
+        // The same second extent, built alone the way the pool builds it.
+        let ks = whole.full[0].k.len() / whole.full[0].positions;
+        let vs = whole.full[0].v.len() / whole.full[0].positions;
+        let alone = KvState {
+            boundary: 2 * grid_tokens(),
+            full: whole
+                .full
+                .iter()
+                .map(|ls| KvLayerState {
+                    layer: ls.layer,
+                    base_pos: grid_tokens(),
+                    positions: grid_tokens(),
+                    k: ls.k[grid_tokens() * ks..].to_vec(),
+                    v: ls.v[grid_tokens() * vs..].to_vec(),
+                })
+                .collect(),
+            window: Vec::new(),
+            recurrent: Vec::new(),
+        };
+        let one = unit_blobs_at(&alone, &[2 * grid_tokens()]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0], together[1], "a lone extent must equal its slice");
+
+        // ... and the pair still assembles, which is what the restore does.
+        let ck = ck_blob(&whole, 2 * grid_tokens());
+        let back =
+            read_back(&alone, &[together[0].clone(), one[0].clone()], &ck).unwrap();
+        assert_eq!(back.full[0].positions, 2 * grid_tokens());
+        assert_eq!(back.full[0].k, whole.full[0].k);
+    }
+
+    #[test]
+    fn extents_that_do_not_abut_are_refused() {
+        let whole = state(2 * grid_tokens());
+        let b = unit_blobs_at(&whole, &[grid_tokens(), 2 * grid_tokens()]);
+        let ck = ck_blob(&whole, 2 * grid_tokens());
+        // second extent first: [256,512) cannot follow position 0
+        let Err(err) = read_back(&whole, &[b[1].clone(), b[0].clone()], &ck) else {
+            panic!("extents out of order were accepted");
+        };
+        assert!(err.contains("reach 0"), "{err}");
+    }
+
     #[test]
     fn refuses_mismatches() {
-        let s = state(UNIT_TOKENS);
+        let s = state(grid_tokens());
         let units = unit_blobs(&s);
-        let ck = checkpoint_blob(&s);
-        assert!(state_from_blobs(&units[..0], &ck).is_err());
+        let ck = ck_blob(&s, s.boundary / grid_tokens() * grid_tokens());
+        assert!(read_back(&s, &units[..0], &ck).is_err());
         let mut bad = units.clone();
         bad[0][0] ^= 1; // the magic
-        assert!(state_from_blobs(&bad, &ck).is_err());
+        assert!(read_back(&s, &bad, &ck).is_err());
     }
 
     /// The property the frame exists for: a section this build does not know is
@@ -963,11 +1352,11 @@ mod tests {
     /// bump invalidates every store.
     #[test]
     fn an_unknown_section_is_ignored() {
-        let s = state(UNIT_TOKENS);
-        let mut ck = checkpoint_blob(&s);
+        let s = state(grid_tokens());
+        let mut ck = ck_blob(&s, s.boundary / grid_tokens() * grid_tokens());
         // What a future writer would append -- media descriptors, say.
         super::push_section(&mut ck, *b"MEDI", b"an image content id lives here");
-        let back = state_from_blobs(&unit_blobs(&s), &ck).unwrap();
+        let back = read_back(&s, &unit_blobs(&s), &ck).unwrap();
         assert_eq!(back.boundary, s.boundary);
         assert_eq!(back.recurrent, s.recurrent);
     }
@@ -975,10 +1364,10 @@ mod tests {
     /// A format from the future is refused rather than read as this one.
     #[test]
     fn a_newer_format_is_refused() {
-        let s = state(UNIT_TOKENS);
-        let mut ck = checkpoint_blob(&s);
+        let s = state(grid_tokens());
+        let mut ck = ck_blob(&s, s.boundary / grid_tokens() * grid_tokens());
         ck[4..8].copy_from_slice(&(super::FORMAT + 1).to_le_bytes());
-        let Err(err) = state_from_blobs(&unit_blobs(&s), &ck) else {
+        let Err(err) = read_back(&s, &unit_blobs(&s), &ck) else {
             panic!("a newer format was accepted")
         };
         assert!(err.contains("this build reads"), "{err}");
@@ -988,14 +1377,14 @@ mod tests {
     /// diagnosis.
     #[test]
     fn a_missing_section_names_itself() {
-        let s = state(UNIT_TOKENS);
+        let s = state(grid_tokens());
         let units = unit_blobs(&s);
         // A checkpoint carrying only its boundary.
         let mut ck = Vec::new();
         super::push_u32(&mut ck, super::CKPT_MAGIC);
         super::push_u32(&mut ck, super::FORMAT);
-        super::push_section(&mut ck, *b"BNDY", &(UNIT_TOKENS as u64).to_le_bytes());
-        let Err(err) = state_from_blobs(&units, &ck) else {
+        super::push_section(&mut ck, *b"BNDY", &(grid_tokens() as u64).to_le_bytes());
+        let Err(err) = read_back(&s, &units, &ck) else {
             panic!("a checkpoint with no window section was accepted")
         };
         assert!(err.contains("WNDW"), "{err}");

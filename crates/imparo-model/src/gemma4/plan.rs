@@ -63,11 +63,7 @@ pub fn build(
     let ffn_plan = if experts > 0 {
         Ffn::Moe {
             activation: Activation::Gelu,
-            expert_hidden: u32_or(
-                document,
-                "gemma4.expert_feed_forward_length",
-                n_ff,
-            ),
+            expert_hidden: u32_or(document, "gemma4.expert_feed_forward_length", n_ff),
             experts,
             experts_used: u32_or(document, "gemma4.expert_used_count", 0),
             shared_hidden: u32_or(
@@ -132,6 +128,15 @@ pub fn build(
             scale_by_sqrt_embd: true,
             per_layer_dim: u32_at(document, "gemma4.embedding_length_per_layer_input")
                 .ok(),
+            // One row = one token's per-layer embedding; ne[1] is the vocabulary.
+            per_layer_row_bytes: document
+                .tensor("per_layer_token_embd.weight")
+                .filter(|t| t.dimensions.len() >= 2 && t.dimensions[1] > 0)
+                .map(|t| t.byte_size / t.dimensions[1]),
+        },
+        kv_storage_basis: crate::KvStorageBasisPolicy::BackendRoute,
+        weight_residency: crate::WeightResidencyPlan {
+            row_gathered: &["per_layer_token_embd.weight"],
         },
         layers,
         output: OutputPlan {

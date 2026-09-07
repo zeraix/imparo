@@ -418,7 +418,11 @@ mod tests {
     fn the_user_turn_opener_is_what_render_emits() {
         use crate::chat::ChatCodec;
         let open = super::Codec.user_turn_open();
-        assert!(open.starts_with(super::TURN_OPEN), "{open} vs {}", super::TURN_OPEN);
+        assert!(
+            open.starts_with(super::TURN_OPEN),
+            "{open} vs {}",
+            super::TURN_OPEN
+        );
         assert!(open.ends_with("user"));
         let rendered = super::Codec.render(
             &[serde_json::json!({"role": "user", "content": "hi"})],
@@ -426,7 +430,10 @@ mod tests {
             false,
             "",
         );
-        assert!(rendered.contains(open), "render did not emit {open}: {rendered}");
+        assert!(
+            rendered.contains(open),
+            "render did not emit {open}: {rendered}"
+        );
     }
 
     use super::*;

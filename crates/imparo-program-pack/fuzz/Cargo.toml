@@ -1,0 +1,33 @@
+[package]
+name = "imparo-program-pack-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ed25519-dalek = "2.1"
+imparo-program-pack = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "signature"
+path = "fuzz_targets/signature.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "launch_expression"
+path = "fuzz_targets/launch_expression.rs"
+test = false
+doc = false
+
+[workspace]

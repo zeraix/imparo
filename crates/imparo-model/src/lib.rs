@@ -21,11 +21,16 @@ use imparo_gguf::{Document, MetadataValue, Scalar};
 pub mod backend;
 pub mod chat;
 pub mod cpu_support;
+#[cfg(feature = "cuda-gate0-capture")]
+pub(crate) mod gate0_capture;
 pub mod gemma4;
 pub mod gpu_support;
 pub mod host;
+pub mod identity;
 pub mod kv;
 pub mod lfm2;
+pub mod placement;
+pub use identity::ModelPlanIdentity;
 pub use imparo_cpu::ops;
 pub use imparo_gguf::scan as ggufscan;
 pub use imparo_gguf::weights;
@@ -33,8 +38,6 @@ pub use imparo_gguf::weights;
 /// Re-exported so tools can set backend tuning without depending on the backend crate.
 #[cfg(target_os = "macos")]
 pub use imparo_metal as imparo_metal_reexport;
-
-
 
 /// Attention geometry for ONE layer.
 ///
@@ -201,6 +204,19 @@ pub enum Ffn {
 }
 
 impl Ffn {
+    /// The widest hidden row a decode step of this FFN forms: the dense width, or the
+    /// larger of one expert and the shared expert.
+    #[must_use]
+    pub fn max_hidden(&self) -> u32 {
+        match *self {
+            Self::Dense { hidden, .. } => hidden,
+            Self::Moe {
+                expert_hidden,
+                shared_hidden,
+                ..
+            } => expert_hidden.max(shared_hidden),
+        }
+    }
     #[must_use]
     pub fn activation(&self) -> Activation {
         match *self {
@@ -265,6 +281,10 @@ pub struct EmbedPlan {
     pub scale_by_sqrt_embd: bool,
     /// Gemma4 feeds an extra per-layer embedding of this width.
     pub per_layer_dim: Option<u32>,
+    /// Bytes of one row of the per-layer token-embedding table in the file's own layout
+    /// (Q4_0: 18 bytes per 32 elements), read from the tensor. The staging buffer for
+    /// host-gathered rows is sized from it; None when the model has no such table.
+    pub per_layer_row_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -274,10 +294,38 @@ pub struct OutputPlan {
     pub tied_embeddings: bool,
 }
 
+/// Row-gathered tables: tensors read by rows (token ids), never as a whole. They form
+/// the host-staged tier of `docs/memory-tiers-and-fit.md` -- bound only when it fits after every layer, else gathered
+/// by the host into a small fast-tier staging buffer per batch. Backends decide how.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WeightResidencyPlan {
+    pub row_gathered: &'static [&'static str],
+}
+
+/// Model/workflow-owned policy for the basis stored in a quantized KV cache.
+///
+/// Backends declare which rotation they implement; a workflow explicitly chooses
+/// whether that route is part of its durable representation. There is intentionally
+/// no `Default`: every new architecture must make this correctness choice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KvStorageBasisPolicy {
+    /// Store the workflow's unrotated K/V representation.
+    Canonical,
+    /// Use the active backend's K/V Hadamard route and execute it in the workflow.
+    BackendRoute,
+    /// Preserve the canonical unrotated representation unless the active backend
+    /// explicitly opts into its independently gated quantized-cache route.
+    BackendOverrideOrCanonical,
+    /// An architecture-owned route used instead of the backend default.
+    ExplicitRoute(imparo_backend::KvQuantizationRoute),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelPlan {
     pub config: ModelConfig,
     pub embed: EmbedPlan,
+    pub kv_storage_basis: KvStorageBasisPolicy,
+    pub weight_residency: WeightResidencyPlan,
     pub layers: Vec<LayerPlan>,
     pub output: OutputPlan,
 }
@@ -355,6 +403,9 @@ impl std::error::Error for PlanError {}
 /// The test for what belongs here is "would a second model write this identically?".
 /// `gemma4`'s per-layer-embedding buffers would not, so they are not here; the batch
 /// width the activation buffers are sized for would, so it is.
+// Four independent flags of one run (device built, logits wanted, ...), not a state machine
+// in disguise: none of them excludes another, so an enum would be the wrong shape.
+#[allow(clippy::struct_excessive_bools)]
 pub struct WorkflowState {
     /// Host KV arrays. Empty when the device holds the weights -- see `host_forward`.
     pub kv: cpu_support::KvCache,
@@ -400,16 +451,55 @@ pub struct WorkflowState {
     pub recur_snap: Option<u32>,
     /// `IMPARO_LOG`, read once.
     pub log: bool,
+    /// Whether the batch being run must produce logits (the final norm, the lm-head, the
+    /// argmax and the readback). True except for the non-final chunks of a chunked
+    /// prefill: the chunk loop keeps only the last chunk's logits, and until 2026-09-02
+    /// every chunk ran the tied lm-head (278 MB on LFM2, 377 MB on E4B) and read 512 KB
+    /// back for nothing -- 33 of 34 on a 17k prefill, ~0.4 % of the leg.
+    pub logits_wanted: bool,
+    /// Set for ONE decode batch by `queue_step`: this batch is a pipelined step
+    /// (docs/decode-turnaround.md). The graph takes its token from the device when
+    /// `token_on_device`, stores its pick through `argmax_feed` into `pick_slot`, and ends
+    /// the region with `end_async` instead of `end` + read.
+    pub pipe: Option<PipeStep>,
+    /// Steps queued by `queue_step` and not yet retired by `wait_step`, oldest first.
+    pub queued: std::collections::VecDeque<QueuedStep>,
+    /// Steps queued so far; the pick slot alternates on it.
+    pub pipe_count: u64,
+    /// The last token a decode step picked (returned by `wait_step` / `forward_next`): the
+    /// input of a queued step that took its token from the device, should that step have
+    /// to be re-run on the host's side.
+    pub last_pick: Option<u32>,
+}
+
+/// What a pipelined decode step tells the device graph. See `WorkflowState::pipe`.
+#[derive(Clone, Copy, Debug)]
+pub struct PipeStep {
+    /// Which `BufId::Pick` slot this step's pick goes to.
+    pub pick_slot: u32,
+    /// The input token is already in `BufId::Tokens[0]` (the previous step's pick); do
+    /// not upload one.
+    pub token_on_device: bool,
+}
+
+/// A queued pipelined decode step, retired by `wait_step` or dropped by `discard_step`.
+#[derive(Clone, Copy, Debug)]
+pub struct QueuedStep {
+    /// The position this step decoded at; `filled` becomes `pos + 1` when it retires.
+    pub pos: usize,
+    /// Its `BufId::Pick` slot.
+    pub slot: u32,
+    /// The recurrent-snapshot arming the batch ran with; read back at retire.
+    pub snap: Option<u32>,
+    /// The input token when the host supplied it; None when the step took the previous
+    /// step's pick from the device (`WorkflowState::last_pick` at retire time).
+    pub token: Option<u32>,
 }
 
 impl WorkflowState {
     /// Everything a workflow needs before it has resolved a single tensor.
     #[must_use]
-    pub fn new(
-        weights: &weights::Weights,
-        plan: &ModelPlan,
-        capacity: usize,
-    ) -> Self {
+    pub fn new(weights: &weights::Weights, plan: &ModelPlan, capacity: usize) -> Self {
         let host_forward = !weights.gpu_enabled();
         Self {
             // Storage only on the host path: the device keeps its own half-precision
@@ -432,6 +522,11 @@ impl WorkflowState {
             recur_ckpt: Vec::new(),
             recur_ckpt_at: 0,
             recur_snap: None,
+            pipe: None,
+            queued: std::collections::VecDeque::new(),
+            pipe_count: 0,
+            last_pick: None,
+            logits_wanted: true,
             log: log_on(),
         }
     }
@@ -462,6 +557,43 @@ pub fn log_on() -> bool {
 /// its own -- most installs will never run the tuner. Defined ONCE, here, and imported by
 /// the tuner and the server: a second copy is how the search-space version came to
 /// disagree with itself, and it had already happened again (gemma4 and lfm2 each had one).
+/// The prefill chunk width. MEASURED, not chosen: 512 was the value this engine shipped
+/// with and nobody had ever swept it, because the speed harness matches the chunk on both
+/// sides (right for attributing kernel differences, and it hides each engine's own
+/// optimum). Swept 2026-09-01 on the M3 Pro, medians of two interleaved rounds:
+///
+/// ```text
+///   leg                  512      1024     change
+///   LFM2 17123 tok     867.4     889.7     +2.57%
+///   E4B  16191 tok     531.2     538.6     +1.40%
+///   LFM2  5963 tok     960.5     969.7     +0.96%
+///   LFM2   455 tok     927.8     929.1     +0.15%   (one chunk either way)
+///   LFM2 17123 @ 2048  889.3               the curve is flat past 1024
+/// ```
+///
+/// Nothing regresses, and the resting footprint FALLS (E4B 614 -> 600 MiB, LFM2 180 -> 174):
+/// fewer chunks means fewer checkpoint and pool cycles, which outweighs the wider activation
+/// arena. Logits are unaffected -- the det_gate pins are EXACT at both widths, so the
+/// arithmetic is chunk-invariant.
+///
+/// AND YET IT STAYS 512, because 1024 BREAKS E4B. The full determinism gate at the wider
+/// chunk:
+///
+/// ```text
+///   LFM2 f16    ALL PASS      logits are chunk-invariant
+///   LFM2 q8_0   ALL PASS
+///   E4B  f16    pin MISMATCH at n=2000, 5642, 16384
+/// ```
+///
+/// E4B's 20 KV layers are windowed at 1024 slots, so its arithmetic depends on where the
+/// chunk boundary falls relative to the window; LFM2's full-attention layers do not. A
+/// speed default must not change answers, and re-pinning E4B to accept a faster chunk would
+/// discard the correctness reference to buy throughput -- the wrong way round.
+///
+/// So the +2.6% is REAL and BLOCKED. `IMPARO_BATCH=1024` still takes it for LFM2-only
+/// deployments. Two things have to happen before it can be the default: understand whether
+/// E4B's chunk-dependence is legitimate (window boundary) or a chunk-boundary defect in the
+/// windowed path, and move this number into the tuner rather than writing a second one.
 pub const PREFILL_BATCH: usize = 512;
 
 /// The chunk width this process will use: `IMPARO_BATCH` when set, else [`PREFILL_BATCH`].
@@ -575,6 +707,13 @@ pub trait Architecture: Sized + 'static {
         Err(no_device_workflow(&wf.plan))
     }
 
+    /// Architecture-owned model-admission work after common activation/KV allocation.
+    /// The default is deliberately empty, preserving Metal and architectures without a
+    /// persistent transformed-weight cache.
+    fn device_prepare(_wf: &mut Workflow<Self>) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Every activation buffer this architecture needs for a batch of `b`, and which of
     /// them may share bytes.
     ///
@@ -625,6 +764,7 @@ macro_rules! architecture {
         prepare:    $prepare:path,
         batch_host: $batch_host:path,
         $(device_batch:        $device_batch:path,)?
+        $(device_prepare:      $device_prepare:path,)?
         $(buffer_requirements: $buffer_requirements:path,)?
     }) => {
         /// The architecture. A unit type: it carries no data, it NAMES a set of methods.
@@ -672,6 +812,14 @@ macro_rules! architecture {
             )?
 
             $(
+                fn device_prepare(
+                    wf: &mut $alias,
+                ) -> ::std::result::Result<(), ::std::string::String> {
+                    $device_prepare(wf)
+                }
+            )?
+
+            $(
                 fn buffer_requirements(
                     plan: &$crate::ModelPlan,
                     b: usize,
@@ -705,6 +853,73 @@ pub struct Workflow<A: Architecture> {
 }
 
 impl<A: Architecture> Workflow<A> {
+    /// One decode step on the device: the batch at `start_pos`, its pick read back.
+    fn device_step(&mut self, token: u32, start_pos: usize) -> Result<u32, String> {
+        let mut pick = Vec::new();
+        // Decode advances one position at a time, so a step either lands on a boundary or
+        // does not; either way this call reaches at most one.
+        self.arm_recurrent_snapshot(start_pos, 1, start_pos + 1);
+        set_device_batch_geometry(start_pos, 1, imparo_backend::BatchPhase::Decode)?;
+        let r = A::device_batch(self, &[token], start_pos, &mut pick, true);
+        if r.is_err() {
+            self.state.recur_snap = None;
+        }
+        r?;
+        self.state.kv_rt.filled = start_pos + 1;
+        self.take_recurrent_snapshot(start_pos);
+        Ok(pick[0].to_bits())
+    }
+
+    /// A queued step's region failed (a mega-kernel barrier timeout, task #149). Its
+    /// output and the output of any step queued behind it are invalid, its KV rows are
+    /// overwritten by a re-run, and its recurrent state is rolled back to the copy the
+    /// batch took at its start. The step is run again as an ordinary forward -- the
+    /// backend holds its persistent route closed after `mega_recover`, so the dispatch
+    /// path runs it -- and the step that was behind it is queued again with the pick the
+    /// re-run produced. The request sees one slow token, not a failure.
+    fn recover_step(&mut self, q: QueuedStep, rc: i32) -> Result<u32, String> {
+        let be = crate::backend::active()
+            .ok_or_else(|| "decode step has no active backend".to_string())?;
+        let later: Vec<QueuedStep> = self.state.queued.drain(..).collect();
+        for _ in &later {
+            // Retired only to drain it; its output is invalid whatever it reports.
+            let _ = be.wait_outstanding();
+        }
+        eprintln!(
+            "[imparo] decode step at {} failed rc={rc}: rolling back and re-running it on the dispatch path",
+            q.pos
+        );
+        be.mega_recover()
+            .map_err(|rc| format!("mega recovery refused rc={rc}"))?;
+        let recur = self.plan.recurrent_elems();
+        if recur > 0 {
+            be.begin();
+            be.copy_range(
+                imparo_backend::BufId::Recur,
+                0,
+                imparo_backend::BufId::RecurPrev,
+                q.slot * recur,
+                recur,
+            );
+            be.end()
+                .map_err(|rc| format!("recurrent rollback failed rc={rc}"))?;
+        }
+        let token = q.token.or(self.state.last_pick).ok_or_else(|| {
+            "failed step has no input token to re-run with".to_string()
+        })?;
+        let pick = self.forward_next(token, q.pos)?;
+        if let Some(next) = later.first() {
+            if next.pos != q.pos + 1 {
+                return Err(format!(
+                    "queued step at {} does not follow the failed step at {}",
+                    next.pos, q.pos
+                ));
+            }
+            self.queue_step(Some(pick), next.pos)?;
+        }
+        Ok(pick)
+    }
+
     /// Loads one file's weights against a plan.
     ///
     /// # Errors
@@ -747,6 +962,24 @@ impl<A: Architecture> kv::KvPoolMember for Workflow<A> {
     }
 }
 
+fn set_device_batch_geometry(
+    absolute_start: usize,
+    active_tokens: usize,
+    phase: imparo_backend::BatchPhase,
+) -> Result<(), String> {
+    let start = u64::try_from(absolute_start)
+        .map_err(|_| format!("batch start {absolute_start} does not fit u64"))?;
+    let count = u32::try_from(active_tokens)
+        .map_err(|_| format!("batch token count {active_tokens} does not fit u32"))?;
+    let geometry = imparo_backend::BatchGeometry::try_new(start, count, phase)
+        .map_err(str::to_string)?;
+    let backend = crate::backend::active()
+        .ok_or_else(|| "device batch has no active backend".to_string())?;
+    backend
+        .set_batch_geometry(geometry)
+        .map_err(|rc| format!("backend set_batch_geometry failed rc={rc}"))
+}
+
 /// Likewise: the object-safe face of every architecture, written once.
 /// The forward, written once for every architecture.
 ///
@@ -764,7 +997,9 @@ impl<A: Architecture> Model for Workflow<A> {
     ) -> Result<(), String> {
         let capacity = self.state.kv_rt.capacity;
         if start_pos + tokens.len() > capacity {
-            return Err(format!("kv capacity {capacity} exceeded at pos {start_pos}"));
+            return Err(format!(
+                "kv capacity {capacity} exceeded at pos {start_pos}"
+            ));
         }
         let batch = prefill_batch();
         let t_start = std::time::Instant::now();
@@ -801,8 +1036,8 @@ impl<A: Architecture> Model for Workflow<A> {
         let prof = std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1");
         // The last unit boundary this call reaches; only that one can be checkpointed,
         // and everything below it is the previous call's copy.
-        let last_boundary = (start_pos + tokens.len()) / imparo_kv::UNIT_TOKENS
-            * imparo_kv::UNIT_TOKENS;
+        let last_boundary = (start_pos + tokens.len()) / imparo_kv::grid_tokens()
+            * imparo_kv::grid_tokens();
         let mut done = 0;
         while done < tokens.len() {
             // Chunk boundaries anchor at ABSOLUTE positions (multiples of `batch`), not
@@ -829,7 +1064,38 @@ impl<A: Architecture> Model for Workflow<A> {
             let chunk = &tokens[done..done + n];
             let t_chunk = std::time::Instant::now();
             if on_gpu {
-                A::device_batch(self, chunk, at, out, false)?;
+                set_device_batch_geometry(at, n, imparo_backend::BatchPhase::Prefill)?;
+                // Only the last chunk's logits are used; the others skip the lm-head.
+                self.state.logits_wanted = done + n == tokens.len();
+                let mut r = A::device_batch(self, chunk, at, out, false);
+                if r.is_err() && n == 1 {
+                    // A one-token batch is a decode step, the form the mega-kernel runs; a
+                    // failed region there is rolled back and run once more on the dispatch
+                    // path (task #149), as `forward_next` and `wait_step` do.
+                    if let Some(be) = crate::backend::active() {
+                        eprintln!(
+                            "[imparo] decode batch at {at} failed: rolling back and re-running it on the dispatch path"
+                        );
+                        let recur = self.plan.recurrent_elems();
+                        if be.mega_recover().is_ok() {
+                            if recur > 0 {
+                                be.begin();
+                                be.copy_range(
+                                    imparo_backend::BufId::Recur,
+                                    0,
+                                    imparo_backend::BufId::RecurPrev,
+                                    0,
+                                    recur,
+                                );
+                                let _ = be.end();
+                            }
+                            self.arm_recurrent_snapshot(at, n, last_boundary);
+                            r = A::device_batch(self, chunk, at, out, false);
+                        }
+                    }
+                }
+                self.state.logits_wanted = true;
+                r?;
             } else {
                 A::batch_host(self, chunk, at, out)?;
             }
@@ -873,21 +1139,162 @@ backend={} ms={ms:.1} ms_per_token={:.2}",
         if !self.state.host_forward && self.state.gpu_ready {
             let capacity = self.state.kv_rt.capacity;
             if start_pos + 1 > capacity {
-                return Err(format!("kv capacity {capacity} exceeded at pos {start_pos}"));
+                return Err(format!(
+                    "kv capacity {capacity} exceeded at pos {start_pos}"
+                ));
             }
             Workflow::kv_fit(self, start_pos + 1)?;
-            let mut pick = Vec::new();
-            // Decode advances one position at a time, so a step either lands on a
-            // boundary or does not; either way this call reaches at most one.
-            self.arm_recurrent_snapshot(start_pos, 1, start_pos + 1);
-            A::device_batch(self, &[token], start_pos, &mut pick, true)?;
-            self.state.kv_rt.filled = start_pos + 1;
-            self.take_recurrent_snapshot(start_pos);
-            return Ok(pick[0].to_bits());
+            let id = match self.device_step(token, start_pos) {
+                Ok(id) => id,
+                Err(e) => {
+                    // A failed region (task #149): roll the recurrent state back to the
+                    // copy the batch took at its start and run the step once more; the
+                    // backend holds its persistent route closed, so the dispatch path
+                    // runs it. A second failure is the caller's.
+                    let be = crate::backend::active().ok_or_else(|| {
+                        "decode step has no active backend".to_string()
+                    })?;
+                    eprintln!(
+                        "[imparo] decode step at {start_pos} failed ({e}): rolling back and re-running it on the dispatch path"
+                    );
+                    be.mega_recover()
+                        .map_err(|rc| format!("mega recovery refused rc={rc}"))?;
+                    let recur = self.plan.recurrent_elems();
+                    if recur > 0 {
+                        be.begin();
+                        be.copy_range(
+                            imparo_backend::BufId::Recur,
+                            0,
+                            imparo_backend::BufId::RecurPrev,
+                            0,
+                            recur,
+                        );
+                        be.end().map_err(|rc| {
+                            format!("recurrent rollback failed rc={rc}")
+                        })?;
+                    }
+                    self.device_step(token, start_pos)?
+                }
+            };
+            self.state.last_pick = Some(id);
+            return Ok(id);
         }
         let mut logits = Vec::new();
         self.forward_into(&[token], start_pos, &mut logits)?;
         Ok(imparo_cpu::ops::argmax_f32(&logits))
+    }
+
+    fn decode_pipelined(&self) -> bool {
+        if self.state.host_forward || !self.state.gpu_ready {
+            return false;
+        }
+        // IMPARO_DECODE_PIPE=0 keeps the round trip in one binary, for the A/B and the
+        // trail comparison. A config, not a knob: it selects a route.
+        if std::env::var("IMPARO_DECODE_PIPE").is_ok_and(|v| v == "0") {
+            return false;
+        }
+        // A host-staged table (E4B's per-layer embeddings under IMPARO_ROW_GATHERED=staged,
+        // or when the table does not fit the fast tier) is gathered by the host per token
+        // and needs the token id at encode time; that model keeps the round trip.
+        crate::backend::active()
+            .is_some_and(|b| b.decode_pipelining() && !b.stages_rows())
+    }
+
+    fn queue_step(
+        &mut self,
+        token: Option<u32>,
+        start_pos: usize,
+    ) -> Result<(), String> {
+        let capacity = self.state.kv_rt.capacity;
+        if start_pos + 1 > capacity {
+            return Err(format!(
+                "kv capacity {capacity} exceeded at pos {start_pos}"
+            ));
+        }
+        if self.state.queued.len() >= 2 {
+            return Err("two decode steps are already queued".to_string());
+        }
+        Workflow::kv_fit(self, start_pos + 1)?;
+        self.arm_recurrent_snapshot(start_pos, 1, start_pos + 1);
+        let snap = self.state.recur_snap;
+        set_device_batch_geometry(start_pos, 1, imparo_backend::BatchPhase::Decode)?;
+        let slot = u32::try_from(self.state.pipe_count % 2).expect("0 or 1");
+        self.state.pipe_count += 1;
+        self.state.pipe = Some(PipeStep {
+            pick_slot: slot,
+            token_on_device: token.is_none(),
+        });
+        let mut scratch = Vec::new();
+        let r =
+            A::device_batch(self, &[token.unwrap_or(0)], start_pos, &mut scratch, true);
+        self.state.pipe = None;
+        // The batch consumed the arming; the snapshot is read back when the step retires.
+        self.state.recur_snap = None;
+        r?;
+        self.state.queued.push_back(QueuedStep {
+            pos: start_pos,
+            slot,
+            snap,
+            token,
+        });
+        Ok(())
+    }
+
+    fn wait_step(&mut self) -> Result<u32, String> {
+        let q = self
+            .state
+            .queued
+            .pop_front()
+            .ok_or_else(|| "no decode step is queued".to_string())?;
+        let be = crate::backend::active()
+            .ok_or_else(|| "decode step has no active backend".to_string())?;
+        if let Err(rc) = be.wait_outstanding() {
+            return self.recover_step(q, rc);
+        }
+        let mut pick = [0.0_f32; 1];
+        be.read(imparo_backend::BufId::Pick, u64::from(q.slot), &mut pick);
+        self.state.kv_rt.filled = q.pos + 1;
+        self.state.recur_snap = q.snap;
+        self.take_recurrent_snapshot(q.pos);
+        let id = pick[0].to_bits();
+        self.state.last_pick = Some(id);
+        Ok(id)
+    }
+
+    fn discard_step(&mut self) -> Result<(), String> {
+        let q = self
+            .state
+            .queued
+            .pop_back()
+            .ok_or_else(|| "no decode step is queued".to_string())?;
+        if !self.state.queued.is_empty() {
+            self.state.queued.push_back(q);
+            return Err("discard_step with an older step still queued".to_string());
+        }
+        let be = crate::backend::active()
+            .ok_or_else(|| "decode step has no active backend".to_string())?;
+        // It must finish before its state can be put back; its position is never
+        // advanced into (`filled` stays), and its snapshot arming is dropped. A failed
+        // region here is discarded like any other: nothing of it is kept.
+        let failed = be.wait_outstanding().is_err();
+        if failed {
+            be.mega_recover()
+                .map_err(|rc| format!("mega recovery refused rc={rc}"))?;
+        }
+        let recur = self.plan.recurrent_elems();
+        if recur > 0 {
+            be.begin();
+            be.copy_range(
+                imparo_backend::BufId::Recur,
+                0,
+                imparo_backend::BufId::RecurPrev,
+                q.slot * recur,
+                recur,
+            );
+            be.end()
+                .map_err(|rc| format!("recurrent rollback failed rc={rc}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -940,6 +1347,45 @@ pub trait Model: kv::KvPoolMember {
         let mut out = Vec::new();
         self.forward_into(tokens, start_pos, &mut out)?;
         Ok(out)
+    }
+
+    /// Whether greedy decode can be PIPELINED here (docs/decode-turnaround.md): step N+1
+    /// is encoded and committed while step N runs, its input token read on the device
+    /// from step N's pick, and the host learns each token one step late. False on the
+    /// host path, on a backend without the capability, and for a model whose per-token
+    /// table rows are staged by the host (it needs the token on the host at encode time).
+    fn decode_pipelined(&self) -> bool {
+        false
+    }
+    /// Queue the decode step for `start_pos` without waiting for it. `Some(token)` is the
+    /// step's input (the first step after a prefill); `None` means the previous queued
+    /// step's pick, on the device. At most two steps are queued at a time.
+    ///
+    /// # Errors
+    /// When the cache would overflow or a device call fails.
+    fn queue_step(
+        &mut self,
+        _token: Option<u32>,
+        _start_pos: usize,
+    ) -> Result<(), String> {
+        Err("decode is not pipelined on this backend".to_string())
+    }
+    /// Wait for the OLDEST queued step, advance the cache position past it, and return
+    /// its pick (the next token).
+    ///
+    /// # Errors
+    /// When the step's command buffers failed.
+    fn wait_step(&mut self) -> Result<u32, String> {
+        Err("decode is not pipelined on this backend".to_string())
+    }
+    /// Drop the one still-queued step after a stop: its position is not advanced into and
+    /// its recurrent-state advance is rolled back on the device. Legal only when it is the
+    /// only queued step.
+    ///
+    /// # Errors
+    /// When older steps are still queued, or a device call fails.
+    fn discard_step(&mut self) -> Result<(), String> {
+        Err("decode is not pipelined on this backend".to_string())
     }
 }
 

@@ -1,0 +1,211 @@
+{
+  "activation_layout": {
+    "format": "BlockQ8_1Mmq",
+    "qs": "int8[128]@0",
+    "record_bytes": 144,
+    "record_index": "(block32/4)*n_tok+tok",
+    "scales": "fp32[4]@128 (DS4 half-rounded producer)"
+  },
+  "builder": {
+    "image_id": "sha256:357ea84b8e099d8b1884bde98172feef40a1acd9dc91f6b256dd16245573a1cf",
+    "image_identity_kind": "local_image_store_digest",
+    "python": "3.12.3",
+    "torch": "absent",
+    "triton": "3.8.0-source-pin"
+  },
+  "candidate": "q4_0_x_q8_1_mmq_epilogue0",
+  "hidden_launch_abi": [
+    {
+      "allocation_bytes": 0,
+      "argument_required": true,
+      "argument_value": "null",
+      "name": "global_scratch",
+      "ordinal": 8,
+      "type": "device_pointer"
+    },
+    {
+      "allocation_bytes": 0,
+      "argument_required": true,
+      "argument_value": "null",
+      "name": "profile_scratch",
+      "ordinal": 9,
+      "type": "device_pointer"
+    }
+  ],
+  "launch_abi": [
+    {
+      "alias": "weights+2",
+      "alignment": 2,
+      "name": "w_qs",
+      "ordinal": 0,
+      "type": "*i8"
+    },
+    {
+      "alias": "weights",
+      "alignment": 2,
+      "name": "w_d",
+      "ordinal": 1,
+      "type": "*fp16"
+    },
+    {
+      "alias": "q8",
+      "alignment": 16,
+      "name": "x_qs",
+      "ordinal": 2,
+      "type": "*i8"
+    },
+    {
+      "alias": "q8+128",
+      "alignment": 16,
+      "name": "x_d",
+      "ordinal": 3,
+      "type": "*fp32"
+    },
+    {
+      "alignment": 16,
+      "name": "y",
+      "ordinal": 4,
+      "type": "*fp32"
+    },
+    {
+      "evidence_value": 512,
+      "name": "n_tok",
+      "ordinal": 5,
+      "supported_range": [
+        1,
+        512
+      ],
+      "type": "i32"
+    },
+    {
+      "name": "out_stride",
+      "ordinal": 6,
+      "type": "i32"
+    },
+    {
+      "contract_by_shape": {
+        "k10240-m2560-n512": "runtime device SM count; RTX3060 evidence=30",
+        "k2560-m10240-n512": "native_tiles=ceil(n_out/128)*ceil(n_tok/128); no seam"
+      },
+      "name": "numeric_stream_grid",
+      "ordinal": 7,
+      "type": "i32"
+    }
+  ],
+  "native_control_by_shape": {
+    "k10240-m2560-n512": {
+      "numeric_seams": true,
+      "symbol": "imparo_sm80_mmq::q4_q8_1_full_tile<false,4,false,true,true>"
+    },
+    "k2560-m10240-n512": {
+      "numeric_seams": false,
+      "symbol": "imparo_sm80_mmq::q4_q8_1_full_tile<false,4>"
+    }
+  },
+  "output_layout": "dst[token*out_stride+row]",
+  "phase": "A2",
+  "production_enabled": false,
+  "schema": 1,
+  "sources": [
+    {
+      "path": "q4_q8_mmq_2560x10240.py",
+      "sha256": "83ec7ea4fcbba817567c4ddae9b9e65a6d99fa23e2e9b59b28aa0398d9a16f8f"
+    },
+    {
+      "path": "q4_q8_mmq_10240x2560.py",
+      "sha256": "f795a3dbd9dcc61996c2da1f1621f9feed9fc6a68c01a9d0df1dd36485965a1d"
+    }
+  ],
+  "target": "cuda:86:32",
+  "variants": [
+    {
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "compile_seconds": 1.5787503899999997,
+      "dynamic_shared_bytes": 16384,
+      "grid_at_evidence_n_tok": [
+        160,
+        8,
+        1
+      ],
+      "grid_formula": [
+        "n_out/64",
+        "ceil_div(n_tok,64)",
+        1
+      ],
+      "module": "modules/ip_a1da19c631b940e2f64b0e46f33bb0ced69e830472eae28b4c06560d2509fda6.cubin",
+      "module_bytes": 63840,
+      "module_sha256": "3c727c0b7de714334b67e0e09ef4d6ac044f84de1d5a02d34e2e8d6478813d75",
+      "n_in": 2560,
+      "n_out": 10240,
+      "n_tok": 512,
+      "num_stages": 2,
+      "num_warps": 4,
+      "resources": {
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 127
+      },
+      "shape_id": "k2560-m10240-n512",
+      "symbol": "ip_a1da19c631b940e2f64b0e46f33bb0ced69e830472eae28b4c06560d2509fda6",
+      "tile": {
+        "rows": 64,
+        "tokens": 64
+      },
+      "variant_id": "bm64-bn64-w4-s2"
+    },
+    {
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "compile_seconds": 0.2657512429999995,
+      "dynamic_shared_bytes": 16384,
+      "grid_at_evidence_n_tok": [
+        40,
+        8,
+        1
+      ],
+      "grid_formula": [
+        "n_out/64",
+        "ceil_div(n_tok,64)",
+        1
+      ],
+      "module": "modules/ip_951d2021de1698086f0d5a89753fb2da8448d43a17a2e01753d9cb7c81039fc6.cubin",
+      "module_bytes": 63840,
+      "module_sha256": "ddf82b19bc20d7f54f0f4da1e1b43c456d47c6fd22afaf7293d17c5549e286be",
+      "n_in": 10240,
+      "n_out": 2560,
+      "n_tok": 512,
+      "num_stages": 2,
+      "num_warps": 4,
+      "resources": {
+        "global_scratch_bytes": 0,
+        "local_memory_bytes": 0,
+        "profile_scratch_bytes": 0,
+        "registers_per_thread": 127
+      },
+      "shape_id": "k10240-m2560-n512",
+      "symbol": "ip_951d2021de1698086f0d5a89753fb2da8448d43a17a2e01753d9cb7c81039fc6",
+      "tile": {
+        "rows": 64,
+        "tokens": 64
+      },
+      "variant_id": "bm64-bn64-w4-s2"
+    }
+  ],
+  "weight_layout": {
+    "dequant": "(q-8)*d4",
+    "format": "Q4_0",
+    "nibble_order": "k0..15 low, k16..31 high",
+    "order": "row-major blocks",
+    "packed_bytes": "w_qs[(row*n_blocks+block)*18+0..15] from weights+2",
+    "record_bytes": 18,
+    "scale": "w_d[(row*n_blocks+block)*9] from weights+0"
+  }
+}

@@ -147,7 +147,13 @@ pub fn build(
             // block's norm. token_embd_norm is the output norm, not an input one.
             scale_by_sqrt_embd: false,
             per_layer_dim: None,
+            per_layer_row_bytes: None,
         },
+        // The established Metal representation is unrotated. CUDA may opt into its
+        // independently receipted llama-compatible full-head route without changing
+        // the shared workflow semantics for backends that do not make that declaration.
+        kv_storage_basis: crate::KvStorageBasisPolicy::BackendOverrideOrCanonical,
+        weight_residency: crate::WeightResidencyPlan::default(),
         layers,
         output: OutputPlan {
             final_norm: true,

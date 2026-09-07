@@ -27,12 +27,13 @@ pub fn prof_log(phase: &str, wall_ms: f64) {
     let p = be.prof_stats();
     eprintln!(
         "[prof] {phase} wall={wall_ms:.0}ms gpu_busy={:.0}ms ({:.0}% of wall) \
-               submit_wall={:.0}ms cbs={} dispatches={} gpu_per_cb={:.0}us",
+               submit_wall={:.0}ms cbs={} dispatches={} barriers={} gpu_per_cb={:.0}us",
         p.gpu_s * 1e3,
         100.0 * p.gpu_s * 1e3 / wall_ms.max(1e-9),
         p.wall_s * 1e3,
         p.cbs,
         p.dispatches,
+        p.barriers,
         1e6 * p.gpu_s / (p.cbs.max(1) as f64)
     );
     let total: f64 = p.categories.iter().map(|(_, t, _)| *t).sum();

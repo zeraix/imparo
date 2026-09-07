@@ -7,6 +7,7 @@ license.workspace = true
 
 [features]
 cuda = ["imparo-model/cuda"]
+cuda-dynamic = ["imparo-model/cuda-dynamic"]
 
 [dependencies]
 imparo-kv = { path = "../imparo-kv" }
@@ -15,11 +16,13 @@ imparo-gguf = { path = "../imparo-gguf" }
 imparo-model = { path = "../imparo-model" }
 imparo-cpu = { path = "../imparo-cpu" }
 imparo-tokenize = { path = "../imparo-tokenize" }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 # Real jinja rendering of the GGUF-embedded chat template (task #15). Pure Rust,
 # cross-platform; the hand-coded gemma4 renderer caused the 7-missing-tokens bug and
 # survives only as the fallback for template-less GGUFs.
-minijinja = { version = "2", features = ["loader"] }
+minijinja = { version = "2", features = ["loader", "preserve_order"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
+serde = "1"
 
 [[bin]]
 name = "imparo-server"

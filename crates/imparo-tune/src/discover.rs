@@ -73,6 +73,12 @@ fn spill_cliff(b: &dyn Backend, verbose: bool) -> u32 {
         let mut here = *NACC.last().unwrap_or(&0);
         for (i, &_n) in NACC.iter().enumerate() {
             let r = b.spill_rate(i as u32, 128, tpg, 4096);
+            if i == 0 && r <= 0.0 {
+                if verbose {
+                    println!("    spill probe unsupported; keeping unknown sentinel");
+                }
+                return 0;
+            }
             if prev > 0.0 && r < prev * (1.0 - CLIFF_DROP) {
                 here = NACC[i.saturating_sub(1)];
                 break;
@@ -111,6 +117,14 @@ fn fill_point(b: &dyn Backend, verbose: bool) -> u32 {
     for &t in &TGS {
         // Fixed work per threadgroup, so the only thing changing is how many there are.
         let r = b.spill_rate(1, t, 256, 4096);
+        if r <= 0.0 {
+            if verbose {
+                println!(
+                    "    compute-fill probe unsupported; keeping unknown sentinel"
+                );
+            }
+            return 0;
+        }
         // Still climbing means still filling. A rate that stops climbing by a quarter of
         // what perfect scaling would give is a machine that has run out of cores.
         if prev > 0.0 && r < prev * 1.25 {
@@ -154,9 +168,15 @@ fn submission_costs(b: &dyn Backend, verbose: bool) -> (u32, u32) {
         v.sort_by(f64::total_cmp);
         v[2]
     };
-    let commit = med(&|| b.commit_overhead(64));
+    // The commit term is a GPU-side GAP between back-to-back buffers and the encode term
+    // is host time per dispatch; both are floors whose noise is one-sided (a scheduling
+    // hiccup only lengthens a gap, contention only lengthens an encode). The median of
+    // five read 0.42 / 0.50 / 3.67 us for the gap across runs and derived flush 1 / 2 / 5
+    // (2026-09-04); the minimum of five holds at 1-2, the flat region of the trade.
+    let mn = |f: &dyn Fn() -> f64| (0..5).map(|_| f()).fold(f64::INFINITY, f64::min);
+    let commit = mn(&|| b.commit_overhead(64));
     let sync = med(&|| b.sync_overhead(32));
-    let encode = med(&|| b.encode_cost(256));
+    let encode = mn(&|| b.encode_cost(256));
     if verbose && commit > 0.0 {
         println!(
             "    command buffer: {commit:.2} us to submit, {sync:.1} us to submit AND WAIT, \
@@ -216,6 +236,12 @@ fn fill_point_membound(b: &dyn Backend, verbose: bool) -> u32 {
         rates.push((t, gbs));
     }
     let peak = rates.iter().map(|&(_, g)| g).fold(0.0_f64, f64::max);
+    if peak <= 0.0 {
+        if verbose {
+            println!("    memory-fill probe unsupported; keeping unknown sentinel");
+        }
+        return 0;
+    }
     let fill = rates
         .iter()
         .find(|&&(_, g)| g >= peak * 0.90)
@@ -297,11 +323,7 @@ fn cache_knee(b: &dyn Backend, verbose: bool) -> (u64, u32) {
     tail.sort_by(f64::total_cmp);
     let dram = tail.get(tail.len() / 2).copied().unwrap_or(0.0);
     if verbose {
-        println!(
-            "    cache knee {} MB, DRAM {:.0} GB/s",
-            knee >> 20,
-            dram
-        );
+        println!("    cache knee {} MB, DRAM {:.0} GB/s", knee >> 20, dram);
     }
     (knee, (dram * 1000.0) as u32)
 }

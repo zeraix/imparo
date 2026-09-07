@@ -1,0 +1,122 @@
+schema = 1
+phase = "A2"
+decision = "gate-a"
+production_authority = false
+target_sm = 86
+
+[workload]
+contract = "rms_norm_q8_1_mmq"
+width = 2560
+n_tok = 512
+native_threads = 1024
+triton_warps = [4, 8]
+eps = 0.000001
+
+[measurement]
+warmup = 20
+abba_baab_pairs = 50
+min_samples_per_route = 100
+launches_per_sample = 16
+interleaved = "abba-baab"
+
+[validation]
+same_device_required = true
+same_shape_required = true
+same_stream_required = true
+cuda_events_required = true
+canary_required = true
+sanitizer_required = true
+
+[correctness]
+max_normalized_abs_vs_native = 0.0002
+max_normalized_rel_vs_native = 0.002
+max_q8_scale_abs_vs_native = 0.00002
+max_q8_value_abs_vs_native = 2
+min_q8_byte_agreement = 0.995
+max_q8_dequant_abs = 0.05
+max_non_finite = 0
+max_canary_errors = 0
+
+[noise]
+max_native_cv = 0.05
+max_candidate_cv = 0.05
+max_paired_mad_fraction = 0.03
+
+[gate]
+min_kernel_speedup_ratio = 1.10
+min_projected_e2e_improvement = 0.03
+require_structural_ok = true
+require_all_variants_correct = true
+
+[resources]
+max_registers_per_thread = 255
+max_static_shared_bytes = 101376
+max_dynamic_shared_bytes = 101376
+max_local_memory_bytes = 0
+
+[scope]
+allowed_sms = [86]
+allow_signing = false
+allow_installer = false
+allow_receipt_update = false
+allow_graph_integration = false
+
+# Phase A2 high-share Q4_0 x Q8_1 MMQ candidate. These names are prefixed
+# deliberately: the lab runners reject duplicate policy keys, and this file
+# remains the single policy authority for both candidate families.
+[q4_mmq]
+q4_candidate = "q4_0_x_q8_1_mmq_epilogue0"
+# This pins the exact run-b evidence document (including diagnostic
+# compile_seconds). Reproducibility is claimed only for the source/module tree
+# and cubin hashes below, not for byte-identical metadata timestamps/timings.
+q4_metadata_sha256 = "3adde31b09017273ace1d89efd37589f7de83c63b65e950dbc596f0b6771bfd9"
+q4_expansion_shape = "k2560-m10240-n512"
+q4_expansion_symbol = "ip_a1da19c631b940e2f64b0e46f33bb0ced69e830472eae28b4c06560d2509fda6"
+q4_expansion_cubin_sha256 = "3c727c0b7de714334b67e0e09ef4d6ac044f84de1d5a02d34e2e8d6478813d75"
+q4_contraction_shape = "k10240-m2560-n512"
+q4_contraction_symbol = "ip_951d2021de1698086f0d5a89753fb2da8448d43a17a2e01753d9cb7c81039fc6"
+q4_contraction_cubin_sha256 = "ddf82b19bc20d7f54f0f4da1e1b43c456d47c6fd22afaf7293d17c5549e286be"
+q4_visible_arguments = 8
+q4_hidden_arguments = 2
+q4_kparam_bytes = 72
+q4_threads = 128
+q4_dynamic_shared_bytes = 16384
+q4_registers_per_thread = 127
+q4_static_shared_bytes = 0
+q4_local_memory_bytes = 0
+q4_cubin_bytes = 63840
+q4_workspace_bytes = 1966080
+q4_native_launch_threads = 256
+q4_native_dynamic_shared_bytes = 36864
+q4_triton_launch_threads = 128
+q4_triton_block_m = 64
+q4_triton_block_n = 64
+q4_output_buffer_count = 2
+q4_builder_triton_commit = "b252c7c4cea49216b27e5a47db061f9d0dbf49f3"
+q4_builder_python = "3.12.3"
+q4_builder_triton = "3.8.0"
+q4_builder_torch = "absent"
+q4_builder_ptxas = "V12.9.86"
+q4_builder_cuobjdump = "V12.9.82"
+q4_builder_recipe_sha256 = "5165e28709da883bd44423c6f980726ed5413b89094f3efa76d3c617cbe4efe7"
+q4_builder_image_id = "sha256:357ea84b8e099d8b1884bde98172feef40a1acd9dc91f6b256dd16245573a1cf"
+q4_builder_linux_amd64_manifest = "sha256:cc77b73970499241bf4e5c9f70a1f4f9571994a7a992937a3dc6827241f0ab76"
+q4_builder_oci_config = "sha256:91239d1dae39c4006010a7ca5f2d0c90f342a6c9327053553ee3b1b36c6a4e54"
+q4_variants_metadata_sha256 = "f4dd69db8475ec881f5bf5062d1a7d4626605b658bd7727233af077eef3d2607"
+q4_variant_allowed_expansion = ["cfg_cd1dd7eea1c5a04fa3fca1d1dbbde58075df25baad5830bf8d1fb179d1c7d5ed", "cfg_040845b88cef1fe24b7900e33d507b81592c31ddc35ba8516ba7151c03741bc0", "cfg_58bab621edc125e72372075f257ab39554b74abc49ff8855e6d836bbcdfd857c", "cfg_2f16dc07d913306ecc0325a784eab13a396850af0b5c8bc1f8c59e6b69f7198b"]
+q4_variant_allowed_contraction = ["cfg_5ee29234f32c69540442430ee69071ca81e4fa89fc48a10d6e32654c8e3c9b32", "cfg_05e1dac74eaa31f6f6fd679867d0c92f3ad684d640d9797119078ed66d1280d4", "cfg_99be389d8e9794a218708e277fcaabde58f53ce81e73c9518a250726a2ded6eb", "cfg_6b4e87dd0bfbf0dd95feac24ca12b2a4c112665dc7bd352e202cb3e84c1c264d"]
+q4_variant_allowlist_rationale = "bounded resource-screen survivors only: vary row/token tile and stage count without Cartesian expansion; each exact metadata rationale remains hash-bound"
+q4_numeric_policy_status = "frozen-from-cpu-oracle"
+q4_max_abs_vs_native = 0.00006103515625
+q4_max_rms_vs_native = 0.00001
+q4_max_normalized_rel_vs_native = 0.00005
+q4_max_non_finite = 0
+q4_max_canary_errors = 0
+q4_max_input_mismatches = 0
+q4_max_padding_errors = 0
+q4_output_stride_padding = 17
+q4_require_tail_tokens = [1, 127, 128, 129, 511, 512]
+q4_oracle_strict_native_max_abs = 0.0
+q4_oracle_strict_triton_max_abs = 0.0000152587890625
+q4_oracle_f64_max_abs = 0.00002
+q4_mutation_min_bitwise_different = 1

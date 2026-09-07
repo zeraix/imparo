@@ -111,10 +111,10 @@ pub fn prepare(weights: &Weights, plan: &ModelPlan) -> Result<ModelW, String> {
 /// # Errors
 /// When a shape disagrees with the plan.
 pub fn batch(
-wf: &mut Gemma4,
-tokens: &[u32],
-start_pos: usize,
-out: &mut Vec<f32>,
+    wf: &mut Gemma4,
+    tokens: &[u32],
+    start_pos: usize,
+    out: &mut Vec<f32>,
 ) -> Result<(), String> {
     let c = wf.plan.config.clone();
     let n_embd = c.n_embd as usize;
@@ -149,8 +149,7 @@ out: &mut Vec<f32>,
     probe(pl.is_some(), "inp_scaled", -1, &x[..n_embd]);
 
     if ple > 0 {
-        if let (Some(pm), Some(pt)) =
-            (mw.per_layer_model_proj, mw.per_layer_token_embd)
+        if let (Some(pm), Some(pt)) = (mw.per_layer_model_proj, mw.per_layer_token_embd)
         {
             let width = ple * n_layers;
             let mut proj = vec![0.0_f32; b * width];
@@ -259,12 +258,7 @@ out: &mut Vec<f32>,
                 heads: n_kv,
                 ..rope
             };
-            norm_and_rope(
-                &mut kbuf[..b * kw],
-                lw.attn_k_norm.as_slice(),
-                freq,
-                &krope,
-            );
+            norm_and_rope(&mut kbuf[..b * kw], lw.attn_k_norm.as_slice(), freq, &krope);
             // V is RMS-normed with NO weight vector, which is gemma4's own and stays
             // here: pushing it into the shared helper would mean a flag per model.
             for t in 0..b {

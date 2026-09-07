@@ -1,0 +1,23 @@
+Imparo third-party notices
+==========================
+
+Triton
+------
+
+Project: Triton language and compiler
+Upstream: https://github.com/triton-lang/triton
+License: MIT
+
+Triton may be used by an optional, pinned build-time toolchain to produce Community
+Program Pack cubin artifacts. Triton, Python, PyTorch, and the Triton JIT/compiler are
+not required or shipped as production Imparo runtime dependencies by this integration.
+Redistributed Triton-derived material must retain the notices required by its MIT
+license and exact locked source/toolchain provenance.
+
+CUDA and LLVM ecosystem components
+----------------------------------
+
+CUDA toolkit, driver, and LLVM-related components have their own licenses and
+redistribution terms. A release requires human review of exact artifacts, SBOM,
+provenance, and applicable terms before publication. This notice records the
+engineering boundary; it is not legal approval or a grant of third-party rights.

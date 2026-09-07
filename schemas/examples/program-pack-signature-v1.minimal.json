@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "domain": "imparo-program-pack-v1",
+  "algorithm": "ed25519",
+  "key_id": "imparo.release.test",
+  "manifest_bytes": 4096,
+  "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+}

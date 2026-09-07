@@ -1,6 +1,32 @@
-//! Model-agnostic KV-pool glue at the crate level: everything a model needs to
-//! join the pool that is derivable from the SHARED plan types. A model module
-//! contributes only its geometry descriptor (see gemma4's `kv_state_geometry`).
+//! THE BRIDGE between a model plan and the KV pool.
+//!
+//! The pool, the store, the identity grid and the state blobs all live in `imparo-kv`,
+//! which knows nothing about models. What is left here is everything that has to read
+//! BOTH -- and one rule decides whether a thing belongs in this file:
+//!
+//! ```text
+//!   reads Attention / KvSource / ModelPlan   ->  a BRIDGE, and it belongs here
+//!   reads only KV values                     ->  it belongs in imparo-kv
+//! ```
+//!
+//! By that rule six functions are bridges: `config_root` and `state_geometry` turn a
+//! plan into a `ConfigRoot` and a `Vec<LayerStateGeom>`, `ring_slots` and `ring_mask`
+//! turn an `Attention` into a ring, `kv_bytes_for` counts a layer's KV, and `scan`
+//! walks the plan's layers to report on the live cache. Each one matches on a model
+//! enum, which is exactly why it cannot move down.
+//!
+//! The rest of the file is three things that are not bridges but are still model-side:
+//! the engine-global cache TYPE (`KvType`), the two REGISTRY adapters (`backend`,
+//! `read_recurrent`) that supply the active device to functions in `imparo-kv`, and the
+//! model half of the pool's tenant contract (`KvPoolMember` plus `pool_tenant_for!`).
+//!
+//! A model module contributes only its geometry descriptor (see gemma4's
+//! `kv_state_geometry`).
+
+use imparo_backend::{
+    HadamardWidth, KvByteCodec, KvByteCodecRoute, KvQuantizationRoute,
+};
+use imparo_kv::{KvByteLayoutProfile, KvByteType, KvQuantizationBasis};
 
 // Engine-global KV cache-type configuration: which storage type the K and V
 // caches use. Not a model property (every model reads the same config), so it
@@ -50,6 +76,14 @@ impl KvType {
             Self::Q8_0 => width / 32 * 34,
         }
     }
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Q4_0 => "q4_0",
+            Self::Q8_0 => "q8_0",
+        }
+    }
+
     pub(crate) fn ggml_id(self) -> u32 {
         match self {
             Self::F16 => 1,
@@ -57,6 +91,279 @@ impl KvType {
             Self::Q8_0 => 8,
         }
     }
+
+    fn identity_type(self) -> KvByteType {
+        match self.as_str() {
+            "f16" => KvByteType::F16,
+            "q4_0" => KvByteType::Q4_0,
+            "q8_0" => KvByteType::Q8_0,
+            _ => unreachable!("KvType has a canonical spelling for every variant"),
+        }
+    }
+
+    fn identity_codec(self, route: KvByteCodecRoute) -> KvByteCodec {
+        match self {
+            Self::F16 => route.f16,
+            Self::Q4_0 => route.q4_0,
+            Self::Q8_0 => route.q8_0,
+        }
+    }
+}
+
+const HAD_K_VAR: &str = "IMPARO_HAD_K";
+const HAD_V_VAR: &str = "IMPARO_HAD_V";
+
+/// Parse a diagnostic override without consulting process-global state. Keeping
+/// parsing pure lets the identity and workflow share one contract and keeps tests
+/// from racing through the environment.
+fn parse_hadamard_override(
+    var: &str,
+    value: Option<&str>,
+    default: HadamardWidth,
+) -> Result<HadamardWidth, String> {
+    match value {
+        None => Ok(default),
+        Some("0") => Ok(HadamardWidth::Disabled),
+        Some("hd") => Ok(HadamardWidth::FullHead),
+        Some(value) => value
+            .parse::<u32>()
+            .map(|width| {
+                if width == 0 {
+                    HadamardWidth::Disabled
+                } else {
+                    HadamardWidth::Fixed(width)
+                }
+            })
+            .map_err(|_| {
+                format!("{var} must be '0', 'hd', or a positive integer; got '{value}'")
+            }),
+    }
+}
+
+fn resolve_hadamard_override(
+    var: &str,
+    value: Option<&str>,
+    default: HadamardWidth,
+    head_dim: u32,
+) -> Result<u32, String> {
+    parse_hadamard_override(var, value, default)?
+        .resolve(head_dim)
+        .map_err(|message| {
+            format!("invalid {var} route for head_dim={head_dim}: {message}")
+        })
+}
+
+/// Resolve a route that has already passed through the shared policy/override resolver.
+pub(crate) fn had_nrot(
+    var: &str,
+    effective: HadamardWidth,
+    head_dim: u32,
+) -> Result<u32, String> {
+    resolve_hadamard_override(var, None, effective, head_dim)
+}
+
+fn identity_basis(width: HadamardWidth) -> KvQuantizationBasis {
+    match width {
+        HadamardWidth::Disabled => KvQuantizationBasis::Disabled,
+        HadamardWidth::FullHead => KvQuantizationBasis::FullHead,
+        HadamardWidth::Fixed(width) => KvQuantizationBasis::Fixed(width),
+    }
+}
+
+/// Pure authority resolver shared by execution and durable identity.
+fn kv_basis_route_with_overrides(
+    policy: crate::KvStorageBasisPolicy,
+    key_type: KvType,
+    value_type: KvType,
+    backend_route: KvQuantizationRoute,
+    backend_override: Option<KvQuantizationRoute>,
+    key_override: Option<&str>,
+    value_override: Option<&str>,
+) -> Result<KvQuantizationRoute, String> {
+    let disabled = KvQuantizationRoute {
+        key: HadamardWidth::Disabled,
+        value: HadamardWidth::Disabled,
+    };
+    let declared = match policy {
+        crate::KvStorageBasisPolicy::Canonical => disabled,
+        crate::KvStorageBasisPolicy::BackendRoute => backend_route,
+        crate::KvStorageBasisPolicy::BackendOverrideOrCanonical => {
+            backend_override.unwrap_or(disabled)
+        }
+        crate::KvStorageBasisPolicy::ExplicitRoute(route) => route,
+    };
+    let allow_override = matches!(policy, crate::KvStorageBasisPolicy::BackendRoute)
+        || (matches!(
+            policy,
+            crate::KvStorageBasisPolicy::BackendOverrideOrCanonical
+        ) && backend_override.is_some());
+    let key = if key_type == KvType::F16 {
+        HadamardWidth::Disabled
+    } else if allow_override {
+        parse_hadamard_override(HAD_K_VAR, key_override, declared.key)?
+    } else {
+        declared.key
+    };
+    let value = if value_type == KvType::F16 {
+        HadamardWidth::Disabled
+    } else if allow_override {
+        parse_hadamard_override(HAD_V_VAR, value_override, declared.value)?
+    } else {
+        declared.value
+    };
+    Ok(KvQuantizationRoute { key, value })
+}
+
+fn environment_override(var: &str) -> Result<Option<String>, String> {
+    match std::env::var(var) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("cannot read {var}: {error}")),
+    }
+}
+
+/// Effective basis route used by the workflow. Only backend-owned routes accept the
+/// global diagnostic overrides; canonical and explicit model contracts ignore them.
+pub(crate) fn effective_workflow_kv_route(
+    plan: &crate::ModelPlan,
+    key_type: KvType,
+    value_type: KvType,
+    backend_route: KvQuantizationRoute,
+    backend_override: Option<KvQuantizationRoute>,
+) -> Result<KvQuantizationRoute, String> {
+    let (key_override, value_override) = if matches!(
+        plan.kv_storage_basis,
+        crate::KvStorageBasisPolicy::BackendRoute
+            | crate::KvStorageBasisPolicy::BackendOverrideOrCanonical
+    ) {
+        (
+            environment_override(HAD_K_VAR)?,
+            environment_override(HAD_V_VAR)?,
+        )
+    } else {
+        (None, None)
+    };
+    kv_basis_route_with_overrides(
+        plan.kv_storage_basis,
+        key_type,
+        value_type,
+        backend_route,
+        backend_override,
+        key_override.as_deref(),
+        value_override.as_deref(),
+    )
+}
+
+#[cfg(test)]
+fn byte_layout_profile_with_overrides(
+    key_type: KvType,
+    value_type: KvType,
+    route: KvQuantizationRoute,
+    key_override: Option<&str>,
+    value_override: Option<&str>,
+) -> Result<KvByteLayoutProfile, String> {
+    let basis = kv_basis_route_with_overrides(
+        crate::KvStorageBasisPolicy::BackendRoute,
+        key_type,
+        value_type,
+        route,
+        None,
+        key_override,
+        value_override,
+    )?;
+    let codecs = KvByteCodecRoute::default();
+    Ok(KvByteLayoutProfile::current(
+        key_type.identity_type(),
+        value_type.identity_type(),
+        identity_basis(basis.key),
+        identity_basis(basis.value),
+        key_type.identity_codec(codecs),
+        value_type.identity_codec(codecs),
+    ))
+}
+
+fn effective_byte_layout_profile(
+    plan: &crate::ModelPlan,
+    key_type: KvType,
+    value_type: KvType,
+    route: KvQuantizationRoute,
+    route_override: Option<KvQuantizationRoute>,
+    codecs: KvByteCodecRoute,
+) -> Result<KvByteLayoutProfile, String> {
+    let basis =
+        effective_workflow_kv_route(plan, key_type, value_type, route, route_override)?;
+    Ok(KvByteLayoutProfile::current(
+        key_type.identity_type(),
+        value_type.identity_type(),
+        identity_basis(basis.key),
+        identity_basis(basis.value),
+        key_type.identity_codec(codecs),
+        value_type.identity_codec(codecs),
+    ))
+}
+
+fn execution_kv_route(
+    gpu_requested: bool,
+    active_route: KvQuantizationRoute,
+) -> KvQuantizationRoute {
+    if gpu_requested {
+        active_route
+    } else {
+        imparo_backend::Backend::kv_quantization_route(&imparo_cpu::CpuBackend)
+    }
+}
+
+fn execution_kv_route_override(
+    gpu_requested: bool,
+    active_route: Option<KvQuantizationRoute>,
+) -> Option<KvQuantizationRoute> {
+    if gpu_requested { active_route } else { None }
+}
+
+fn execution_kv_codec_route(
+    gpu_requested: bool,
+    active_route: KvByteCodecRoute,
+) -> KvByteCodecRoute {
+    if gpu_requested {
+        active_route
+    } else {
+        imparo_backend::Backend::kv_byte_codec_route(&imparo_cpu::CpuBackend)
+    }
+}
+
+fn effective_active_byte_layout_profile(
+    plan: &crate::ModelPlan,
+    key_type: KvType,
+    value_type: KvType,
+) -> Result<KvByteLayoutProfile, String> {
+    let active = crate::backend::active().ok_or_else(|| {
+        "configuration identity requires an active backend route".to_string()
+    })?;
+    let gpu_requested = crate::backend::gpu_requested_from_env();
+    effective_byte_layout_profile(
+        plan,
+        key_type,
+        value_type,
+        execution_kv_route(gpu_requested, active.kv_quantization_route()),
+        execution_kv_route_override(
+            gpu_requested,
+            active.kv_quantization_route_override(),
+        ),
+        execution_kv_codec_route(gpu_requested, active.kv_byte_codec_route()),
+    )
+}
+
+/// Complete effective durable byte profile for an explicit K/V type pair.
+pub fn effective_kv_byte_layout_profile(
+    plan: &crate::ModelPlan,
+    key_type: &str,
+    value_type: &str,
+) -> Result<KvByteLayoutProfile, String> {
+    let key_type = KvType::parse(key_type)
+        .ok_or_else(|| format!("unsupported KV key type: {key_type}"))?;
+    let value_type = KvType::parse(value_type)
+        .ok_or_else(|| format!("unsupported KV value type: {value_type}"))?;
+    effective_active_byte_layout_profile(plan, key_type, value_type)
 }
 /// The configuration root for this plan + KV types: every input that shapes the
 /// cache bytes, and nothing else (no tuned value may enter -- see the design's
@@ -65,6 +372,7 @@ impl KvType {
 pub fn config_root(
     plan: &crate::ModelPlan,
     model_digest: &[u8],
+    device_tag: &str,
 ) -> imparo_kv::ConfigRoot {
     use crate::Attention;
     let c = &plan.config;
@@ -115,34 +423,26 @@ pub fn config_root(
             }
         }
     }
-    imparo_kv::ConfigRoot::new(
-        model_digest,
-        (KvType::k().ggml_id(), KvType::v().ggml_id()),
-        &geom,
-    )
-}
-
-/// Cheap, stable model identity for the configuration root: sha256 of the header
-/// region (metadata + tensor table live at the front) plus the file length.
-/// Hashing 4 GB per launch is not acceptable; the header pins architecture, quant
-/// layout and vocab.
-///
-/// # Errors
-/// Returns an error when the file cannot be read.
-pub fn model_digest(path: &std::path::Path) -> Result<Vec<u8>, String> {
-    use sha2::Digest as _;
-    use std::io::Read as _;
-    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let len = f.metadata().map_err(|e| e.to_string())?.len();
-    let mut head = vec![0u8; 1 << 20];
-    let n = f.read(&mut head).map_err(|e| e.to_string())?;
-    head.truncate(n);
-    let mut out = len.to_le_bytes().to_vec();
-    let mut h = sha2::Sha256::new();
-    h.update(&head);
-    let d: [u8; 32] = h.finalize().into();
-    out.extend_from_slice(&d);
-    Ok(out)
+    // Durable bytes must be isolated by both their complete numerical layout and
+    // the backend that wrote them. Resume-vs-cold gates establish compatibility
+    // within one backend, not across different accumulation orders.
+    //
+    // The grid is deliberately absent: a coarser reader can still reuse boundaries
+    // that land on its own grid. The backend identity is a whole-store distinction.
+    geom.extend_from_slice(device_tag.as_bytes());
+    let key_type = KvType::k();
+    let value_type = KvType::v();
+    let profile = effective_active_byte_layout_profile(plan, key_type, value_type)
+        .unwrap_or_else(|_| {
+            // No valid workflow can write bytes for a malformed route. Keep its root
+            // disjoint from every valid profile while the workflow reports the exact
+            // original error at the established call site.
+            KvByteLayoutProfile::rejected(
+                key_type.identity_type(),
+                value_type.identity_type(),
+            )
+        });
+    imparo_kv::ConfigRoot::from_layout(model_digest, &profile, &geom)
 }
 
 // ---- POOL GEOMETRY, DERIVED FROM THE PLAN ------------------------------------------
@@ -153,45 +453,56 @@ pub fn model_digest(path: &std::path::Path) -> Result<Vec<u8>, String> {
 // same byte budget over a different mix of block kinds, so a copy would have to be kept in
 // step by hand.
 
-/// The three numbers a pool member tracks, together because they are one fact in three
-/// parts: what the cache can ever hold, what it has allocated, and what it holds now.
-///
-/// They used to be two fields inside KvCache -- which otherwise holds the CPU backend's
-/// actual cache arrays -- and one field beside it. That is why exposing three numbers took
-/// four accessors: the CPU arrays and the device counters are different things and had been
-/// merged.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct KvRuntime {
-    /// The context bound: the cache can never hold more.
-    pub capacity: usize,
-    /// Slots currently allocated on the device.
-    pub slots: usize,
-    /// Positions currently held.
-    pub filled: usize,
-}
+// ---------------------------------------------------------------- RE-EXPORTS
+//
+// OWNED BY `imparo-kv`, named here so a caller that already reaches for this module
+// does not have to learn which crate each one settled in. Every one of them failed the
+// bridge rule -- none reads a model type:
+//
+//   model_digest        file length + sha2 over the first MiB
+//   resume_point        arithmetic on the identity grid
+//   window_regions      one env var
+//   bounded_geometry    filters LayerStateGeom by StateKind
+//   full_layers         the same
+//   window_slack        the same
+//   set_scrambled_tables  builds block tables from geometry (a test instrument)
+//   KvRuntime           capacity, slots, filled
+pub use imparo_kv::identity::{model_digest, resume_point};
+pub use imparo_kv::resident::{set_scrambled_tables, window_regions};
+pub use imparo_kv::state::{KvRuntime, bounded_geometry, full_layers, window_slack};
 
 /// Slots the first allocation covers. Growth is by `kv_round` from here.
 pub(crate) const KV_FIRST_SLOTS: usize = 512;
 
-/// Growth granularity in slots.
+/// Round a position count up to the next whole PAGE, with one page of headroom.
 ///
-/// One block of headroom keeps decode from growing every token. 64 rather than 256 because
-/// the block is pure headroom on the full-attention layers: MEASURED on gemma4 E4B, whose
-/// four full layers carry 16384 bytes per position between them, a 256-block rounds 5674
-/// positions to 6144 slots and a 64-block to 5760 -- 384 slots, 6 MiB, for one extra grow
-/// every 64 decode tokens instead of every 256.
-const KV_BLOCK: usize = 64;
-
-/// Round a position count up to the next growth block, with one block of headroom.
+/// The growth unit is `page_cells()`, not a number of its own. It was a `KV_BLOCK = 64`
+/// beside a page that is also 64, which is one fact written twice: the cache is grown to
+/// this many slots while the pool PLACES in pages, so a backend whose page differs would
+/// have grown the buffer in HALF-PAGES -- an allocation ending mid-page with the pool
+/// free to hand out the block that straddles the end. `set_scrambled_tables` carries the
+/// note from a neighbouring form of that ("the first version did, at n=65, and produced
+/// wild stores").
+///
+/// Allocation happens in pages, so growth has no quantum of its own to be. What stays
+/// separate is where a stream may be CUT (`PoolCaps::finest_cut_tokens`), which is a
+/// different question -- docs/kv-identity-grid.md.
 ///
 /// NOT doubling. `kv_fit` runs once per request with the whole prompt, so a request never
 /// grows more than once and geometric growth buys nothing -- while rounding 5642 up to the
-/// next power of two is 8192, the entire context, which saves nothing at all. A block plus
-/// one block of headroom keeps decode from growing every token: at 4 layers x 4 KiB a
-/// position, a grow copies about 96 MiB, which is a millisecond every block of tokens.
+/// next power of two is 8192, the entire context, which saves nothing at all. A page plus
+/// one page of headroom keeps decode from growing every token: at 4 layers x 4 KiB a
+/// position, a grow copies about 96 MiB, which is a millisecond every page of tokens.
+///
+/// The measurement that chose 64 stands, and is why the page is the right unit rather
+/// than a multiple of it: on gemma4 E4B, whose four full layers carry 16384 bytes per
+/// position between them, a 256-block rounds 5674 positions to 6144 slots and a 64-block
+/// to 5760 -- 384 slots, 6 MiB, for one extra grow every 64 decode tokens instead of
+/// every 256.
 #[must_use]
 pub(crate) fn kv_round(positions: usize) -> usize {
-    (positions + KV_BLOCK).div_ceil(KV_BLOCK) * KV_BLOCK
+    let page = imparo_kv::page_cells();
+    (positions + page).div_ceil(page) * page
 }
 
 /// Slots a windowed layer's ring needs, or 0 for a layer that is not ringed.
@@ -220,23 +531,6 @@ pub fn ring_slots(attention: crate::Attention, max_batch: usize) -> usize {
     }
 }
 
-/// How many windowed conversations may be live at once, each with its own ring.
-///
-/// A windowed layer keeps ONE ring, so the conversation that ran last owns it and every
-/// switch captures the outgoing window and restores the incoming one. A ring per
-/// conversation removes that, and is what makes two conversations in one forward
-/// expressible at all. The extra rings are address space: the caches are zero-fill
-/// allocations that commit a page on first write, measured at E4B as 38.1 -> 125.2 MiB
-/// allocated with the resident footprint unchanged.
-#[must_use]
-pub fn window_regions() -> usize {
-    std::env::var("IMPARO_KV_REGIONS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1)
-}
-
 /// The ring mask for a layer, or 0 when the layer is not ringed.
 #[must_use]
 pub fn ring_mask(attention: crate::Attention, max_batch: usize) -> u32 {
@@ -244,6 +538,43 @@ pub fn ring_mask(attention: crate::Attention, max_batch: usize) -> u32 {
         0 => 0,
         slots => slots as u32 - 1,
     }
+}
+
+/// Explicit logical KV geometry corresponding to [`kv_bytes_for`].
+///
+/// CUDA consumes this alongside the byte budget. Keeping the derivation here means the
+/// native backend never guesses slots or independent K/V strides from padded bytes.
+#[must_use]
+pub fn kv_layout_for(
+    plan: &crate::ModelPlan,
+    positions: usize,
+    capacity: usize,
+    ring_batch: usize,
+) -> Vec<imparo_backend::KvLayout> {
+    let c = &plan.config;
+    let regions = window_regions();
+    let mut layouts = vec![imparo_backend::KvLayout::default(); c.n_layers as usize];
+    for (index, layout) in layouts.iter_mut().enumerate() {
+        layout.layer = index as u32;
+    }
+    for layer in &plan.layers {
+        if layer.kv_source != crate::KvSource::Own || !layer.attention.is_attention() {
+            continue;
+        }
+        let width = c.n_kv_heads as usize * layer.attention.head_dim() as usize;
+        let slots = match ring_slots(layer.attention, ring_batch) {
+            0 => kv_round(positions).min(capacity),
+            ring => ring.min(capacity) * regions,
+        };
+        layouts[layer.index as usize] = imparo_backend::KvLayout {
+            layer: layer.index,
+            reserved: 0,
+            logical_slots: slots as u64,
+            k_stride: KvType::k().row_bytes(width) as u64,
+            v_stride: KvType::v().row_bytes(width) as u64,
+        };
+    }
+    layouts
 }
 
 /// Bytes each layer's cache needs to hold `positions`, indexed by layer.
@@ -344,60 +675,6 @@ pub fn state_geometry(
         .collect()
 }
 
-/// The pooled set: layers whose state grows with context.
-#[must_use]
-pub fn full_layers(geom: &[LayerStateGeom]) -> Vec<u32> {
-    geom.iter()
-        .filter(|g| matches!(g.kind, StateKind::Full))
-        .map(|g| g.layer)
-        .collect()
-}
-
-/// The bounded set, which is what gets captured rather than pooled.
-#[must_use]
-pub fn bounded_geometry(geom: &[LayerStateGeom]) -> Vec<LayerStateGeom> {
-    geom.iter()
-        .filter(|g| !matches!(g.kind, StateKind::Full))
-        .copied()
-        .collect()
-}
-
-/// The furthest position a resumed prefill may start at, given how much of the request is
-/// already computed (`resident`) and how long the request is (`len`).
-///
-/// A resume is only worth anything if it reproduces what a cold prefill would have
-/// produced, and two engine properties decide where that holds (both measured, and both
-/// gated by dev_harness/kv_gates.py `engine`):
-///
-/// - 64 is the token-tile width. Resuming off that grid does not reproduce the cold pass
-///   -- 500 and 130 have differed since the pool landed.
-/// - One token is a DECODE shape: it takes the GEMV, not the staged prefill GEMM, so a
-///   1-token tail differs where a 2-token tail is byte-equal (n=705 split@704 against
-///   n=706, q4_0).
-///
-/// The tail's width does not otherwise matter. It used to: the wo projection staged half
-/// only at >= 64 tokens, so a narrow resumed chunk took the float path where the cold
-/// pass had staged half, and callers carried rules to avoid landing there. The floor is 2
-/// now (HALF_A_MIN, imparo_metal.mm) and this is the whole rule.
-#[must_use]
-pub fn resume_point(resident: usize, len: usize) -> usize {
-    resident.min(len.saturating_sub(2)) & !63
-}
-
-/// The tightest ring slack across windowed layers: a boundary is capturable from the rings
-/// while `filled - boundary <= slack`. The pool uses it to decide whether a checkpoint can
-/// be DEFERRED to switch-out or has to be taken eagerly mid-prefill.
-#[must_use]
-pub fn window_slack(geom: &[LayerStateGeom]) -> usize {
-    geom.iter()
-        .filter_map(|g| match g.kind {
-            StateKind::Window { window, ring } => Some(ring - window),
-            StateKind::Full => None,
-        })
-        .min()
-        .unwrap_or(usize::MAX)
-}
-
 /// See the IMPARO_KV_SCAN call site.
 /// Per-layer KV drift scan: RMS and the widest per-dimension magnitudes, which is how a
 /// quantised cache's outliers are spotted. IMPARO_KV_SCAN gates the caller.
@@ -468,36 +745,6 @@ pub fn scan(be: &dyn Backend, plan: &crate::ModelPlan, positions: usize) {
                 top.join(" ")
             );
         }
-    }
-}
-
-/// TEST INSTRUMENT (the isolation invariant's mechanical half): scatter every
-/// full-attention layer's placement by pair-swapping 64-cell blocks. Output
-/// must be byte-identical to identity placement -- physical location must be
-/// invisible. Pair-swap breaks block adjacency at every crossing, so the
-/// kernels' 8-run fast/slow paths are both exercised.
-pub fn set_scrambled_tables(
-    be: &dyn Backend,
-    geom: &[LayerStateGeom],
-    slots: usize,
-    capacity: usize,
-) {
-    // Clamped to CAPACITY: buffers are sized min(kv_round(pos), capacity), so a
-    // swap must never map into blocks the allocation clamped away (the first
-    // version did, at n=65, and produced wild stores -- in the TEST, not the
-    // engine).
-    let backed = slots.min(capacity);
-    let blocks = (backed / 64) & !1; // even count; tail stays identity
-    for geom in geom {
-        if !matches!(geom.kind, StateKind::Full) {
-            continue;
-        }
-        let ident = std::env::var("IMPARO_SCRAMBLE_IDENTITY").is_ok();
-        let table: Vec<u32> = (0..blocks as u32)
-            .map(|i| if ident { i } else { i ^ 1 })
-            .chain((blocks as u32)..(blocks as u32 + 8))
-            .collect();
-        be.set_kv_page_table(geom.layer, &table);
     }
 }
 
@@ -592,9 +839,12 @@ pub trait KvPoolMember {
         }
         window_slack(&self.kv_state_geometry())
     }
-    /// 64-cell blocks each pooled layer holds once prepared to capacity.
+    /// Pages each pooled layer holds once prepared to capacity.
+    ///
+    /// The divisor is the PAGE, not a literal 64: this is a count of the blocks the
+    /// pool hands out, and it allocates in `page_cells`.
     fn kv_capacity_blocks(&self) -> u32 {
-        (self.kv_runtime().capacity / 64) as u32
+        (self.kv_runtime().capacity / imparo_kv::page_cells()) as u32
     }
     /// Declare the resume point without touching any state (bookkeeping after an external
     /// truncation decision).
@@ -603,8 +853,28 @@ pub trait KvPoolMember {
     }
     /// Largest boundary spillable from live state: floor-256 discards at most 255
     /// positions, inside every ring's slack (ring >= window + batch).
+    /// WHERE THE DEVICE IS. Not snapped to any grid, and that is the point.
+    ///
+    /// Two different quantities were being confused here:
+    ///
+    /// ```text
+    ///   boundary  where the captured state ends    -> exactly where the device is
+    ///   cut       where shareable extents end      -> snapped to grid_tokens()
+    ///   tail      boundary - cut                   -> rides in the checkpoint's rows
+    /// ```
+    ///
+    /// `stage_whole` already computes the cut, on the identity grid, from the
+    /// boundary it is handed. Snapping the BOUNDARY as well asks the model for state
+    /// at a position it may not be able to produce: a recurrent buffer holds NOW and
+    /// has no history behind it, which is why `kv_checkpoint_slack` is 0 for it. This
+    /// returned `filled & !255` -- the retired 256-token unit grid, the last one left
+    /// in the KV path -- so `kv_recurrent_blob` refused every LFM2 spill and the gate
+    /// read "spill: nothing to spill" at f16 as well as quantized.
+    ///
+    /// Renumbering it to 64 would not have fixed that; it would have moved the same
+    /// defect to 1984. The snap belongs on the cut, and it is already there.
     fn kv_spill_boundary(&self) -> usize {
-        self.kv_runtime().filled & !255
+        self.kv_runtime().filled
     }
     /// Captures canonical state at `kv_spill_boundary()` (device idle).
     fn kv_spill(&self) -> Option<KvState> {
@@ -665,7 +935,9 @@ pub trait KvPoolMember {
     fn kv_apply_region(&self, region: usize) {
         let be = backend();
         for g in self.kv_state_geometry() {
-            let StateKind::Window { ring, .. } = g.kind else { continue };
+            let StateKind::Window { ring, .. } = g.kind else {
+                continue;
+            };
             be.set_kv_region(
                 g.layer,
                 (region * ring * g.k_stride) as u64,
@@ -697,7 +969,10 @@ pub trait KvPoolMember {
     ///
     /// # Errors
     /// When the blob's length disagrees with this model.
-    fn kv_install_recurrent(&mut self, note: Option<(usize, Vec<u8>)>) -> Result<(), String> {
+    fn kv_install_recurrent(
+        &mut self,
+        note: Option<(usize, Vec<u8>)>,
+    ) -> Result<(), String> {
         let n = self.plan().recurrent_elems() as usize;
         if n == 0 {
             return Ok(());
@@ -755,7 +1030,8 @@ pub trait KvPoolMember {
         if boundary == self.kv_runtime().filled {
             return Some(read_recurrent(n, imparo_backend::BufId::Recur));
         }
-        if boundary == self.state().recur_ckpt_at && !self.state().recur_ckpt.is_empty() {
+        if boundary == self.state().recur_ckpt_at && !self.state().recur_ckpt.is_empty()
+        {
             return Some(self.state().recur_ckpt.clone());
         }
         if crate::log_on() {
@@ -781,7 +1057,11 @@ pub trait KvPoolMember {
     /// Capture a bounded-layer DELTA at `boundary` chained from a checkpoint at `from`:
     /// rows [max(from, boundary - window), boundary) per layer, so cost min(gap, window)
     /// instead of a whole window.
-    fn kv_capture_delta(&self, boundary: usize, from: usize) -> imparo_kv::state::KvDelta {
+    fn kv_capture_delta(
+        &self,
+        boundary: usize,
+        from: usize,
+    ) -> imparo_kv::state::KvDelta {
         let geom = bounded_geometry(&self.kv_state_geometry());
         imparo_kv::state::capture_delta(
             backend(),
@@ -855,6 +1135,75 @@ pub trait KvPoolMember {
     }
 }
 
+/// Every pool member IS a pool tenant.
+///
+/// The contract lives in `imparo-kv` because the pool does; this is the model side of
+/// that inversion, and it is forwarding only. Two lines are not forwarding, and they are
+/// the two that kept the pool out of that crate:
+///
+/// ```text
+///   recurrent_elems   the pool asked plan() for exactly this one number
+///   backend           the registry lives here, not in imparo-kv
+/// ```
+///
+/// Written for TRAIT OBJECTS rather than blanket over `T: KvPoolMember`, because the
+/// orphan rule refuses a foreign trait over a foreign type parameter -- and emitted by a
+/// macro because `dyn Model + Send` is a different type from `dyn KvPoolMember`, and the
+/// server holds the first while the pool is happy with either. The pool takes its tenant
+/// generically (`T: PoolTenant + ?Sized`), so both substitute directly.
+macro_rules! pool_tenant_for {
+    ($ty:ty) => {
+        impl imparo_kv::PoolTenant for $ty {
+            fn recurrent_elems(&self) -> usize {
+                self.plan().recurrent_elems() as usize
+            }
+            fn backend(&self) -> Option<&'static dyn imparo_backend::Backend> {
+                crate::backend::active()
+            }
+            fn kv_runtime(&self) -> &imparo_kv::state::KvRuntime {
+                KvPoolMember::kv_runtime(self)
+            }
+            fn kv_state_geometry(&self) -> Vec<LayerStateGeom> {
+                KvPoolMember::kv_state_geometry(self)
+            }
+            fn kv_apply_tables(
+                &self,
+                tables: &std::collections::BTreeMap<u32, Vec<u32>>,
+            ) {
+                KvPoolMember::kv_apply_tables(self, tables);
+            }
+            fn kv_apply_region(&self, region: usize) {
+                KvPoolMember::kv_apply_region(self, region);
+            }
+            fn kv_recurrent_note(&self) -> Option<(usize, Vec<u8>)> {
+                KvPoolMember::kv_recurrent_note(self)
+            }
+            fn kv_capture_windows(&self, boundary: usize) -> KvState {
+                KvPoolMember::kv_capture_windows(self, boundary)
+            }
+            fn kv_capture_delta(
+                &self,
+                boundary: usize,
+                from: usize,
+            ) -> imparo_kv::state::KvDelta {
+                KvPoolMember::kv_capture_delta(self, boundary, from)
+            }
+            fn kv_assemble_chain(
+                &self,
+                chain: &[&imparo_kv::state::KvDelta],
+            ) -> Option<KvState> {
+                KvPoolMember::kv_assemble_chain(self, chain)
+            }
+            fn kv_resume(&mut self, state: &KvState) -> Result<(), String> {
+                KvPoolMember::kv_resume(self, state)
+            }
+        }
+    };
+}
+
+pool_tenant_for!(dyn KvPoolMember + '_);
+pool_tenant_for!(dyn crate::Model + Send + '_);
+
 /// The active backend. The defaults above reach it here rather than taking it as an
 /// eleventh accessor: which backend is live is a process fact, not a model's.
 fn backend() -> &'static dyn Backend {
@@ -863,7 +1212,15 @@ fn backend() -> &'static dyn Backend {
 
 #[cfg(test)]
 mod tests {
-    use super::resume_point;
+    use super::{
+        KvType, byte_layout_profile_with_overrides, execution_kv_route,
+        kv_basis_route_with_overrides, parse_hadamard_override,
+        resolve_hadamard_override, resume_point,
+    };
+    use imparo_backend::{
+        HadamardWidth, KvByteCodec, KvByteCodecRoute, KvQuantizationRoute,
+    };
+    use imparo_kv::{ConfigRoot, KvQuantizationBasis};
 
     /// The rule the engine gate measures, in one place: land on the 64 grid, and leave
     /// the resumed pass at least two tokens (one is a decode shape and still differs).
@@ -881,5 +1238,288 @@ mod tests {
         assert_eq!(resume_point(1000, 0), 0);
         // Never past what is resident.
         assert_eq!(resume_point(100, 10_000), 64);
+    }
+
+    #[test]
+    fn hadamard_override_parser_preserves_workflow_contract() {
+        let default = HadamardWidth::Fixed(128);
+        assert_eq!(parse_hadamard_override("R", None, default), Ok(default));
+        assert_eq!(
+            parse_hadamard_override("R", Some("0"), default),
+            Ok(HadamardWidth::Disabled)
+        );
+        assert_eq!(
+            parse_hadamard_override("R", Some("00"), default),
+            Ok(HadamardWidth::Disabled)
+        );
+        assert_eq!(
+            parse_hadamard_override("R", Some("hd"), default),
+            Ok(HadamardWidth::FullHead)
+        );
+        assert_eq!(
+            parse_hadamard_override("R", Some("64"), default),
+            Ok(HadamardWidth::Fixed(64))
+        );
+        assert_eq!(
+            parse_hadamard_override("R", Some("bad"), default),
+            Err("R must be '0', 'hd', or a positive integer; got 'bad'".into())
+        );
+    }
+
+    #[test]
+    fn established_128_and_cuda_64_value_layouts_never_alias() {
+        let established = byte_layout_profile_with_overrides(
+            KvType::Q4_0,
+            KvType::Q8_0,
+            KvQuantizationRoute::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let cuda = byte_layout_profile_with_overrides(
+            KvType::Q4_0,
+            KvType::Q8_0,
+            KvQuantizationRoute {
+                key: HadamardWidth::FullHead,
+                value: HadamardWidth::Fixed(64),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(established.value_basis(), KvQuantizationBasis::Fixed(128));
+        assert_eq!(cuda.value_basis(), KvQuantizationBasis::Fixed(64));
+        assert_ne!(
+            ConfigRoot::from_layout(b"m", &established, b"g"),
+            ConfigRoot::from_layout(b"m", &cuda, b"g")
+        );
+    }
+
+    #[test]
+    fn gpu_off_identity_uses_cpu_route_even_when_cuda_is_available() {
+        use imparo_backend::Backend as _;
+        let cuda_like = KvQuantizationRoute {
+            key: HadamardWidth::FullHead,
+            value: HadamardWidth::Fixed(64),
+        };
+        let route = execution_kv_route(false, cuda_like);
+        assert_eq!(route, imparo_cpu::CpuBackend.kv_quantization_route());
+        assert_eq!(route.value, HadamardWidth::Fixed(128));
+    }
+
+    #[test]
+    fn cpu_keeps_the_established_128_value_route() {
+        use imparo_backend::Backend as _;
+        let route = imparo_cpu::CpuBackend.kv_quantization_route();
+        assert_eq!(route.key, HadamardWidth::FullHead);
+        assert_eq!(route.value, HadamardWidth::Fixed(128));
+    }
+
+    #[test]
+    fn explicit_model_route_is_authoritative_and_ignores_diagnostic_overrides() {
+        let explicit = KvQuantizationRoute {
+            key: HadamardWidth::FullHead,
+            value: HadamardWidth::FullHead,
+        };
+        let route = kv_basis_route_with_overrides(
+            crate::KvStorageBasisPolicy::ExplicitRoute(explicit),
+            KvType::Q4_0,
+            KvType::Q8_0,
+            KvQuantizationRoute::default(),
+            None,
+            Some("bad"),
+            Some("0"),
+        )
+        .unwrap();
+        assert_eq!(route, explicit);
+    }
+
+    #[test]
+    fn canonical_policy_disables_both_quantized_basis_routes() {
+        let route = kv_basis_route_with_overrides(
+            crate::KvStorageBasisPolicy::Canonical,
+            KvType::Q4_0,
+            KvType::Q8_0,
+            KvQuantizationRoute::default(),
+            None,
+            Some("hd"),
+            Some("64"),
+        )
+        .unwrap();
+        assert_eq!(route.key, HadamardWidth::Disabled);
+        assert_eq!(route.value, HadamardWidth::Disabled);
+    }
+
+    #[test]
+    fn backend_override_or_canonical_preserves_metal_and_accepts_cuda_opt_in() {
+        let cuda = KvQuantizationRoute {
+            key: HadamardWidth::FullHead,
+            value: HadamardWidth::Fixed(64),
+        };
+        let established = kv_basis_route_with_overrides(
+            crate::KvStorageBasisPolicy::BackendOverrideOrCanonical,
+            KvType::Q4_0,
+            KvType::Q4_0,
+            KvQuantizationRoute::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(established.key, HadamardWidth::Disabled);
+        assert_eq!(established.value, HadamardWidth::Disabled);
+
+        let opted_in = kv_basis_route_with_overrides(
+            crate::KvStorageBasisPolicy::BackendOverrideOrCanonical,
+            KvType::Q4_0,
+            KvType::Q4_0,
+            KvQuantizationRoute::default(),
+            Some(cuda),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(opted_in, cuda);
+    }
+
+    #[test]
+    fn codec_contract_shares_f16_q4_but_splits_cuda_q8_rounding() {
+        let common = KvByteCodecRoute::default();
+        let cuda = KvByteCodecRoute {
+            q8_0: KvByteCodec::Q8_0RoundAwayV1,
+            ..common
+        };
+        assert_eq!(common.f16, cuda.f16);
+        assert_eq!(common.q4_0, cuda.q4_0);
+        assert_ne!(common.q8_0, cuda.q8_0);
+    }
+
+    #[cfg(any(feature = "cuda", feature = "cuda-dynamic"))]
+    #[test]
+    fn cuda_declaration_produces_the_distinct_64_value_layout() {
+        use imparo_backend::Backend as _;
+        let route = imparo_cuda::CudaBackend.kv_quantization_route();
+        let codecs = imparo_cuda::CudaBackend.kv_byte_codec_route();
+        assert_eq!(codecs.f16, KvByteCodec::F16LeRneV1);
+        assert_eq!(codecs.q4_0, KvByteCodec::Q4_0LlamaV1);
+        assert_eq!(codecs.q8_0, KvByteCodec::Q8_0RoundAwayV1);
+        assert_eq!(route.key, HadamardWidth::FullHead);
+        let selected = execution_kv_route(true, route);
+        assert_eq!(selected.key, HadamardWidth::FullHead);
+        assert_eq!(selected.value, HadamardWidth::Fixed(64));
+
+        assert_eq!(route.value, HadamardWidth::Fixed(64));
+        let established = byte_layout_profile_with_overrides(
+            KvType::Q4_0,
+            KvType::Q8_0,
+            KvQuantizationRoute::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let cuda = byte_layout_profile_with_overrides(
+            KvType::Q4_0,
+            KvType::Q8_0,
+            route,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            ConfigRoot::from_layout(b"m", &established, b"g"),
+            ConfigRoot::from_layout(b"m", &cuda, b"g")
+        );
+    }
+
+    #[test]
+    fn override_and_workflow_use_the_same_route_resolution() {
+        let profile = byte_layout_profile_with_overrides(
+            KvType::Q4_0,
+            KvType::Q8_0,
+            KvQuantizationRoute::default(),
+            Some("hd"),
+            Some("64"),
+        )
+        .unwrap();
+        assert_eq!(profile.key_basis(), KvQuantizationBasis::FullHead);
+        assert_eq!(profile.value_basis(), KvQuantizationBasis::Fixed(64));
+        assert_eq!(
+            resolve_hadamard_override(
+                "IMPARO_HAD_V",
+                Some("64"),
+                HadamardWidth::Fixed(128),
+                256
+            ),
+            Ok(64)
+        );
+    }
+
+    #[test]
+    fn textual_zero_routes_share_one_disabled_identity() {
+        let zero = byte_layout_profile_with_overrides(
+            KvType::Q4_0,
+            KvType::Q8_0,
+            KvQuantizationRoute::default(),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let padded = byte_layout_profile_with_overrides(
+            KvType::Q4_0,
+            KvType::Q8_0,
+            KvQuantizationRoute::default(),
+            Some("00"),
+            Some("000"),
+        )
+        .unwrap();
+        assert_eq!(zero.key_basis(), KvQuantizationBasis::Disabled);
+        assert_eq!(zero.value_basis(), KvQuantizationBasis::Disabled);
+        assert_eq!(zero, padded);
+        assert_eq!(
+            ConfigRoot::from_layout(b"m", &zero, b"g"),
+            ConfigRoot::from_layout(b"m", &padded, b"g")
+        );
+    }
+
+    #[test]
+    fn f16_sides_ignore_irrelevant_quantization_routes_and_invalid_overrides() {
+        let a = byte_layout_profile_with_overrides(
+            KvType::F16,
+            KvType::F16,
+            KvQuantizationRoute::default(),
+            Some("bad"),
+            Some("bad"),
+        )
+        .unwrap();
+        let b = byte_layout_profile_with_overrides(
+            KvType::F16,
+            KvType::F16,
+            KvQuantizationRoute {
+                key: HadamardWidth::Fixed(64),
+                value: HadamardWidth::FullHead,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.key_basis(), KvQuantizationBasis::Disabled);
+        assert_eq!(a.value_basis(), KvQuantizationBasis::Disabled);
+    }
+
+    #[test]
+    fn invalid_quantized_override_is_rejected() {
+        let error = byte_layout_profile_with_overrides(
+            KvType::Q4_0,
+            KvType::F16,
+            KvQuantizationRoute::default(),
+            Some("bad"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "IMPARO_HAD_K must be '0', 'hd', or a positive integer; got 'bad'"
+        );
     }
 }

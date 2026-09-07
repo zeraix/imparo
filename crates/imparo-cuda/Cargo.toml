@@ -1,20 +1,43 @@
 [package]
 name = "imparo-cuda"
-description = "CUDA backend skeleton: the Backend trait as stubs a Windows/CUDA developer fills"
+description = "Direct CUDA backend for Imparo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [features]
-# Everything real sits behind this feature: with it OFF (the default) the crate
-# compiles everywhere -- including this macOS dev machine -- to nothing but the
-# module skeleton, so shared-code changes cannot rot it unnoticed.
-cuda = []
+# `cuda` remains the source-build/developer spelling and links one locally compiled
+# native backend. Official thin releases use `cuda-dynamic`: the common runtime is
+# toolkit-free and resolves exactly one per-SM backend at runtime.
+cuda = ["cuda-static"]
+cuda-static = ["dep:imparo-program-pack", "dep:sha2"]
+cuda-dynamic = ["dep:ed25519-dalek", "dep:imparo-program-pack", "dep:serde_json", "dep:sha2"]
+signing-tool = ["dep:ed25519-dalek", "dep:serde_json", "dep:sha2"]
 
 [dependencies]
 imparo-backend = { path = "../imparo-backend" }
 imparo-host = { path = "../imparo-host" }
+imparo-program-pack = { path = "../imparo-program-pack", optional = true }
+ed25519-dalek = { version = "2.1", optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.11", optional = true }
+
+[build-dependencies]
+serde_json = "1"
+sha2 = "0.11"
+
+[dev-dependencies]
+base64 = "0.22"
+ed25519-dalek = "2.1"
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+
+[[bin]]
+name = "imparo-cuda-sign"
+path = "src/bin/imparo-cuda-sign.rs"
+required-features = ["signing-tool"]
 
 # FFI onto the .cu surface is unsafe by nature -- the same exception imparo-metal
 [lints]

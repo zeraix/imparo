@@ -129,10 +129,10 @@ pub fn prepare(weights: &Weights, plan: &ModelPlan) -> Result<ModelW, String> {
 /// # Errors
 /// When the plan and the resolved weights disagree about a layer's block kind.
 pub fn batch(
-wf: &mut Lfm2,
-tokens: &[u32],
-start_pos: usize,
-out: &mut Vec<f32>,
+    wf: &mut Lfm2,
+    tokens: &[u32],
+    start_pos: usize,
+    out: &mut Vec<f32>,
 ) -> Result<(), String> {
     let c = wf.plan.config.clone();
     let n_embd = c.n_embd as usize;

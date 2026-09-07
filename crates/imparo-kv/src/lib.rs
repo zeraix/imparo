@@ -16,15 +16,42 @@
 //! behavior is unchanged while this crate is not called.
 
 pub mod alloc;
+pub mod disk;
 pub mod identity;
 pub mod index;
+pub mod pool;
 pub mod resident;
 pub mod state;
 pub mod store;
+pub mod tenant;
 
 pub use alloc::BlockAllocator;
-pub use identity::{ConfigRoot, UNIT_TOKENS, UnitHash, unit_hashes};
-pub use index::{ConversationId, Pool, Probe, UnitId};
-pub use resident::{ResidentKv, UNIT_BLOCKS};
-pub use state::{KvDelta, KvLayerState, KvState, LayerStateGeom, StateKind};
+pub use disk::DiskQueue;
+pub use identity::{
+    ConfigRoot, DEFAULT_PAGE_CELLS, KV_BYTE_LAYOUT_PROFILE_VERSION,
+    KvByteLayoutProfile, KvByteType, KvQuantizationBasis, PrefixHash, UnitHash,
+    grid_tokens, page_cells, prefix_hashes, resident_bounds, set_page_cells, unit_id,
+    unit_ids, unit_ids_at,
+};
+pub use index::{AdoptError, ConversationId, Lookup, Pool, Probe, UnitId};
+pub use pool::PoolMode;
+pub use resident::{
+    DemotionPlan, DroppedConversation, EvictedResidency, HostResidency,
+    PlacementLifecycle, PromotionPlan, ResidencyError, ResidentKv, ResidentProbe,
+    ResidentProbePlan, SealOutcome, TableError, UNIT_BLOCKS, UnitPlacement,
+    UnitResidency,
+};
+pub use state::{
+    CheckpointShape, KvDelta, KvLayerState, KvState, LayerStateGeom, StateKind,
+};
 pub use store::{Manifest, Store};
+pub use tenant::PoolTenant;
+
+/// Whether the engine's own logging is on (`IMPARO_LOG`).
+///
+/// A copy of `imparo_model::log_on` rather than a call to it: this crate sits below
+/// the model crate, and one env read is not worth a dependency edge.
+#[must_use]
+pub fn log_on() -> bool {
+    std::env::var("IMPARO_LOG").is_ok_and(|v| v != "0" && !v.is_empty())
+}

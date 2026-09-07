@@ -7,6 +7,9 @@
 **Native model execution, measurement-driven tuning, and persistent inference state—unified in a Rust runtime.**
 
 [Why Imparo](#why-imparo) ·
+[Design Rules](#design-rules) ·
+[Megakernel Decode](#megakernel-decode) ·
+[Performance](#performance) ·
 [Latest Updates](#latest-updates) ·
 [Quick Start](#quick-start) ·
 [Contributing](#contributing) ·
@@ -51,6 +54,72 @@ shape—from short decode steps to long prefills and repeated-prefix workloads.
 - **Correctness-gated optimization.** Candidate optimizations must preserve
   model outputs and state transitions before they can be selected. Performance
   results remain bound to the configuration and hardware that produced them.
+
+## Design rules
+
+Two rules define the layering; everything else is their consequence.
+
+- **A model contributes a plan and a workflow, never a scattered code path.** No
+  `if arch == "gemma4"` outside the model layer.
+- **A backend contributes kernels, never model knowledge.** No model name in a kernel. The one
+  deliberate exception is the Metal megakernel's phase list: a decode layer is emitted from a
+  per-architecture list of phases held in the backend, so a new architecture is a program rather
+  than a new hand-written kernel.
+
+And two principles govern how the code is allowed to grow:
+
+- **Simple is the strength.** Middleware is thin: common abstraction exists only where it
+  removes redundant code. There is no graph IR, no scheduler, no runtime fusion machinery —
+  a model's workflow is a direct, hand-scheduled function calling a backend trait. Fusion
+  happens by hand, where a measurement justified it.
+- **Nothing is believed without a measurement.** Every kernel change is gated on pinned
+  logits, determinism suites, and interleaved same-session comparisons. Rejected
+  experiments are recorded with their numbers so they are not re-attempted on a hunch.
+
+## Megakernel decode
+
+On Metal a decode step used to be about 180 (Gemma 4 E4B) or 34 (LFM2) small GPU dispatches
+per token, each carrying 5-9 microseconds of fixed cost around less than a microsecond of
+arithmetic. Imparo now runs a whole decode layer as **one persistent dispatch**: the
+threadgroups stay resident for the layer and a grid barrier stands where each dispatch
+boundary used to be. On LFM2 a single dispatch covers all of a token's layers.
+
+```
+  dispatches per decode token     Gemma 4 E4B  ~180 -> 42     LFM2  34 -> 5
+```
+
+Both kernels are generated at build time from a phase list the host writes -- a phase is the
+entry condition that enables it, the code it runs, and what separates it from the next phase
+-- so a new architecture is a list of phases rather than a hand-written kernel. The route
+refuses a layer it cannot serve (weights not resident, a shape the pipeline was not compiled
+for) and leaves it on the ordinary dispatch path; a region that fails to complete is rolled
+back and re-run there, so the fast route cannot return a wrong answer.
+
+## Performance
+
+Apple M3 Pro, Gemma 4 E4B (`UD-Q4_K_XL`) and LFM2.5-2.6B (`Q8_0`), f16 KV cache, 512-token
+prefill chunks, thinking disabled on every engine. tok/s, median of two interleaved rounds.
+Every engine is measured the same way and in the same session: a client sends the same prompt
+to each in turn and times it, so prefill is derived from time-to-first-token and decode from
+the token stream — no engine reports its own numbers. A reference cell shows that engine's
+tok/s and imparo's lead over it.
+
+| model | prompt | phase | imparo | llama.cpp | oMLX | rapid-mlx |
+|---|---|---|---|---|---|---|
+| E4B | 449 | prefill | **932** | 556 (+68%) | 590 (+58%) | 830 (+12%) |
+| E4B | 5651 | prefill | **1063** | 570 (+86%) | 904 (+18%) | 960 (+11%) |
+| E4B | 16191 | prefill | **1006** | 522 (+93%) | 888 (+13%) | 914 (+10%) |
+| LFM2 | 455 | prefill | **1023** | 933 (+10%) | 675 (+52%) | 857 (+19%) |
+| LFM2 | 5963 | prefill | **1060** | 980 (+8%) | 964 (+10%) | 1007 (+5%) |
+| LFM2 | 17123 | prefill | **972** | 900 (+8%) | 921 (+6%) | 957 (+2%) |
+| E4B | 449 | decode | **46.6** | 40.5 (+15%) | 43.9 (+6%) | 42.8 (+9%) |
+| E4B | 5651 | decode | **44.2** | 38.5 (+15%) | 41.8 (+6%) | 40.5 (+9%) |
+| E4B | 16191 | decode | **40.0** | 34.5 (+16%) | 37.9 (+6%) | 36.7 (+9%) |
+| LFM2 | 455 | decode | **46.6** | 43.9 (+6%) | 46.8 (tie) | 44.6 (+4%) |
+| LFM2 | 5963 | decode | **45.1** | 42.4 (+7%) | 44.6 (+1%) | 42.6 (+6%) |
+| LFM2 | 17123 | decode | **42.7** | 40.0 (+7%) | 40.8 (+5%) | 39.6 (+8%) |
+
+Ahead on every cell but one: LFM2's short-prompt decode ties oMLX (46.6 against 46.8).
 
 ## Latest Updates
 

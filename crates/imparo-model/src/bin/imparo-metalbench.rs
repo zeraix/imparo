@@ -55,9 +55,214 @@ mod bench {
         // The plan is what says which activation the epilogue kernels are specialised
         // with, so the bench profiles the pipelines this model would actually run.
         let plan = imparo_model::build_plan(&imparo_gguf::read(&path)?, &path)?;
-        imparo_model::backend::enable_gpu(&mut w, &plan)?;
+        imparo_model::backend::enable_gpu(
+            &mut w,
+            &plan,
+            plan.config.context_length as usize,
+            imparo_model::prefill_batch(),
+        )?;
         if !w.gpu_enabled() {
             return Err("metal not enabled".into());
+        }
+
+        // ---- ATTENTION PROBE: one prefill attention dispatch per geometry ----------------
+        //
+        // IMPARO_BENCH_ATTN="n_tok,pos;n_tok,pos" times ONE dispatch of this model's prefill
+        // attention (its attention layers' head dim, full attention, causal over pos + n_tok
+        // keys) on synthetic f16 K/V, GPU-timed, min of five after a warm-up. It is how this
+        // engine's kernel is put beside another engine's on the SAME geometry with neither
+        // graph around it: llama.cpp's `test-backend-ops perf -o FLASH_ATTN_EXT` with
+        // TBO_CAUSAL_MASK=1 at (hsk = hd, nh = kv heads, nr23 = {GQA, 1}, kv = pos + n_tok,
+        // nb = n_tok) is the other side (docs/evidence/bracket/2026-09-01-attention-
+        // isolation.md). The route follows the engine's own selection, so IMPARO_ATTN_FA=1
+        // and the tuned config apply and the time is the kernel the engine would run. Light
+        // by construction: one dispatch per sample, no sweep.
+        if let Ok(spec) = std::env::var("IMPARO_BENCH_ATTN") {
+            let c = &plan.config;
+            let pick = |want_full: bool| {
+                plan.layers.iter().find_map(|l| match l.attention {
+                    imparo_model::Attention::Full { head_dim, .. } if want_full => {
+                        Some(head_dim)
+                    }
+                    imparo_model::Attention::Window { head_dim, .. } if !want_full => {
+                        Some(head_dim)
+                    }
+                    _ => None,
+                })
+            };
+            // IMPARO_BENCH_ATTN_WINDOW=1 times the WINDOWED layers' head dim instead (gemma4
+            // E4B: 35 layers at hd 256 over at most 512 keys -- the fixed per-token attention
+            // cost at every context length); default is the full-attention head dim.
+            let want_window =
+                std::env::var("IMPARO_BENCH_ATTN_WINDOW").is_ok_and(|v| v == "1");
+            let hd = pick(!want_window)
+                .or_else(|| pick(want_window))
+                .ok_or("model has no attention layer")?;
+            let geoms: Vec<(u32, u32)> = spec
+                .split(';')
+                .filter_map(|p| {
+                    let (a, b) = p.split_once(',')?;
+                    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                })
+                .collect();
+            let span = geoms
+                .iter()
+                .map(|&(n, p)| n + p)
+                .max()
+                .ok_or("IMPARO_BENCH_ATTN: no geometry (want \"n_tok,pos;...\")")?;
+            // One KV layer (index 0), f16 rows of kv_width, with the tuner's allowance over
+            // the span so the ring the engine allocates is reproduced.
+            let kv_width = c.n_kv_heads * hd;
+            let slots = u64::from(span + span / 4);
+            let kv_bytes = u64::from(kv_width) * 2 * slots;
+            // COLD K/V (IMPARO_BENCH_KV_LAYERS=N): N layers' caches, the probe cycling through
+            // them one per dispatch, so consecutive dispatches never find their K/V in the
+            // cache -- the engine's case, where a gigabyte of weights streams between two
+            // attention layers. One layer (the default) re-reads a warm cache.
+            let kv_layers: u32 = std::env::var("IMPARO_BENCH_KV_LAYERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+                .max(1);
+            let layer_bytes: Vec<u64> = (0..kv_layers).map(|_| kv_bytes).collect();
+            m::alloc_kv(&layer_bytes).map_err(|rc| format!("alloc_kv rc={rc}"))?;
+            // WRITE THE CACHE BEFORE READING IT. A buffer that was allocated and never
+            // touched is demand-zero pages; the kernel would time page faults, not loads,
+            // and the more span it sweeps the more of them. Real half values in every row,
+            // as the tuner stages its synthetic K/V (IMPARO_BENCH_KV_ZERO=1 keeps the
+            // untouched buffer, for measuring that difference itself).
+            if std::env::var_os("IMPARO_BENCH_KV_ZERO").is_none() {
+                let mut row =
+                    vec![0_u8; usize::try_from(kv_bytes).expect("kv bytes fit usize")];
+                for (i, pair) in row.chunks_exact_mut(2).enumerate() {
+                    // f16 in [-0.5, 0.5): a 10-bit mantissa pattern keyed on the element index
+                    let v = ((i as u32 * 2_654_435_761_u32) >> 22) as u16;
+                    let bits = 0x3000u16 | (v & 0x03ff) | ((i as u16 & 1) << 15);
+                    pair.copy_from_slice(&bits.to_le_bytes());
+                }
+                for l in 0..kv_layers {
+                    m::write_kv_bytes(l, false, 0, &row);
+                    m::write_kv_bytes(l, true, 0, &row);
+                }
+            }
+            // SCATTERED PAGES (IMPARO_BENCH_KV_SCATTER=1): the pool places a conversation's
+            // 64-cell pages wherever it has room, so the engine's attention walks a permuted
+            // table where the bench's default walks the identity. A fixed pseudo-random
+            // permutation of the layer's pages puts the placement cost on the probe; the
+            // difference against the identity run is what the pool's placement costs the
+            // kernel. Same set of pages, so every read stays inside the allocation.
+            if std::env::var_os("IMPARO_BENCH_KV_SCATTER").is_some() {
+                let npages = u32::try_from(slots / 64).expect("page count fits u32");
+                let mut perm: Vec<u32> = (0..npages).collect();
+                let mut x: u32 = 0x9e37_79b9;
+                for i in (1..perm.len()).rev() {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5; // xorshift32, deterministic
+                    let j = (x as usize) % (i + 1);
+                    perm.swap(i, j);
+                }
+                m::set_kv_page_table(0, &perm);
+                println!("-- pages scattered: {npages} pages, a fixed permutation --");
+            }
+            let max_tok = geoms.iter().map(|&(n, _)| n).max().unwrap_or(1);
+            let act = u64::from(max_tok) * u64::from(c.n_heads) * u64::from(hd) * 4;
+            m::alloc(m::buf::Q, act).map_err(|rc| format!("alloc Q rc={rc}"))?;
+            m::alloc(m::buf::ATTN, act).map_err(|rc| format!("alloc ATTN rc={rc}"))?;
+            println!(
+                "-- attention probe: hd={hd} heads={}/{} f16 KV, one dispatch, min of 5 --",
+                c.n_heads, c.n_kv_heads
+            );
+            // WARM THE CLOCK FIRST. The GPU idles down between processes, and a probe taken
+            // on the way back up reads high and swings: the 1024-key geometry read 2.6 ms in
+            // one run and 1.15 in the next with nothing changed. ~300 ms of the deepest
+            // geometry's own dispatches before the first measurement, as the tuner warms up.
+            if let Some(&(wn, wp)) = geoms.iter().max_by_key(|&&(n, p)| n + p) {
+                let t0 = std::time::Instant::now();
+                while t0.elapsed().as_millis() < 300 {
+                    m::begin();
+                    m::attention(
+                        0,
+                        hd,
+                        c.n_heads,
+                        c.n_kv_heads,
+                        kv_width,
+                        wp,
+                        0,
+                        wn,
+                        (wp + wn).clamp(1, 8192),
+                        0,
+                    );
+                    m::end().map_err(|rc| format!("attention rc={rc}"))?;
+                }
+            }
+            for &(n_tok, pos) in &geoms {
+                let keys = pos + n_tok;
+                let next_layer = std::cell::Cell::new(0u32);
+                let dispatch = || {
+                    let l = next_layer.get();
+                    next_layer.set((l + 1) % kv_layers);
+                    m::attention(
+                        l,
+                        hd,
+                        c.n_heads,
+                        c.n_kv_heads,
+                        kv_width,
+                        pos,
+                        0,
+                        n_tok,
+                        keys.clamp(1, 8192),
+                        0,
+                    );
+                };
+                // SEVERAL DISPATCHES PER COMMAND BUFFER, time divided by their count, as the
+                // tuner's time_us does. A command buffer carries a fixed GPU-side cost that a
+                // single ~1 ms dispatch cannot hide: one dispatch per buffer read 1.7-1.95 ms
+                // for a kernel the tuner times at 1.0, and matched it within 3% at 20 ms.
+                // Two phases, because the clock ramps over the first buffers and any ONE
+                // early sample over-sizes nothing: five single-dispatch buffers give a min,
+                // that min sizes the rep count to ~4 ms of work, and five buffers of that
+                // many dispatches give the number reported.
+                // Both the min and the mean are printed: llama.cpp's `test-backend-ops perf`
+                // reports the MEAN over >= 1 s of runs, so a comparison against it reads the
+                // mean column; the min is the kernel's own cost with the machine's phase out.
+                // Five buffers gave a mean 5-31% over the min (one slow buffer in five moves
+                // it); the mean is taken over >= 300 ms of GPU time instead, at least five
+                // buffers, each still <= ~4 ms of dispatches so nothing here can stall the
+                // screen.
+                // IMPARO_BENCH_ATTN_REPS=N pins the dispatches per buffer (1 = one dispatch
+                // per command buffer: the LATENCY of a dispatch standing alone, the way a
+                // decode step runs it, plus the buffer's fixed cost, which an A/B cancels).
+                let forced_reps: Option<usize> =
+                    std::env::var("IMPARO_BENCH_ATTN_REPS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|&r: &usize| r >= 1);
+                let sample =
+                    |reps: usize, floor_us: f64| -> Result<(f64, f64, usize), String> {
+                        let reps = forced_reps.unwrap_or(reps);
+                        let (mut best, mut sum, mut n) = (f64::INFINITY, 0.0, 0usize);
+                        while n < 5 || sum < floor_us {
+                            m::begin();
+                            for _ in 0..reps {
+                                dispatch();
+                            }
+                            m::end().map_err(|rc| format!("attention rc={rc}"))?;
+                            let us = m::last_gpu_us();
+                            best = best.min(us / reps as f64);
+                            sum += us;
+                            n += 1;
+                        }
+                        Ok((best, sum / (n * reps) as f64, n * reps))
+                    };
+                let single = sample(1, 0.0)?;
+                let reps = ((4000.0 / single.0.max(1.0)) as usize).clamp(1, 64);
+                let (best, mean, n) = sample(reps, 300_000.0)?;
+                println!(
+                    "attn probe  n_tok={n_tok} pos={pos} keys={keys}  min {best:.1} us  mean {mean:.1} us  ({n} dispatches, {reps} per buffer)"
+                );
+            }
+            return Ok(());
         }
 
         // ---- SHORTCONV CORRECTNESS, GPU AGAINST THE CPU REFERENCE ---------------------
@@ -80,7 +285,9 @@ mod bench {
             let be = imparo_model::backend::active().ok_or("no backend")?;
             let name = "blk.0.shortconv.conv.weight";
             let Some(cw_t) = w.get(name).copied() else {
-                return Err(format!("{name} absent: this check needs an LFM2 file").into());
+                return Err(
+                    format!("{name} absent: this check needs an LFM2 file").into()
+                );
             };
             let cw = w.f32s(&cw_t).to_vec();
             let width = cw_t.ne1();
@@ -113,7 +320,13 @@ mod bench {
                 let mut dev_out = vec![0.0_f32; n_tok * width];
                 for call in 0..2 {
                     imparo_model::ops::shortconv(
-                        &bcx, &cw, &mut host_state, &mut host_out, width, kern, n_tok,
+                        &bcx,
+                        &cw,
+                        &mut host_state,
+                        &mut host_out,
+                        width,
+                        kern,
+                        n_tok,
                     );
                     be.begin();
                     be.write(BufId::Model0, 0, &bcx);
@@ -150,10 +363,19 @@ mod bench {
                         if ok { "OK" } else { "FAIL" }
                     );
                     if !ok && std::env::var("IMPARO_SHORTCONV_DUMP").is_ok() {
-                        println!("    out host {:?}", &host_out[..4.min(host_out.len())]);
+                        println!(
+                            "    out host {:?}",
+                            &host_out[..4.min(host_out.len())]
+                        );
                         println!("    out dev  {:?}", &dev_out[..4.min(dev_out.len())]);
-                        println!("    st  host {:?}", &host_state[..4.min(host_state.len())]);
-                        println!("    st  dev  {:?}", &dev_state[..4.min(dev_state.len())]);
+                        println!(
+                            "    st  host {:?}",
+                            &host_state[..4.min(host_state.len())]
+                        );
+                        println!(
+                            "    st  dev  {:?}",
+                            &dev_state[..4.min(dev_state.len())]
+                        );
                         println!("    cw       {:?}", &cw[..6.min(cw.len())]);
                         println!("    bcx      {:?}", &bcx[..4.min(bcx.len())]);
                     }
@@ -190,19 +412,36 @@ mod bench {
                     let mut ref_state = seed.clone();
                     let mut ref_out = vec![0.0_f32; k * width];
                     imparo_model::ops::shortconv(
-                        &bcx[..k * 3 * width], &cw, &mut ref_state, &mut ref_out,
-                        width, kern, k,
+                        &bcx[..k * 3 * width],
+                        &cw,
+                        &mut ref_state,
+                        &mut ref_out,
+                        width,
+                        kern,
+                        k,
                     );
                     be.write(BufId::Recur, 0, &seed);
                     be.begin();
                     be.write(BufId::Model0, 0, &bcx);
                     be.shortconv_snapshot(
-                        BufId::Model0, BufId::Recur, 0, BufId::RecurSnap, 0,
-                        width as u32, kern as u32, k as u32,
+                        BufId::Model0,
+                        BufId::Recur,
+                        0,
+                        BufId::RecurSnap,
+                        0,
+                        width as u32,
+                        kern as u32,
+                        k as u32,
                     );
                     be.shortconv(
-                        BufId::Model0, cw_t.offset as u64, BufId::Recur, 0, BufId::O,
-                        width as u32, kern as u32, n_tok as u32,
+                        BufId::Model0,
+                        cw_t.offset as u64,
+                        BufId::Recur,
+                        0,
+                        BufId::O,
+                        width as u32,
+                        kern as u32,
+                        n_tok as u32,
                     );
                     be.end().map_err(|rc| format!("snapshot end rc={rc}"))?;
                     let mut snap = vec![0.0_f32; seed.len()];
@@ -254,7 +493,9 @@ mod bench {
             let mut fails = 0usize;
             let mut worst = 0.0_f64;
             for name in names {
-                let Some(t) = w.get(name).copied() else { continue };
+                let Some(t) = w.get(name).copied() else {
+                    continue;
+                };
                 let Some(kind) = imparo_gguf::weights::weight_kind(t.ggml_type) else {
                     println!("SKIP {name}: ggml type {} has no kernel", t.ggml_type);
                     continue;
@@ -281,21 +522,26 @@ mod bench {
                             v.push((4u32, tile, sgs, 0, 0));
                         }
                     }
-                    for shape in 0..m::q8_gemm_shapes() {
+                    for shape in 0..m::st_gemm_shapes() {
                         for n_tok in [32u32, 33, 64] {
                             v.push((n_tok, 0, 0, shape, 1));
                         }
                     }
                     v
                 } else {
-                    vec![(1, 0, 0, 0, 0), (4, 0, 0, 0, 0), (32, 0, 0, 0, 0),
-                         (33, 0, 0, 0, 0), (64, 0, 0, 0, 0)]
+                    vec![
+                        (1, 0, 0, 0, 0),
+                        (4, 0, 0, 0, 0),
+                        (32, 0, 0, 0, 0),
+                        (33, 0, 0, 0, 0),
+                        (64, 0, 0, 0, 0),
+                    ]
                 };
                 for (n_tok, cfa, cfb, shape, is_gemm) in combos {
                     if wire == 2 {
                         if is_gemm == 1 {
-                            m::set_q8_gemm_shape(shape);
-                            m::set_q8_gemm_large_shape(shape);
+                            m::set_st_gemm_shape(shape);
+                            m::set_st_gemm_large_shape(shape);
                         } else if n_tok == 1 {
                             m::set_q8_decode_rows(cfa);
                             m::set_q8_decode_sgs(cfb);
@@ -313,9 +559,16 @@ mod bench {
                         })
                         .collect();
                     let mut want = vec![0.0f32; (n_out as usize) * (n_tok as usize)];
-                    imparo_cpu::ops::mul_mat_batch(&w, &t, &x, n_tok as usize, &mut want);
+                    imparo_cpu::ops::mul_mat_batch(
+                        &w,
+                        &t,
+                        &x,
+                        n_tok as usize,
+                        &mut want,
+                    );
 
-                    m::alloc(m::buf::X, x.len() as u64 * 4).map_err(|e| format!("alloc x {e}"))?;
+                    m::alloc(m::buf::X, x.len() as u64 * 4)
+                        .map_err(|e| format!("alloc x {e}"))?;
                     m::alloc(m::buf::LOGITS, want.len() as u64 * 4)
                         .map_err(|e| format!("alloc y {e}"))?;
                     m::write(m::buf::X, 0, &x);
@@ -360,11 +613,19 @@ mod bench {
                     } else if route == "gemm" {
                         format!("shape={shape}")
                     } else if route == "gemv" {
-                        format!("rows={} sgs={}", m::q8_decode_rows(), m::q8_decode_sgs())
+                        format!(
+                            "rows={} sgs={}",
+                            m::q8_decode_rows(),
+                            m::q8_decode_sgs()
+                        )
                     } else {
                         format!("tile={} sgs={}", m::q8_token_tile(), m::q8_batch_sgs())
                     };
-                    let bad = if route == "gemm" { rel >= 1e-3 } else { rel >= 1e-5 };
+                    let bad = if route == "gemm" {
+                        rel >= 1e-3
+                    } else {
+                        rel >= 1e-5
+                    };
                     if bad {
                         fails += 1;
                     }
@@ -377,7 +638,9 @@ mod bench {
                 }
             }
             if checked == 0 {
-                return Err("quant check found no quantised tensor in this model".into());
+                return Err(
+                    "quant check found no quantised tensor in this model".into()
+                );
             }
             // TWO TOLERANCES, because the routes do not carry the same arithmetic.
             //
@@ -563,7 +826,9 @@ mod bench {
             println!(
                 "  threadgroup memory vs throughput, 8 acc, 6 loads per 8 multiplies:"
             );
-            for smem in [2048u32, 8192, 16896, 32768] {
+            // 6144 = st_gemm shape 3's allocation, 8448 = rt_gemm's gated 64x64 and
+            // 12288 = st_gemm at K chunk 64: the residency points the GEMM shapes sit at.
+            for smem in [2048u32, 6144, 8192, 8448, 12288, 16896, 32768] {
                 let t = m::mma_loaded_smem(280, 8, 4096, smem);
                 println!("    {smem:5} bytes   {t:5.2} TFLOPS");
             }
@@ -590,6 +855,105 @@ mod bench {
         // wide FFN matmuls with narrow q/k/v ones. A narrow n_out launches few threadgroups and
         // may simply not fill the GPU, which is a different problem from a slow kernel -- and
         // the two want opposite fixes. Cycling layers keeps every read cold, as above.
+        // IMPARO_BENCH_GEMV=1 times this model's DECODE GEMV (n_tok = 1) per projection
+        // shape, on the model's own weight kind -- the row-major Q8_0 file and the
+        // tile-major Q8_0_TM file therefore measure their own kernels on identical shapes.
+        // One dispatch per layer's tensor of a shape, several per command buffer, min and
+        // mean over >= 300 ms of GPU time, after a 300 ms clock warm-up: the same
+        // instrument as the attention probe, because the tuner's decode workload floor
+        // (5-10%) cannot resolve the 1-3% the bracket showed and a bracket costs 7 minutes.
+        if std::env::var("IMPARO_BENCH_GEMV").is_ok() {
+            let mut groups: std::collections::BTreeMap<
+                String,
+                Vec<(u32, u64, u32, u32)>,
+            > = std::collections::BTreeMap::new();
+            let (mut max_in, mut max_out) = (0u64, 0u64);
+            for (name, t) in &w.tensors {
+                if t.n_dims != 2 || name == "token_embd.weight" {
+                    continue;
+                }
+                let Some(kind) = imparo_gguf::weights::weight_kind(t.ggml_type) else {
+                    continue;
+                };
+                let wire = kind as u32;
+                if wire != 1 && wire != 2 && wire != 3 {
+                    continue;
+                }
+                let suffix = name
+                    .splitn(3, '.')
+                    .nth(2)
+                    .unwrap_or(name.as_str())
+                    .to_string();
+                groups.entry(suffix).or_default().push((
+                    wire,
+                    t.offset as u64,
+                    t.ne0() as u32,
+                    t.ne1() as u32,
+                ));
+                max_in = max_in.max(t.ne0() as u64);
+                max_out = max_out.max(t.ne1() as u64);
+            }
+            if groups.is_empty() {
+                return Err(
+                    "IMPARO_BENCH_GEMV: no 2-D Q8 projection in this model".into()
+                );
+            }
+            m::alloc(m::buf::X, max_in * 4).map_err(|e| format!("alloc {e}"))?;
+            m::alloc(m::buf::O, max_out * 4).map_err(|e| format!("alloc {e}"))?;
+            let xin: Vec<f32> =
+                (0..max_in).map(|i| 0.01 + (i % 7) as f32 * 1e-3).collect();
+            m::write(m::buf::X, 0, &xin);
+            let first = groups.values().next().unwrap().clone();
+            let t0 = std::time::Instant::now();
+            while t0.elapsed().as_millis() < 300 {
+                m::begin();
+                for &(wire, off, n_in, n_out) in &first {
+                    m::matmat(wire, off, n_in, n_out, m::buf::X, m::buf::O, 1);
+                }
+                m::end().map_err(|rc| format!("gemv rc={rc}"))?;
+            }
+            println!("-- gemv probe: n_tok=1, min and mean per dispatch --");
+            for (suffix, tensors) in &groups {
+                let sample =
+                    |reps: usize, floor_us: f64| -> Result<(f64, f64, usize), String> {
+                        let (mut best, mut sum, mut n) = (f64::INFINITY, 0.0, 0usize);
+                        let per_buf = reps * tensors.len();
+                        while n < 5 || sum < floor_us {
+                            m::begin();
+                            for _ in 0..reps {
+                                for &(wire, off, n_in, n_out) in tensors {
+                                    m::matmat(
+                                        wire,
+                                        off,
+                                        n_in,
+                                        n_out,
+                                        m::buf::X,
+                                        m::buf::O,
+                                        1,
+                                    );
+                                }
+                            }
+                            m::end().map_err(|rc| format!("gemv rc={rc}"))?;
+                            let us = m::last_gpu_us();
+                            best = best.min(us / per_buf as f64);
+                            sum += us;
+                            n += 1;
+                        }
+                        Ok((best, sum / (n * per_buf) as f64, n * per_buf))
+                    };
+                let single = sample(1, 0.0)?;
+                let reps = ((4000.0 / (single.0 * tensors.len() as f64).max(1.0))
+                    as usize)
+                    .clamp(1, 64);
+                let (best, mean, n) = sample(reps, 300_000.0)?;
+                let (wire, _, n_in, n_out) = tensors[0];
+                println!(
+                    "gemv probe  {suffix:<28} kind={wire} {n_in:>5}->{n_out:<6} x{:<2} min {best:>7.1} us  mean {mean:>7.1} us  ({n} dispatches)",
+                    tensors.len()
+                );
+            }
+            return Ok(());
+        }
         {
             let n_tok: u32 = std::env::var("IMPARO_BENCH_TOK")
                 .ok()

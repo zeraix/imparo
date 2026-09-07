@@ -35,7 +35,9 @@ const MINIMUM_METADATA_ENTRY_RESIDENT_BYTES: u64 = 1024;
 mod test_coordination {
     use std::cell::RefCell;
     use std::io;
+    #[cfg(unix)]
     use std::marker::PhantomData;
+    #[cfg(unix)]
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
@@ -63,17 +65,20 @@ mod test_coordination {
         static ACTIVE: RefCell<Option<Arc<State>>> = const { RefCell::new(None) };
     }
 
+    #[cfg(unix)]
     #[derive(Debug)]
     pub(super) struct Scope {
         state: Arc<State>,
         _not_send: PhantomData<Rc<()>>,
     }
 
+    #[cfg(unix)]
     #[derive(Debug)]
     pub(super) struct Controller {
         state: Arc<State>,
     }
 
+    #[cfg(unix)]
     pub(super) fn intercept_after(
         reads_to_skip: u64,
     ) -> io::Result<(Scope, Controller)> {
@@ -103,6 +108,7 @@ mod test_coordination {
         ))
     }
 
+    #[cfg(unix)]
     impl Controller {
         pub(super) fn wait_until_reader_located(&self) -> io::Result<()> {
             let phase = self.state.phase.lock().map_err(|_| {
@@ -139,6 +145,7 @@ mod test_coordination {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Scope {
         fn drop(&mut self) {
             ACTIVE.with(|active| {
@@ -296,6 +303,9 @@ pub struct TensorInfo {
     pub relative_offset: u64,
     pub absolute_offset: u64,
     pub byte_size: u64,
+    /// File offset of this tensor's `ggml_type` u32 inside the tensor-info table, so a
+    /// converter can retype a tensor in place without re-serialising the header.
+    pub type_field_offset: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -594,8 +604,15 @@ fn snapshot_read_options() -> OpenOptions {
     {
         use std::os::windows::fs::OpenOptionsExt as _;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.share_mode(FILE_SHARE_READ);
+        // Keep Unix-equivalent snapshot semantics on Windows: other processes
+        // may replace or mutate the pathname while this identity-bound handle
+        // remains valid. Every public read re-verifies the held handle/path and
+        // fails closed on drift; denying sharing would hide those transitions
+        // behind ERROR_SHARING_VIOLATION instead of exercising that contract.
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     options
@@ -742,6 +759,7 @@ impl VerifiedGgufSnapshot {
     ///
     /// Returns bounded GGUF parse errors or snapshot length drift.
     pub fn read_document(&self) -> Result<Document, GgufError> {
+        self.verify_snapshot_path()?;
         self.verify_held_content()?;
         let reader = HeldSnapshotPositionalReader {
             file: &self.file,
@@ -750,6 +768,7 @@ impl VerifiedGgufSnapshot {
         };
         let document = read_from(BufReader::new(reader), self.length)?;
         self.verify_held_content()?;
+        self.verify_snapshot_path()?;
         Ok(document)
     }
 
@@ -969,7 +988,7 @@ fn same_opened_identity(
         if unsafe { GetFileInformationByHandle(f.as_raw_handle().cast(), &raw mut i) }
             == 0
         {
-            return Err(GgufError::Io(std::io::Error::last_os_error()));
+            return Err(GgufError::Io(std::io::Error::last_os_error().to_string()));
         }
         Ok((i.vol, i.idx_hi, i.idx_lo))
     };
@@ -1129,6 +1148,10 @@ pub fn tensor_layout(ggml_type: u32) -> Result<TensorLayout, GgufError> {
         6 => (32, 22, "Q5_0"),
         7 => (32, 24, "Q5_1"),
         8 => (32, 34, "Q8_0"),
+        // imparo-private: Q8_0 bytes in the tile-major order imparo-repack writes; the
+        // block arithmetic (and so every size and bounds check) is Q8_0's.
+        1000 => (32, 34, "Q8_0_TM"),
+        1001 => (32, 18, "Q4_0_TM"),
         9 => (32, 40, "Q8_1"),
         10 => (256, 84, "Q2_K"),
         11 => (256, 110, "Q3_K"),
@@ -1166,7 +1189,7 @@ pub fn tensor_layout(ggml_type: u32) -> Result<TensorLayout, GgufError> {
     })
 }
 
-type TensorHeader = (String, Vec<u64>, u32, u64);
+type TensorHeader = (String, Vec<u64>, u32, u64, u64);
 
 struct Parser<R> {
     reader: R,
@@ -1321,9 +1344,16 @@ impl<R: Read + Seek> Parser<R> {
                 }
                 dimensions.push(dimension);
             }
+            let type_field_offset = self.position()?;
             let ggml_type = self.u32()?;
             let relative_offset = self.u64()?;
-            tensor_headers.push((name, dimensions, ggml_type, relative_offset));
+            tensor_headers.push((
+                name,
+                dimensions,
+                ggml_type,
+                relative_offset,
+                type_field_offset,
+            ));
         }
         Ok(tensor_headers)
     }
@@ -1351,7 +1381,9 @@ impl<R: Read + Seek> Parser<R> {
         }
 
         let mut tensors = Vec::with_capacity(tensor_headers.len());
-        for (name, dimensions, ggml_type, relative_offset) in tensor_headers {
+        for (name, dimensions, ggml_type, relative_offset, type_field_offset) in
+            tensor_headers
+        {
             if relative_offset % alignment != 0 {
                 return Err(GgufError::TensorOffsetMisaligned(name));
             }
@@ -1383,6 +1415,7 @@ impl<R: Read + Seek> Parser<R> {
                 relative_offset,
                 absolute_offset,
                 byte_size,
+                type_field_offset,
             });
         }
         validate_non_overlapping(&tensors)?;

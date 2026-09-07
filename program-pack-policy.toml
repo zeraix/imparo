@@ -1,0 +1,54 @@
+# Central Program Pack v1 defaults and hard ceilings. Runtime wiring is added only
+# after the parser boundary exists. CLI overrides may narrow or tune search within
+# these ceilings, never exceed them.
+
+[format]
+policy_version = 1
+program_pack_abi = 1
+kernel_contract_abi = 1
+
+[limits]
+manifest_max_bytes = 1048576
+signature_envelope_max_bytes = 16384
+pack_max_bytes = 536870912
+module_max_bytes = 268435456
+sbom_max_bytes = 16777216
+notices_max_bytes = 4194304
+provenance_max_bytes = 16777216
+channel_pointer_max_bytes = 1024
+channel_transaction_max_bytes = 4096
+json_depth_max = 128
+json_node_max = 1048576
+trust_key_max_count = 256
+module_max_count = 64
+choice_group_max_count = 256
+variant_max_count = 4096
+extension_max_count = 64
+string_max_bytes = 255
+symbol_max_bytes = 255
+launch_argument_max_count = 64
+constraint_max_count = 128
+effect_max_count = 128
+scratch_max_bytes = 2147483648
+dynamic_shared_memory_max_bytes = 262144
+block_threads_max = 1024
+grid_x_max = 2147483647
+grid_y_max = 65535
+grid_z_max = 65535
+launch_expression_depth_max = 8
+launch_expression_nodes_max = 64
+
+[search]
+screen_top_k = 8
+benchmark_warmup_iterations = 3
+benchmark_measure_iterations = 10
+minimum_relative_improvement = 0.01
+maximum_regression_relative = 0.0
+
+[fallback]
+native_required = true
+fail_closed = true
+retain_known_good_versions = 1
+allow_forward_hot_swap = false
+telemetry_enabled = false
+network_during_inference = false

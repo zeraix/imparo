@@ -1,10 +1,8 @@
 name: release-linux
 
-# Manual: builds the linux-x64 server and tuner with the CUDA backend compiled in (newest 12.x
-# for hardware reach -- CUDA 13 dropped Maxwell/Pascal/Volta; cudart linked
-# statically so no toolkit is needed at runtime, only the NVIDIA driver to use the
-# GPU; without one the server runs its CPU path). Attaches to the tag's DRAFT
-# release, created if missing.
+# Manual thin release: one common runtime plus signed per-SM CUDA shared objects.
+# The selected plugin links cudart statically, so the user needs only an NVIDIA driver.
+# The SM list is shared with Windows in crates/imparo-cuda/cuda-sm.json.
 on:
   workflow_dispatch:
     inputs:
@@ -20,15 +18,76 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Verify release tag owns checkout
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
+          head_commit="$(git rev-parse HEAD)"
+          test "$tag_commit" = "$head_commit"
       - uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '12.9.1'
           method: network
           sub-packages: '["nvcc", "cudart"]'
           use-github-cache: true
-      - name: Build
-        run: cargo build --release --locked --bin imparo-server --bin imparo-tune --features cuda
-      - name: Package
+      - name: Build per-SM CUDA plugins
+        run: |
+          set -euo pipefail
+          mkdir -p dist/backends
+          test "$(jq -r .schema crates/imparo-cuda/cuda-sm.json)" = "1"
+          test "$(jq -r .backend_abi crates/imparo-cuda/cuda-sm.json)" -ge 1
+          cargo build --release --locked -p imparo-cuda --features signing-tool \
+            --bin imparo-cuda-sign
+          identity_tool=target/release/imparo-cuda-sign
+          for sm in $(jq -r '.sms[]' crates/imparo-cuda/cuda-sm.json); do
+            build_id="$($identity_tool build-id linux-x86_64 "$sm" fast nvcc)"
+            test "${#build_id}" = 64
+            nvcc -O3 -std=c++17 -lineinfo --use_fast_math -shared --cudart static -Xcompiler=-fPIC \
+              -DIMPARO_CUDA_BACKEND_ABI="$(jq -r .backend_abi crates/imparo-cuda/cuda-sm.json)" \
+              -DIMPARO_CUDA_BUILD_SHA256="\"${build_id}\"" \
+              --generate-code="arch=compute_${sm},code=sm_${sm}" \
+              crates/imparo-cuda/native/imparo_cuda.cu \
+              -o "dist/backends/libimparo-cuda-sm${sm}.so"
+          done
+      - name: Sign backends and generate embedded manifest
+        env:
+          IMPARO_CUDA_RELEASE_PRIVATE_KEY: ${{ secrets.IMPARO_CUDA_RELEASE_PRIVATE_KEY }}
+          IMPARO_CUDA_RELEASE_PUBLIC_KEY: ${{ vars.IMPARO_CUDA_RELEASE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$IMPARO_CUDA_RELEASE_PRIVATE_KEY"
+          test -n "$IMPARO_CUDA_RELEASE_PUBLIC_KEY"
+          base="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}"
+          cargo run --release --locked -p imparo-cuda --features signing-tool \
+            --bin imparo-cuda-sign -- linux-x86_64 "$base" \
+            dist/imparo-cuda-manifest.json dist/backends/*.so
+      - name: Build thin common runtime
+        env:
+          IMPARO_CUDA_RELEASE_PUBLIC_KEY: ${{ vars.IMPARO_CUDA_RELEASE_PUBLIC_KEY }}
+          IMPARO_CUDA_EMBED_MANIFEST: ${{ github.workspace }}/dist/imparo-cuda-manifest.json
+        run: cargo build --release --locked --bin imparo-server --bin imparo-tune --features cuda-dynamic
+      - name: Verify signed SM resolution and ABI loading
+        env:
+          IMPARO_CUDA_RELEASE_PUBLIC_KEY: ${{ vars.IMPARO_CUDA_RELEASE_PUBLIC_KEY }}
+          IMPARO_CUDA_EMBED_MANIFEST: ${{ github.workspace }}/dist/imparo-cuda-manifest.json
+          IMPARO_BACKEND_CACHE: ${{ github.workspace }}/dist/runtime-test-cache
+        run: |
+          set -euo pipefail
+          sm="$(jq -r '.backends[0].sm' dist/imparo-cuda-manifest.json)"
+          abi="$(jq -r '.backends[0].abi' dist/imparo-cuda-manifest.json)"
+          file="$(jq -r '.backends[0].file' dist/imparo-cuda-manifest.json)"
+          mkdir -p "$IMPARO_BACKEND_CACHE/cuda/abi$abi/sm$sm"
+          cp "dist/backends/$file" "$IMPARO_BACKEND_CACHE/cuda/abi$abi/sm$sm/$file"
+          export IMPARO_CUDA_SM="$sm"
+          unset IMPARO_CUDA_BACKEND || true
+          cargo test --release --locked -p imparo-cuda --features cuda-dynamic \
+            ffi::imp_dynamic::tests::resolved_plugin_loads_and_matches_abi -- --exact
+      - name: Package common runtime
         run: |
           set -euo pipefail
           name="imparo-${{ inputs.tag }}-linux-x64"
@@ -39,8 +98,10 @@ jobs:
       - name: Attach to draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          gh release view "${{ inputs.tag }}" >/dev/null 2>&1 || \
-            gh release create "${{ inputs.tag }}" --target "$GITHUB_SHA" --draft \
-              --title "Imparo ${{ inputs.tag }}" --generate-notes
-          gh release upload "${{ inputs.tag }}" dist/*.tar.gz --clobber
+          target_commit="$(git rev-parse HEAD)"
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --target "$target_commit" --draft \
+              --title "Imparo $RELEASE_TAG" --generate-notes
+          gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/backends/*.so --clobber

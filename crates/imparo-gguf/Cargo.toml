@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "imparo-repack"
+path = "src/bin/imparo-repack.rs"
+
 [dependencies]
 sha2 = "0.11"
 
