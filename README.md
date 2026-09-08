@@ -4,7 +4,7 @@
 
 ### LLM inference that adapts to your hardware and workload.
 
-**Native model execution, measurement-driven tuning, and persistent inference state—unified in a Rust runtime.**
+**Lower execution overhead, reusable context, and persistent state for long-running AI workloads.**
 
 [Why Imparo](#why-imparo) ·
 [Design Rules](#design-rules) ·
@@ -21,39 +21,55 @@
 
 ## About
 
-Imparo is a hardware- and workload-adaptive LLM inference engine built in Rust
-with native Metal, CUDA, and CPU backends. It brings model execution,
-measurement-driven hardware tuning, and persistent inference state into one runtime.
+Imparo is a hardware- and workload-adaptive LLM inference engine built to reduce
+execution overhead and repeated context computation, with persistent state for
+long conversations and multi-agent workflows.
 
-Execution adapts to the model architecture, hardware topology, and live workload
-shape—from short decode steps to long prefills and repeated-prefix workloads.
+Built in Rust with native Metal, CUDA, and CPU backends, it combines measured
+hardware tuning, workload-aware execution, and shared, paged inference state.
+Supported configurations and measured results are documented below.
 
 ## Why Imparo
 
-- **Lean native execution.** Model workflows call backend kernels directly,
-  keeping the hot path compact and giving each architecture an execution path
-  designed around its actual operators and state.
+- **Reduce trial and error when tuning your hardware.** Imparo's tuning tools
+  measure execution choices and save configurations for reuse. The runtime
+  applies those settings alongside model and hardware facts, selecting paths
+  for the current token batch and context shape.
 
-- **Fitted to your hardware.** Imparo reads the model and device geometry, then
-  measures only the execution choices that cannot be safely derived. Tuning is
-  tied to the exact model, hardware, backend, and engine version that produced it.
+- **Spend less time on execution overhead.** Direct backend calls keep the hot
+  path compact. On supported Metal paths, megakernel decode combines small GPU
+  dispatches, improving token generation in the [published benchmarks](#performance).
+  Unsupported regions use ordinary kernels; recoverable decode failures can
+  restore state and retry there.
 
-- **Shaped by the workload.** Prefill, decode, attention, KV, and narrow-batch
-  paths can be selected from the current token width, context depth, cache
-  format, prefix reuse, and per-layer model structure.
+- **Reuse context across agents.** Agents using the same model and matching
+  prompt prefixes can share cached computation and full-attention KV pages,
+  reducing repeated prefill work and duplicate cache storage. Sharing requires
+  compatible model and cache settings.
 
-- **Persistent, paged state.** Content-addressed state allows matching prefixes
-  to be reused across conversations, while inactive KV and recurrent state can
-  move between memory and disk under explicit resource limits. This is designed
-  for multi-turn conversations, repeated tool use, and long-running workloads.
+- **Resume and branch with less recomputation.** Persisted KV and recurrent
+  state let conversations restore matching saved boundaries after a switch or
+  restart. Retained checkpoints also support rewinds and branches, so reusable
+  history does not have to be processed from scratch.
 
-- **Memory-efficient model-native acceleration.** Imparo's native MTP research
-  reuses target-model components and keeps only the architecture-specific
-  auxiliary state, rather than loading a complete second draft model.
+- **Keep long tool loops manageable.** Superseded tool-step checkpoints are
+  collapsed within a conversation turn. Paged allocation, residency budgets,
+  and disk-cache eviction help control redundant state and inactive-cache
+  growth as conversations accumulate.
 
-- **Correctness-gated optimization.** Candidate optimizations must preserve
-  model outputs and state transitions before they can be selected. Performance
-  results remain bound to the configuration and hardware that produced them.
+- **Explore acceleration with a smaller memory overhead.** Imparo's native
+  MTP research reuses target-model components and keeps architecture-specific
+  auxiliary state, aiming to reduce the extra memory needed for speculative
+  decoding. This remains a research path, not a default server capability.
+
+- **Check correctness alongside speed.** Tuning screens measured gains against
+  timing noise. Output and state-transition checks help identify numerical
+  regressions, with results bound to the tested model, configuration, and hardware.
+
+- **Extend the engine through focused contributions.** Model plans describe
+  architecture-specific execution and state; backends provide kernels through
+  shared interfaces. Contributors can add model support or improve a kernel
+  without spreading model-specific branches throughout the runtime.
 
 ## Design rules
 
@@ -182,6 +198,11 @@ curl http://127.0.0.1:8420/v1/chat/completions \
 Backend and model support is qualification-specific. Apple Silicon with Metal is
 the primary development and validation path today; other backend combinations
 should be treated as experimental until explicitly validated.
+
+Shared paged residency currently targets the supported Metal path. The public
+server executes generation requests serially: multi-agent context reuse does
+not imply concurrent decoding or continuous batching. Persisted-state reuse
+requires matching model/cache settings and retained cache data.
 
 ## Contributing
 
