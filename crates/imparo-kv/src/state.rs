@@ -185,12 +185,12 @@ pub struct KvState {
 /// `elems` is 0 for a model without one, and then this is empty and every path below is
 /// a no-op -- which is why gemma4 sees no change at all.
 #[must_use]
-pub fn capture_recurrent(be: &dyn Backend, elems: usize, from: BufId) -> Vec<u8> {
+pub fn capture_recurrent(be: &dyn Backend, elems: usize, from: BufId, off: u64) -> Vec<u8> {
     if elems == 0 {
         return Vec::new();
     }
     let mut f = vec![0.0_f32; elems];
-    be.read(from, 0, &mut f);
+    be.read(from, off, &mut f);
     let mut out = Vec::with_capacity(elems * 4);
     for v in f {
         out.extend_from_slice(&v.to_le_bytes());

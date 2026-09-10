@@ -262,7 +262,8 @@ pub fn batch(
                 probe(p, "conv.in_proj", li as i32, &bcx[..3 * n_embd]);
                 // `mix` holds c * conv(b * x) here; out_proj turns it back into the
                 // residual stream below, exactly as wo does for an attention block.
-                ops::shortconv(
+                ops::causal_conv(
+                    ops::ConvForm::GatedBcx,
                     &bcx,
                     &conv_w.w,
                     &mut conv.r[li],

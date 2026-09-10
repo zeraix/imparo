@@ -40,6 +40,37 @@ pub const Q4_0_BLOCK_BYTES: usize = 18;
 pub const QK8_0: usize = 32;
 pub const Q8_0_BLOCK_BYTES: usize = 34;
 
+/// The rest of the legacy family: an asymmetric scale+min (Q4_1, Q5_1) or a fifth bit in
+/// a separate word (Q5_0, Q5_1), still one scale per 32 values.
+pub const GGML_Q4_1: u32 = 3;
+pub const GGML_Q5_0: u32 = 6;
+pub const GGML_Q5_1: u32 = 7;
+
+/// The k-quant family. A 256-element SUPER-BLOCK whose sub-blocks carry their own scale,
+/// packed against one super-block scale -- a different SHAPE of quantisation from Q4_0 /
+/// Q8_0's one scale per 32 values, which is why the reader needs the block interior and
+/// not just the geometry (`tensor_layout` already has the geometry: 256/144, 256/176,
+/// 256/210).
+pub const GGML_Q2_K: u32 = 10;
+pub const GGML_Q3_K: u32 = 11;
+pub const GGML_Q4_K: u32 = 12;
+pub const GGML_Q5_K: u32 = 13;
+pub const GGML_Q6_K: u32 = 14;
+
+/// The k-quant super-block width: 256 elements, whatever the bit depth.
+pub const QK_K: usize = 256;
+
+/// The IQ family. A third SHAPE: the stored bits are an INDEX into a fixed codebook, not a
+/// number, so no arithmetic reproduces the value -- the table is part of the format. An
+/// unsloth "UD" mix carries these next to the k-quants (Qwen3.8-27B-UD-Q4_K_M is 117
+/// IQ4_XS tensors, 7 IQ4_NL, 4 IQ3_S), so reading k-quants alone does not load such a file.
+pub const GGML_IQ2_XS: u32 = 17;
+pub const GGML_IQ3_XXS: u32 = 18;
+pub const GGML_IQ4_NL: u32 = 20;
+pub const GGML_IQ3_S: u32 = 21;
+pub const GGML_IQ2_S: u32 = 22;
+pub const GGML_IQ4_XS: u32 = 23;
+
 /// Q8_0_TM: the 8-row x 32-element unit, 272 bytes = the unit's eight half scales
 /// (16 bytes, row order) followed by its eight 32-byte payload rows `[row 0..8][k 0..32]`.
 /// Units are row-tile-major with K blocks adjacent. The scales sit INSIDE their unit
@@ -95,10 +126,22 @@ pub struct TmRule {
     pub to: u32,
     pub from_name: &'static str,
     pub to_name: &'static str,
-    /// Elements per block (32 for both Q4_0 and Q8_0).
+    /// Elements per block: 32 for the legacy family, 256 for a k-quant or IQ super-block.
     pub block_elems: usize,
-    /// Payload bytes per block after the 2-byte scale is split off.
-    pub payload_bytes: usize,
+    /// Bytes one row-major block occupies. `tensor_layout(from)` says the same thing; it
+    /// is repeated here so every address below is `const`.
+    pub block_bytes_src: usize,
+    /// WHERE THE SCALES ARE IN THE SOURCE BLOCK, as byte ranges `(offset, len)` in order.
+    ///
+    /// This is what makes the rule a FAMILY rather than one layout. Q4_0 and Q8_0 open
+    /// with a 2-byte scale, so a length was enough. A k-quant does not: Q6_K keeps its
+    /// sub-scales at byte 192 and its super-scale at 208, Q3_K at 96 and 108, and Q2_K
+    /// splits them across the front and the back. A rule that assumed "the first N bytes"
+    /// would silently treat quant bits as a scale -- plausible garbage, not a crash.
+    ///
+    /// The scale bytes move to the head of the unit (one aligned load per row); the rest
+    /// of the block, in source order, is the payload.
+    pub scale_spans: &'static [(usize, usize)],
     /// Rows per unit.
     pub unit_rows: usize,
     /// Backends with kernels that read `to`. A rule with no readers is a layout the
@@ -111,17 +154,35 @@ pub struct TmRule {
 impl TmRule {
     #[must_use]
     pub const fn block_bytes(&self) -> usize {
-        2 + self.payload_bytes
+        self.block_bytes_src
+    }
+    /// Scale bytes per block, summed over the spans.
+    #[must_use]
+    pub const fn scale_bytes(&self) -> usize {
+        let mut n = 0;
+        let mut i = 0;
+        while i < self.scale_spans.len() {
+            n += self.scale_spans[i].1;
+            i += 1;
+        }
+        n
+    }
+    /// Payload bytes per block: everything the scale spans do not claim.
+    #[must_use]
+    pub const fn payload_bytes(&self) -> usize {
+        self.block_bytes_src - self.scale_bytes()
     }
     /// Rows must fill whole units and the row width whole blocks.
     #[must_use]
     pub const fn convertible(&self, n_in: usize, n_out: usize) -> bool {
         n_in % self.block_elems == 0 && n_out % self.unit_rows == 0
     }
-    /// Bytes per unit: the unit's scales, then its payload rows.
+    /// Bytes per unit: the unit's scales, then its payload rows. Always the row-major
+    /// size of the same blocks -- the layout MOVES bytes, it never adds or drops one, so
+    /// a converted tensor is byte-for-byte the same length and the file's offsets hold.
     #[must_use]
     pub const fn unit_bytes(&self) -> usize {
-        self.unit_rows * (2 + self.payload_bytes)
+        self.unit_rows * self.block_bytes_src
     }
     const fn unit_start(&self, row: usize, block: usize, blocks: usize) -> usize {
         ((row / self.unit_rows) * blocks + block) * self.unit_bytes()
@@ -136,8 +197,8 @@ impl TmRule {
         blocks: usize,
     ) -> usize {
         self.unit_start(row, block, blocks)
-            + self.unit_rows * 2
-            + (row % self.unit_rows) * self.payload_bytes
+            + self.unit_rows * self.scale_bytes()
+            + (row % self.unit_rows) * self.payload_bytes()
     }
     /// Byte offset of `row`'s half scale for K block `block`: at the head of its unit.
     /// `_n_out` is no longer needed by the layout; kept so the signature is stable.
@@ -149,8 +210,36 @@ impl TmRule {
         blocks: usize,
         _n_out: usize,
     ) -> usize {
-        self.unit_start(row, block, blocks) + (row % self.unit_rows) * 2
+        self.unit_start(row, block, blocks) + (row % self.unit_rows) * self.scale_bytes()
     }
+    /// The byte ranges the scale spans do NOT claim, in source order -- the payload.
+    ///
+    /// Derived rather than written: a second list would be a second chance to disagree
+    /// with the first, and the disagreement reads as a slightly wrong weight.
+    #[must_use]
+    pub fn payload_spans(&self) -> Vec<(usize, usize)> {
+        let mut spans: Vec<(usize, usize)> = self.scale_spans.to_vec();
+        spans.sort_unstable();
+        let mut out = Vec::new();
+        let mut at = 0_usize;
+        for (off, len) in spans {
+            assert!(at <= off, "{}: scale spans overlap", self.to_name);
+            if off > at {
+                out.push((at, off - at));
+            }
+            at = off + len;
+        }
+        assert!(
+            at <= self.block_bytes_src,
+            "{}: a scale span runs past the block",
+            self.to_name
+        );
+        if at < self.block_bytes_src {
+            out.push((at, self.block_bytes_src - at));
+        }
+        out
+    }
+
     /// Row-major bytes of one whole tensor -> tile-major bytes, same length.
     #[must_use]
     pub fn convert(&self, src: &[u8], n_in: usize, n_out: usize) -> Vec<u8> {
@@ -160,10 +249,18 @@ impl TmRule {
         for r in 0..n_out {
             for b in 0..blocks {
                 let blk = &src[(r * blocks + b) * bb..][..bb];
-                let p = self.payload_offset(r, b, blocks);
-                out[p..p + self.payload_bytes].copy_from_slice(&blk[2..]);
-                let s = self.scale_offset(r, b, blocks, n_out);
-                out[s..s + 2].copy_from_slice(&blk[..2]);
+                // Scales first, in span order, at the head of the unit.
+                let mut at = self.scale_offset(r, b, blocks, n_out);
+                for &(off, len) in self.scale_spans {
+                    out[at..at + len].copy_from_slice(&blk[off..off + len]);
+                    at += len;
+                }
+                // Then everything the spans did not claim, in SOURCE order.
+                let mut at = self.payload_offset(r, b, blocks);
+                for (off, len) in self.payload_spans() {
+                    out[at..at + len].copy_from_slice(&blk[off..off + len]);
+                    at += len;
+                }
             }
         }
         out
@@ -193,13 +290,19 @@ impl TmRule {
         for r in 0..n_out {
             for b in 0..blocks {
                 let blk = &src[(r * blocks + b) * bb..][..bb];
-                let p = self.payload_offset(r, b, blocks);
-                if tm[p..p + self.payload_bytes] != blk[2..] {
-                    return Err(format!("{name}: values differ at row {r} block {b}"));
+                let mut at = self.scale_offset(r, b, blocks, n_out);
+                for &(off, len) in self.scale_spans {
+                    if tm[at..at + len] != blk[off..off + len] {
+                        return Err(format!("{name}: scale differs at row {r} block {b}"));
+                    }
+                    at += len;
                 }
-                let s = self.scale_offset(r, b, blocks, n_out);
-                if tm[s..s + 2] != blk[..2] {
-                    return Err(format!("{name}: scale differs at row {r} block {b}"));
+                let mut at = self.payload_offset(r, b, blocks);
+                for (off, len) in self.payload_spans() {
+                    if tm[at..at + len] != blk[off..off + len] {
+                        return Err(format!("{name}: values differ at row {r} block {b}"));
+                    }
+                    at += len;
                 }
             }
         }
@@ -207,14 +310,51 @@ impl TmRule {
     }
 }
 
-pub const TM_RULES: [TmRule; 2] = [
+/// The tile-major twin of every block format the engine reads. Ids are imparo-private and
+/// follow the source's ggml id (1000 + it) so a reader can recover the source at a glance.
+pub const GGML_Q4_1_TM: u32 = 1003;
+pub const GGML_Q5_0_TM: u32 = 1006;
+pub const GGML_Q5_1_TM: u32 = 1007;
+pub const GGML_Q2_K_TM: u32 = 1010;
+pub const GGML_Q3_K_TM: u32 = 1011;
+pub const GGML_Q4_K_TM: u32 = 1012;
+pub const GGML_Q5_K_TM: u32 = 1013;
+pub const GGML_Q6_K_TM: u32 = 1014;
+pub const GGML_IQ2_XS_TM: u32 = 1017;
+pub const GGML_IQ3_XXS_TM: u32 = 1018;
+pub const GGML_IQ4_NL_TM: u32 = 1020;
+pub const GGML_IQ3_S_TM: u32 = 1021;
+pub const GGML_IQ2_S_TM: u32 = 1022;
+pub const GGML_IQ4_XS_TM: u32 = 1023;
+
+/// THE LAYOUT FAMILY. One rule per readable block format; every rule is the SAME move --
+/// the block's scale bytes to the head of an 8-row unit, its payload after them -- so a
+/// reader's address arithmetic is one formula and only the DECODE differs, by family:
+///
+/// ```text
+///   affine      value = q * scale + min          Q4_1 Q5_1 Q2_K Q4_K Q5_K
+///   symmetric   value = (q - bias) * scale       Q4_0 Q5_0 Q8_0 Q3_K Q6_K
+///   codebook    value = table[q] * scale         IQ4_NL IQ4_XS IQ3_S
+/// ```
+///
+/// Byte count is UNCHANGED by construction (`unit_bytes` is the row-major size of the same
+/// blocks), so a converted tensor keeps its file offset and a load-time transform needs no
+/// extra memory beyond the target buffer. What changes is the ADDRESS a lane touches: one
+/// aligned scale load per row per block instead of a strided read plus a bitfield unpack
+/// spread over the block.
+///
+/// `readers` is the gate. A rule with none is a layout the converter writes only on
+/// request and the load-time transform never applies, so a backend that cannot decode a
+/// family refuses the file by name instead of misreading it.
+pub const TM_RULES: [TmRule; 16] = [
     TmRule {
         from: GGML_Q8_0,
         to: GGML_Q8_0_TM,
         from_name: "Q8_0",
         to_name: "Q8_0_TM",
         block_elems: QK8_0,
-        payload_bytes: QK8_0,
+        block_bytes_src: Q8_0_BLOCK_BYTES,
+        scale_spans: &[(0, 2)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
     },
@@ -224,9 +364,184 @@ pub const TM_RULES: [TmRule; 2] = [
         from_name: "Q4_0",
         to_name: "Q4_0_TM",
         block_elems: QK4_0,
-        payload_bytes: QK4_0 / 2,
+        block_bytes_src: Q4_0_BLOCK_BYTES,
+        scale_spans: &[(0, 2)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &[],
+    },
+    TmRule {
+        from: GGML_Q4_1,
+        to: GGML_Q4_1_TM,
+        from_name: "Q4_1",
+        to_name: "Q4_1_TM",
+        block_elems: 32,
+        block_bytes_src: 20,
+        // d, m.
+        scale_spans: &[(0, 4)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &[],
+    },
+    TmRule {
+        from: GGML_Q5_0,
+        to: GGML_Q5_0_TM,
+        from_name: "Q5_0",
+        to_name: "Q5_0_TM",
+        block_elems: 32,
+        block_bytes_src: 22,
+        // d only: qh is a fifth QUANT bit, not a scale, so it stays in the payload.
+        scale_spans: &[(0, 2)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &[],
+    },
+    TmRule {
+        from: GGML_Q5_1,
+        to: GGML_Q5_1_TM,
+        from_name: "Q5_1",
+        to_name: "Q5_1_TM",
+        block_elems: 32,
+        block_bytes_src: 24,
+        scale_spans: &[(0, 4)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &[],
+    },
+    TmRule {
+        from: GGML_Q2_K,
+        to: GGML_Q2_K_TM,
+        from_name: "Q2_K",
+        to_name: "Q2_K_TM",
+        block_elems: QK_K,
+        block_bytes_src: 84,
+        // TWO spans: the 16 packed sub-scale bytes open the block and (d, dmin) close it.
+        scale_spans: &[(0, 16), (80, 4)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_Q3_K,
+        to: GGML_Q3_K_TM,
+        from_name: "Q3_K",
+        to_name: "Q3_K_TM",
+        block_elems: QK_K,
+        block_bytes_src: 110,
+        // scales[12] then d, at the END of the block -- hmask and qs come first.
+        scale_spans: &[(96, 14)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_Q4_K,
+        to: GGML_Q4_K_TM,
+        from_name: "Q4_K",
+        to_name: "Q4_K_TM",
+        block_elems: QK_K,
+        block_bytes_src: 144,
+        // d, dmin, scales[12] -- sixteen bytes, so a row's whole scale header is ONE
+        // aligned 16-byte load where row-major spread it over a 144-byte stride.
+        scale_spans: &[(0, 16)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_Q5_K,
+        to: GGML_Q5_K_TM,
+        from_name: "Q5_K",
+        to_name: "Q5_K_TM",
+        block_elems: QK_K,
+        block_bytes_src: 176,
+        scale_spans: &[(0, 16)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_Q6_K,
+        to: GGML_Q6_K_TM,
+        from_name: "Q6_K",
+        to_name: "Q6_K_TM",
+        block_elems: QK_K,
+        block_bytes_src: 210,
+        // sc[16] (signed) then d, at byte 192 -- ql and qh come first.
+        scale_spans: &[(192, 18)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_IQ4_NL,
+        to: GGML_IQ4_NL_TM,
+        from_name: "IQ4_NL",
+        to_name: "IQ4_NL_TM",
+        block_elems: 32,
+        block_bytes_src: 18,
+        scale_spans: &[(0, 2)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_IQ3_S,
+        to: GGML_IQ3_S_TM,
+        from_name: "IQ3_S",
+        to_name: "IQ3_S_TM",
+        block_elems: QK_K,
+        block_bytes_src: 110,
+        // d at the front, the 4 sub-scale bytes at the back; qs / qh / signs between.
+        // The ONLY rule whose scales are two spans. The tile-major layout concatenates
+        // them into 6 contiguous bytes, so the Metal brick's single scale pointer works;
+        // a ROW-MAJOR IQ3_S row has no such pointer, which is why the kind is served only
+        // as IQ3_S_TM and a row-gathered IQ3_S tensor is refused at load rather than read
+        // through an address the format cannot express.
+        scale_spans: &[(0, 2), (106, 4)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_IQ4_XS,
+        to: GGML_IQ4_XS_TM,
+        from_name: "IQ4_XS",
+        to_name: "IQ4_XS_TM",
+        block_elems: QK_K,
+        block_bytes_src: 136,
+        // d, scales_h, scales_l[4].
+        scale_spans: &[(0, 8)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_IQ2_XS,
+        to: GGML_IQ2_XS_TM,
+        from_name: "IQ2_XS",
+        to_name: "IQ2_XS_TM",
+        block_elems: QK_K,
+        block_bytes_src: 74,
+        // d at the front, the 8 sub-scale bytes at the back; the 32 index words between.
+        scale_spans: &[(0, 2), (66, 8)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_IQ2_S,
+        to: GGML_IQ2_S_TM,
+        from_name: "IQ2_S",
+        to_name: "IQ2_S_TM",
+        block_elems: QK_K,
+        block_bytes_src: 82,
+        // d, then the two 8-byte trailers -- qh (the index's top bits) and the sub-scales.
+        // The payload is the 32 index bytes and the 32 sign bytes, in source order.
+        scale_spans: &[(0, 2), (66, 8), (74, 8)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
+    },
+    TmRule {
+        from: GGML_IQ3_XXS,
+        to: GGML_IQ3_XXS_TM,
+        from_name: "IQ3_XXS",
+        to_name: "IQ3_XXS_TM",
+        block_elems: QK_K,
+        block_bytes_src: 98,
+        // d, then the eight scale-and-sign words: the sub-block scale lives in the top
+        // nibble of the word that also carries that sub-block's four sign indices, so the
+        // signs travel with the scales, not with the payload.
+        scale_spans: &[(0, 2), (66, 32)],
+        unit_rows: Q8_0_TM_UNIT_ROWS,
+        readers: &["metal"],
     },
 ];
 
@@ -293,25 +608,166 @@ pub enum WeightKind {
     Q8_0_TM = 3,
     /// Q4_0 values, tile-major (`GGML_Q4_0_TM`). The rule exists; no backend reads it yet.
     Q4_0_TM = 4,
+    /// The k-quants: 256-element super-blocks with per-sub-block scales.
+    Q4_K = 5,
+    Q5_K = 6,
+    Q6_K = 7,
+    Q2_K = 8,
+    Q3_K = 9,
+    /// The rest of the legacy family.
+    Q4_1 = 10,
+    Q5_0 = 11,
+    Q5_1 = 12,
+    /// The IQ family: the quant is a codebook index.
+    IQ4_NL = 13,
+    IQ4_XS = 14,
+    IQ3_S = 15,
+    /// The tile-major twin of each of the above. A backend is told WHICH LAYOUT it is
+    /// getting, because the address arithmetic differs even though the decode does not;
+    /// `imparo-repack` also writes these kinds to a file, so the loader must name them.
+    Q4_1_TM = 16,
+    Q5_0_TM = 17,
+    Q5_1_TM = 18,
+    Q2_K_TM = 19,
+    Q3_K_TM = 20,
+    Q4_K_TM = 21,
+    Q5_K_TM = 22,
+    Q6_K_TM = 23,
+    IQ4_NL_TM = 24,
+    IQ4_XS_TM = 25,
+    IQ3_S_TM = 26,
+    /// The sub-3-bit IQ types an unsloth "UD" mix reaches for on the tensors it can
+    /// afford to spend least on. Same codebook shape as IQ3_S, fewer bits per index.
+    IQ2_XS = 27,
+    IQ3_XXS = 28,
+    IQ2_S = 29,
+    IQ2_XS_TM = 30,
+    IQ3_XXS_TM = 31,
+    IQ2_S_TM = 32,
 }
 
 /// Names of every type `weight_kind` accepts, for the error message that rejects the
-/// others. Kept beside the match because it had already gone stale once: it still read
-/// "F32, Q4_0" after Q8_0 landed, in the message a user sees when a file is refused.
-pub const SUPPORTED_WEIGHT_TYPES: &str =
-    "F32, Q4_0, Q8_0, Q8_0_TM, Q4_0_TM (imparo-repack)";
+/// others -- DERIVED from `weight_kind` and the layout table, never written out. The hand
+/// written version had already gone stale once (it still read "F32, Q4_0" after Q8_0
+/// landed, in the message a user sees when a file is refused), and a list that can
+/// disagree with the code it describes is worse than no list.
+#[must_use]
+pub fn supported_weight_types() -> String {
+    WEIGHT_KINDS
+        .iter()
+        .filter_map(|(t, _)| crate::tensor_layout(*t).ok().map(|l| l.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The one table that pairs a GGUF ggml type with its wire weight kind.
+///
+/// TWO numbering schemes meet at the `Backend` seam: a file names a ggml type, the trait
+/// passes the compact wire value (a kernel table index), and a backend's readers switch
+/// back on the ggml type. Both directions are read off this table so there is no second
+/// copy to disagree with it -- a backend that kept its own half of the mapping read a Q8
+/// matrix as Q4 the moment a type was added, and that is plausible garbage, not a crash.
+///
+/// Adding a format is one row here plus its codec; nothing else enumerates the list.
+const WEIGHT_KINDS: &[(u32, WeightKind)] = &[
+    (GGML_F32, WeightKind::F32),
+    (GGML_Q4_0, WeightKind::Q4_0),
+    (GGML_Q4_1, WeightKind::Q4_1),
+    (GGML_Q5_0, WeightKind::Q5_0),
+    (GGML_Q5_1, WeightKind::Q5_1),
+    (GGML_Q8_0, WeightKind::Q8_0),
+    (GGML_Q2_K, WeightKind::Q2_K),
+    (GGML_Q3_K, WeightKind::Q3_K),
+    (GGML_Q4_K, WeightKind::Q4_K),
+    (GGML_Q5_K, WeightKind::Q5_K),
+    (GGML_Q6_K, WeightKind::Q6_K),
+    (GGML_IQ4_NL, WeightKind::IQ4_NL),
+    (GGML_IQ3_S, WeightKind::IQ3_S),
+    (GGML_IQ4_XS, WeightKind::IQ4_XS),
+    (GGML_IQ2_XS, WeightKind::IQ2_XS),
+    (GGML_IQ3_XXS, WeightKind::IQ3_XXS),
+    (GGML_IQ2_S, WeightKind::IQ2_S),
+    (GGML_Q8_0_TM, WeightKind::Q8_0_TM),
+    (GGML_Q4_0_TM, WeightKind::Q4_0_TM),
+    (GGML_Q4_1_TM, WeightKind::Q4_1_TM),
+    (GGML_Q5_0_TM, WeightKind::Q5_0_TM),
+    (GGML_Q5_1_TM, WeightKind::Q5_1_TM),
+    (GGML_Q2_K_TM, WeightKind::Q2_K_TM),
+    (GGML_Q3_K_TM, WeightKind::Q3_K_TM),
+    (GGML_Q4_K_TM, WeightKind::Q4_K_TM),
+    (GGML_Q5_K_TM, WeightKind::Q5_K_TM),
+    (GGML_Q6_K_TM, WeightKind::Q6_K_TM),
+    (GGML_IQ4_NL_TM, WeightKind::IQ4_NL_TM),
+    (GGML_IQ4_XS_TM, WeightKind::IQ4_XS_TM),
+    (GGML_IQ3_S_TM, WeightKind::IQ3_S_TM),
+    (GGML_IQ2_XS_TM, WeightKind::IQ2_XS_TM),
+    (GGML_IQ3_XXS_TM, WeightKind::IQ3_XXS_TM),
+    (GGML_IQ2_S_TM, WeightKind::IQ2_S_TM),
+];
+
+/// Every tile-major rule must have a wire kind, or a backend cannot be told which layout
+/// it is being handed. Derived check rather than a written list.
+#[cfg(test)]
+mod wire_kind_tests {
+    use super::*;
+    #[test]
+    fn every_tm_rule_has_a_wire_kind() {
+        for rule in &TM_RULES {
+            assert!(
+                weight_kind(rule.to).is_some(),
+                "{} has no WeightKind",
+                rule.to_name
+            );
+            assert!(
+                weight_kind(rule.from).is_some(),
+                "{} has no WeightKind",
+                rule.from_name
+            );
+        }
+    }
+}
 
 /// Maps a GGUF ggml type id to the kernel table, or None for anything unsupported.
 #[must_use]
 pub fn weight_kind(ggml_type: u32) -> Option<WeightKind> {
-    match ggml_type {
-        GGML_F32 => Some(WeightKind::F32),
-        GGML_Q4_0 => Some(WeightKind::Q4_0),
-        GGML_Q8_0 => Some(WeightKind::Q8_0),
-        GGML_Q8_0_TM => Some(WeightKind::Q8_0_TM),
-        GGML_Q4_0_TM => Some(WeightKind::Q4_0_TM),
-        _ => None,
-    }
+    WEIGHT_KINDS
+        .iter()
+        .find(|(t, _)| *t == ggml_type)
+        .map(|(_, k)| *k)
+}
+
+/// Every (wire kind, ggml type) pair, for a backend that must be told the mapping rather
+/// than carry a copy of it.
+#[must_use]
+pub fn wire_kind_types() -> Vec<(u32, u32)> {
+    WEIGHT_KINDS.iter().map(|(t, k)| (*k as u32, *t)).collect()
+}
+
+/// The ggml type a wire weight kind names -- the inverse of `weight_kind`.
+///
+/// # Panics
+/// On a wire value no `WeightKind` has. That is a seam defect (a backend inventing a
+/// kind, or a stale binary on one side), and reading on is how a wrong matrix becomes a
+/// plausible answer.
+#[must_use]
+pub fn ggml_type_of_wire(wire: u32) -> u32 {
+    WEIGHT_KINDS
+        .iter()
+        .find(|(_, k)| *k as u32 == wire)
+        .map(|(t, _)| *t)
+        .unwrap_or_else(|| panic!("unknown weight kind wire value {wire}"))
+}
+
+/// The same lookup for a caller that must not die on an unknown value -- a TOOL reading a
+/// kind out of a file or a config rather than off the engine's own seam. The panicking form
+/// above stays the default: inside the engine an unknown wire kind IS a seam defect, and
+/// reading on is how a wrong matrix becomes a plausible answer.
+#[must_use]
+pub fn ggml_type_of_wire_opt(wire: u32) -> Option<u32> {
+    WEIGHT_KINDS
+        .iter()
+        .find(|(_, k)| *k as u32 == wire)
+        .map(|(t, _)| *t)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -827,12 +1283,13 @@ mod tm_rule_tests {
             for r in 0..n_out {
                 for b in 0..blocks {
                     let p = rule.payload_offset(r, b, blocks);
-                    for i in 0..rule.payload_bytes {
+                    for i in 0..rule.payload_bytes() {
                         hit[p + i] += 1;
                     }
                     let s = rule.scale_offset(r, b, blocks, n_out);
-                    hit[s] += 1;
-                    hit[s + 1] += 1;
+                    for i in 0..rule.scale_bytes() {
+                        hit[s + i] += 1;
+                    }
                 }
             }
             assert!(
@@ -843,6 +1300,40 @@ mod tm_rule_tests {
             assert!(rule.convertible(n_in, n_out));
             assert!(!rule.convertible(n_in + 1, n_out));
             assert!(!rule.convertible(n_in, n_out + 1));
+        }
+    }
+
+    /// The rule table and the geometry table describe the same blocks, so they must agree.
+    /// `block_bytes_src` is repeated in the rule only to keep the address arithmetic
+    /// `const`; a copy that drifts would put every payload at a wrong offset.
+    #[test]
+    fn every_rule_agrees_with_the_layout_table() {
+        for rule in &TM_RULES {
+            let src = crate::tensor_layout(rule.from).expect("rule source has a layout");
+            assert_eq!(
+                (src.block_elements as usize, src.block_bytes as usize),
+                (rule.block_elems, rule.block_bytes_src),
+                "{} geometry disagrees with tensor_layout",
+                rule.from_name
+            );
+            // A tile-major kind keeps its source's geometry by construction: the layout
+            // MOVES bytes. If the two ever differ, every size and bounds check is wrong.
+            let dst = crate::tensor_layout(rule.to).expect("rule target has a layout");
+            assert_eq!(
+                (dst.block_elements, dst.block_bytes),
+                (src.block_elements, src.block_bytes),
+                "{} is not the same size as {}",
+                rule.to_name,
+                rule.from_name
+            );
+            // Spans partition the block: payload_spans() asserts no overlap and no
+            // overrun, and the two counts must add up to the whole block.
+            assert_eq!(
+                rule.scale_bytes() + rule.payload_bytes(),
+                rule.block_bytes_src,
+                "{}: scale + payload is not the block",
+                rule.to_name
+            );
         }
     }
 

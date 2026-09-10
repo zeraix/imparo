@@ -409,7 +409,7 @@ pub fn config_root(
             // state whose shape is nothing like a KV row, so two models that differ only
             // in where their recurrent blocks sit, or in how much state those blocks
             // carry, must not hash the same.
-            Attention::Recurrent { r_elems, s_elems } => {
+            Attention::Recurrent { r_elems, s_elems, .. } => {
                 geom.push(2);
                 geom.extend_from_slice(&r_elems.to_le_bytes());
                 geom.extend_from_slice(&s_elems.to_le_bytes());
@@ -632,9 +632,13 @@ use imparo_kv::{KvState, LayerStateGeom, StateKind};
 ///
 /// One place, because two would be two chances to disagree about the encoding. `from` is
 /// `BufId::Recur` for the live state, `BufId::RecurSnap` for a boundary snapshot.
+///
+/// `plane` selects which of `Recur`'s planes holds the live state (task #165); `RecurSnap`
+/// is one plane and always takes 0.
 #[must_use]
-pub fn read_recurrent(elems: usize, from: imparo_backend::BufId) -> Vec<u8> {
-    imparo_kv::state::capture_recurrent(backend(), elems, from)
+pub fn read_recurrent(elems: usize, from: imparo_backend::BufId, plane: u32) -> Vec<u8> {
+    let off = u64::from(plane) * elems as u64;
+    imparo_kv::state::capture_recurrent(backend(), elems, from, off)
 }
 
 /// Per-layer capture geometry for the layers that own a growing-or-bounded cache.
@@ -783,6 +787,14 @@ pub trait KvPoolMember {
     ///
     /// # Errors
     /// Returns an error when preparation fails, or there is no device workflow.
+    /// Whether this ARCHITECTURE has a device forward at all.
+    ///
+    /// Not "is a backend active": a backend is always active when one is compiled in, and
+    /// IMPARO_BACKEND=cpu makes the CPU backend the active one. A caller that used the
+    /// second question to answer the first asked a CPU-only architecture to be GPU-ready
+    /// and got a refusal it could do nothing about.
+    fn has_device_workflow(&self) -> bool;
+
     fn ensure_gpu_ready(&mut self) -> Result<(), String>;
     /// Grow every layer's cache to hold `positions`, keeping the contents.
     ///
@@ -908,6 +920,7 @@ pub trait KvPoolMember {
             state,
             self.plan().recurrent_elems() as usize,
         )?;
+        self.recur_restored_to_plane0();
         self.kv_note_restored_recurrent(state);
         self.kv_runtime_mut().filled = state.boundary;
         Ok(())
@@ -986,10 +999,24 @@ pub trait KvPoolMember {
             return Ok(());
         };
         imparo_kv::state::restore_recurrent(backend(), n, &blob)?;
+        self.recur_restored_to_plane0();
         let st = self.state_mut();
         st.recur_ckpt_at = at;
         st.recur_ckpt = blob;
         Ok(())
+    }
+
+    /// The host has just written the recurrent state to the device, so PLANE 0 holds it
+    /// and both cursors follow (task #165).
+    ///
+    /// `restore_recurrent` writes plane 0, and a restored conversation has nothing in
+    /// flight, so this is the whole rule -- but it has to be said at every path that
+    /// writes `BufId::Recur` from the host, or the next decode reads the plane the cursor
+    /// was left on and answers from a state three steps old.
+    fn recur_restored_to_plane0(&mut self) {
+        let st = self.state_mut();
+        st.recur_plane = 0;
+        st.recur_plane_next = 0;
     }
 
     /// Records a just-restored recurrent state as the process's known snapshot.
@@ -1028,7 +1055,11 @@ pub trait KvPoolMember {
             return Some(Vec::new());
         }
         if boundary == self.kv_runtime().filled {
-            return Some(read_recurrent(n, imparo_backend::BufId::Recur));
+            return Some(read_recurrent(
+                n,
+                imparo_backend::BufId::Recur,
+                self.state().recur_plane,
+            ));
         }
         if boundary == self.state().recur_ckpt_at && !self.state().recur_ckpt.is_empty()
         {
@@ -1116,6 +1147,7 @@ pub trait KvPoolMember {
             state,
             self.plan().recurrent_elems() as usize,
         )?;
+        self.recur_restored_to_plane0();
         self.kv_note_restored_recurrent(state);
         self.kv_runtime_mut().filled = state.boundary;
         Ok(())

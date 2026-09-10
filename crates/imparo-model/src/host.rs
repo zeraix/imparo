@@ -19,6 +19,11 @@ use crate::backend::active;
 /// command buffers. For per-category TIME, difference two unprofiled runs using the skip
 /// levers instead: `IMPARO_SKIP_ATTN=2` drops the full-attention layers, `IMPARO_SKIP_CAT`
 /// drops a category, and neither costs anything to have compiled in.
+///
+/// `raw_ms` is a SUM OF OVERLAPPING INTERVALS, not a share of the step. Independent
+/// encoders run together, so the column adds up to more than wall -- that is the profiler
+/// reporting concurrency, not an error. It is comparable with a skip-and-diff only for a
+/// category nothing overlaps, which is what a serial dependency chain gives.
 pub fn prof_log(phase: &str, wall_ms: f64) {
     if !std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1") {
         return;
@@ -47,11 +52,18 @@ pub fn prof_log(phase: &str, wall_ms: f64) {
     }
     let mut cats = p.categories;
     cats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // gpu_ms is the category's OWN summed duration, from the hardware timestamps, and the
+    // column is allowed to sum to more than wall -- concurrent categories each report
+    // their whole time. It replaced a wall-rescaled column that read as a duration and was
+    // not one: scaling by share divides every category by the overlap factor, which
+    // understates a SERIAL category by exactly that much (2026-09-09; the qwen35 delta
+    // rule printed 1.9 ms/token that way against a real 4.0, and the skip-and-diff had
+    // said 3.9 all along).
     for (name, t, calls) in &cats {
         eprintln!(
-            "[prof]   {name:<15} {:5.1}%  calls={calls:<6} gpu_ms~{:7.1}",
+            "[prof]   {name:<15} gpu_ms={:8.1}  of_sum={:5.1}%  calls={calls}",
+            t * 1e3,
             100.0 * t / total.max(1e-9),
-            wall_ms * (t / total.max(1e-9))
         );
     }
 }

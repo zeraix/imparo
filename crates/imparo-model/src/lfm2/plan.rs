@@ -95,6 +95,8 @@ pub fn build(
             Attention::Recurrent {
                 r_elems: n_embd * (kernel - 1),
                 s_elems: 0,
+                key_dim: 0,
+                value_dim: 0,
             }
         } else if window > 0 {
             Attention::Window {

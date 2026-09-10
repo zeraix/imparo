@@ -311,7 +311,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vocab_size = plan.config.vocab_size;
 
     let mut model = imparo_model::load(weights, plan, capacity)?;
-    if imparo_model::backend::active().is_some() {
+    // BOTH questions, because they are different ones: a backend is active whenever one
+    // is compiled in (and IMPARO_BACKEND=cpu makes the CPU backend the active one), while
+    // `has_device_workflow` says whether THIS architecture has a device forward to make
+    // ready. Asking only the first sent a CPU-only architecture into a refusal.
+    if model.has_device_workflow() && imparo_model::backend::active().is_some() {
         model.ensure_gpu_ready()?;
     }
     let load_ms = t0.elapsed().as_secs_f64() * 1e3;

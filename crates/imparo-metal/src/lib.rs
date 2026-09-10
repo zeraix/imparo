@@ -39,6 +39,49 @@ pub mod buf {
     pub const COUNT: u32 = 20;
 }
 
+/// THE BRICK'S GATE, test support. Runs the MSL decode brick (`tm_sub32`) over one
+/// tensor row's SCALE RUN and PAYLOAD RUN -- the two byte runs the tile-major layout
+/// concatenates -- and returns `n_elems` floats.
+///
+/// It takes the runs rather than blocks because that is exactly the brick's contract, so
+/// the decode is gated with no addressing mixed in; it is also the only shape that can
+/// express IQ3_S, whose scales are TWO spans of the source block. `tests/brick_rows.rs`
+/// splits by `TmRule`'s spans -- the same table the repack moves bytes with -- and diffs
+/// the result against `imparo_cpu::quants::row_codec`, which is itself pinned bit-exact
+/// against llama.cpp's own dequantiser.
+///
+/// # Errors
+/// The backend's return code when the device, the pipeline or the dispatch fails.
+#[doc(hidden)]
+pub fn decode_probe_for_tests(
+    wfmt: u32,
+    scales: &[u8],
+    payload: &[u8],
+    n_elems: usize,
+) -> Result<Vec<f32>, i32> {
+    // The probe needs the device and the compiled library, which `imparo_metal_init`
+    // builds; the process runs one model, so this init is the test's model.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    static DUMMY: [u8; 64] = [0; 64];
+    ONCE.call_once(|| {
+        let rc = unsafe { imparo_metal_init(DUMMY.as_ptr().cast(), DUMMY.len() as u64) };
+        assert!(rc == 0 || rc == 4, "metal init for the brick gate: rc={rc}");
+    });
+    let mut out = vec![0.0_f32; n_elems];
+    let rc = unsafe {
+        imparo_metal_decode_probe(
+            wfmt,
+            scales.as_ptr().cast(),
+            scales.len() as u64,
+            payload.as_ptr().cast(),
+            payload.len() as u64,
+            u32::try_from(n_elems).map_err(|_| -1_i32)?,
+            out.as_mut_ptr(),
+        )
+    };
+    if rc == 0 { Ok(out) } else { Err(rc) }
+}
+
 unsafe extern "C" {
     fn imparo_metal_set_qcomb_nsg(n: u32);
     fn imparo_metal_set_attn_fa(v: u32);
@@ -47,6 +90,18 @@ unsafe extern "C" {
     fn imparo_metal_fa_has_hd(hd: u32) -> u32;
     fn imparo_metal_fa_nsg_mask(hd: u32) -> u32;
     fn imparo_metal_init(base: *const core::ffi::c_void, len: u64) -> i32;
+    /// THE BRICK'S GATE (test-only). Decodes row-major blocks of `wfmt` through the same
+    /// `tm_sub32` the GEMM, the GEMV and the gather call, so `tests/brick_rows.rs` can diff
+    /// the MSL transcription against the CPU row codec. Not on any serving path.
+    fn imparo_metal_decode_probe(
+        wfmt: u32,
+        scales: *const core::ffi::c_void,
+        n_scale_bytes: u64,
+        payload: *const core::ffi::c_void,
+        n_pay_bytes: u64,
+        n_elems: u32,
+        out: *mut f32,
+    ) -> i32;
     fn imparo_metal_working_set_budget() -> u64;
     fn imparo_metal_set_placement(segs: *const WSegWire, n: u32, budget: u64);
     fn imparo_metal_tune(sgs: u32, rows: u32);
@@ -116,6 +171,9 @@ unsafe extern "C" {
         applied: *mut u8,
     ) -> i32;
     fn imparo_metal_read_weight_bytes(off: u64, bytes: u64, out: *mut u8) -> i32;
+    fn imparo_metal_set_weight_kind_types(pairs: *const u32, n: u32);
+    fn imparo_metal_refused_dispatches() -> u64;
+    fn imparo_metal_rt_route_kinds() -> u64;
     fn imparo_metal_ple_gather_combine_staged(
         proj: u32,
         rows: u32,
@@ -155,6 +213,7 @@ unsafe extern "C" {
     fn imparo_metal_set_q8_dev_a(on: u32);
     fn imparo_metal_set_q8_clamp_edge(on: u32);
     fn imparo_metal_set_q8_mma_fence(on: u32);
+    fn imparo_metal_set_rt_mma_fence(on: u32);
     fn imparo_metal_set_attn_skip(bits: u32);
     fn imparo_metal_st_gemm_shape() -> u32;
     fn imparo_metal_set_st_gemm_large_shape(shape: u32);
@@ -227,7 +286,7 @@ unsafe extern "C" {
     fn imparo_metal_set_rt_shape(i: u32) -> i32;
     fn imparo_metal_prof_enable(on: u32);
     fn imparo_metal_prof_barriers() -> u64;
-    fn imparo_metal_prof_cats(ticks: *mut f64, calls: *mut u64, n: *mut u32);
+    fn imparo_metal_prof_cats(secs: *mut f64, calls: *mut u64, n: *mut u32);
     fn imparo_metal_prof_cat_name(i: u32) -> *const std::os::raw::c_char;
     fn imparo_metal_prof_read(
         gpu_s: *mut f64,
@@ -258,6 +317,10 @@ unsafe extern "C" {
     fn imparo_metal_kv_advise_free(layer: u32, is_v: u32, off: u64, len: u64);
     fn imparo_metal_kv_advise_reuse(layer: u32, is_v: u32, off: u64, len: u64);
     fn imparo_metal_write(id: u32, off: u64, src: *const f32, n: u64);
+    fn imparo_metal_zero(id: u32, off: u64, n: u64);
+    fn imparo_metal_wire_weights(stall_budget_s: f64);
+    fn imparo_metal_set_weight_path(path: *const std::os::raw::c_char);
+    fn imparo_metal_longest_cb_us() -> f64;
     fn imparo_metal_read(id: u32, off: u64, dst: *mut f32, n: u64);
     fn imparo_metal_end_async() -> i32;
     fn imparo_metal_wait_outstanding() -> i32;
@@ -283,6 +346,7 @@ unsafe extern "C" {
         src_row: u32,
     );
     fn imparo_metal_mega_layer(e: *const MegaEntryFfi) -> bool;
+    fn imparo_metal_mega_wfmt(wkind: u32) -> u32;
     fn imparo_metal_ffn_persistent(
         gate_off: u64,
         up_off: u64,
@@ -424,21 +488,25 @@ unsafe extern "C" {
         n_tok: u32,
         max_scores: u32,
         ring: u32,
+        scale: f32,
     );
     fn imparo_metal_act_mul(a: u32, b: u32, n: u32);
     fn imparo_metal_act(a: u32, n: u32);
-    fn imparo_metal_shortconv(
-        bcx: u32,
+    fn imparo_metal_causal_conv(
+        form: u32,
+        src: u32,
         w_off: u64,
         state: u32,
         state_off: u32,
+        state_out_off: u32,
         out: u32,
         width: u32,
         kern: u32,
         n_tok: u32,
     );
-    fn imparo_metal_shortconv_snapshot(
-        bcx: u32,
+    fn imparo_metal_causal_conv_snapshot(
+        form: u32,
+        src: u32,
         state: u32,
         state_off: u32,
         snap: u32,
@@ -446,6 +514,46 @@ unsafe extern "C" {
         width: u32,
         kern: u32,
         n_tok: u32,
+    );
+    fn imparo_metal_delta_net(
+        qkv: u32,
+        alpha: u32,
+        beta: u32,
+        a_off: u64,
+        dt_off: u64,
+        state: u32,
+        state_off: u32,
+        state_out_off: u32,
+        out: u32,
+        k_heads: u32,
+        v_heads: u32,
+        key_dim: u32,
+        value_dim: u32,
+        n_tok: u32,
+        eps: f32,
+        // The fused epilogue: IMPARO_NO_EPILOGUE in norm_w_off means "not fused".
+        norm_w_off: u64,
+        gate: u32,
+    ) -> bool;
+    fn imparo_metal_set_recurrent_dims(key_dim: u32, value_dim: u32);
+    fn imparo_metal_supports_gated_delta() -> u32;
+    fn imparo_metal_delta_net_fuses_epilogue() -> u32;
+    fn imparo_metal_mul_sigmoid(
+        a: u32,
+        b: u32,
+        n: u32,
+        b_off: u32,
+        b_stride: u32,
+        a_stride: u32,
+        n_row: u32,
+    );
+    fn imparo_metal_copy_strided(
+        dst: u32,
+        src: u32,
+        width: u32,
+        src_off: u32,
+        src_stride: u32,
+        n_row: u32,
     );
     fn imparo_metal_add(a: u32, b: u32, n: u32);
     fn imparo_metal_add_scale(a: u32, b: u32, k: f32, n: u32);
@@ -1123,22 +1231,30 @@ pub fn prof_enable(on: bool) {
     unsafe { imparo_metal_prof_enable(u32::from(on)) }
 }
 
-/// Per-kernel-category GPU time since the last read, as (name, ticks, calls).
+/// Per-kernel-category GPU time since the last read, as (name, SECONDS, calls).
 ///
-/// Ticks are the hardware timestamp counter's own unit. They are reported as shares of the
-/// total rather than converted to seconds: the share is what decides where to work, and a
-/// tick-to-nanosecond factor that varies by device would be one more thing to get wrong.
+/// Seconds, not ticks. The backend converts each region's counter ticks with the tick
+/// period that region measured, because the period is only known once a region samples the
+/// CPU and GPU clocks together. It used to hand back ticks and the caller printed shares,
+/// which read as durations and were not: a category's share times WALL divides every
+/// category by however much the concurrent ones overlapped, and it understated a serial
+/// category by exactly that factor (2026-09-09; the qwen35 delta rule read 1.9 ms/token
+/// that way against a real 4.0).
+///
+/// Concurrent categories each report their own full duration, so the column can sum to
+/// more than the wall it ran in. That is overlap, not error -- and it is why a category's
+/// figure is comparable with a skip-and-diff only when nothing overlaps it.
 pub fn prof_categories() -> Vec<(String, f64, u64)> {
-    let (mut ticks, mut calls, mut n) = ([0.0f64; 32], [0u64; 32], 0u32);
+    let (mut secs, mut calls, mut n) = ([0.0f64; 32], [0u64; 32], 0u32);
     unsafe {
-        imparo_metal_prof_cats(ticks.as_mut_ptr(), calls.as_mut_ptr(), &raw mut n);
+        imparo_metal_prof_cats(secs.as_mut_ptr(), calls.as_mut_ptr(), &raw mut n);
     };
     (0..n.min(32) as usize)
         .map(|i| {
             let name = unsafe {
                 std::ffi::CStr::from_ptr(imparo_metal_prof_cat_name(i as u32))
             };
-            (name.to_string_lossy().into_owned(), ticks[i], calls[i])
+            (name.to_string_lossy().into_owned(), secs[i], calls[i])
         })
         .filter(|(_, t, calls)| *t > 0.0 || *calls > 0)
         .collect()
@@ -1521,6 +1637,9 @@ pub unsafe fn init_tuned(base: *const u8, len: u64) -> Result<(), i32> {
     if let Ok(v) = std::env::var("IMPARO_Q8_MMA_FENCE") {
         unsafe { imparo_metal_set_q8_mma_fence(u32::from(v != "0")) };
     }
+    if let Ok(v) = std::env::var("IMPARO_RT_MMA_FENCE") {
+        unsafe { imparo_metal_set_rt_mma_fence(u32::from(v != "0")) };
+    }
     if let Ok(v) = std::env::var("IMPARO_Q8_CLAMP_EDGE") {
         unsafe { imparo_metal_set_q8_clamp_edge(u32::from(v != "0")) };
     }
@@ -1878,6 +1997,28 @@ pub fn kv_advise_reuse(layer: u32, is_v: bool, off: u64, len: u64) {
 pub fn write(id: u32, off: u64, src: &[f32]) {
     unsafe { imparo_metal_write(id, off, src.as_ptr(), src.len() as u64) }
 }
+/// Fill `n` floats of buffer `id` with zero, in place: no host source to allocate,
+/// fault in and read back.
+pub fn zero(id: u32, off: u64, n: u64) {
+    unsafe { imparo_metal_zero(id, off, n) }
+}
+/// The GGUF the mapping came from, so the repack can read converted tensors with the page
+/// cache turned off. A path that will not convert to C (an interior NUL) is simply not set,
+/// and the repack keeps reading through the mapping.
+pub fn set_weight_path(path: &std::path::Path) {
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    unsafe { imparo_metal_set_weight_path(c.as_ptr()) }
+}
+/// Make the weights GPU-resident now, so the first request does not wait for it.
+pub fn wire_weights(stall_budget_s: f64) {
+    unsafe { imparo_metal_wire_weights(stall_budget_s) }
+}
+/// GPU seconds of the LONGEST single command buffer of the last region.
+pub fn longest_cb_gpu_seconds() -> f64 {
+    unsafe { imparo_metal_longest_cb_us() * 1e-6 }
+}
 pub fn read(id: u32, off: u64, dst: &mut [f32]) {
     unsafe { imparo_metal_read(id, off, dst.as_mut_ptr(), dst.len() as u64) }
 }
@@ -2035,6 +2176,38 @@ pub fn mega_slot_kv(role: u32) -> MegaSlotFfi {
         id: 0,
         off: 0,
     }
+}
+/// THE LEVEL THE QWEN35 PROGRAM NEEDS, and it is ABOVE the default (5) on purpose.
+///
+/// Measured 2026-09-08, 16-step decode at position 23 on UD-Q4_K_S, ms per token, two
+/// rotated rounds:
+///
+/// ```text
+///   dispatch path            127.16 / 123.76
+///   mega tail, 18 x 16       140.81 / 140.22   +11.9%
+///   mega tail, 18 x 32       153.09 / 151.58   +21.3%
+/// ```
+///
+/// The trail is IDENTICAL in every run -- the phases are correct, they are not worth it yet.
+/// ATTRIBUTED 2026-09-08: the gap was GRID IMBALANCE, not the kernel's arithmetic. Ablating
+/// each phase prices the gated pair at 55.1 ms/token against the dispatch path's ~54 (+2%)
+/// and the down projection at 36.0 against ~27 (+33%), and down is the phase whose 640 units
+/// do not divide the 288-simdgroup grid: three waves run for 2.22 units of work. The grid is
+/// derived from the phases' item counts now (18 x 18 here), which takes the route to 131.4
+/// with the same step hash. See docs/grid-balance-and-occupancy.md. What is left against the
+/// dispatch path is the gated pair's 4% residual waste and the norm and tail phases; the
+/// fold's 3064 fewer dispatches only pay once the mixer arms join it. The pre-step state
+/// copy that cost 2.4 ms a token here is gone -- the state is planes now (task #165).
+/// `IMPARO_MEGA_FFN=6` runs it meanwhile.
+pub const MEGA_LEVEL_QWEN35: u32 = 6;
+
+/// The mega row brick's weight format for a wire kind, or 0 when the brick cannot read it
+/// (no decode arm, or the tensor kept the row-major layout -- the mega phases read
+/// tile-major only). An architecture whose weights differ per tensor asks this per tensor;
+/// 0 means REFUSE the layer, never "read it as row-major".
+#[must_use]
+pub fn mega_wfmt(wkind: u32) -> u32 {
+    unsafe { imparo_metal_mega_wfmt(wkind) }
 }
 /// One layer of any architecture as one persistent dispatch (or one entry of the program run).
 /// Returns false, nothing encoded, when the bridge refuses the entry.
@@ -2404,10 +2577,29 @@ pub fn attention(
     max_scores: u32,
     ring: u32,
 ) {
+    attention_scaled(kv_layer, head_dim, n_heads, n_kv, kv_width, start_pos,
+        window, n_tok, max_scores, ring, 1.0);
+}
+
+/// FA scales the scores after its half-Q dot product. Other routes retain prescaled Q.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_scaled(
+    kv_layer: u32,
+    head_dim: u32,
+    n_heads: u32,
+    n_kv: u32,
+    kv_width: u32,
+    start_pos: u32,
+    window: u32,
+    n_tok: u32,
+    max_scores: u32,
+    ring: u32,
+    scale: f32,
+) {
     unsafe {
         imparo_metal_attention(
             kv_layer, head_dim, n_heads, n_kv, kv_width, start_pos, window, n_tok,
-            max_scores, ring,
+            max_scores, ring, scale,
         );
     }
 }
@@ -2418,27 +2610,33 @@ pub fn act(a: u32, n: u32) {
     unsafe { imparo_metal_act(a, n) }
 }
 
-/// LFM2's gated short convolution; see `Backend::shortconv`.
+/// A causal depthwise convolution; see `Backend::causal_conv`. `form` is the wire value
+/// of `ConvForm`, which selects the pipeline.
 #[allow(clippy::too_many_arguments)]
-pub fn shortconv(
-    bcx: u32,
+pub fn causal_conv(
+    form: u32,
+    src: u32,
     w_off: u64,
     state: u32,
     state_off: u32,
+    state_out_off: u32,
     out: u32,
     width: u32,
     kern: u32,
     n_tok: u32,
 ) {
     unsafe {
-        imparo_metal_shortconv(bcx, w_off, state, state_off, out, width, kern, n_tok);
+        imparo_metal_causal_conv(
+            form, src, w_off, state, state_off, state_out_off, out, width, kern, n_tok,
+        );
     }
 }
 
-/// The short-conv state at a boundary inside the batch; see `Backend::shortconv_snapshot`.
+/// The conv state at a boundary inside the batch; see `Backend::causal_conv_snapshot`.
 #[allow(clippy::too_many_arguments)]
-pub fn shortconv_snapshot(
-    bcx: u32,
+pub fn causal_conv_snapshot(
+    form: u32,
+    src: u32,
     state: u32,
     state_off: u32,
     snap: u32,
@@ -2448,10 +2646,98 @@ pub fn shortconv_snapshot(
     n_tok: u32,
 ) {
     unsafe {
-        imparo_metal_shortconv_snapshot(
-            bcx, state, state_off, snap, snap_off, width, kern, n_tok,
+        imparo_metal_causal_conv_snapshot(
+            form, src, state, state_off, snap, snap_off, width, kern, n_tok,
         );
     }
+}
+
+/// The gated delta rule; see `Backend::delta_net`. False when the pipeline was not built
+/// or was built for other head widths, and then nothing is written.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net(
+    qkv: u32,
+    alpha: u32,
+    beta: u32,
+    a_off: u64,
+    dt_off: u64,
+    state: u32,
+    state_off: u32,
+    state_out_off: u32,
+    out: u32,
+    k_heads: u32,
+    v_heads: u32,
+    key_dim: u32,
+    value_dim: u32,
+    n_tok: u32,
+    eps: f32,
+    // The gated-RMS epilogue's weight offset, or `NO_EPILOGUE` for the unfused form
+    // (then `gate` is ignored and the rule writes `out` as before).
+    norm_w_off: u64,
+    gate: u32,
+) -> bool {
+    unsafe {
+        imparo_metal_delta_net(
+            qkv, alpha, beta, a_off, dt_off, state, state_off, state_out_off, out,
+            k_heads, v_heads, key_dim, value_dim, n_tok, eps, norm_w_off, gate,
+        )
+    }
+}
+
+/// `norm_w_off` for a `delta_net` call with no fused epilogue. Not a valid weight offset:
+/// the same all-ones sentinel the norm kernels use for "this row has no weight".
+pub const NO_EPILOGUE: u64 = u64::MAX;
+
+/// Whether the built delta pipeline applies the gated-RMS epilogue itself; see
+/// `Backend::delta_net_fuses_epilogue`.
+#[must_use]
+pub fn delta_net_fuses_epilogue() -> bool {
+    // DEFAULT ON, opt OUT with IMPARO_DELTA_EPI=0.
+    //
+    //
+    // The fold is measured and it wins -- +0.75% prefill at 512 tokens, decode exactly
+    // flat, four rotated arms with no overlap -- and it is BIT-IDENTICAL to the two
+    // dispatches it replaces: the 16-step decode stephash is 79f9225dce7c46b3 with the
+    // fold on and off alike, which is also what the engine returned before the fold
+    // existed. It was off until the last-bit difference was explained; the explanation is
+    // the volatile store on `tout` in imparo_delta_net, which forces the rule's output to
+    // round to f32 before the epilogue reads it back. One build, two arms: the gate is an
+    // env read, not a comment-out, so the verified build and the measured build are the
+    // same file.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IMPARO_DELTA_EPI").as_deref() != Ok("0"))
+        && unsafe { imparo_metal_delta_net_fuses_epilogue() != 0 }
+}
+
+/// The recurrent head widths, before `init_weights`; see `Backend::set_recurrent_dims`.
+pub fn set_recurrent_dims(key_dim: u32, value_dim: u32) {
+    unsafe { imparo_metal_set_recurrent_dims(key_dim, value_dim) }
+}
+
+/// Whether the delta pipeline exists in the built library.
+#[must_use]
+pub fn supports_gated_delta() -> bool {
+    unsafe { imparo_metal_supports_gated_delta() != 0 }
+}
+
+/// `a *= sigmoid(b)` over strided rows; see `Backend::mul_strided_sigmoid`.
+#[allow(clippy::too_many_arguments)]
+pub fn mul_strided_sigmoid(
+    a: u32,
+    b: u32,
+    n: u32,
+    b_off: u32,
+    b_stride: u32,
+    a_stride: u32,
+    n_row: u32,
+) {
+    unsafe { imparo_metal_mul_sigmoid(a, b, n, b_off, b_stride, a_stride, n_row) }
+}
+
+/// One sub-block out of every row; see `Backend::copy_strided`.
+pub fn copy_strided(dst: u32, src: u32, width: u32, src_off: u32, src_stride: u32, n_row: u32) {
+    unsafe { imparo_metal_copy_strided(dst, src, width, src_off, src_stride, n_row) }
 }
 pub fn add(a: u32, b: u32, n: u32) {
     unsafe { imparo_metal_add(a, b, n) }
@@ -2505,8 +2791,17 @@ pub fn write_u32(id: u32, off: u64, src: &[u32]) {
 }
 
 /// Wire layout of one load-time repack job; mirrors `WXformWire` in imparo_metal.mm.
+///
+/// The job carries THE RULE, not just the type ids. `TmRule` in imparo-gguf is the one
+/// statement of where a block's scales are and where they go; a backend that re-derived
+/// that from `from_type` would be a second copy of the layout, and the copy is what puts
+/// every payload at a wrong offset the moment a format is added. The repack kernel is
+/// therefore format-agnostic: it moves the spans it is given.
+///
+/// Spans are the scale spans first (`n_scale_spans` of them), then the payload spans, in
+/// source order. Mirrors `imparo_backend::WeightBlockLayout`.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct WXformWire {
     pub off: u64,
     pub bytes: u64,
@@ -2514,6 +2809,30 @@ pub struct WXformWire {
     pub to_type: u32,
     pub n_in: u32,
     pub n_out: u32,
+    pub block_elems: u32,
+    pub block_bytes: u32,
+    pub unit_rows: u32,
+    /// Scale spans + payload spans. At most `MAX_XFORM_SPANS`.
+    pub n_spans: u32,
+    pub n_scale_spans: u32,
+    pub span_off: [u32; imparo_backend::MAX_BLOCK_SPANS],
+    pub span_len: [u32; imparo_backend::MAX_BLOCK_SPANS],
+}
+
+impl WXformWire {
+    /// Fills in the layout half from the job's `WeightBlockLayout`. This crate never
+    /// derives a layout: it copies the one the common runtime read from `TmRule`.
+    #[must_use]
+    pub fn with_layout(mut self, l: &imparo_backend::WeightBlockLayout) -> Self {
+        self.block_elems = l.block_elems;
+        self.block_bytes = l.block_bytes;
+        self.unit_rows = l.unit_rows;
+        self.n_spans = l.n_spans;
+        self.n_scale_spans = l.n_scale_spans;
+        self.span_off = l.span_off;
+        self.span_len = l.span_len;
+        self
+    }
 }
 
 /// Load-time repack of fast-tier tensors into private buffers on the GPU. One flag per
@@ -2531,6 +2850,29 @@ pub fn transform_weights(jobs: &[WXformWire]) -> Result<Vec<bool>, String> {
         return Err(format!("imparo_metal_transform_weights rc={rc}"));
     }
     Ok(applied.into_iter().map(|a| a != 0).collect())
+}
+
+/// Tells the backend which ggml type each wire weight kind is, as flat (wire, ggml) pairs.
+/// The table is imparo-gguf's; this crate stores what it is handed and derives nothing.
+pub fn set_weight_kind_types(pairs: &[(u32, u32)]) {
+    let flat: Vec<u32> = pairs.iter().flat_map(|&(w, g)| [w, g]).collect();
+    unsafe { imparo_metal_set_weight_kind_types(flat.as_ptr(), pairs.len() as u32) }
+}
+
+/// Dispatches this process refused rather than encoding -- an unserved weight kind, a
+/// width no route can walk, a span past the kernel's slices. Nonzero means some op did
+/// NOT run; a harness that must have dispatched reads this instead of scanning the log.
+#[must_use]
+pub fn refused_dispatches() -> u64 {
+    unsafe { imparo_metal_refused_dispatches() }
+}
+
+/// The weight kinds whose matmul the register-tiled GEMM serves, one bit per wire kind.
+/// Asked of the routing itself so an `applies` predicate cannot fall behind it; valid
+/// only after `set_weight_kind_types`, which is where the kind -> ggml mapping arrives.
+#[must_use]
+pub fn rt_route_kinds() -> u64 {
+    unsafe { imparo_metal_rt_route_kinds() }
 }
 
 /// Weight bytes as the GPU sees them at a file offset (private buffers read back through

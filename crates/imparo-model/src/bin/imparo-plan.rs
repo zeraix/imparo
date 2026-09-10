@@ -202,8 +202,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "layer {:2} window head_dim={head_dim} rope_base={rope_base:e} rope_dim={rope_dim} window={window} kv={:?}",
                     l.index, l.kv_source
                 ),
-                Attention::Recurrent { r_elems, s_elems } => println!(
-                    "layer {:2} recur  state r={r_elems} s={s_elems} elements/layer",
+                Attention::Recurrent { r_elems, s_elems, key_dim, value_dim } => println!(
+                    "layer {:2} recur  state r={r_elems} s={s_elems} elements/layer \
+                     (matrix {value_dim}x{key_dim})",
                     l.index
                 ),
             }

@@ -319,6 +319,8 @@ name = "imparo-metal"
 version = "0.1.0"
 dependencies = [
  "imparo-backend",
+ "imparo-cpu",
+ "imparo-gguf",
  "imparo-host",
 ]
 

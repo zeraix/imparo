@@ -273,12 +273,18 @@ pub fn kv_dequant_scratch_requirements(
 ///
 /// Two slots rather than one: the fused up epilogue writes G's mirror while the SAME
 /// dispatch is still reading CUR's mirror out of the first slot, so they cannot share
-/// bytes.  Both ALIAS `host`'s pages and cost zero memory, which is why `host` must be a
-/// buffer that is dead during prefill -- `U` on a SwiGLU feed-forward, because the fused
-/// epilogue writes G and leaves U untouched.  That is a REQUIREMENT, not a nicety: with
-/// the epilogue unfused the up projection writes U while the mirror of its own input
-/// still lives in U's pages, and the dispatch reads and writes the same bytes.  A slot
-/// that does not fit inside `host` is skipped, and the backend keeps converting inline.
+/// bytes.  Both ALIAS `host`'s pages, which is why `host` must be a buffer that is dead
+/// during prefill -- `U` on a SwiGLU feed-forward, because the fused epilogue writes G and
+/// leaves U untouched.  That is a REQUIREMENT, not a nicety: with the epilogue unfused the
+/// up projection writes U while the mirror of its own input still lives in U's pages, and
+/// the dispatch reads and writes the same bytes.
+///
+/// A dead host is necessary and NOT sufficient: overlapping arena groups all start at
+/// offset zero, so another group's live buffers reach into the host's bytes whenever that
+/// group is larger.  `place_buffers` checks it and allocates the slot dedicated when the
+/// alias would be unsafe, so this list does not have to know the arena's shape.  A slot
+/// that does not fit inside `host` at all is skipped, and the backend keeps converting
+/// inline.
 ///
 /// `widest_elems` is the largest per-token activation any matmul stages through the
 /// mirror, which is `n_ff` on a SwiGLU feed-forward -- wider than the model itself.
@@ -438,6 +444,14 @@ pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
             Placement::Within { .. } => {}
         }
     }
+    // WHICH GROUP EACH BUFFER IS IN, so an alias can ask what else reaches its bytes.
+    let group_of: BTreeMap<u32, u8> = reqs
+        .iter()
+        .filter_map(|r| match r.placement {
+            Placement::Group(g) => Some((r.id as u32, g)),
+            _ => None,
+        })
+        .collect();
     for r in reqs {
         let Placement::Within { host, slot } = r.placement else {
             continue;
@@ -446,6 +460,42 @@ pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
             continue; // host was dedicated or forced out; nothing to alias into
         };
         let skip = be().page_round(r.bytes) * u64::from(slot);
+        // AN ALIAS IS ONLY SAFE BEYOND EVERY OTHER GROUP'S END. Overlapping groups all
+        // start at offset zero, so bytes inside one group's region are ALSO written by
+        // any other group whose own region reaches that far -- being inside a host that
+        // is dead is necessary and not sufficient.
+        //
+        // gemma4 and LFM2 satisfy this by accident: their feed-forward group is the
+        // largest, so nothing reaches into it. Qwen3.8's mixer group is more than twice
+        // the feed-forward group, and the half-activation mirrors landed in bytes its
+        // packed projection was writing -- the GEMM read its own operand as it was being
+        // overwritten and the logits came back NaN at every prompt over 64 tokens.
+        //
+        // Dedicated rather than skipped: the mirror family is worth its bytes (17 MB per
+        // slot here), and skipping would silently cost the whole fast path instead.
+        let others_reach = if overlap {
+            group_bytes
+                .iter()
+                .filter(|(g, _)| group_of.get(&(host as u32)) != Some(g))
+                .map(|(_, &b)| b)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if host_off + skip < others_reach {
+            bytes += be().page_round(r.bytes);
+            be().alloc(r.id, r.bytes)
+                .map_err(|rc| format!("metal alloc {:?} failed rc={rc}", r.id))?;
+            if crate::log_on() {
+                eprintln!(
+                    "[imparo] alias {:?} slot {slot} DEDICATED: another group reaches \
+                     {others_reach} bytes, past {host_off}+{skip} inside {host:?}",
+                    r.id
+                );
+            }
+            continue;
+        }
         // A SKIPPED alias is invisible in the output -- the backend's slower path is
         // still correct -- so it has to be visible in the log, or a performance cliff
         // has no explanation. Absence of evidence is not evidence.
@@ -506,6 +556,108 @@ pub fn probe_first(label: &str) {
     if !SEEN[slot].swap(true, Ordering::Relaxed) {
         crate::host::log_footprint(label);
     }
+}
+
+/// Layers per command buffer for this forward: the tuner's seat, LOWERED when the
+/// last one held the GPU too long.
+///
+/// A COMMAND BUFFER'S DURATION IS OTHERWISE UNBOUNDED IN MODEL SIZE. Every
+/// architecture encodes a whole prefill chunk into one buffer when the seat is 0, and
+/// nothing in that decision scales with the model: LFM2 and gemma4 E4B land around
+/// 450-500 ms, and Qwen3.8-27B lands at 5.0 s on the same 512-token chunk. A buffer
+/// that long leaves the compositor no gap at all, which is the failure this bound
+/// exists for -- a 2026-09-09 run held one for over fifteen minutes and took the
+/// machine with it.
+///
+/// THE SEAT STILL DECIDES SPEED; this only ever lowers it, and only after a
+/// measurement. `flush_layers` is swept by imparo-tune and stays the answer to "how
+/// many layers per buffer is fastest"; the bound is a separate question -- "how long
+/// may one buffer hold the device" -- and the two are kept apart on purpose.
+///
+/// The budget is a POLICY, not a derivation, and is stated as one: 1000 ms by default,
+/// `IMPARO_CB_STALL_MS` to change it. Two things pin it rather than taste. It sits
+/// under the mega failsafe's ~1.2 s spin cap, so a prefill buffer can no longer outlive
+/// the mechanism that catches a wedged decode. And it is above both shipped small
+/// models' whole-prefill buffers, measured, so neither of them moves -- a bound that
+/// silently reshaped LFM2 or E4B would be paying for the 27B with their speed. No
+/// probe was run to find the point where a compositor actually starves: deliberately
+/// holding the GPU to find it is how this machine was hurt before.
+///
+/// Decode is returned untouched. A decode buffer is one token, milliseconds wide, and
+/// was never the thing holding the device.
+pub fn flush_layers_bounded(decode: bool, layers: usize) -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// The cap this process has ratcheted to, or `usize::MAX` while none is needed.
+    ///
+    /// THE STATE IS THE DECISION, NOT THE SEAT. Deriving "layers per buffer" from the
+    /// seat on every call and then comparing the last measurement against the budget is
+    /// a control loop with no memory of its own output, and it oscillates: the clamp
+    /// brings the buffer under budget, the next call sees a healthy measurement, reverts
+    /// to one buffer, and the buffer is over budget again. Measured on Qwen3.8-27B before
+    /// this was a ratchet -- cbs 1 (4983 ms), 6 (830 ms), 1 (4969 ms) over three reps.
+    ///
+    /// It only ever tightens. Re-testing a safety bound by going back to a five-second
+    /// command buffer is the thing the bound exists to prevent.
+    static CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    let seat = be().flush_layers(decode) as usize;
+    if decode || layers == 0 {
+        return seat;
+    }
+    // A seat of 0, or one wider than the model, means one buffer for the whole forward.
+    let want_by_seat = if seat == 0 || seat > layers {
+        layers
+    } else {
+        seat
+    };
+    let mut cap = CAP.load(Ordering::Relaxed);
+    let effective = want_by_seat.min(cap);
+
+    let longest = be().longest_cb_gpu_seconds();
+    let budget = stall_budget_s();
+    if longest > budget && effective > 1 {
+        // The last region ran `effective` layers in `longest` seconds. Scale so the
+        // projection lands under the budget; never below one layer per buffer.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation
+        )]
+        let tightened =
+            (((effective as f64) * budget / longest).floor() as usize).max(1);
+        if tightened < effective {
+            CAP.store(tightened, Ordering::Relaxed);
+            cap = tightened;
+            // Log every actual change, not only the first one: a later, tighter cap
+            // changes execution geometry and must remain visible in raw run logs.
+            // This branch runs only on a decrease; stable forwards do not log.
+            eprintln!(
+                "[imparo] one command buffer held the GPU for {:.0} ms over a \
+                 {:.0} ms budget; prefill flushes every {tightened} of {layers} \
+                 layers from here (previous effective {effective}; \
+                 IMPARO_CB_STALL_MS to change the budget)",
+                longest * 1e3,
+                budget * 1e3
+            );
+        }
+    }
+    let out = want_by_seat.min(cap);
+    // The call sites read 0 as "one buffer for the whole forward"; say that when the
+    // answer is the whole model, so an unbounded model keeps the seat it was tuned with.
+    if out >= layers { seat } else { out }
+}
+
+/// How long one command buffer may hold the device. See `flush_layers_bounded`.
+pub fn stall_budget_s() -> f64 {
+    static MS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("IMPARO_CB_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(1000.0)
+            * 1e-3
+    })
 }
 
 impl<A: Architecture> Workflow<A> {
@@ -665,17 +817,17 @@ impl<A: Architecture> Workflow<A> {
             .map_err(|rc| format!("metal mega scratch reserve rc={rc}"))?;
         let recur = self.plan.recurrent_elems();
         if recur > 0 {
-            be().alloc(BufId::Recur, u64::from(recur) * 4)
+            // PLANES, not one buffer plus a rollback copy: a decode step reads one plane and
+            // writes the next, so the plane it read IS its pre-step state and a failure is
+            // undone by not advancing an index. Same bytes as the old Recur plus its
+            // two-slot rollback copy, and no per-step copy at all (task #165).
+            be().alloc(BufId::Recur, u64::from(recur) * 4 * u64::from(imparo_backend::RECUR_PLANES))
                 .map_err(|rc| format!("metal alloc recurrent state rc={rc}"))?;
             // The snapshot twin, same size: where the state at a boundary INSIDE a batch
             // is written. See `arm_recurrent_snapshot`.
             be().alloc(BufId::RecurSnap, u64::from(recur) * 4)
                 .map_err(|rc| format!("metal alloc recurrent snapshot rc={rc}"))?;
-            // The pre-step copies a decode step is rolled back from: one per pipe slot,
-            // since two steps can be in flight and a failed one is rolled back to the
-            // state before IT, not before the one queued behind it.
-            be().alloc(BufId::RecurPrev, u64::from(recur) * 4 * 2)
-                .map_err(|rc| format!("metal alloc recurrent rollback rc={rc}"))?;
+
             self.zero_recurrent();
             if crate::log_on() {
                 eprintln!(
@@ -701,12 +853,28 @@ impl<A: Architecture> Workflow<A> {
         // Account for what the engine ACTUALLY allocates, from the layout that did it.
         // Footprint once read 452 MiB against a hand estimate of ~138, and guessing at
         // the difference is how you optimise the wrong thing.
+        // The recurrent state was missing from this line, and on Qwen3.8-27B that is not a
+        // rounding error: 149.62 MiB of state becomes 598.5 MiB of allocation (RECUR_PLANES
+        // planes so a failed step is undone by not advancing an index, plus one boundary
+        // snapshot), which read as 600 MiB of unexplained growth between two footprint
+        // stages. A line that omits an allocation invites exactly the guessing the comment
+        // above forbids, so it names every one.
         let kv_total: u64 = kv_bytes.iter().sum::<u64>() * 2; // K and V
+        let recur = u64::from(self.plan.recurrent_elems()) * 4;
+        let recur_total = recur * u64::from(imparo_backend::RECUR_PLANES) + recur;
+        let mib = |b: u64| b as f64 / (1 << 20) as f64;
         eprintln!(
-            "[imparo] gpu alloc: kv={:.1} MiB activations={:.1} MiB (max_batch={max_batch})",
-            kv_total as f64 / (1 << 20) as f64,
-            act_bytes as f64 / (1 << 20) as f64
+            "[imparo] gpu alloc: kv={:.1} MiB activations={:.1} MiB recurrent={:.1} MiB              ({} planes + snapshot of {:.1}) (max_batch={max_batch})",
+            mib(kv_total),
+            act_bytes as f64 / (1 << 20) as f64,
+            mib(recur_total),
+            imparo_backend::RECUR_PLANES,
+            mib(recur)
         );
+        // LAST, because it is the last thing load owes the device: every allocation above
+        // has joined whatever the backend keeps resident, so wiring them now is wiring
+        // them once. See `Backend::wire_weights` for why it is not left to request one.
+        be().wire_weights(stall_budget_s());
         Ok(())
     }
 
@@ -736,19 +904,23 @@ impl<A: Architecture> Workflow<A> {
     /// Clears the device recurrent state: the device twin of `RecurrentState::reset`.
     ///
     /// A conversation that resumed on a dirty state gives the right shape and the wrong
-    /// numbers. Allocating the zeros here rather than keeping them resident because this
-    /// runs once per conversation, not once per token.
+    /// numbers.
+    ///
+    /// THE BACKEND FILLS; THE HOST DOES NOT BUILD THE ZEROS. This used to allocate a host
+    /// `Vec<f32>` of `recurrent_elems * RECUR_PLANES`, fault every page of it in, and
+    /// memcpy it across. On Qwen3.8-27B that is a gigabyte of state, and it cost 3374 ms
+    /// on the first conversation and 65 ms on every one after -- all of it to produce a
+    /// source operand whose value is known. `Backend::zero` fills the buffer in place.
     pub fn zero_recurrent(&self) {
-        let n = self.plan.recurrent_elems() as usize;
+        let n = self.plan.recurrent_elems() as u64;
         if n > 0 {
-            let zeros = vec![0.0_f32; n];
-            be().write(BufId::Recur, 0, &zeros);
+            be().zero(BufId::Recur, 0, n * u64::from(imparo_backend::RECUR_PLANES));
             // The snapshot twin too. A layer kind writes only the part of the state it
             // owns -- a short convolution writes its history and nothing else -- so any
             // region no snapshot dispatch covers would be read back as whatever the
             // allocation happened to contain. LFM2 has no such region (s_elems = 0); a
             // gated-delta-rule model would.
-            be().write(BufId::RecurSnap, 0, &zeros);
+            be().zero(BufId::RecurSnap, 0, n);
         }
     }
 
@@ -793,7 +965,7 @@ impl<A: Architecture> Workflow<A> {
             return;
         };
         let n = self.plan.recurrent_elems() as usize;
-        self.state.recur_ckpt = crate::kv::read_recurrent(n, BufId::RecurSnap);
+        self.state.recur_ckpt = crate::kv::read_recurrent(n, BufId::RecurSnap, 0);
         self.state.recur_ckpt_at = at + k as usize;
     }
 

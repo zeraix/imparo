@@ -30,6 +30,7 @@ pub mod identity;
 pub mod kv;
 pub mod lfm2;
 pub mod placement;
+pub mod qwen35;
 pub use identity::ModelPlanIdentity;
 pub use imparo_cpu::ops;
 pub use imparo_gguf::scan as ggufscan;
@@ -79,11 +80,22 @@ pub enum Attention {
     /// the model's own records where its kernels read them. Neither count grows with
     /// context, which is what `grows_with_context` reports and what keeps these blocks out
     /// of the KV pool.
+    ///
+    /// The recurrent MATRIX also carries its two coordinates, because a kernel that holds
+    /// one of its rows per lane needs them as a compile-time constant -- the same reason
+    /// the attention head dim is here rather than in a model's own records, and the same
+    /// mechanism (`Backend::set_recurrent_dims`, before `init_weights`). Every
+    /// architecture in this family shapes that matrix the same way, `[head][value][key]`;
+    /// `s_elems = heads * value_dim * key_dim`.
     Recurrent {
         /// Elements per layer of rolling state: a conv history, a token shift.
         r_elems: u32,
         /// Elements per layer of recurrent matrix state; 0 for a block that has none.
         s_elems: u32,
+        /// The matrix's key coordinate, which is also the Q/K head width. 0 with no matrix.
+        key_dim: u32,
+        /// The matrix's value coordinate, which is also the V head width. 0 with no matrix.
+        value_dim: u32,
     },
 }
 
@@ -143,13 +155,44 @@ impl ModelPlan {
         let mut out = Vec::with_capacity(self.layers.len());
         for l in &self.layers {
             let (r, sz) = match l.attention {
-                Attention::Recurrent { r_elems, s_elems } => (r_elems, s_elems),
+                Attention::Recurrent { r_elems, s_elems, .. } => (r_elems, s_elems),
                 _ => (0, 0),
             };
             out.push((at, at + r, r, sz));
             at += r + sz;
         }
         out
+    }
+
+    /// The recurrent matrix's key and value coordinates, or None when no layer has one.
+    ///
+    /// The backend compiles its delta kernel for these, so a file whose layers disagreed
+    /// would need two kernels; the first pair wins and the rest must match it, which is
+    /// checked here rather than discovered as wrong numbers.
+    ///
+    /// # Errors
+    /// When two recurrent layers carry differently shaped matrices.
+    pub fn recurrent_dims(&self) -> Result<Option<(u32, u32)>, String> {
+        let mut found: Option<(u32, u32)> = None;
+        for l in &self.layers {
+            let Attention::Recurrent { key_dim, value_dim, s_elems, .. } = l.attention else {
+                continue;
+            };
+            if s_elems == 0 {
+                continue;
+            }
+            match found {
+                None => found = Some((key_dim, value_dim)),
+                Some(d) if d == (key_dim, value_dim) => {}
+                Some(d) => {
+                    return Err(format!(
+                        "layer {} has a {key_dim}x{value_dim} recurrent matrix and an                          earlier layer has {}x{}; one kernel cannot serve both",
+                        l.index, d.0, d.1
+                    ));
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Elements the whole per-conversation recurrent state occupies; 0 when there is none.
@@ -470,6 +513,13 @@ pub struct WorkflowState {
     /// input of a queued step that took its token from the device, should that step have
     /// to be re-run on the host's side.
     pub last_pick: Option<u32>,
+    /// The recurrent plane holding the state as of the last RETIRED step: what the host
+    /// reads, captures and restores.
+    pub recur_plane: u32,
+    /// The plane the NEXT encode reads. It runs ahead of `recur_plane` by the number of
+    /// steps in flight, and a rollback is `recur_plane_next = recur_plane` -- which is the
+    /// whole reason the state is planes and not a copy (`imparo_backend::RECUR_PLANES`).
+    pub recur_plane_next: u32,
 }
 
 /// What a pipelined decode step tells the device graph. See `WorkflowState::pipe`.
@@ -494,9 +544,32 @@ pub struct QueuedStep {
     /// The input token when the host supplied it; None when the step took the previous
     /// step's pick from the device (`WorkflowState::last_pick` at retire time).
     pub token: Option<u32>,
+    /// The recurrent plane this step WROTE; `recur_plane` becomes it when the step retires.
+    pub recur_plane_out: u32,
 }
 
 impl WorkflowState {
+    /// The recurrent planes a decode step uses: `(read, write)`. The read plane is the
+    /// state as of the step before it; the write plane is where its update lands, so the
+    /// read plane survives as that step's rollback point (`imparo_backend::RECUR_PLANES`).
+    ///
+    /// Prefill and the host path use `(p, p)` -- in place -- because nothing rolls a
+    /// prefill chunk back to a per-token boundary.
+    #[must_use]
+    pub fn recur_decode_planes(&self) -> (u32, u32) {
+        let r = self.recur_plane_next;
+        (r, (r + 1) % imparo_backend::RECUR_PLANES)
+    }
+
+    /// A SYNCHRONOUS decode step succeeded: the plane it wrote is now the state, and the
+    /// next encode reads it. The pipelined path defers the second half to `wait_step`,
+    /// which is the only difference between the two (task #165).
+    pub fn recur_commit_step(&mut self) {
+        let (_, wrote) = self.recur_decode_planes();
+        self.recur_plane_next = wrote;
+        self.recur_plane = wrote;
+    }
+
     /// Everything a workflow needs before it has resolved a single tensor.
     #[must_use]
     pub fn new(weights: &weights::Weights, plan: &ModelPlan, capacity: usize) -> Self {
@@ -521,6 +594,8 @@ impl WorkflowState {
             recurrent: cpu_support::RecurrentState::new(plan, host_forward),
             recur_ckpt: Vec::new(),
             recur_ckpt_at: 0,
+            recur_plane: 0,
+            recur_plane_next: 0,
             recur_snap: None,
             pipe: None,
             queued: std::collections::VecDeque::new(),
@@ -616,7 +691,9 @@ pub fn prefill_batch() -> usize {
 /// for the same reason, and three separately-worded refusals read as three problems.
 fn no_device_workflow(plan: &ModelPlan) -> String {
     format!(
-        "{}: no GPU workflow; unset IMPARO_GPU to run the CPU reference deliberately",
+        // IMPARO_GPU=0, not "unset": since 2026-09-02 (#115) UNSET means GPU, so the
+        // old wording sent a reader to the one setting that cannot work.
+        "{}: no GPU workflow; set IMPARO_GPU=0 to run the CPU reference deliberately",
         plan.config.architecture
     )
 }
@@ -865,6 +942,7 @@ impl<A: Architecture> Workflow<A> {
             self.state.recur_snap = None;
         }
         r?;
+        self.state.recur_commit_step();
         self.state.kv_rt.filled = start_pos + 1;
         self.take_recurrent_snapshot(start_pos);
         Ok(pick[0].to_bits())
@@ -872,11 +950,11 @@ impl<A: Architecture> Workflow<A> {
 
     /// A queued step's region failed (a mega-kernel barrier timeout, task #149). Its
     /// output and the output of any step queued behind it are invalid, its KV rows are
-    /// overwritten by a re-run, and its recurrent state is rolled back to the copy the
-    /// batch took at its start. The step is run again as an ordinary forward -- the
-    /// backend holds its persistent route closed after `mega_recover`, so the dispatch
-    /// path runs it -- and the step that was behind it is queued again with the pick the
-    /// re-run produced. The request sees one slow token, not a failure.
+    /// overwritten by a re-run, and its recurrent state is rewound to the plane it read.
+    /// The step is run again as an ordinary forward -- the backend holds its persistent
+    /// route closed after `mega_recover`, so the dispatch path runs it -- and the step
+    /// that was behind it is queued again with the pick the re-run produced. The request
+    /// sees one slow token, not a failure.
     fn recover_step(&mut self, q: QueuedStep, rc: i32) -> Result<u32, String> {
         let be = crate::backend::active()
             .ok_or_else(|| "decode step has no active backend".to_string())?;
@@ -891,19 +969,10 @@ impl<A: Architecture> Workflow<A> {
         );
         be.mega_recover()
             .map_err(|rc| format!("mega recovery refused rc={rc}"))?;
-        let recur = self.plan.recurrent_elems();
-        if recur > 0 {
-            be.begin();
-            be.copy_range(
-                imparo_backend::BufId::Recur,
-                0,
-                imparo_backend::BufId::RecurPrev,
-                q.slot * recur,
-                recur,
-            );
-            be.end()
-                .map_err(|rc| format!("recurrent rollback failed rc={rc}"))?;
-        }
+        // ROLLING BACK IS AN INDEX, NOT A COPY: the failed step wrote a DIFFERENT plane, so
+        // the plane it read still holds the pre-step state. Rewinding the encode cursor to
+        // the last retired plane is the whole undo (task #165).
+        self.state.recur_plane_next = self.state.recur_plane;
         let token = q.token.or(self.state.last_pick).ok_or_else(|| {
             "failed step has no input token to re-run with".to_string()
         })?;
@@ -954,6 +1023,9 @@ impl<A: Architecture> kv::KvPoolMember for Workflow<A> {
     }
     // Both bodies are generic and live in `gpu_support`, next to the rest of the device
     // machinery. These two are the object-safe face of them.
+    fn has_device_workflow(&self) -> bool {
+        A::DEVICE
+    }
     fn ensure_gpu_ready(&mut self) -> Result<(), String> {
         Workflow::ensure_gpu_ready(self)
     }
@@ -1008,14 +1080,25 @@ impl<A: Architecture> Model for Workflow<A> {
         // OS one. On a build with no GPU backend compiled in this is always false and the
         // host reference path runs.
         let on_gpu = !self.state.host_forward;
+        // The setup a request pays BEFORE its first chunk. On a small model this is
+        // microseconds; on a 27B it was seconds, and the whole of it read as "prefill".
+        // Timed under IMPARO_PROF so the wait is attributed rather than guessed at.
+        let prof = std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1");
         if on_gpu {
             // A pool entry point can arrive before any forward, so this is the same call
             // the pool makes. gemma4 used to inline a second copy of it here.
+            let t = std::time::Instant::now();
             kv::KvPoolMember::ensure_gpu_ready(self)?;
+            let t_ready = t.elapsed().as_secs_f64() * 1e3;
             // Grow the cache to what THIS request reaches, not to the context bound. The
             // full-attention layers are 128 MiB of a 148 MiB cache at ctx 8192, and a
             // short conversation touches a fraction of it.
+            let t = std::time::Instant::now();
             Workflow::kv_fit(self, start_pos + tokens.len())?;
+            let t_fit = t.elapsed().as_secs_f64() * 1e3;
+            if prof && t_ready + t_fit > 1.0 {
+                eprintln!("[prof] setup ensure_gpu_ready={t_ready:.1}ms kv_fit={t_fit:.1}ms");
+            }
         }
 
         // Recurrent state is only valid for the positions it has already absorbed.
@@ -1028,12 +1111,19 @@ impl<A: Architecture> Model for Workflow<A> {
         // because `gpu_prepare` happens to zero it too. One rule, one place.
         if start_pos == 0 {
             self.state.recurrent.reset();
+            // A conversation starting at position 0 has nothing in flight: plane 0 again.
+            self.state.recur_plane = 0;
+            self.state.recur_plane_next = 0;
             if on_gpu {
+                let t = std::time::Instant::now();
                 self.zero_recurrent();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                if prof && ms > 1.0 {
+                    eprintln!("[prof] setup zero_recurrent={ms:.1}ms");
+                }
             }
         }
 
-        let prof = std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1");
         // The last unit boundary this call reaches; only that one can be checkpointed,
         // and everything below it is the previous call's copy.
         let last_boundary = (start_pos + tokens.len()) / imparo_kv::grid_tokens()
@@ -1076,19 +1166,8 @@ impl<A: Architecture> Model for Workflow<A> {
                         eprintln!(
                             "[imparo] decode batch at {at} failed: rolling back and re-running it on the dispatch path"
                         );
-                        let recur = self.plan.recurrent_elems();
                         if be.mega_recover().is_ok() {
-                            if recur > 0 {
-                                be.begin();
-                                be.copy_range(
-                                    imparo_backend::BufId::Recur,
-                                    0,
-                                    imparo_backend::BufId::RecurPrev,
-                                    0,
-                                    recur,
-                                );
-                                let _ = be.end();
-                            }
+                            self.state.recur_plane_next = self.state.recur_plane;
                             self.arm_recurrent_snapshot(at, n, last_boundary);
                             r = A::device_batch(self, chunk, at, out, false);
                         }
@@ -1096,6 +1175,9 @@ impl<A: Architecture> Model for Workflow<A> {
                 }
                 self.state.logits_wanted = true;
                 r?;
+                if n == 1 {
+                    self.state.recur_commit_step();
+                }
             } else {
                 A::batch_host(self, chunk, at, out)?;
             }
@@ -1147,10 +1229,11 @@ backend={} ms={ms:.1} ms_per_token={:.2}",
             let id = match self.device_step(token, start_pos) {
                 Ok(id) => id,
                 Err(e) => {
-                    // A failed region (task #149): roll the recurrent state back to the
-                    // copy the batch took at its start and run the step once more; the
-                    // backend holds its persistent route closed, so the dispatch path
-                    // runs it. A second failure is the caller's.
+                    // A failed region (task #149): rewind the recurrent state to the plane
+                    // this step READ -- the step wrote a different one, so the pre-step
+                    // state is intact -- and run it once more; the backend holds its
+                    // persistent route closed, so the dispatch path runs it. A second
+                    // failure is the caller's.
                     let be = crate::backend::active().ok_or_else(|| {
                         "decode step has no active backend".to_string()
                     })?;
@@ -1159,20 +1242,7 @@ backend={} ms={ms:.1} ms_per_token={:.2}",
                     );
                     be.mega_recover()
                         .map_err(|rc| format!("mega recovery refused rc={rc}"))?;
-                    let recur = self.plan.recurrent_elems();
-                    if recur > 0 {
-                        be.begin();
-                        be.copy_range(
-                            imparo_backend::BufId::Recur,
-                            0,
-                            imparo_backend::BufId::RecurPrev,
-                            0,
-                            recur,
-                        );
-                        be.end().map_err(|rc| {
-                            format!("recurrent rollback failed rc={rc}")
-                        })?;
-                    }
+                    self.state.recur_plane_next = self.state.recur_plane;
                     self.device_step(token, start_pos)?
                 }
             };
@@ -1231,11 +1301,16 @@ backend={} ms={ms:.1} ms_per_token={:.2}",
         // The batch consumed the arming; the snapshot is read back when the step retires.
         self.state.recur_snap = None;
         r?;
+        // The encode advanced one plane; `recur_plane` follows only when the step retires,
+        // so a failure rewinds to it and the read plane is still intact (task #165).
+        let (_, wrote) = self.state.recur_decode_planes();
+        self.state.recur_plane_next = wrote;
         self.state.queued.push_back(QueuedStep {
             pos: start_pos,
             slot,
             snap,
             token,
+            recur_plane_out: wrote,
         });
         Ok(())
     }
@@ -1254,6 +1329,8 @@ backend={} ms={ms:.1} ms_per_token={:.2}",
         let mut pick = [0.0_f32; 1];
         be.read(imparo_backend::BufId::Pick, u64::from(q.slot), &mut pick);
         self.state.kv_rt.filled = q.pos + 1;
+        // The step retired: the plane it wrote is now the state (task #165).
+        self.state.recur_plane = q.recur_plane_out;
         self.state.recur_snap = q.snap;
         self.take_recurrent_snapshot(q.pos);
         let id = pick[0].to_bits();
@@ -1281,19 +1358,9 @@ backend={} ms={ms:.1} ms_per_token={:.2}",
             be.mega_recover()
                 .map_err(|rc| format!("mega recovery refused rc={rc}"))?;
         }
-        let recur = self.plan.recurrent_elems();
-        if recur > 0 {
-            be.begin();
-            be.copy_range(
-                imparo_backend::BufId::Recur,
-                0,
-                imparo_backend::BufId::RecurPrev,
-                q.slot * recur,
-                recur,
-            );
-            be.end()
-                .map_err(|rc| format!("recurrent rollback failed rc={rc}"))?;
-        }
+        // The discarded step wrote a plane nothing committed to; rewinding the cursor drops
+        // it. No copy: its READ plane was never written (task #165).
+        self.state.recur_plane_next = self.state.recur_plane;
         Ok(())
     }
 }
@@ -1408,6 +1475,7 @@ pub fn load(
     match plan.config.architecture.as_str() {
         "gemma4" => Ok(Box::new(gemma4::Gemma4::new(weights, plan, capacity)?)),
         "lfm2" => Ok(Box::new(lfm2::Lfm2::new(weights, plan, capacity)?)),
+        "qwen35" => Ok(Box::new(qwen35::Qwen35::new(weights, plan, capacity)?)),
         other => Err(format!(
             "no workflow for architecture '{other}'; build_plan accepted it, so the \
              plan arm and the load arm disagree"
@@ -1422,6 +1490,7 @@ pub fn build_plan(document: &Document, path: &Path) -> Result<ModelPlan, PlanErr
     match arch {
         "gemma4" => gemma4::build(document, path),
         "lfm2" => lfm2::build(document, path),
+        "qwen35" => qwen35::build(document, path),
         other => Err(PlanError::UnknownArchitecture(other.into())),
     }
 }

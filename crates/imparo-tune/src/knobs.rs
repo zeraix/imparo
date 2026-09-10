@@ -94,6 +94,47 @@ pub const MODEL_BENCHES: &[ModelBench] = &[
         // gate/up projections, standalone SiLU-mul, down projection, residual add.
         layer_dispatches: 11,
     },
+    ModelBench {
+        arch: "qwen35",
+        // blk.0 is a GATED DELTA-NET block, and 48 of this model's 64 blocks are: the
+        // file's `full_attention_interval` is 4 and the attending block is the LAST of
+        // each group, so blk.0 carries attn_qkv / ssm_* and no attn_q at all. Naming
+        // gemma4's attn_q/attn_k/attn_v here would look up tensors this file does not
+        // have on block 0 and silently measure four fewer projections. This is the
+        // majority block's decode mix, the same rule gemma4's row follows.
+        //
+        // ssm_alpha and ssm_beta are n_out = 48 -- six work units on any grid. They are
+        // in the list because they really are dispatched once per delta block at decode;
+        // dropping them would rank the knobs on a mix the engine never runs.
+        decode_tensors: &[
+            "attn_qkv",
+            "attn_gate",
+            "ssm_alpha",
+            "ssm_beta",
+            "ssm_out",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ],
+        ple_tensors: None,
+        // NOT ssm_conv1d. The short-convolution workload is for a conv that IS the whole
+        // mixer state (LFM2: width = n_embd, no matrix state). qwen35's conv is one stage
+        // of the gated delta rule -- it runs over the qkv projection's width and hands a
+        // [value_head][value][key] matrix state to the delta rule after it. The
+        // transaction's own guard rejects that shape, so naming it would add a non-
+        // projection tensor to the decode mix and buy nothing.
+        shortconv_tensor: None,
+        // Counted from qwen35/workflow_gpu.rs for a one-token DELTA block (48 of 64):
+        // attn norm, qkv / gate / alpha / beta projections, the causal conv (TWO: the
+        // conv output and the state shift are separate dispatches on this route), the
+        // delta rule, the per-value-head norm, act_mul, the out projection, residual add,
+        // FFN norm, three FFN projections, act_mul, residual add.
+        //
+        // Cross-checked against the engine's own counter (IMPARO_PROF=1, 8 decode steps
+        // on Qwen3.8-27B-UD-Q4_K_S): 9496 dispatches / 8 = 1187 per token, and
+        // 48 delta x 18 + 16 attention x 20 + 3 outside the layers = 1187 exactly.
+        layer_dispatches: 18,
+    },
 ];
 
 #[must_use]

@@ -121,10 +121,15 @@ impl Canonical {
                 self.u32(rope_dim);
                 self.u32(window);
             }
-            Attention::Recurrent { r_elems, s_elems } => {
+            Attention::Recurrent { r_elems, s_elems, key_dim, value_dim } => {
                 self.u8(2);
                 self.u32(r_elems);
                 self.u32(s_elems);
+                // The matrix's SHAPE, not just its size: a kernel is compiled for these,
+                // so two files with the same s_elems and different coordinates run
+                // different code and are different configurations.
+                self.u32(key_dim);
+                self.u32(value_dim);
             }
         }
     }
@@ -284,6 +289,8 @@ mod tests {
                 LayerPlan {
                     index: 1,
                     attention: Attention::Recurrent {
+                        key_dim: 0,
+                        value_dim: 0,
                         r_elems: 128,
                         s_elems: 64,
                     },

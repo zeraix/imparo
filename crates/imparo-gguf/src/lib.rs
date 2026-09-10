@@ -1148,10 +1148,6 @@ pub fn tensor_layout(ggml_type: u32) -> Result<TensorLayout, GgufError> {
         6 => (32, 22, "Q5_0"),
         7 => (32, 24, "Q5_1"),
         8 => (32, 34, "Q8_0"),
-        // imparo-private: Q8_0 bytes in the tile-major order imparo-repack writes; the
-        // block arithmetic (and so every size and bounds check) is Q8_0's.
-        1000 => (32, 34, "Q8_0_TM"),
-        1001 => (32, 18, "Q4_0_TM"),
         9 => (32, 40, "Q8_1"),
         10 => (256, 84, "Q2_K"),
         11 => (256, 110, "Q3_K"),
@@ -1180,7 +1176,21 @@ pub fn tensor_layout(ggml_type: u32) -> Result<TensorLayout, GgufError> {
         40 => (64, 36, "NVFP4"),
         41 => (128, 18, "Q1_0"),
         42 => (64, 18, "Q2_0"),
-        _ => return Err(GgufError::UnknownTensorType(ggml_type)),
+        // imparo-private tile-major kinds are DERIVED, not listed: the layout moves a
+        // block's bytes and never adds or drops one, so a TM kind's geometry is exactly
+        // its source's. Listing them again would be a second copy of every size and
+        // bounds check, and the copy is what goes stale when a rule is added.
+        _ => {
+            if let Some(rule) = weights::tm_rule_to(ggml_type) {
+                let src = tensor_layout(rule.from)?;
+                return Ok(TensorLayout {
+                    block_elements: src.block_elements,
+                    block_bytes: src.block_bytes,
+                    name: rule.to_name,
+                });
+            }
+            return Err(GgufError::UnknownTensorType(ggml_type));
+        }
     };
     Ok(TensorLayout {
         block_elements,

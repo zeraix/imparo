@@ -221,6 +221,66 @@ impl Candidate {
     }
 }
 
+/// Batch is a model-level setting, not a searched backend knob. Retuning another
+/// coordinate must keep its stored effective value instead of resetting it to the
+/// compiled default. Match `imparo_model::prefill_batch`'s minimum of one.
+fn seated_prefill_batch(stored: Option<usize>) -> usize {
+    stored.unwrap_or(PREFILL_BATCH).max(1)
+}
+
+/// A dynamic ladder needs the loaded model and measured device. Preflight can
+/// reject static-list mistakes immediately; dynamic membership is checked again
+/// after discovery, before a candidate is applied or written.
+fn external_candidate_membership(
+    declaration: &KnobDecl,
+    value: u32,
+    context: Option<(&imparo_backend::ModelFacts, &imparo_backend::DeviceProfile)>,
+) -> Result<(), String> {
+    let values = match declaration.candidates {
+        Some(candidates) => {
+            let Some((facts, profile)) = context else {
+                return Ok(());
+            };
+            candidates(facts, profile)
+        }
+        None => declaration.values.to_vec(),
+    };
+    if values.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "--external-candidate {}={value} is not declared; candidates: {values:?}",
+            declaration.name
+        ))
+    }
+}
+
+/// A stored request can become illegal when init discovers the device's limits.
+/// Accept a backend adjustment only when the existing legality hook explains BOTH
+/// sides: the request cannot run here, and the readback can. A legal value lost by
+/// init/setter remains an error, as does any unexplained or illegal replacement.
+fn stored_seat_adjusted(
+    declaration: &KnobDecl,
+    requested: u32,
+    actual: u32,
+    facts: &imparo_backend::ModelFacts,
+    profile: &imparo_backend::DeviceProfile,
+) -> Result<bool, String> {
+    if actual == requested {
+        return Ok(false);
+    }
+    if declaration.legal.is_some_and(|legal| {
+        !legal(requested, facts, profile) && legal(actual, facts, profile)
+    }) {
+        return Ok(true);
+    }
+    Err(format!(
+        "stored seat {} requested={requested} actual={actual} after backend initialization; \
+         the registry does not explain this as an illegal request adjusted to a legal value",
+        declaration.name
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExternalCandidate {
     name: String,
@@ -375,13 +435,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        if !declaration.values.contains(&external.value) {
-            return Err(format!(
-                "--external-candidate {}={} is not declared; legal candidates: {:?}",
-                external.name, external.value, declaration.values
-            )
-            .into());
-        }
+        external_candidate_membership(declaration, external.value, None)?;
         if declaration.bit_affecting && !allow_bits {
             return Err(format!(
                 "--external-candidate {} changes output bits; add --allow-bit-changes",
@@ -545,6 +599,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // never seeds a new build; and derived knobs are recomputed, not seated.
     let t_micro = Instant::now();
     (sp.prepare)();
+    // WHICH GGML TYPE EACH WIRE KIND IS -- the same handover `backend::enable_gpu` makes at
+    // model load, made here too because the tuner never loads a model's tensors. It is a
+    // static table with no model input, so there is nothing to derive and nothing to get
+    // wrong; what WAS wrong is that the tuner never handed it over at all. Without it the
+    // Metal matmat cannot map a kind to a decode brick and REFUSES every dispatch above
+    // Q8_0_TM, which no earlier model reached:
+    //
+    //   gemma4 Q4_0, LFM2 Q8_0_TM   kinds 1 and 3   dispatched      every sweep real
+    //   qwen35 UD mix               kinds 22..32    all refused     38005 empty dispatches
+    //
+    // and the sweep still ranked twelve prefill tiles against each other on nothing.
+    sp.ops
+        .set_weight_kind_types(&imparo_gguf::weights::wire_kind_types());
     let mut tuner_mode = TunerModeGuard::enter(sp.ops)?;
 
     // Apply stored seats before init for selectors that influence native preparation.
@@ -677,22 +744,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (name, value) in &stored.knobs {
             if let Some(declaration) = sp.reg.iter().find(|d| d.name == name.as_str()) {
                 (declaration.apply)(*value);
-                assert_eq!(
-                    (declaration.current)(),
-                    *value,
-                    "stored seat {name} was reset after backend initialization"
-                );
             }
         }
     }
-
-    // Capture the active incumbent only after backend initialization and the second
-    // stored-seat application. With no stored config this is the architecture default;
-    // with one it is the exact dependency-complete route the candidate must beat.
-    let incumbent = Candidate {
-        batch: PREFILL_BATCH,
-        vals: sp.reg.iter().map(|d| (d.current)()).collect(),
-    };
+    // Validate the completed tuple below, once model facts are available. Checking
+    // during the apply loop would miss a later coupled setter changing an earlier seat.
 
     // The decode matmuls at their REAL per-tensor dimensions, read from the header. The
     // tensor list comes from the model's bench extension (knobs.rs); the tuner core stays
@@ -754,18 +810,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // prefill projections (decode MMVQ happened to tolerate it).
                 const SYNTHETIC_TENSOR_ALIGNMENT: u64 = 256;
                 let off = ((i as u64) * span) & !(SYNTHETIC_TENSOR_ALIGNMENT - 1);
-                // BYTES PER BLOCK COMES FROM THE KIND. This was a literal 18 (Q4_0),
-                // which under-counts a Q8_0 tensor by 89% -- 34 bytes per 32 values --
-                // so the bounds check below would admit an offset whose kernel then
-                // reads past the synthetic weight buffer.
-                let bpb = match kind {
-                    imparo_gguf::weights::WeightKind::F32 => 4 * 32,
-                    imparo_gguf::weights::WeightKind::Q4_0
-                    | imparo_gguf::weights::WeightKind::Q4_0_TM => 18,
-                    imparo_gguf::weights::WeightKind::Q8_0
-                    | imparo_gguf::weights::WeightKind::Q8_0_TM => 34,
-                };
-                let need = ne0 * ne1 / 32 * bpb;
+                // THE SIZE COMES FROM THE LAYOUT TABLE, not from a match on the kind.
+                // It was a literal 18 (Q4_0), which under-counts a Q8_0 tensor by 89% --
+                // 34 bytes per 32 values -- so the bounds check below admitted an offset
+                // whose kernel then read past the synthetic weight buffer. A match here
+                // fixed that but kept two mistakes: it repeated the geometry a third
+                // time, and it hardcoded /32, which a k-quant's 256-element super-block
+                // breaks silently. tensor_layout(runtime_type) answers both.
+                let layout = imparo_gguf::tensor_layout(runtime_type).ok()?;
+                let need = ne0 * ne1 / layout.block_elements * layout.block_bytes;
                 (off + need <= blk_bytes as u64).then_some((
                     off,
                     ne0 as u32,
@@ -839,7 +892,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layers
         .iter()
         .filter_map(|layer| match layer.attention {
-            imparo_model::Attention::Recurrent { r_elems, s_elems } => {
+            imparo_model::Attention::Recurrent { r_elems, s_elems, .. } => {
                 Some((r_elems, s_elems))
             }
             _ => None,
@@ -900,7 +953,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|&(_, _, _, k)| k)
         .chain(lm_head.map(|(_, _, _, k)| k))
-        .fold(0u32, |m, k| m | (1u32 << k));
+        .fold(0u64, |m, k| {
+            // The shift width is checked, not assumed: a kind past the mask's width would
+            // wrap to another kind's bit and gate the wrong knob family, silently.
+            assert!(k < 64, "weight kind {k} does not fit the weight_kinds mask");
+            m | (1u64 << k)
+        });
     if let Some((_, i, o, k)) = lm_head {
         println!(
             "  lm-head in the decode mix: {i} -> {o} kind {k}, weighted 1/{} (n_layers)",
@@ -929,19 +987,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..shapes
     };
 
+    let facts = imparo_backend::ModelFacts {
+        n_embd: shapes.n_embd,
+        n_ff: shapes.n_ff,
+        n_head: shapes.n_head,
+        n_kv: shapes.n_kv,
+        head_dim: shapes.head_dim,
+        deep_head_dim: shapes.deep_head_dim,
+        n_experts: shapes.n_experts,
+        n_layers: shapes.n_layers,
+        layer_dispatches: shapes.layer_dispatches,
+        weight_kinds: shapes.weight_kinds,
+    };
+    let limits = sp.ops.device_profile();
+    if let Some(stored) = stored_config.as_ref() {
+        for (name, requested) in &stored.knobs {
+            if let Some(declaration) = sp.reg.iter().find(|d| d.name == name.as_str()) {
+                let actual = (declaration.current)();
+                if stored_seat_adjusted(
+                    declaration,
+                    *requested,
+                    actual,
+                    &facts,
+                    &limits,
+                )? {
+                    println!(
+                        "stored seat {name} requested={requested} adjusted to legal actual={actual} \
+                         after device initialization; using actual as the incumbent{}",
+                        if declaration.bit_affecting {
+                            " (can change output bits; re-run numerical gates)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+    }
+    // Capture only the final, checked readback -- never publish the stale request or
+    // rank candidates against it. No kernel workload has run since stored-seat apply.
+    let incumbent = Candidate {
+        batch: seated_prefill_batch(stored_config.as_ref().and_then(|c| c.batch)),
+        vals: sp.reg.iter().map(|d| (d.current)()).collect(),
+    };
+    println!(
+        "prefill batch={} retained from the stored config or compiled default; batch is not swept",
+        incumbent.batch
+    );
+
     if explain {
-        let facts = imparo_backend::ModelFacts {
-            n_embd: shapes.n_embd,
-            n_ff: shapes.n_ff,
-            n_head: shapes.n_head,
-            n_kv: shapes.n_kv,
-            head_dim: shapes.head_dim,
-            deep_head_dim: shapes.deep_head_dim,
-            n_experts: shapes.n_experts,
-            n_layers: shapes.n_layers,
-            layer_dispatches: shapes.layer_dispatches,
-            weight_kinds: shapes.weight_kinds,
-        };
         let profile = discover::profile(sp.ops, false);
         explain_registry(sp.reg, &facts, &profile);
         tuner_mode.close()?;
@@ -977,18 +1071,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .find(|declaration| declaration.name == external.name)
             .expect("external candidate was registry-validated before model init");
-        let facts = imparo_backend::ModelFacts {
-            n_embd: shapes.n_embd,
-            n_ff: shapes.n_ff,
-            n_head: shapes.n_head,
-            n_kv: shapes.n_kv,
-            head_dim: shapes.head_dim,
-            deep_head_dim: shapes.deep_head_dim,
-            n_experts: shapes.n_experts,
-            n_layers: shapes.n_layers,
-            layer_dispatches: shapes.layer_dispatches,
-            weight_kinds: shapes.weight_kinds,
-        };
+        external_candidate_membership(
+            declaration,
+            external.value,
+            Some((&facts, &measured)),
+        )?;
         if !declaration.applies.is_none_or(|applies| applies(&facts)) {
             return Err(format!(
                 "--external-candidate {} does not apply to this model",
@@ -1085,6 +1172,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_or_else(|| "?".into(), |n| n.to_string_lossy().into_owned()),
         cur.batch
     );
+    // A CONFIG IS A CLAIM THAT THE SWEEP DISPATCHED. If the backend refused any dispatch,
+    // some candidate was ranked against work that never ran, and the file would record that
+    // as a measurement. This is the same rule #74 gave speed_gate -- an untuned or unproven
+    // baseline cannot be recorded -- applied to the tuner's own output.
+    //
+    // It caught nothing on gemma4 or LFM2 because their weight kinds are 1 and 3, the two
+    // the Metal matmat serves without the wire-kind table. A qwen35 tune refused 38005
+    // dispatches, printed 38005 lines, exited 0 and wrote a config in which twelve prefill
+    // tiles had each measured the same empty dispatch.
+    let refused = sp.ops.refused_dispatches();
+    if refused > 0 {
+        return Err(format!(
+            "the backend REFUSED {refused} dispatch(es) during this tune -- some candidate \
+             was ranked against work that never ran, so nothing is written. The refusals are \
+             logged with their weight kind and n_out; a kind above Q8_0_TM usually means the \
+             wire-kind table never reached the backend."
+        )
+        .into());
+    }
     // Publish only after production stream/graph state was restored successfully.
     tuner_mode.close()?;
     imparo_host::receipted_config::write_atomic(&out, body.as_bytes())?;
@@ -1145,6 +1251,171 @@ mod environment_tests {
         ] {
             assert!(!cuda_tuner_env_is_polluting(name), "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod stored_seat_tests {
+    use super::{
+        external_candidate_membership, seated_prefill_batch, stored_seat_adjusted,
+    };
+    use imparo_backend::{
+        DeviceProfile, KnobCategory, KnobDecl, ModelFacts, SweepKind, Workload,
+    };
+
+    fn fixture() -> (KnobDecl, ModelFacts, DeviceProfile) {
+        (
+            KnobDecl {
+                name: "device_limited_seat",
+                legal: Some(|value, _, device| {
+                    value > 0 && value <= device.max_threads
+                }),
+                applies: None,
+                bit_affecting: true,
+                derive: None,
+                candidates: None,
+                after: &[],
+                cross_check: None,
+                tuple: None,
+                category: KnobCategory::EndToEnd,
+                values: &[],
+                apply: |_| {},
+                current: || 0,
+                screened: false,
+                sweep: SweepKind::External,
+                workload: Workload::DecodeMix,
+            },
+            ModelFacts {
+                n_embd: 2048,
+                n_ff: 10752,
+                n_head: 32,
+                n_kv: 8,
+                head_dim: 64,
+                deep_head_dim: 64,
+                n_experts: 0,
+                n_layers: 30,
+                layer_dispatches: 0,
+                weight_kinds: 4,
+            },
+            DeviceProfile {
+                max_threads: 20,
+                ..DeviceProfile::default()
+            },
+        )
+    }
+
+    #[test]
+    fn preserves_model_level_batch_while_tuning_backend_knobs() {
+        for batch in [1, 512, 1024, 2048] {
+            assert_eq!(seated_prefill_batch(Some(batch)), batch);
+        }
+    }
+
+    #[test]
+    fn batch_without_a_stored_value_uses_the_shared_default() {
+        assert_eq!(seated_prefill_batch(None), imparo_model::PREFILL_BATCH);
+    }
+
+    #[test]
+    fn zero_batch_matches_the_runtime_effective_minimum() {
+        assert_eq!(seated_prefill_batch(Some(0)), 1);
+    }
+
+    #[test]
+    fn external_dynamic_ladder_is_resolved_after_discovery() {
+        let (mut decl, facts, mut device) = fixture();
+        decl.candidates = Some(|_, d| {
+            [8, 16, 24, 32]
+                .into_iter()
+                .filter(|v| v * 32 <= d.max_threads)
+                .collect()
+        });
+        // Before discovery, an empty static values list is NOT the dynamic ladder.
+        assert!(external_candidate_membership(&decl, 24, None).is_ok());
+        device.max_threads = 1024;
+        assert!(
+            external_candidate_membership(&decl, 24, Some((&facts, &device))).is_ok()
+        );
+        assert!(
+            external_candidate_membership(&decl, 23, Some((&facts, &device))).is_err()
+        );
+        device.max_threads = 512;
+        assert!(
+            external_candidate_membership(&decl, 24, Some((&facts, &device))).is_err()
+        );
+        assert!(
+            external_candidate_membership(&decl, 16, Some((&facts, &device))).is_ok()
+        );
+    }
+
+    #[test]
+    fn external_static_ladder_still_rejects_undeclared_values_at_preflight() {
+        let (mut decl, facts, device) = fixture();
+        decl.values = &[1, 2];
+        for context in [None, Some((&facts, &device))] {
+            assert!(external_candidate_membership(&decl, 2, context).is_ok());
+            assert!(external_candidate_membership(&decl, 3, context).is_err());
+        }
+    }
+
+    #[test]
+    fn external_dynamic_ladder_takes_precedence_over_static_values() {
+        let (mut decl, facts, device) = fixture();
+        decl.values = &[32];
+        decl.candidates = Some(|_, _| vec![24]);
+        assert!(
+            external_candidate_membership(&decl, 24, Some((&facts, &device))).is_ok()
+        );
+        assert!(
+            external_candidate_membership(&decl, 32, Some((&facts, &device))).is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_device_clamping_of_stale_stored_requests() {
+        let (decl, facts, mut device) = fixture();
+        assert_eq!(
+            stored_seat_adjusted(&decl, 36, 20, &facts, &device),
+            Ok(true)
+        );
+        for limit in [1, 8, 18, 20, 32, 64] {
+            device.max_threads = limit;
+            assert_eq!(
+                stored_seat_adjusted(&decl, limit * 2, limit, &facts, &device),
+                Ok(true)
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_readback_is_not_reported_as_an_adjustment() {
+        let (decl, facts, device) = fixture();
+        assert_eq!(
+            stored_seat_adjusted(&decl, 16, 16, &facts, &device),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn a_legal_value_lost_by_the_setter_still_fails() {
+        let (decl, facts, device) = fixture();
+        let error = stored_seat_adjusted(&decl, 16, 8, &facts, &device).unwrap_err();
+        assert!(error.contains("device_limited_seat requested=16 actual=8"));
+    }
+
+    #[test]
+    fn an_illegal_replacement_is_not_accepted() {
+        let (decl, facts, device) = fixture();
+        assert!(stored_seat_adjusted(&decl, 36, 24, &facts, &device).is_err());
+        assert!(stored_seat_adjusted(&decl, 36, 0, &facts, &device).is_err());
+    }
+
+    #[test]
+    fn a_mismatch_without_a_legality_rule_still_fails() {
+        let (mut decl, facts, device) = fixture();
+        decl.legal = None;
+        assert!(stored_seat_adjusted(&decl, 36, 20, &facts, &device).is_err());
     }
 }
 

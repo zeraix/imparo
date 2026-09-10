@@ -8,5 +8,6 @@ reference engine by layer (dev_harness/README.md), not against this crate."]
 
 pub mod backend_impl;
 pub mod ops;
+pub mod quants;
 
 pub use backend_impl::CpuBackend;

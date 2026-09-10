@@ -100,8 +100,9 @@ pub struct Shapes {
     pub shortconv_transaction: Option<ShortconvTransactionShape>,
     /// Weight kinds present on the layer projections, as a bitmask over the wire values
     /// (bit 1 = Q4_0, bit 2 = Q8_0). Derived from `decode_mix`, so it says what the
-    /// workloads will actually dispatch.
-    pub weight_kinds: u32,
+    /// workloads will actually dispatch. u64: the discriminants reach 32, and a u32 shift
+    /// by 32 silently wraps to bit 0 (see `ModelFacts::weight_kinds`).
+    pub weight_kinds: u64,
     /// The kind the WIDE prefill matmuls carry (n_embd->n_ff, n_ff->n_embd). PrefillGemm
     /// used a hardcoded Q4_0 and would otherwise rank a Q8 tile knob against a Q4 kernel.
     pub wide_kind: u32,
@@ -334,17 +335,60 @@ const GEMM_SLICE_PAST_KNEE: u64 = 4;
 /// nothing about what is ranked -- identical kernel, tile and per-threadgroup work, fewer
 /// threadgroups -- for the knobs whose trade this slice can see (see the constant above
 /// for the one whose trade it cannot).
+/// Bytes per weight element for a WIRE weight kind, as (numerator, denominator), ASKED OF
+/// imparo-gguf's layout table rather than matched here.
+///
+/// It was a three-arm match -- Q4_0, row-major Q8_0, everything else raw f32 -- and
+/// "everything else" is where every model but gemma4 lands: LFM2 carries Q8_0_TM (wire 3)
+/// and qwen35's widest projection is IQ2_S_TM (wire 32). Both took the f32 arm and were
+/// sized as if a weight element were 4 bytes.
+///
+/// The error is not cosmetic where this feeds `gemm_slice`, whose whole job is to push the
+/// weight tile PAST the cache knee. An overstated element size SHRINKS the slice:
+///
+///   qwen35, IQ2_S (82 B per 256)   wrong  5120 * 4       = 20480 B/row ->  448 rows, 735 KB
+///                                  right  5120 * 82/256  =  1640 B/row -> 5120 rows, 8.4 MB
+///
+/// At 448 rows the tile sits inside the cache, so a candidate's weight RE-READS are free in
+/// the sweep and expensive in the engine -- the one trade that slice exists to rank. It
+/// promoted rt_shape 7, the 128-token tile and so the most re-read-hungry shape, as 1.9x
+/// FASTER; in the engine at 128 tokens that shape ran two orders of magnitude slower and
+/// held the GPU long enough to starve the display server.
+fn weight_bytes_per_element(wide_kind: u32) -> (u64, u64) {
+    imparo_gguf::weights::ggml_type_of_wire_opt(wide_kind)
+        .and_then(|t| imparo_gguf::tensor_layout(t).ok())
+        .filter(|l| l.block_elements > 0)
+        .map_or(
+            // A kind imparo-gguf does not know is a seam defect, not a shape to guess at.
+            // f32 is the WIDEST element and so gives the WIDEST slice: err toward a ranking
+            // that costs too much rather than one that cannot see the trade at all.
+            (4, 1),
+            |l| (l.block_bytes, l.block_elements),
+        )
+}
+
 fn gemm_slice(profile: &imparo_backend::DeviceProfile, s: &Shapes) -> u32 {
     if profile.cache_knee_bytes == 0 {
         return s.n_ff.min(GEMM_WORK_SLICE);
     }
-    // Bytes per weight element for the kind the wide projections actually carry: Q4_0 is
-    // an 18-byte block of 32, Q8_0 a 34-byte block of 32, anything else raw f32.
-    let (num, den): (u64, u64) = match s.wide_kind {
-        1 => (18, 32),
-        2 => (34, 32),
-        _ => (4, 1),
-    };
+    // Bytes per weight element for the kind the wide projections actually carry, ASKED OF
+    // THE LAYOUT TABLE. It was a three-arm match -- Q4_0, Q8_0, everything else raw f32 --
+    // and "everything else" is where every model but gemma4 lands: LFM2 carries Q8_0_TM
+    // (wire 3) and qwen35's widest projection is IQ2_S_TM (wire 32). Both took the f32 arm
+    // and were sized as if a weight element were 4 bytes.
+    //
+    // The error is not cosmetic, because this width exists to push the weight tile PAST the
+    // cache knee (see GEMM_SLICE_PAST_KNEE) and an overstated element size shrinks it:
+    //
+    //   qwen35, IQ2_S (82 B per 256)   wrong 5120*4 = 20480 B/row ->  448 rows,  735 KB
+    //                                  right 5120*82/256 = 1640   -> 5120 rows,  8.4 MB
+    //
+    // At 448 rows the tile sits inside the cache, so a candidate's weight RE-READS are free
+    // in the sweep and expensive in the engine -- which is the one trade this slice exists
+    // to rank. It promoted rt_shape 7 (a 128-token tile, the most re-read-hungry shape) as
+    // 1.9x FASTER; in the engine at 128 tokens that shape ran ~185x slower and held the GPU
+    // long enough to starve WindowServer into a kernel panic.
+    let (num, den) = weight_bytes_per_element(s.wide_kind);
     let want_bytes = profile
         .cache_knee_bytes
         .saturating_mul(GEMM_SLICE_PAST_KNEE);
@@ -1661,10 +1705,12 @@ pub fn measure(
                     .shortconv_transaction
                     .expect("short-convolution workload requires a validated shape");
                 timed(5, 64, &|| {
-                    b.shortconv(
+                    b.causal_conv(
+                        imparo_backend::ConvForm::GatedBcx,
                         BufId::Model3,
                         shape.weight_off,
                         BufId::Recur,
+                        0,
                         0,
                         BufId::Model4,
                         shape.width,
@@ -1983,6 +2029,13 @@ pub fn measure(
         // matmuls only, so like the decode term it is a FLOOR on a layer's work. A floor
         // is the safe direction here: it makes the encode lag look relatively larger, so
         // the derivation errs toward flushing rather than away from it.
+        //
+        // CHECKED against the engine once, on qwen35 (64 layers, UD-Q4_K_S): 92 ms per layer
+        // here against the engine's real 81 ms (a 5209 ms 512-token prefill / 64) -- 14%
+        // over, which is the scale-up slightly outrunning what the matmul-only count omits.
+        // A reading of 372 ms was recorded earlier the same day and was an ARTIFACT: that
+        // run refused 38005 dispatches and its timing was dominated by 38005 NSLog calls,
+        // not by kernels. Any number from a run with refusals is host logging.
         let _ = run_workload(Workload::PrefillGemm);
         let mut tp: Vec<f64> = (0..3)
             .map(|_| run_workload(Workload::PrefillGemm))
@@ -2031,11 +2084,27 @@ pub fn measure(
     // Q8 GEMM's design; a Q4 matmat never reads it, so all eight of its candidates screened
     // identical and rt_gemm<Q8> shape 7 -- 12 s per buffer at the workload's size, ~1000x
     // the others -- reached the sweep and held the machine for minutes (task #111).
+    // AND IT MUST CLEAR THE ROUTE'S OWN TOKEN BOUNDARY, which is why this is 64 tokens and
+    // not 8. A tile-major weight below 64 tokens takes the GEMV, not the register-tiled
+    // GEMM -- a hard rule in the route (the rt write-back assumes whole 64-token tiles), so
+    // no knob can turn it off the way the Crossing knobs above are forced to `lo`. Screened
+    // at 8 tokens, a tile-major model dispatched a GEMV and every rt shape read identical:
+    //
+    //   survived_screen=[("rt_shape", [0,1,2,3,4,5,6,7])]     all eight, told apart not at all
+    //
+    // which is how rt_shape 7 reached the sweep, won it, was written to a config, and then
+    // ran two orders of magnitude slower in the engine -- a multi-minute command buffer that
+    // starved the display server. Same failure as task #111 one level down: there a knob was
+    // unreachable because of the QUANT, here because of the ROUTE.
+    //
+    // 64 keeps the screen's own rule (small enough that a bad candidate costs the machine
+    // little): it is 8x the work of the old probe, ~0.2 ms at the pace, so even a candidate
+    // 200x off the pace is tens of milliseconds in one dispatch, not minutes.
     let screen_probe = || {
         let t = std::time::Instant::now();
         b.reset_tuner_dispatch_proof();
         b.begin();
-        b.matmat(s.wide_kind, 0, 256, 256, BufId::Cur, BufId::Logits, 8);
+        b.matmat(s.wide_kind, 0, 256, 256, BufId::Cur, BufId::Logits, 64);
         b.end().unwrap_or_else(|rc| {
             panic!("tuner screen GPU submission failed with backend code {rc}")
         });
@@ -3348,9 +3417,31 @@ mod tests {
     use super::{
         RestoreGuard, ScratchImage, exact128_route_evidence, kv_scratch_bytes,
         reps_per_buffer, settle_token_min_scans, stable_token_min_threshold,
+        weight_bytes_per_element,
     };
     use imparo_backend::{BufId, TunerScratchRegion, WorkloadEffects};
     use std::cell::{Cell, RefCell};
+
+    /// EVERY WEIGHT KIND IS SIZED FROM THE LAYOUT TABLE, not from a three-arm match that
+    /// silently called everything it did not name "f32, 4 bytes per element".
+    ///
+    /// This number sets the tile-ranking slice's width (`gemm_slice`), and an OVERSTATED
+    /// element size shrinks that slice -- the one direction that breaks it, because the
+    /// slice exists to push the weight tile past the cache knee so a candidate's weight
+    /// re-reads cost something.
+    #[test]
+    fn weight_element_bytes_come_from_the_layout_table_for_every_kind() {
+        // gemma4: Q4_0, 18 bytes per 32. Already right under the old match; must not move.
+        assert_eq!(weight_bytes_per_element(1), (18, 32));
+        // LFM2: Q8_0_TM (wire 3) is Q8_0's layout, 34 per 32. Took the f32 arm before.
+        assert_eq!(weight_bytes_per_element(3), (34, 32));
+        // qwen35's widest projection: IQ2_S_TM (wire 32) -> IQ2_S, 82 bytes per 256. That is
+        // 0.32 bytes per element against the 4 the old arm assumed -- 12.5x too wide.
+        assert_eq!(weight_bytes_per_element(32), (82, 256));
+        // A wire value no WeightKind has falls back to f32, the WIDEST element: the slice
+        // errs toward too expensive, never toward invisible.
+        assert_eq!(weight_bytes_per_element(63), (4, 1));
+    }
 
     #[test]
     fn exact128_evidence_binds_every_controlled_model_layer() {

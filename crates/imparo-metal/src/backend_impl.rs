@@ -4,8 +4,9 @@
 //! the tuner and dev binaries use them without the trait.
 
 use imparo_backend::{
-    Backend, BackendKnobs, BufId, Gemma4MegaLayer, KnobCategory, KnobDecl,
-    Lfm2MegaLayer, Lfm2MegaMixer, NO_WEIGHT, WeightKindWire,
+    Backend, BackendKnobs, BufId, ConvForm, Gemma4MegaLayer, KnobCategory, KnobDecl,
+    Lfm2MegaLayer, Lfm2MegaMixer, NO_WEIGHT, Qwen35MegaLayer, Qwen35MegaMixer,
+    WeightKindWire,
 };
 
 /// The Metal backend as a trait object. Zero-sized: all state lives in the
@@ -105,6 +106,18 @@ impl Backend for MetalBackend {
     }
     fn write(&self, id: BufId, off: u64, src: &[f32]) {
         crate::write(b(id), off, src);
+    }
+    fn zero(&self, id: BufId, off: u64, elems: u64) {
+        crate::zero(b(id), off, elems);
+    }
+    fn wire_weights(&self, stall_budget_s: f64) {
+        crate::wire_weights(stall_budget_s);
+    }
+    fn set_weight_path(&self, path: &std::path::Path) {
+        crate::set_weight_path(path);
+    }
+    fn longest_cb_gpu_seconds(&self) -> f64 {
+        crate::longest_cb_gpu_seconds()
     }
     fn write_u32(&self, id: BufId, off: u64, src: &[u32]) {
         crate::write_u32(b(id), off, src);
@@ -561,33 +574,32 @@ impl Backend for MetalBackend {
         max_scores: u32,
         ring: u32,
     ) {
-        // The op applies its scale: Q is scaled in place before the kernel reads it. The
-        // same dispatch the workflow used to issue, now where the contract lives.
-        if scale.to_bits() != 1.0_f32.to_bits() {
-            self.scale(BufId::Q, scale, n_tok * n_heads * head_dim);
-        }
-        crate::attention(
+        crate::attention_scaled(
             kv_layer, head_dim, n_heads, n_kv, kv_width, start_pos, window, n_tok,
-            max_scores, ring,
+            max_scores, ring, scale,
         );
     }
     #[allow(clippy::too_many_arguments)]
-    fn shortconv(
+    fn causal_conv(
         &self,
-        bcx: BufId,
+        form: ConvForm,
+        src: BufId,
         w_off: u64,
         state: BufId,
         state_off: u32,
+        state_out_off: u32,
         out: BufId,
         width: u32,
         kernel: u32,
         n_tok: u32,
     ) {
-        crate::shortconv(
-            b(bcx),
+        crate::causal_conv(
+            form as u32,
+            b(src),
             w_off,
             b(state),
             state_off,
+            state_out_off,
             b(out),
             width,
             kernel,
@@ -595,9 +607,10 @@ impl Backend for MetalBackend {
         );
     }
     #[allow(clippy::too_many_arguments)]
-    fn shortconv_snapshot(
+    fn causal_conv_snapshot(
         &self,
-        bcx: BufId,
+        form: ConvForm,
+        src: BufId,
         state: BufId,
         state_off: u32,
         snap: BufId,
@@ -606,8 +619,9 @@ impl Backend for MetalBackend {
         kernel: u32,
         n_tok: u32,
     ) {
-        crate::shortconv_snapshot(
-            b(bcx),
+        crate::causal_conv_snapshot(
+            form as u32,
+            b(src),
             b(state),
             state_off,
             b(snap),
@@ -617,12 +631,67 @@ impl Backend for MetalBackend {
             n_tok,
         );
     }
+    fn delta_net(&self, op: &imparo_backend::DeltaNet) -> bool {
+        crate::delta_net(
+            b(op.qkv),
+            b(op.alpha),
+            b(op.beta),
+            op.a_off,
+            op.dt_bias_off,
+            b(op.state),
+            op.state_off,
+            op.state_out_off,
+            b(op.out),
+            op.k_heads,
+            op.v_heads,
+            op.key_dim,
+            op.value_dim,
+            op.n_tok,
+            op.eps,
+            op.epilogue.map_or(crate::NO_EPILOGUE, |e| e.norm_w_off),
+            op.epilogue.map_or(0, |e| b(e.gate)),
+        )
+    }
+    fn supports_gated_delta(&self) -> bool {
+        crate::supports_gated_delta()
+    }
+    fn delta_net_fuses_epilogue(&self) -> bool {
+        crate::delta_net_fuses_epilogue()
+    }
+    fn set_recurrent_dims(&self, key_dim: u32, value_dim: u32) {
+        crate::set_recurrent_dims(key_dim, value_dim);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn mul_strided_sigmoid(
+        &self,
+        a: BufId,
+        bb: BufId,
+        width: u32,
+        b_off: u32,
+        b_stride: u32,
+        a_stride: u32,
+        n_row: u32,
+    ) {
+        crate::mul_strided_sigmoid(b(a), b(bb), width, b_off, b_stride, a_stride, n_row);
+    }
+    fn copy_strided(
+        &self,
+        dst: BufId,
+        src: BufId,
+        width: u32,
+        src_off: u32,
+        src_stride: u32,
+        n_row: u32,
+    ) {
+        crate::copy_strided(b(dst), b(src), width, src_off, src_stride, n_row);
+    }
     /// One decode layer as one entry of the mega kernel: the architecture's variant names the
     /// operands, the entry function below turns them into the program's slots and words.
     fn mega_layer(&self, e: &imparo_backend::MegaEntry<'_>) -> bool {
         match &e.layer {
             imparo_backend::MegaLayer::Gemma4(l) => mega_gemma4_entry(l, e.n_tok),
             imparo_backend::MegaLayer::Lfm2(l) => mega_lfm2_entry(l, e.n_tok),
+            imparo_backend::MegaLayer::Qwen35(l) => mega_qwen35_entry(l, e.n_tok),
         }
     }
     fn mega_qkv_wanted(&self) -> bool {
@@ -741,20 +810,47 @@ impl Backend for MetalBackend {
     ) -> Result<Vec<bool>, String> {
         let wire: Vec<crate::WXformWire> = jobs
             .iter()
-            .map(|j| crate::WXformWire {
-                off: j.offset,
-                bytes: j.bytes,
-                from_type: j.from_type,
-                to_type: j.to_type,
-                n_in: j.n_in,
-                n_out: j.n_out,
+            .map(|j| {
+                crate::WXformWire {
+                    off: j.offset,
+                    bytes: j.bytes,
+                    from_type: j.from_type,
+                    to_type: j.to_type,
+                    n_in: j.n_in,
+                    n_out: j.n_out,
+                    ..Default::default()
+                }
+                .with_layout(&j.layout)
             })
             .collect();
         crate::transform_weights(&wire)
     }
+    fn set_weight_kind_types(&self, pairs: &[(imparo_backend::WeightKindWire, u32)]) {
+        // Stored, never derived: the mapping is imparo-gguf's and this crate is told it.
+        crate::set_weight_kind_types(pairs);
+    }
+    fn refused_dispatches(&self) -> u64 {
+        crate::refused_dispatches()
+    }
     fn serves_weight_type(&self, ggml_type: u32) -> bool {
-        // F32, Q4_0, Q8_0 and the tile-major Q8_0 (fc 15 pipelines). Q4_0_TM has no kernels.
-        matches!(ggml_type, 0 | 2 | 8 | 1000)
+        // F32, Q4_0, Q8_0, the tile-major Q8_0 (fc 15) and the tile-major family the
+        // WFMT decode bricks read (fc 21). Q4_0_TM and the tile-major Q2_K / Q4_1 / Q5_x
+        // have rules but no brick arm yet, so they are refused BY NAME at load.
+        //
+        // Row-major 11/12/13/14/20/23 are here because a ROW-GATHERED tensor (token_embd)
+        // keeps the row-major layout by rule and is read by imparo_blk_gather_rows, which
+        // runs the same decode brick over a row-major block. The MULTI-SPAN formats --
+        // Q2_K (10), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22) -- are absent
+        // from that list while their tile-major twins are present: their scales are two or
+        // three spans of the source block, so a row-major row has no single scale pointer
+        // and the gather cannot read one. Tile-major concatenates the spans, so the GEMM
+        // can. A file that carries one of them as its token_embd is refused BY NAME.
+        matches!(
+            ggml_type,
+            0 | 2 | 8 | 11 | 12 | 13 | 14 | 20 | 23
+                | 1000 | 1010 | 1011 | 1012 | 1013 | 1014 | 1017 | 1018
+                | 1020 | 1021 | 1022 | 1023
+        )
     }
     fn read_weight_bytes(&self, file_off: u64, dst: &mut [u8]) -> bool {
         crate::read_weight_bytes(file_off, dst)
@@ -1662,10 +1758,19 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // silent -- add a shape and the tuner simply never tries it.
         candidates: Some(|_m, _d| (0..crate::rt_shape_count()).collect()),
         after: &[],
-        cross_check: None,
-        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
-        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
-        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
+        // THIS KNOB'S TRADE IS WEIGHT RE-READS, so it is cross-checked where re-reads cost
+        // something. RT_SHAPES' own comment says it: "RT_TOKENS decides how many times a
+        // batch re-reads the weight matrix -- ceil(n_tok / RT_TOKENS) passes". The sweep
+        // runs on PrefillGemm, a slice narrow enough to sit in cache, where a wider token
+        // tile looks free. PrefillGemmUbatch is the full projection, which is the regime
+        // this knob is actually chosen for.
+        cross_check: Some(Wl::PrefillGemmUbatch),
+        // WHICHEVER KINDS THE RT ROUTE SERVES, asked of the routing rather than listed
+        // here. This read "Q4_0 present" from the day rt_gemm was the Q4 kernel; the
+        // tile-major family joined the route (every k-quant, at every batch width) and
+        // the predicate did not, so on qwen35 -- 94% of whose prefill is this kernel --
+        // the tuner skipped the knob as inapplicable and the tile stayed at its default.
+        applies: Some(|m| m.weight_kinds & crate::rt_route_kinds() != 0),
         tuple: None,
         category: KnobCategory::Benched,
         values: &[],
@@ -1937,70 +2042,93 @@ static METAL_KNOBS: &[KnobDecl] = &[
         workload: Wl::DecodeAttentionStep,
     },
     KnobDecl {
-        // MEGA BLOCK GRID (task #141). The persistent FFN(+PLE) dispatch's threadgroups all
-        // wait on each other, so the grid is bounded by a DERIVED limit -- gpu_cores x the
-        // pipeline's maxTotalThreadsPerThreadgroup (see the host) -- and the shape inside
-        // it is a tuned value: the barrier cost grows with the number of arrivers, the
-        // GEMV phases want simdgroups in flight, 1024-thread groups leave cores idle.
-        // Candidates are per core: one, two-minus-slack, two per core.
+        // The persistent grid needs a whole-engine decode measurement: DecodeMix only
+        // dispatches independent matmuls and never exercises its barriers. It previously
+        // called this knob INERT and stored the untested two-per-core default on M4.
+        // The native setter now caps stored seats at one group per detected core; wider
+        // grids are explicit env experiments, not micro-tuner candidates. Changing the
+        // grid can change attention's split/reduction order, so correctness is required.
         name: "mega_tgs",
         legal: Some(|v, _m, _d| {
             let lim = crate::mega_threads_limit();
-            lim == 0 || v * crate::mega_nsg_current() * 32 <= lim
+            v > 0
+                && (crate::gpu_cores() == 0 || v <= crate::gpu_cores())
+                && (lim == 0
+                    || u64::from(v) * u64::from(crate::mega_nsg_current()) * 32
+                        <= u64::from(lim))
         }),
-        bit_affecting: false,
+        bit_affecting: true,
         derive: None,
         candidates: Some(|_m, _d| {
             let c = crate::gpu_cores();
             if c == 0 {
-                return vec![8, 16];
+                return vec![1];
             }
-            let mut v: Vec<u32> = [c, 2 * c - 4, 2 * c - 2, 2 * c]
-                .into_iter()
-                .filter(|&t| t > 0)
-                .collect();
-            v.sort_unstable();
-            v.dedup();
-            v
+            vec![c]
         }),
         after: &[],
         cross_check: None,
-        applies: Some(|m| m.weight_kinds & (1 << 1) != 0 && crate::mega_level() >= 1),
+        // Facts describe the post-load projections: Gemma's block reads Q4_0 (1),
+        // LFM2's reads Q8_0_TM (3), including Q8_0 repacked at load. Row-major Q8_0
+        // alone cannot enter the LFM2 block. This is only eligibility for an external
+        // trial; the whole-model run must still prove that the route engaged.
+        applies: Some(|m| {
+            m.weight_kinds & ((1 << 1) | (1 << 3)) != 0 && crate::mega_level() >= 1
+        }),
         tuple: Some("mega"),
-        category: KnobCategory::Benched,
+        category: KnobCategory::EndToEnd,
         values: &[],
         apply: crate::set_mega_tgs,
         current: crate::mega_tgs_current,
         screened: false,
-        sweep: Sw::Values,
+        sweep: Sw::External,
+        // Unused for External knobs; never rank the grid on this operator proxy.
         workload: Wl::DecodeMix,
     },
     KnobDecl {
-        // Simdgroups per mega threadgroup; with mega_tgs the product is the grid.
+        // Simdgroups per mega threadgroup, and with mega_tgs the product is the grid. This
+        // value is the FLOOR, not the answer: when a program declares what its phases stride
+        // over (mega_program.rs), the host raises the count above the seat so that no phase's
+        // last wave is mostly idle -- that part is arithmetic on the model's shapes and no
+        // measurement can produce it (qwen35 wants 18, which is not on any candidate ladder).
+        // What is left for the tuner is the DEVICE's occupancy term: below some number of
+        // simdgroups a core cannot cover memory latency however well the work divides. On an
+        // M3 Pro that floor is 16 -- at 9 simdgroups a perfectly balanced grid ran 18% slower.
+        // A program that declares nothing runs at the seat exactly, as before.
         name: "mega_nsg",
         legal: Some(|v, _m, d| {
             let lim = crate::mega_threads_limit();
-            v * 32 <= d.max_threads
-                && (lim == 0 || crate::mega_tgs_current() * v * 32 <= lim)
+            v > 0
+                && u64::from(v) * 32 <= u64::from(d.max_threads)
+                && (lim == 0
+                    || u64::from(crate::mega_tgs_current()) * u64::from(v) * 32
+                        <= u64::from(lim))
         }),
-        bit_affecting: false,
+        bit_affecting: true,
         derive: None,
         candidates: Some(|_m, d| {
-            [8u32, 16, 32]
+            // Keep the intermediate 24-SG width. Powers of two alone miss a legal
+            // device occupancy point (and LFM2's HD=64 fold admits multiples of 8).
+            // These are external trial candidates, never a hardware-name default.
+            [8u32, 16, 24, 32]
                 .into_iter()
                 .filter(|&n| n * 32 <= d.max_threads)
                 .collect()
         }),
         after: &[],
         cross_check: None,
-        applies: Some(|m| m.weight_kinds & (1 << 1) != 0 && crate::mega_level() >= 1),
+        // Keep the same post-load format eligibility as mega_tgs above.
+        applies: Some(|m| {
+            m.weight_kinds & ((1 << 1) | (1 << 3)) != 0 && crate::mega_level() >= 1
+        }),
         tuple: Some("mega"),
-        category: KnobCategory::Benched,
+        category: KnobCategory::EndToEnd,
         values: &[],
         apply: crate::set_mega_nsg,
         current: crate::mega_nsg_current,
         screened: false,
-        sweep: Sw::Values,
+        sweep: Sw::External,
+        // As above, no micro workload currently executes the persistent kernel.
         workload: Wl::DecodeMix,
     },
     KnobDecl {
@@ -2619,7 +2747,10 @@ fn mega_gemma4_entry(l: &Gemma4MegaLayer<'_>, n_tok: u32) -> bool {
         e.u[G4_U_N_FREQS] = e.n_freqs;
         e.f[MEGA_F_ROPE_BASE] = q.rope_base;
     }
+    // These phases form the layer's row in threadgroup memory and read it back across the
+    // threadgroup's simdgroups, so the row is what they need there.
     e.u[MEGA_U_N_EMBD] = n_embd;
+    e.u[MEGA_U_TGMEM_F] = n_embd;
     e.u[G4_U_N_MID] = n_ff;
     e.u[G4_U_PLE] = ple;
     e.u[G4_U_PL_OFF] = per_layer_off;
@@ -2653,7 +2784,10 @@ fn mega_lfm2_entry(l: &Lfm2MegaLayer, n_tok: u32) -> bool {
     e.slots[L2_O] = sbuf(RW, b(l.add), 0);
     e.slots[L2_G] = sbuf(W, b(l.g), 0);
     e.slots[L2_U] = sbuf(W, b(l.u), 0);
+    // These phases form the layer's row in threadgroup memory and read it back across the
+    // threadgroup's simdgroups, so the row is what they need there.
     e.u[MEGA_U_N_EMBD] = l.n_embd;
+    e.u[MEGA_U_TGMEM_F] = l.n_embd;
     e.u[L2_U_N_FF] = l.n_ff;
     e.f[MEGA_F_EPS] = l.eps;
     e.f[L2_F_Q_SCALE] = 1.0;
@@ -2670,6 +2804,7 @@ fn mega_lfm2_entry(l: &Lfm2MegaLayer, n_tok: u32) -> bool {
             bcx,
             state,
             state_off,
+            state_out_off,
             snap,
         } => {
             if in_kind != 3 || out_kind != 3 || kernel == 0 || kernel - 1 > 8 {
@@ -2683,6 +2818,10 @@ fn mega_lfm2_entry(l: &Lfm2MegaLayer, n_tok: u32) -> bool {
             e.slots[L2_W_OUT] = sw(out_off, L2_O_OUT_OFF);
             e.slots[L2_BCX] = sbuf(RW, b(bcx), 0);
             e.slots[L2_STATE] = sbuf(RW, b(state), state_off);
+            // The plane the shift writes. The same offset is the in-place form, which is
+            // what prefill passes; a decode step passes the next plane so the one it read
+            // survives as its rollback point (task #165).
+            e.slots[L2_STATE_OUT] = sbuf(RW, b(state), state_out_off);
             if let Some((sb, so)) = snap {
                 e.slots[L2_SNAP] = sbuf(RW, b(sb), so);
                 e.u[L2_U_HAS_SNAP] = 1;
@@ -2763,6 +2902,61 @@ fn mega_lfm2_entry(l: &Lfm2MegaLayer, n_tok: u32) -> bool {
             e.f[MEGA_F_ROPE_BASE] = rope_base;
             e.f[L2_F_Q_SCALE] = q_scale;
         }
+    }
+    crate::mega_layer(&e)
+}
+
+/// One Qwen3.8 decode layer as one entry (task #165).
+///
+/// THE FORMAT IS PER TENSOR, so every weight's kind is mapped to the row brick's format
+/// here and a weight the brick cannot read refuses the layer -- the architecture's rules
+/// live next to its program, which is where the bridge expects them. 0 means refuse: it is
+/// also the brick's row-major arm, which decodes nothing, so passing it on would produce
+/// plausible zeros rather than an error.
+fn mega_qwen35_entry(l: &Qwen35MegaLayer, n_tok: u32) -> bool {
+    use crate::mega_slots::*;
+    use crate::{MEGA_SLOT_BUF_RW as RW, MEGA_SLOT_BUF_W as W};
+    use crate::{mega_slot_buf as sbuf, mega_slot_weight as sw};
+    if n_tok != 1 {
+        return false;
+    }
+    // The tile-major unit is 8 rows, and the brick walks whole units.
+    if l.n_embd % 32 != 0 || l.n_ff % 32 != 0 || l.n_embd % 8 != 0 || l.n_ff % 8 != 0 {
+        return false;
+    }
+    let (f_gate, f_up, f_down) = (
+        crate::mega_wfmt(l.gate_kind),
+        crate::mega_wfmt(l.up_kind),
+        crate::mega_wfmt(l.down_kind),
+    );
+    if f_gate == 0 || f_up == 0 || f_down == 0 {
+        return false;
+    }
+    let mut e = crate::MegaEntryFfi::new(2);
+    e.min_level = crate::MEGA_LEVEL_QWEN35;
+    e.slots[Q35_W_GATE] = sw(l.gate_off, Q35_O_GATE_OFF);
+    e.slots[Q35_W_UP] = sw(l.up_off, Q35_O_UP_OFF);
+    e.slots[Q35_W_DOWN] = sw(l.down_off, Q35_O_DOWN_OFF);
+    e.slots[Q35_W_FN] = sw(l.ffn_norm_off, Q35_O_FN_OFF);
+    e.slots[Q35_X] = sbuf(RW, b(l.x), 0);
+    e.slots[Q35_O] = sbuf(RW, b(l.add), 0);
+    e.slots[Q35_G] = sbuf(W, b(l.g), 0);
+    e.slots[Q35_U] = sbuf(W, b(l.u), 0);
+    e.slots[Q35_CUR] = sbuf(RW, b(l.cur), 0);
+    e.u[MEGA_U_N_EMBD] = l.n_embd;
+    // THE ROW LIVES IN DEVICE MEMORY (task #175 step 2, under measurement): these phases read
+    // it back across the threadgroup's simdgroups, which is what threadgroup memory is for --
+    // but holding it costs the whole core's admission (20 KB admits one threadgroup) and puts
+    // a hard wall at n_embd 8156. The down projection already reads its activation from device
+    // and ties its dispatch-path GEMV, so the re-read is cache-served, not DRAM.
+    e.u[MEGA_U_TGMEM_F] = 0;
+    e.u[Q35_U_N_FF] = l.n_ff;
+    e.u[Q35_U_F_GATE] = f_gate;
+    e.u[Q35_U_F_UP] = f_up;
+    e.u[Q35_U_F_DOWN] = f_down;
+    e.f[MEGA_F_EPS] = l.eps;
+    match l.mixer {
+        Qwen35MegaMixer::None => e.u[Q35_U_KIND] = 0,
     }
     crate::mega_layer(&e)
 }

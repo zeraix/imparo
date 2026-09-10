@@ -9,6 +9,13 @@ build = "build.rs"
 [lints]
 workspace = true
 
+[dev-dependencies]
+# Test-only: the brick gate diffs the MSL decode against the CPU row codec, which is
+# itself pinned bit-exact against llama.cpp's dequantiser. Not a runtime dependency --
+# imparo-metal never calls the CPU backend while serving.
+imparo-cpu = { path = "../imparo-cpu" }
+imparo-gguf = { path = "../imparo-gguf" }
+
 [dependencies]
 imparo-host = { path = "../imparo-host" }
 imparo-backend = { path = "../imparo-backend" }

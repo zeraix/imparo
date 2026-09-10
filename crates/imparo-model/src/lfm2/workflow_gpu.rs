@@ -301,18 +301,21 @@ pub fn batch(
         }
     }
     gprobe("inp_embd", BufId::X, 0, n_embd as usize);
-    // A decode step may be discarded after a stop or rolled back after a failed region;
-    // the shortconv history advances in place, so keep the pre-step state where
-    // `discard_step` / `recover_step` restore it from -- per pipe slot, as two steps can
-    // be in flight.
-    if b == 1 && wf.plan.recurrent_elems() > 0 {
-        let recur = wf.plan.recurrent_elems();
-        let slot = pipe.map_or(0, |p| p.pick_slot);
-        be().copy_range(BufId::RecurPrev, slot * recur, BufId::Recur, 0, recur);
-    }
+    // THE RECURRENT PLANES for this batch (task #165). A decode step reads one plane and
+    // writes the next, so the plane it read stays intact and a discarded or failed step is
+    // undone by an index rather than by a pre-step copy of the whole history. Prefill is
+    // IN PLACE: nothing rolls a chunk back to a per-token boundary.
+    let recur_elems = wf.plan.recurrent_elems();
+    let (plane_in, plane_out) = if b == 1 {
+        let (i, o) = wf.state.recur_decode_planes();
+        (i * recur_elems, o * recur_elems)
+    } else {
+        let p = wf.state.recur_plane * recur_elems;
+        (p, p)
+    };
 
-    let flush_every = be().flush_layers(b == 1) as usize;
     let n_layers_total = wf.plan.layers.len();
+    let flush_every = crate::gpu_support::flush_layers_bounded(b == 1, n_layers_total);
     let tail = if wf.state.logits_wanted && b >= 128 {
         tail_split(b, tail_align())
     } else {
@@ -390,7 +393,8 @@ pub fn batch(
                         kernel: kern,
                         bcx: BCX,
                         state: BufId::Recur,
-                        state_off: r_off,
+                        state_off: r_off + plane_in,
+                        state_out_off: r_off + plane_out,
                         snap,
                     })
             }
@@ -728,10 +732,11 @@ pub fn batch(
                 // which the answer needs whenever the boundary is nearer than `kern - 1`
                 // tokens in. One dispatch of `n_embd` threads; the batch runs on.
                 if let Some(k) = wf.state.recur_snap {
-                    be().shortconv_snapshot(
+                    be().causal_conv_snapshot(
+                        imparo_backend::ConvForm::GatedBcx,
                         BCX,
                         BufId::Recur,
-                        r_off,
+                        r_off + plane_in,
                         BufId::RecurSnap,
                         r_off,
                         n_embd,
@@ -741,11 +746,13 @@ pub fn batch(
                 }
                 // ATTN is the scratch: on a recurrent layer nothing attends, and it is
                 // sized n_head * head_dim = 2048, exactly the model width.
-                be().shortconv(
+                be().causal_conv(
+                    imparo_backend::ConvForm::GatedBcx,
                     BCX,
                     conv.offset,
                     BufId::Recur,
-                    r_off,
+                    r_off + plane_in,
+                    r_off + plane_out,
                     BufId::Attn,
                     n_embd,
                     kern,
@@ -830,9 +837,10 @@ pub fn batch(
         // mixer above, or alone here), every step below is already done.
         let mega_tail_done =
             layer_in_block || mega_entry(imparo_backend::Lfm2MegaMixer::None);
+        // Ordinary residual+norm fusion does not require a private projection layout.
+        // Each backend admits the operation itself; false preserves the split path.
         let mixer_ffn_norm_fused = mega_tail_done
-            || projection_preparation
-                && li != gpu_probe_layer()
+            || li != gpu_probe_layer()
                 && be().add_rms_norm(
                     BufId::Cur,
                     BufId::X,
@@ -1005,8 +1013,7 @@ pub fn batch(
         // its own; the dispatch path norms at its top).
         let next_operator_norm_fused = if mega_tail_done {
             false
-        } else if projection_preparation
-            && li + 1 < n_layers_total
+        } else if li + 1 < n_layers_total
             && li != gpu_probe_layer()
             && li + 1 != gpu_probe_layer()
         {
@@ -1185,6 +1192,10 @@ mod tests {
                     Attention::Recurrent {
                         r_elems: 2048 * (3 - 1),
                         s_elems: 0,
+                        // LFM2's short conv carries no delta-rule state, so it has no
+                        // key/value geometry: the recurrent dims are the delta net's.
+                        key_dim: 0,
+                        value_dim: 0,
                     }
                 },
                 ffn: Ffn::Dense {

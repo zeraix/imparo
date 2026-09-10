@@ -37,7 +37,7 @@
 use crate::ffi::*;
 use core::mem::size_of;
 use imparo_backend::{
-    Backend, BatchGeometry, BufId, Epilogue, HadamardWidth, HostTierProfile,
+    Backend, BatchGeometry, BufId, ConvForm, Epilogue, HadamardWidth, HostTierProfile,
     KvByteCodec, KvByteCodecRoute, KvHostHandle, KvLayout, KvQuantizationRoute,
     KvTransferSpan, QuantizedWeightCachePlan, StreamedWeightSpan, WeightKindWire,
     Workload,
@@ -1695,10 +1695,14 @@ impl Backend for CudaBackend {
             )
         }
     }
+    /// The gated form only: CUDA has no plain causal-conv kernel, and
+    /// `supports_gated_delta` is false so no workflow reaches it with another form.
+    /// The assertion is there because a silent no-op here is a plausible wrong answer.
     #[allow(clippy::too_many_arguments)]
-    fn shortconv(
+    fn causal_conv(
         &self,
-        bcx: BufId,
+        form: ConvForm,
+        src: BufId,
         w_off: u64,
         state: BufId,
         state_off: u32,
@@ -1707,9 +1711,14 @@ impl Backend for CudaBackend {
         kernel: u32,
         n_tok: u32,
     ) {
+        assert_eq!(
+            form,
+            ConvForm::GatedBcx,
+            "cuda implements only the gated causal-conv form"
+        );
         unsafe {
             imparo_cuda_shortconv(
-                b(bcx),
+                b(src),
                 w_off,
                 b(state),
                 state_off,
@@ -1721,9 +1730,10 @@ impl Backend for CudaBackend {
         }
     }
     #[allow(clippy::too_many_arguments)]
-    fn shortconv_snapshot(
+    fn causal_conv_snapshot(
         &self,
-        bcx: BufId,
+        form: ConvForm,
+        src: BufId,
         state: BufId,
         state_off: u32,
         snap: BufId,
@@ -1732,9 +1742,14 @@ impl Backend for CudaBackend {
         kernel: u32,
         n_tok: u32,
     ) {
+        assert_eq!(
+            form,
+            ConvForm::GatedBcx,
+            "cuda implements only the gated causal-conv form"
+        );
         unsafe {
             imparo_cuda_shortconv_snapshot(
-                b(bcx),
+                b(src),
                 b(state),
                 state_off,
                 b(snap),
@@ -1744,6 +1759,20 @@ impl Backend for CudaBackend {
                 n_tok,
             )
         }
+    }
+    /// Part of the gated delta-net set, which CUDA does not serve; `supports_gated_delta`
+    /// is false, so a model refuses before it can be called.
+    fn mul_strided_sigmoid(
+        &self,
+        _a: BufId,
+        _b: BufId,
+        _width: u32,
+        _b_off: u32,
+        _b_stride: u32,
+        _a_stride: u32,
+        _n_row: u32,
+    ) {
+        unreachable!("cuda: supports_gated_delta() is false");
     }
     unsafe fn init_weights(&self, base: *const u8, len: u64) -> Result<(), i32> {
         // CUDA uploads the blob to device memory.

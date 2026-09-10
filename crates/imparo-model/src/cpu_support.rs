@@ -13,7 +13,7 @@
 //! for itself.
 
 use imparo_cpu::ops;
-use imparo_gguf::weights::{SUPPORTED_WEIGHT_TYPES, Tensor, Weights};
+use imparo_gguf::weights::{Tensor, Weights, supported_weight_types};
 
 use crate::{KvSource, ModelPlan};
 
@@ -143,9 +143,10 @@ impl<'a> Tensors<'a> {
         if imparo_gguf::weights::weight_kind(x.ggml_type).is_none() {
             return Err(format!(
                 "tensor '{name}': unsupported weight type (ggml type id {}) for a \
-                 matmul; supported today: {SUPPORTED_WEIGHT_TYPES}. Refusing to load \
+                 matmul; supported today: {}. Refusing to load \
                  rather than silently misread the blocks.",
-                x.ggml_type
+                x.ggml_type,
+                supported_weight_types()
             ));
         }
         Ok(x)
@@ -282,7 +283,7 @@ impl RecurrentState {
         let mut s = vec![Vec::new(); n];
         if allocate {
             for l in &plan.layers {
-                if let crate::Attention::Recurrent { r_elems, s_elems } = l.attention {
+                if let crate::Attention::Recurrent { r_elems, s_elems, .. } = l.attention {
                     r[l.index as usize] = vec![0.0; r_elems as usize];
                     s[l.index as usize] = vec![0.0; s_elems as usize];
                 }

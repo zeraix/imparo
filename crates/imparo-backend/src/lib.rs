@@ -80,10 +80,6 @@ pub enum BufId {
     /// which the same kernel wrote; the host reads slot N % 2 after step N retires and
     /// before it queues step N+2, the next writer of that slot.
     Pick = 27,
-    /// PIPELINED DECODE: the recurrent state as it was BEFORE the newest queued step, so a
-    /// step discarded after a stop rolls its in-place state advance back on the device.
-    /// Same shape as `Recur`; unused by a model without recurrent layers.
-    RecurPrev = 28,
 }
 
 impl BufId {
@@ -97,7 +93,7 @@ impl BufId {
     ///
     /// Three declarations of one number is how NO_WEIGHT ended up with two different
     /// values in this codebase, so there is one declaration and a check.
-    pub const COUNT: usize = 29;
+    pub const COUNT: usize = 28;
 }
 
 /// Fail loudly when a backend's buffer table cannot hold every `BufId`.
@@ -125,6 +121,19 @@ pub type WeightKindWire = u32;
 /// and the CUDA backend tested `w_off != u64::MAX`, so a no-weight norm on CUDA read a
 /// weight vector at offset 4294967295. All-ones in 64 bits cannot be a real tensor offset,
 /// which is what the Metal kernel's IMPARO_NO_WEIGHT now is too.
+/// PLANES OF THE RECURRENT STATE, and why three.
+///
+/// A decode step reads one plane and writes the next, so the plane it read IS the pre-step
+/// state and a failed step is undone by NOT ADVANCING an index -- no copy. The count is
+/// `max steps in flight + 1`: with two pipelined steps encoded before either retires,
+///
+///   step t    reads p0  writes p1
+///   step t+1  reads p1  writes p2      <- p0 is still t's rollback point, so it must live
+///
+/// Two planes would have t+1 write over p0 and destroy it. This is exactly the allocation
+/// the old `Recur` + a two-slot rollback copy already cost, so the footprint does not move.
+pub const RECUR_PLANES: u32 = 3;
+
 pub const NO_WEIGHT: u64 = u64::MAX;
 
 /// The mixer of an LFM2 decode layer, for [`Backend::mega_lfm2_layer`].
@@ -147,7 +156,12 @@ pub enum Lfm2MegaMixer {
         kernel: u32,
         bcx: BufId,
         state: BufId,
+        /// The plane the conv READS.
         state_off: u32,
+        /// The plane its shift WRITES; equal to `state_off` is the in-place form. Two
+        /// offsets because the shift carries values forward from the plane it read
+        /// (task #165).
+        state_out_off: u32,
         snap: Option<(BufId, u32)>,
     },
     /// Full attention at one token: the operator norm of `x`, the q/k/v projections, per-head
@@ -248,6 +262,44 @@ pub struct Gemma4MegaLayer<'a> {
     pub front: Option<MegaFront<'a>>,
 }
 
+/// What precedes qwen35's shared tail. `None` is the tail alone, with `add` already holding
+/// the mixer's output; the two mixers (full attention with a packed `[query | gate]`
+/// projection, and the gated delta net) join as their phases land (task #165).
+#[derive(Clone, Copy, Debug)]
+pub enum Qwen35MegaMixer {
+    /// `add` holds the mixer's output: the dispatch path ran it.
+    None,
+}
+
+/// The operands of one Qwen3.8 decode layer, one variant of [`MegaLayer`]: the mixer, then
+/// the tail `x' = x + add; cur = rms(x') * w_ffn; x = x' + down(act(gate*cur) * (up*cur))`.
+///
+/// EVERY WEIGHT CARRIES ITS OWN KIND, and that is the architecture, not caution: this
+/// file's quants are assigned per tensor by importance, so two projections of one layer
+/// routinely differ (one UD file: 53 distinct per-block signatures over 65 blocks). A
+/// backend that stamps one format into its pipeline cannot serve it.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen35MegaLayer {
+    pub mixer: Qwen35MegaMixer,
+    pub gate_kind: WeightKindWire,
+    pub gate_off: u64,
+    pub up_kind: WeightKindWire,
+    pub up_off: u64,
+    pub down_kind: WeightKindWire,
+    pub down_off: u64,
+    pub ffn_norm_off: u64,
+    pub n_embd: u32,
+    pub n_ff: u32,
+    pub eps: f32,
+    pub x: BufId,
+    pub add: BufId,
+    pub g: BufId,
+    pub u: BufId,
+    /// The FFN-normalised row. Whether it lives in device or threadgroup memory is the
+    /// backend's choice (task #175); the model only says which buffer holds it.
+    pub cur: BufId,
+}
+
 /// What one decode layer IS, per architecture. A backend that runs the whole layer as one
 /// operation reads the variant it knows; a new architecture is a new variant, never a new
 /// `Backend` method.
@@ -255,6 +307,7 @@ pub struct Gemma4MegaLayer<'a> {
 pub enum MegaLayer<'a> {
     Gemma4(Gemma4MegaLayer<'a>),
     Lfm2(Lfm2MegaLayer),
+    Qwen35(Qwen35MegaLayer),
 }
 
 /// One decode layer offered to the backend as a MEGA ENTRY (see [`Backend::mega_layer`]).
@@ -291,6 +344,126 @@ pub enum Epilogue {
     Gelu = 1,
     /// `y = silu(y) * product`. SwiGLU -- LFM2's, and most other architectures'.
     Silu = 2,
+}
+
+/// What a causal depthwise convolution reads, and what it does with the tap sum.
+///
+/// The convolution itself -- one channel, `kernel` taps, a per-conversation history of
+/// `kernel - 1` past values, causal -- is the same in every architecture that has one.
+/// What differs is the VALUE the taps run over and the epilogue, and those two facts are
+/// this enum. They are a compile-time choice on the device, not a runtime branch: a
+/// runtime branch in a Metal kernel costs speed and moves the floating-point answer
+/// (`set_activation` carries the measurement).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ConvForm {
+    /// LFM2's gated short convolution. The source row is `[b | c | x]`, three widths per
+    /// token; the value is `b * x` and the output is `c * sum`.
+    GatedBcx = 0,
+    /// Qwen3.8's delta-net convolution. The source row is ONE width per token, the value
+    /// is the row itself, and the output is `silu(sum)`.
+    ///
+    /// The history holds the RAW value, never the activated output. Storing the output
+    /// would decay the history through the activation -- a slow drift that still runs.
+    PlainSilu = 1,
+}
+
+impl ConvForm {
+    /// Elements one token occupies in the source buffer, for a convolution of `width`
+    /// channels. The gated form packs three chunks per token; the plain form packs one.
+    #[must_use]
+    pub fn src_stride(self, width: u32) -> u32 {
+        match self {
+            Self::GatedBcx => 3 * width,
+            Self::PlainSilu => width,
+        }
+    }
+}
+
+/// One gated delta-net step for every value head, over a whole batch.
+///
+/// A struct because the op takes fourteen operands and a positional list of them is a
+/// silent-wrong-answer waiting to happen -- `k_heads` and `v_heads` are both small
+/// integers, and swapping them still runs.
+///
+/// THE RULE, per value head `h`, reading key head `h % k_heads`:
+///
+/// ```text
+///   S      *= exp(g[h])                   g = a[h] * softplus(alpha[h] + dt_bias[h])
+///   sk[j]   = SUM_i S[j][i] * khat[i]     what the state already remembers of k
+///   d[j]    = (v[j] - sk[j]) * beta[h]    beta = sigmoid(the beta projection)
+///   S[j][i]+= khat[i] * d[j]              rank-one update
+///   o[j]    = SUM_i S[j][i] * qhat[i]     read it back with the query
+/// ```
+///
+/// `qhat` and `khat` are the L2-normalised query and key of that head, `qhat` also scaled
+/// by `1 / sqrt(key_dim)` BEFORE the state product -- the same order the reference rounds
+/// in. `S` is `[value_head][value_coord][key_coord]` with the key coordinate contiguous.
+///
+/// KEY HEAD MAPPING. The reference widens Q and K from `k_heads` to `v_heads` with a
+/// repeat, and a repeat TILES: value head `h` reads key head `h % k_heads`, NOT
+/// `h / group`. A grouped-query attention in the same model uses `h / group`, because
+/// there the widening is a strided view. Both are right for their own tensor.
+/// The gated-RMS epilogue that follows the delta rule in every architecture that has one:
+/// `out = rms_norm(core, w) * silu(gate)`, per VALUE HEAD.
+///
+/// It is a SEPARATE type, not two more fields, because it is optional as a UNIT -- a
+/// backend either does both steps inside the rule or neither, and half of it is not a
+/// state anyone should be able to construct.
+#[derive(Clone, Copy, Debug)]
+pub struct DeltaEpilogue {
+    /// `ssm_norm` in the weight buffer: ONE head's worth of weights (`value_dim`),
+    /// shared by every value head, which is exactly `rms_norm`'s row geometry.
+    pub norm_w_off: u64,
+    /// The SiLU gate, `v_heads * value_dim` per token, READ AND WRITTEN: the fused form
+    /// leaves `silu(gate) * norm(core)` here, which is what the out projection reads.
+    pub gate: BufId,
+}
+
+pub struct DeltaNet {
+    /// The convolved projection, `2 * k_heads * key_dim + v_heads * value_dim` elements
+    /// per token, packed `[Q | K | V]`.
+    pub qkv: BufId,
+    /// The raw alpha projection, `v_heads` per token. `softplus` and `dt_bias` are the
+    /// op's, so a caller cannot apply them in the wrong order.
+    pub alpha: BufId,
+    /// The raw beta projection, `v_heads` per token; the op takes its sigmoid.
+    pub beta: BufId,
+    /// `ssm_a` in the weight buffer: one value per value head, ALREADY negated in the
+    /// file (`-exp(A_log)`), so `a * softplus(dt)` is the negative log decay.
+    pub a_off: u64,
+    /// `ssm_dt.bias` in the weight buffer, one value per value head.
+    pub dt_bias_off: u64,
+    /// The recurrent matrix, `v_heads * value_dim * key_dim` floats at `state_off`.
+    pub state: BufId,
+    /// The plane the step READS.
+    pub state_off: u32,
+    /// The plane it WRITES. `state_out_off == state_off` is the in-place form, which is
+    /// what prefill and every non-recurrent caller pass.
+    ///
+    /// WHY A SECOND OFFSET AND NOT A COPY: the rule reads and writes EVERY element of the
+    /// head's matrix on every call (the kernel loads `s[r][c]` for all `j < value_dim`,
+    /// `i < key_dim` and stores all of them back), so directing the store at another plane
+    /// costs an address, not traffic. That is what lets a failed decode step be rolled
+    /// back by NOT ADVANCING an index instead of by copying 149.6 MiB before every step.
+    pub state_out_off: u32,
+    /// `v_heads * value_dim` per token. With a fused `epilogue` this buffer is NOT
+    /// written -- the normalised, gated row goes straight to `epilogue.gate`.
+    pub out: BufId,
+    /// The gated-RMS epilogue, folded into the rule by a backend that advertises
+    /// `delta_net_fuses_epilogue`. `None`, or a backend that does not advertise it,
+    /// leaves the caller to dispatch `rms_norm` and `act_mul` itself.
+    pub epilogue: Option<DeltaEpilogue>,
+    pub k_heads: u32,
+    pub v_heads: u32,
+    /// The Q/K head width, which is also the state's key coordinate.
+    pub key_dim: u32,
+    /// The V head width, which is also the state's value coordinate.
+    pub value_dim: u32,
+    pub n_tok: u32,
+    /// The floor of the L2 normalisation: `max(norm, eps)`, not `norm + eps`. The second
+    /// shrinks every vector slightly, which is a different function.
+    pub eps: f32,
 }
 
 /// Stable, typed policy for resolving the block width of the orthonormal
@@ -579,6 +752,31 @@ pub struct WeightTransform {
     pub to_type: u32,
     pub n_in: u32,
     pub n_out: u32,
+    /// THE LAYOUT, as data. A repack moves a block's scale bytes to the head of a unit and
+    /// its payload after them; which bytes are which is stated once, in imparo-gguf's
+    /// `TmRule`, and travels here. A backend that re-derived the layout from `from_type`
+    /// would carry a second copy of it, and a copy puts every payload at a wrong offset
+    /// the moment a format is added -- a slightly wrong weight, never a crash.
+    pub layout: WeightBlockLayout,
+}
+
+/// Two scale spans is the most any format needs (Q2_K and IQ3_S split them front and back),
+/// leaving at most three payload spans between and around them.
+pub const MAX_BLOCK_SPANS: usize = 5;
+
+/// Where a block's bytes are, and where the repack puts them.
+///
+/// Spans are the SCALE spans first (`n_scale_spans` of them), then the payload spans, in
+/// source order. The repack is format-agnostic: it moves the spans it is given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WeightBlockLayout {
+    pub block_elems: u32,
+    pub block_bytes: u32,
+    pub unit_rows: u32,
+    pub n_spans: u32,
+    pub n_scale_spans: u32,
+    pub span_off: [u32; MAX_BLOCK_SPANS],
+    pub span_len: [u32; MAX_BLOCK_SPANS],
 }
 
 /// The common runtime's placement of a model's weights across the tiers: segments sorted by
@@ -865,6 +1063,14 @@ pub trait Backend: Sync {
     }
     /// Command-buffer length policy: layers per flush at decode / prefill.
     fn flush_layers(&self, decode: bool) -> u32;
+    /// GPU seconds of the LONGEST single command buffer of the last region, or 0.0 from a
+    /// backend that does not measure -- which leaves every policy built on it inert.
+    ///
+    /// The longest ONE, not the region's sum: what starves the rest of the machine is a
+    /// single buffer holding the GPU with no gap in it.
+    fn longest_cb_gpu_seconds(&self) -> f64 {
+        0.0
+    }
 
     /// Rows retained after the last state-writing operator when all remaining
     /// work is row-local and only the final logit row is observable.
@@ -891,7 +1097,52 @@ pub trait Backend: Sync {
     fn grow_kv_layout(&self, bytes: &[u64], _layouts: &[KvLayout]) -> Result<(), i32> {
         self.grow_kv(bytes)
     }
+    /// Load is over: make every weight the device will read ready to be read.
+    ///
+    /// A LOAD THAT RETURNS WITH WORK STILL OWED IS CLAIMING READY WHEN IT IS NOT. On Metal
+    /// this is the residency set's page wiring: measured 3.7-8.7 s for Qwen3.8-27B's
+    /// 15509 MiB, and until this hook existed every millisecond of it landed inside the
+    /// first request. Backends with nothing to wire inherit the no-op.
+    ///
+    /// `stall_budget_s` is how long ONE uninterruptible step may hold the host. A backend
+    /// that wires in pieces stops when a piece exceeds it and leaves the rest pageable: a
+    /// tier that does not fit must DEGRADE, never freeze. Measured on Metal, one call over
+    /// a 15509 MiB tier: 26.8 ms with the memory free, 122177.6 ms with it not -- two
+    /// minutes in which nothing else on the machine can run.
+    fn wire_weights(&self, stall_budget_s: f64) {
+        let _ = stall_budget_s;
+    }
+    /// The file the weight mapping came from, so a backend that CONVERTS weights can read
+    /// them without the page cache.
+    ///
+    /// A converted tensor is read once and its source is dead the moment the twin exists, so
+    /// caching it means the file's bytes sit in the page cache beside the twin that replaced
+    /// them -- measured at +9588 MiB of file-backed pages across a Qwen3.8-27B load. A
+    /// tensor used DIRECTLY has no such twin: the mapping is the resident copy, one copy, and
+    /// should stay mapped. Backends that convert nothing inherit the no-op.
+    fn set_weight_path(&self, _path: &std::path::Path) {}
     fn write(&self, id: BufId, off: u64, src: &[f32]);
+    /// Set `elems` floats of a device buffer to zero, starting at `off`.
+    ///
+    /// SEPARATE FROM `write` BECAUSE THE SOURCE DOES NOT EXIST. Writing zeros through
+    /// `write` means the caller builds them: a recurrent state cleared that way allocated
+    /// a host `Vec` the size of the whole state times `RECUR_PLANES`, faulted it in, and
+    /// memcpy'd it across -- 3374 ms on Qwen3.8-27B's first conversation and 65 ms on
+    /// every one after, for a buffer a backend can fill in place.
+    ///
+    /// The default keeps the semantics with a bounded staging buffer, so a backend that
+    /// has no in-place fill still never allocates more than a megabyte. A backend whose
+    /// memory the host can address overrides it with a `memset`.
+    fn zero(&self, id: BufId, off: u64, elems: u64) {
+        const CHUNK: usize = 256 * 1024; // 1 MiB of f32
+        let zeros = vec![0.0_f32; CHUNK.min(elems as usize)];
+        let mut done = 0u64;
+        while done < elems {
+            let n = CHUNK.min((elems - done) as usize);
+            self.write(id, off + done, &zeros[..n]);
+            done += n as u64;
+        }
+    }
     fn write_u32(&self, id: BufId, off: u64, src: &[u32]);
     fn read(&self, id: BufId, off: u64, dst: &mut [f32]);
     fn read_kv_bytes(&self, layer: u32, is_v: bool, off: u64, dst: &mut [u8]);
@@ -1142,41 +1393,54 @@ pub trait Backend: Sync {
         epi == Epilogue::None
     }
 
-    /// LFM2's gated short convolution, for `n_tok` tokens of `width` channels.
+    /// A causal depthwise convolution over `n_tok` tokens of `width` channels.
     ///
-    /// `bcx` is the input projection, token-major with three chunks of `width` per token
-    /// (b, c, x in that order). `conv_w` is at `w_off`, channel-major with the tap
-    /// fastest. `state` holds `kernel - 1` past values per channel, oldest first, at
-    /// element offset `state_off`, and is ADVANCED in place.
+    /// `src` is the input projection, token-major with `form.src_stride(width)` elements
+    /// per token. `conv_w` is at `w_off`, channel-major with the tap fastest. `state`
+    /// holds `kernel - 1` past values per channel, oldest first, at element offset
+    /// `state_off`, and the advanced history is written at `state_out_off`.
+    ///
+    /// `form` says what the taps run over and what the epilogue does; see [`ConvForm`].
+    /// LFM2's gated short convolution and Qwen3.8's delta-net convolution differ in
+    /// exactly those two places and in nothing else, which is why they are one op.
     ///
     /// The state advance is a second dispatch, not part of this one: the new state is the
     /// tail of the same sequence the outputs read, so a single dispatch would have
     /// threads overwriting slots other threads still need, and a kernel cannot barrier
     /// its whole grid.
-    fn shortconv(
+    ///
+    /// `state_out_off` is the plane the advanced history is written to; equal to
+    /// `state_off` is the in-place form. The shift rewrites every value it read, so
+    /// aiming it at another plane costs an address, not traffic.
+    #[allow(clippy::too_many_arguments)]
+    fn causal_conv(
         &self,
-        bcx: BufId,
+        form: ConvForm,
+        src: BufId,
         w_off: u64,
         state: BufId,
         state_off: u32,
+        state_out_off: u32,
         out: BufId,
         width: u32,
         kernel: u32,
         n_tok: u32,
     );
-    /// The short-convolution state as of `n_tok` tokens into this batch, written to
-    /// `snap` and leaving `state` alone.
+    /// The convolution state as of `n_tok` tokens into this batch, written to `snap` and
+    /// leaving `state` alone.
     ///
     /// This is what lets a batch run past a checkpoint boundary instead of being cut to
     /// end on one. The state after `n_tok` tokens is just the last `kernel - 1` values of
-    /// `b * x` ending there, and `bcx` already holds them, so the mid-batch state is
-    /// COMPUTED rather than stood on.
+    /// the form's value sequence ending there, and `src` already holds them, so the
+    /// mid-batch state is COMPUTED rather than stood on.
     ///
-    /// Must be dispatched BEFORE `shortconv` advances `state`: with `n_tok` shorter than
-    /// the history, part of the answer is the pre-batch state.
-    fn shortconv_snapshot(
+    /// Must be dispatched BEFORE `causal_conv` advances `state`: with `n_tok` shorter
+    /// than the history, part of the answer is the pre-batch state.
+    #[allow(clippy::too_many_arguments)]
+    fn causal_conv_snapshot(
         &self,
-        bcx: BufId,
+        form: ConvForm,
+        src: BufId,
         state: BufId,
         state_off: u32,
         snap: BufId,
@@ -1184,6 +1448,74 @@ pub trait Backend: Sync {
         width: u32,
         kernel: u32,
         n_tok: u32,
+    );
+    /// The gated delta rule over `n_tok` tokens, advancing the recurrent matrix in place.
+    ///
+    /// Returns false when this backend has no kernel for it, and writes nothing: a model
+    /// must then refuse rather than read an untouched output buffer, which is a plausible
+    /// answer and a wrong one. Default: no support.
+    fn delta_net(&self, _op: &DeltaNet) -> bool {
+        false
+    }
+    /// Whether this backend serves a gated delta-net mixer at all: `delta_net`, the
+    /// `PlainSilu` causal-conv form and `mul_strided_sigmoid`.
+    ///
+    /// ONE question asked once, before the first layer, rather than three checks spread
+    /// through a forward. A backend that answers false is never dispatched into those
+    /// three entries -- they assert rather than write nothing, because a no-op leaves a
+    /// buffer holding the previous layer's values, which is a plausible answer.
+    fn supports_gated_delta(&self) -> bool {
+        false
+    }
+    /// Whether `delta_net` applies `DeltaNet::epilogue` itself.
+    ///
+    /// ASKED BEFORE THE DISPATCH, not after: the caller must know whether to issue the
+    /// `rms_norm` + `act_mul` pair, and `delta_net`'s bool already means "the rule ran".
+    /// A backend that answers true and then ignores the field would leave the gate
+    /// holding an un-normalised row, which is a plausible answer and a wrong one, so the
+    /// two are read from the same place.
+    fn delta_net_fuses_epilogue(&self) -> bool {
+        false
+    }
+    /// `dst[r * width + i] = src[r * src_stride + src_off + i]` for `i < width`,
+    /// `r < n_row`: ONE sub-block out of every row.
+    ///
+    /// The op a projection that packs two tensors per head needs -- Qwen3.8's Q weight is
+    /// 24 heads of `[query(256) | gate(256)]`, and reading it as two halves puts every
+    /// head after the first on the wrong side. The default walks the rows with
+    /// `copy_range`, which is correct everywhere and one dispatch per row; a backend with
+    /// a strided copy overrides it with one.
+    fn copy_strided(
+        &self,
+        dst: BufId,
+        src: BufId,
+        width: u32,
+        src_off: u32,
+        src_stride: u32,
+        n_row: u32,
+    ) {
+        for r in 0..n_row {
+            self.copy_range(dst, r * width, src, r * src_stride + src_off, width);
+        }
+    }
+    /// `a[r * a_stride + i] *= sigmoid(b[r * b_stride + b_off + i])`, the strided sigmoid
+    /// gate. Same parameter order as `mul_strided`, which is the same op without the
+    /// sigmoid.
+    ///
+    /// Sigmoid is not an `Epilogue`: `set_activation` bakes ONE activation into every
+    /// epilogue for the whole process, and Qwen3.8 needs SiLU there for its feed-forward
+    /// while its attention output gate is a plain sigmoid. Two gates, two activations, in
+    /// one architecture.
+    #[allow(clippy::too_many_arguments)]
+    fn mul_strided_sigmoid(
+        &self,
+        a: BufId,
+        b: BufId,
+        width: u32,
+        b_off: u32,
+        b_stride: u32,
+        a_stride: u32,
+        n_row: u32,
     );
     /// One embedding-table row, dequantised and scaled into `dst`.
     ///
@@ -1493,6 +1825,14 @@ pub trait Backend: Sync {
     /// kernels at library compile takes the row stride as a compile-time constant from it
     /// (every K/V tile load carries that stride); a backend that does not, ignores it.
     fn set_attention_kv_widths(&self, _widths: &[u32]) {}
+    /// The delta-net head widths this model uses -- `key_dim` is the Q/K head width and
+    /// the state's key coordinate, `value_dim` the V head width and its value coordinate.
+    ///
+    /// Same timing and same reason as `set_attention_head_dims`: the recurrence holds one
+    /// state row per lane in REGISTERS, and a register array's size must be a constant
+    /// expression, so the dims are compiled in. A backend that does not specialise on
+    /// them ignores this. Zero means the model has no recurrent mixer.
+    fn set_recurrent_dims(&self, _key_dim: u32, _value_dim: u32) {}
     /// `a = act(a)`, elementwise.
     fn act(&self, a: BufId, n: u32);
     /// `a = act(a) * b`, elementwise -- the DECODE form of the fused epilogue.
@@ -1642,6 +1982,27 @@ pub trait Backend: Sync {
     /// built for another layout. The default is the row-major set every backend reads.
     fn serves_weight_type(&self, ggml_type: u32) -> bool {
         matches!(ggml_type, 0 | 2 | 8) // F32, Q4_0, Q8_0
+    }
+    /// Tells the backend which GGML TYPE each compact wire kind is, once at load.
+    ///
+    /// A backend switches its kernels on the wire kind but its DECODE depends on the ggml
+    /// type -- and it must not re-derive one from the other, because that is a second copy
+    /// of a mapping imparo-gguf already states (`ggml_type_of_wire`). The common runtime
+    /// reads it there and hands the pairs over; a backend that does not need them ignores
+    /// this.
+    fn set_weight_kind_types(&self, _pairs: &[(WeightKindWire, u32)]) {}
+    /// Dispatches the backend REFUSED rather than encoding: a weight kind no kernel
+    /// serves, a width no route can walk, a span past a kernel's slices. Every refusal
+    /// logs, and a log line is not something a harness can act on -- a tuner run refused
+    /// 38005 k-quant matmats, printed 38005 lines and still wrote a config in which every
+    /// prefill-tile candidate had measured the same empty dispatch. A harness that must
+    /// have dispatched reads this and records nothing when it is nonzero. 0 by default:
+    /// a backend that cannot count them says so by never rising above zero, so a caller
+    /// gets no false all-clear from a backend that simply does not implement it -- it
+    /// gets the same answer as a clean run, which is why the tuner ALSO checks the count
+    /// moved during a workload it knows dispatches.
+    fn refused_dispatches(&self) -> u64 {
+        0
     }
     /// Read `dst.len()` weight bytes as the backend will serve them at file offset
     /// `file_off` (after any load-time transform). For verification only; false when the
@@ -2315,7 +2676,8 @@ pub struct DeviceProfile {
     pub layer_work_ns: u32,
     /// GPU nanoseconds for ONE layer's PREFILL matmuls, at this model's dimensions and a
     /// full chunk. MEASURED (the PrefillGemm workload, scaled back up from its slice);
-    /// 0 until probed.
+    /// 0 until probed. Checked against the engine once (qwen35: 92 ms per layer here, 81 ms
+    /// real) -- 14% over, close enough that the floor claim holds.
     ///
     /// The term that separates the two flush knobs. A prefill layer carries hundreds of
     /// times the GPU work of a decode layer while costing the host the SAME encode, so the
@@ -2359,7 +2721,12 @@ pub struct ModelFacts {
     /// A knob that governs one quant's kernels must not be swept on a model that has no
     /// tensor of that quant: the workload would dispatch a different kernel family and
     /// rank the candidates on noise. `applies` reads this.
-    pub weight_kinds: u32,
+    ///
+    /// u64 BECAUSE THE DISCRIMINANTS REACH 32. It was u32, and `1u32 << 32` does not
+    /// overflow in release Rust -- it shifts by 32 % 32 = 0 -- so a model carrying an
+    /// IQ2_S_TM tensor set bit 0 and read as "F32 present, IQ2_S_TM absent". Two wrong
+    /// answers, no error. The assertion below is what stops the same silence at 64.
+    pub weight_kinds: u64,
 }
 
 /// The front of a gemma4 layer offered to `mega_layer` (when `mega_front_wanted`):

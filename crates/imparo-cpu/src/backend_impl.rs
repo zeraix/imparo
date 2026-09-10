@@ -29,24 +29,20 @@
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use imparo_backend::{Backend, BufId, Epilogue, NO_WEIGHT, PoolCaps, WeightKindWire};
-use imparo_gguf::weights::{GGML_F32, GGML_Q4_0, GGML_Q8_0, GGML_Q8_0_TM};
+use imparo_backend::{
+    Backend, BufId, ConvForm, Epilogue, NO_WEIGHT, PoolCaps, WeightKindWire,
+};
+use imparo_gguf::weights::GGML_Q4_0;
 
 use crate::ops;
 
 /// The wire weight kind (`WeightKind as u32`) as a ggml type id.
 ///
-/// Two numbering schemes meet here: the trait passes the compact wire value, this
-/// crate's kernels switch on the ggml type. Getting it wrong reads a Q8 matrix as
-/// Q4 and produces plausible garbage, so it is one function.
+/// Through imparo-gguf's table on purpose: this used to be its own four-arm match, which
+/// meant a second copy of the mapping that went stale the moment a type was added -- and
+/// a stale copy reads a Q8 matrix as Q4, which is plausible garbage, not a crash.
 fn ggml_type(wkind: WeightKindWire) -> u32 {
-    match wkind {
-        0 => GGML_F32,
-        1 => GGML_Q4_0,
-        2 => GGML_Q8_0,
-        3 => GGML_Q8_0_TM,
-        other => panic!("cpu backend: unknown weight kind wire value {other}"),
-    }
+    imparo_gguf::weights::ggml_type_of_wire(wkind)
 }
 
 /// f32 -> f16 bits, round-to-nearest-even, with overflow to infinity.
@@ -406,18 +402,21 @@ impl Backend for CpuBackend {
     fn set_activation(&self, act: Epilogue) {
         ctx().activation = act;
     }
-    fn shortconv(
+    fn causal_conv(
         &self,
-        bcx: BufId,
+        form: ConvForm,
+        src: BufId,
         w_off: u64,
         state: BufId,
         state_off: u32,
+        state_out_off: u32,
         out: BufId,
         width: u32,
         kernel: u32,
         n_tok: u32,
     ) {
         let (w, k, n) = (width as usize, kernel as usize, n_tok as usize);
+        let stride = form.src_stride(width) as usize;
         let mut c = ctx();
         let conv = c
             .weights
@@ -427,21 +426,23 @@ impl Backend for CpuBackend {
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
-        let x = c.buf(bcx)[..n * 3 * w].to_vec();
+        let x = c.buf(src)[..n * stride].to_vec();
         let so = state_off as usize;
         let mut st = c.buf(state)[so..so + (k - 1) * w].to_vec();
         let mut o = vec![0.0_f32; n * w];
-        ops::shortconv(&x, &cw, &mut st, &mut o, w, k, n);
-        c.buf(state)[so..so + (k - 1) * w].copy_from_slice(&st);
+        ops::causal_conv(form, &x, &cw, &mut st, &mut o, w, k, n);
+        let so_out = state_out_off as usize;
+        c.buf(state)[so_out..so_out + (k - 1) * w].copy_from_slice(&st);
         let d = c.buf(out);
         if d.len() < o.len() {
             d.resize(o.len(), 0.0);
         }
         d[..o.len()].copy_from_slice(&o);
     }
-    fn shortconv_snapshot(
+    fn causal_conv_snapshot(
         &self,
-        bcx: BufId,
+        form: ConvForm,
+        src: BufId,
         state: BufId,
         state_off: u32,
         snap: BufId,
@@ -450,13 +451,14 @@ impl Backend for CpuBackend {
         kernel: u32,
         n_tok: u32,
     ) {
-        // The state as of `n_tok` tokens in, computed the same way the kernel does:
-        // the last (kernel - 1) values of b*x ending there, falling back to the
-        // pre-batch state for the positions below it.
+        // The state as of `n_tok` tokens in, computed the same way the kernel does: the
+        // last (kernel - 1) values of the form's value sequence ending there, falling
+        // back to the pre-batch state for the positions below it.
         let (w, k, n) = (width as usize, kernel as usize, n_tok as usize);
         let hist = k - 1;
+        let stride = form.src_stride(width) as usize;
         let mut c = ctx();
-        let x = c.buf(bcx)[..(n.max(hist)) * 3 * w].to_vec();
+        let x = c.buf(src)[..(n.max(hist)) * stride].to_vec();
         let so = state_off as usize;
         let prev = c.buf(state)[so..so + hist * w].to_vec();
         let mut next = vec![0.0_f32; hist * w];
@@ -466,8 +468,11 @@ impl Backend for CpuBackend {
                 next[si * w + ch] = if e < hist {
                     prev[e * w + ch]
                 } else {
-                    let row = (e - hist) * 3 * w;
-                    x[row + ch] * x[row + 2 * w + ch]
+                    let row = (e - hist) * stride;
+                    match form {
+                        ConvForm::GatedBcx => x[row + ch] * x[row + 2 * w + ch],
+                        ConvForm::PlainSilu => x[row + ch],
+                    }
                 };
             }
         }
@@ -477,6 +482,82 @@ impl Backend for CpuBackend {
             d.resize(no + next.len(), 0.0);
         }
         d[no..no + next.len()].copy_from_slice(&next);
+    }
+    /// The gated delta rule. `ops::delta_net` is the arithmetic; this resolves the two
+    /// per-head weight vectors and reduces alpha and beta to the scalars it takes.
+    fn delta_net(&self, op: &imparo_backend::DeltaNet) -> bool {
+        let shape = ops::DeltaShape {
+            k_heads: op.k_heads as usize,
+            v_heads: op.v_heads as usize,
+            key_dim: op.key_dim as usize,
+            value_dim: op.value_dim as usize,
+        };
+        let (vh, n) = (shape.v_heads, op.n_tok as usize);
+        let mut c = ctx();
+        let weights = c.weights.expect("cpu backend: no weights");
+        let read = |off: u64| -> Vec<f32> {
+            weights
+                .at(off, vh * 4)
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        };
+        let (a, dt_bias) = (read(op.a_off), read(op.dt_bias_off));
+        let alpha = c.buf(op.alpha)[..n * vh].to_vec();
+        let beta_raw = c.buf(op.beta)[..n * vh].to_vec();
+        let mut log_decay = vec![0.0_f32; n * vh];
+        let mut beta = vec![0.0_f32; n * vh];
+        for t in 0..n {
+            for h in 0..vh {
+                // `a` is already -exp(A_log), so this is the NEGATIVE log decay.
+                log_decay[t * vh + h] =
+                    a[h] * ops::softplus_f32(alpha[t * vh + h] + dt_bias[h]);
+                beta[t * vh + h] = ops::sigmoid_f32(beta_raw[t * vh + h]);
+            }
+        }
+        let qkv = c.buf(op.qkv)[..n * shape.qkv_width()].to_vec();
+        let so = op.state_off as usize;
+        let mut state = c.buf(op.state)[so..so + shape.state_elems()].to_vec();
+        let v_width = shape.v_heads * shape.value_dim;
+        let mut out = vec![0.0_f32; n * v_width];
+        ops::delta_net(&qkv, &log_decay, &beta, &mut state, &mut out, shape, n, op.eps);
+        let so_out = op.state_out_off as usize;
+        c.buf(op.state)[so_out..so_out + state.len()].copy_from_slice(&state);
+        let d = c.buf(op.out);
+        if d.len() < out.len() {
+            d.resize(out.len(), 0.0);
+        }
+        d[..out.len()].copy_from_slice(&out);
+        true
+    }
+    fn supports_gated_delta(&self) -> bool {
+        true
+    }
+    fn mul_strided_sigmoid(
+        &self,
+        a: BufId,
+        b: BufId,
+        width: u32,
+        b_off: u32,
+        b_stride: u32,
+        a_stride: u32,
+        n_row: u32,
+    ) {
+        let (w, bo, bs, as_, rows) = (
+            width as usize,
+            b_off as usize,
+            b_stride as usize,
+            a_stride as usize,
+            n_row as usize,
+        );
+        let mut c = ctx();
+        let src = c.buf(b)[..(rows - 1) * bs + bo + w].to_vec();
+        let d = c.buf(a);
+        for r in 0..rows {
+            for i in 0..w {
+                d[r * as_ + i] *= ops::sigmoid_f32(src[r * bs + bo + i]);
+            }
+        }
     }
     fn row(
         &self,
@@ -847,6 +928,17 @@ impl Backend for CpuBackend {
     }
     fn device_tag(&self) -> String {
         format!("cpu x{}", ops::threads())
+    }
+    /// What this backend can read, answered by its OWN codec table rather than by a list.
+    /// The CPU path dequantises a row and dots it, so every row-major block type with a
+    /// codec is served; F32 needs no codec, and the tile-major kinds are read through the
+    /// `TmRule` instead. A list written out here would be a second copy of `row_codec`,
+    /// and the copy is what goes stale when a format is added.
+    fn serves_weight_type(&self, ggml_type: u32) -> bool {
+        ggml_type == imparo_gguf::weights::GGML_F32
+            || ggml_type == imparo_gguf::weights::GGML_Q8_0_TM
+            || ggml_type == imparo_gguf::weights::GGML_Q4_0_TM
+            || crate::quants::row_codec(ggml_type).is_some()
     }
     fn pool_caps(&self) -> PoolCaps {
         PoolCaps {

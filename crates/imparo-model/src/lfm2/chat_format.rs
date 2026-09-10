@@ -9,6 +9,9 @@ use serde_json::Value;
 
 pub const TURN_OPEN: &str = "<|im_start|>";
 pub const TURN_CLOSE: &str = "<|im_end|>";
+/// What OPENS the assistant's turn. `ends_inside` scans only past the last one: a
+/// `<think>` in an older turn or in user text is not this turn opening a channel.
+pub const ASSISTANT_TURN_OPEN: &str = "<|im_start|>assistant\n";
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";
 pub const CALL_OPEN: &str = "<|tool_call_start|>";
@@ -243,42 +246,12 @@ pub fn markers_missing_from(template_src: &str) -> Vec<&'static str> {
 /// `starts_in_reasoning` must be true when the generation prompt ended in
 /// `<think>` (the target GGUF does), because generated deltas then begin inside the
 /// channel and usually contain only the closing marker.
+///
+/// The walk itself is `crate::chat::think`: qwen35 wraps its reasoning in the same
+/// two markers, and one reader of a marker pair is one piece of code.
 #[must_use]
 pub fn split_reasoning(text: &str, starts_in_reasoning: bool) -> (String, String) {
-    let mut reasoning = String::new();
-    let mut visible = String::new();
-    let mut rest = text;
-    let mut in_reasoning = starts_in_reasoning;
-
-    while !rest.is_empty() {
-        if in_reasoning {
-            let open = rest.find(THINK_OPEN);
-            let close = rest.find(THINK_CLOSE);
-            match earliest(open, close) {
-                Some((at, Marker::Open)) => {
-                    reasoning.push_str(&rest[..at]);
-                    rest = &rest[at + THINK_OPEN.len()..];
-                }
-                Some((at, Marker::Close)) => {
-                    reasoning.push_str(&rest[..at]);
-                    rest = &rest[at + THINK_CLOSE.len()..];
-                    in_reasoning = false;
-                }
-                None => {
-                    reasoning.push_str(rest);
-                    break;
-                }
-            }
-        } else if let Some(at) = rest.find(THINK_OPEN) {
-            visible.push_str(&rest[..at]);
-            rest = &rest[at + THINK_OPEN.len()..];
-            in_reasoning = true;
-        } else {
-            visible.push_str(rest);
-            break;
-        }
-    }
-    (reasoning, visible)
+    crate::chat::think::split(text, THINK_OPEN, THINK_CLOSE, starts_in_reasoning)
 }
 
 /// Convenience for the target template, whose generation prompt ends in `<think>`.
@@ -287,87 +260,52 @@ pub fn split_channels(text: &str) -> (String, String) {
     split_reasoning(text, true)
 }
 
-#[derive(Clone, Copy)]
-enum Marker {
-    Open,
-    Close,
-}
-
-fn earliest(open: Option<usize>, close: Option<usize>) -> Option<(usize, Marker)> {
-    match (open, close) {
-        (Some(open), Some(close)) if open <= close => Some((open, Marker::Open)),
-        (Some(_) | None, Some(close)) => Some((close, Marker::Close)),
-        (Some(open), None) => Some((open, Marker::Open)),
-        (None, None) => None,
-    }
-}
-
 /// Length of the longest strict suffix that can still grow into `marker` on the
 /// next streaming delta.
 #[must_use]
 pub fn partial_marker_len(text: &str, marker: &str) -> usize {
-    let max = marker.len().saturating_sub(1).min(text.len());
-    (1..=max)
-        .rev()
-        .find(|&length| text.ends_with(&marker[..length]))
-        .unwrap_or(0)
+    crate::chat::think::partial_marker_len(text, marker)
 }
 
 /// Maximum streaming holdback needed for either LFM reasoning boundary.
 #[must_use]
 pub fn reasoning_marker_holdback(text: &str) -> usize {
-    partial_marker_len(text, THINK_OPEN).max(partial_marker_len(text, THINK_CLOSE))
+    crate::chat::think::holdback(text, THINK_OPEN, THINK_CLOSE)
 }
 
 /// Extracts `<|tool_call_start|>[name(arg=value)]<|tool_call_end|>` blocks,
 /// returning `(visible_text, [(name, json_arguments), ...])`.
+///
+/// Parses everything it is given: a block that never closes is prose, so it stays visible.
+/// A streaming caller cuts with `unsettled_in_visible` first -- see
+/// [`crate::chat::ChatCodec`].
 #[must_use]
 pub fn parse_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
-    parse_tool_calls_impl(text, false)
-}
-
-/// Parses every completed tool block in a streaming prefix while holding back a
-/// complete-but-unclosed block and any suffix that can still become [`CALL_OPEN`].
-/// The returned visible text is monotonic as more bytes arrive, so an SSE caller
-/// never has to retract tool syntax it already emitted as ordinary content.
-#[must_use]
-pub fn parse_tool_calls_prefix(text: &str) -> (String, Vec<(String, String)>) {
-    parse_tool_calls_impl(text, true)
-}
-
-fn parse_tool_calls_impl(
-    text: &str,
-    hold_incomplete: bool,
-) -> (String, Vec<(String, String)>) {
     let mut visible = String::new();
     let mut calls = Vec::new();
     let mut rest = text;
 
     while let Some(at) = rest.find(CALL_OPEN) {
-        visible.push_str(&rest[..at]);
         let after_open = &rest[at + CALL_OPEN.len()..];
+        // Nothing is pushed until the block is known to close: on the break `rest` still
+        // points at the opener, and `visible_end` below decides how much of it to show.
         let Some(end) = after_open.find(CALL_CLOSE) else {
-            if !hold_incomplete {
-                visible.push_str(&rest[at..]);
-            }
-            return (visible, calls);
+            break;
         };
-        let whole = &rest[at..at + CALL_OPEN.len() + end + CALL_CLOSE.len()];
+        visible.push_str(&rest[..at]);
+        let block = &rest[at..at + CALL_OPEN.len() + end + CALL_CLOSE.len()];
         if let Some(parsed) = parse_tool_block(&after_open[..end]) {
             calls.extend(parsed);
         } else {
-            visible.push_str(whole);
+            // A closed block that does not parse is prose, not a call: show it.
+            visible.push_str(block);
         }
         rest = &after_open[end + CALL_CLOSE.len()..];
     }
-    if hold_incomplete {
-        let hold = partial_marker_len(rest, CALL_OPEN);
-        visible.push_str(&rest[..rest.len() - hold]);
-    } else {
-        visible.push_str(rest);
-    }
+    visible.push_str(rest);
     (visible, calls)
 }
+
 
 fn parse_tool_block(body: &str) -> Option<Vec<(String, String)>> {
     let inner = body.trim().strip_prefix('[')?.strip_suffix(']')?;
@@ -672,13 +610,29 @@ impl crate::chat::ChatCodec for Codec {
     ) -> String {
         render(messages, tools, add_generation_prompt, bos)
     }
-    fn split_channels(&self, text: &str) -> (String, String) {
-        split_channels(text)
+    fn split_channels(&self, text: &str, starts_inside: bool) -> (String, String) {
+        split_reasoning(text, starts_inside)
     }
-    /// The SAME rule on both sides: either `<think>` marker can straddle a delta
-    /// wherever the split currently is.
-    fn holdback(&self, text: &str, _side: crate::chat::Channel) -> usize {
+    fn prompt_ends_in_reasoning(&self, prompt: &str) -> bool {
+        crate::chat::think::ends_inside(prompt, ASSISTANT_TURN_OPEN, THINK_OPEN, THINK_CLOSE)
+    }
+    /// ChatML ends the assistant's turn at TURN_CLOSE, which is the EOT token -- the decode
+    /// loop already stops there, and a tool result arrives as a NEW `<|im_start|>tool` turn
+    /// rather than inside this one. So nothing in the generated TEXT ends the turn.
+    fn turn_ends_at(&self, _text: &str) -> Option<usize> {
+        None
+    }
+    /// Either `<think>` marker can straddle a delta, and a tool block that has opened and
+    /// not closed is not yet known to be a call at all -- both are unsettled. A channel that
+    /// is open but unclosed is settled: its text is reasoning either way.
+    fn unsettled_in_raw(&self, text: &str) -> usize {
         reasoning_marker_holdback(text)
+    }
+    fn unsettled_in_visible(&self, text: &str) -> usize {
+        crate::chat::think::unsettled_pair(text, CALL_OPEN, CALL_CLOSE)
+    }
+    fn channel_state_after(&self, text: &str, before: bool) -> bool {
+        crate::chat::think::state_after(text, THINK_OPEN, THINK_CLOSE, before)
     }
     fn parse_tool_calls(&self, text: &str) -> (String, Vec<(String, String)>) {
         parse_tool_calls(text)
@@ -690,6 +644,38 @@ impl crate::chat::ChatCodec for Codec {
 
 #[cfg(test)]
 mod tests {
+    /// The RENDERED PROMPT decides which channel the answer starts in, and only the
+    /// CURRENT assistant turn counts: a `<think>` a user pasted, or one left in an older
+    /// turn, is not this turn opening a channel.
+    #[test]
+    fn response_channel_follows_the_current_assistant_turn() {
+        use crate::chat::ChatCodec;
+        let codec = super::Codec;
+        for (prompt, inside) in [
+            ("<|im_start|>assistant\n<think>", true),
+            ("<|im_start|>assistant\n<think></think>", false),
+            ("<|im_start|>assistant\n<think></think>\n\n", false),
+            // In USER text, so not the model's.
+            ("<|im_start|>user\n<think><|im_end|>\n<|im_start|>assistant\n", false),
+            // In an OLDER assistant turn, so not this one's.
+            ("<|im_start|>assistant\n<think>old<|im_end|>\n<|im_start|>assistant\n", false),
+            ("<|im_start|>assistant\n<think></think><think>", true),
+        ] {
+            assert_eq!(codec.prompt_ends_in_reasoning(prompt), inside, "{prompt:?}");
+            let got = codec.split_channels("normal answer", inside);
+            let want = if inside {
+                ("normal answer".to_string(), String::new())
+            } else {
+                (String::new(), "normal answer".to_string())
+            };
+            assert_eq!(got, want, "{prompt:?}");
+        }
+        assert_eq!(
+            codec.split_channels("before<think>hidden</think>after", false),
+            ("hidden".to_string(), "beforeafter".to_string())
+        );
+    }
+
     /// The opener the server scans for must be the one `render` writes. Two
     /// spellings of one rule is how they drift apart.
     #[test]
@@ -853,6 +839,7 @@ mod tests {
 
     #[test]
     fn streaming_tool_parser_never_exposes_a_valid_call_as_content() {
+        use crate::chat::ChatCodec;
         let text =
             "before<|tool_call_start|>[weather(city='Paris')]<|tool_call_end|>after";
         let close_at = text.find(CALL_CLOSE).unwrap() + CALL_CLOSE.len();
@@ -862,7 +849,9 @@ mod tests {
             if !text.is_char_boundary(end) {
                 continue;
             }
-            let (visible, calls) = parse_tool_calls_prefix(&text[..end]);
+            let seen = &text[..end];
+            let settled = &seen[..seen.len() - Codec.unsettled_in_visible(seen)];
+            let (visible, calls) = parse_tool_calls(settled);
             assert!(
                 visible.starts_with(&prior_visible),
                 "visible output retracted at {end}"
@@ -880,27 +869,59 @@ mod tests {
             prior_calls = calls.len();
         }
 
-        let streamed = parse_tool_calls_prefix(text);
-        let complete = parse_tool_calls(text);
-        assert_eq!(streamed, complete);
+        let streamed = parse_tool_calls(text);
         assert_eq!(streamed.0, "beforeafter");
         assert_eq!(streamed.1.len(), 1);
     }
 
+    /// The parse always SHOWS an unclosed opener -- text the model wrote is never silently
+    /// eaten. Holding it while it might still close is `unsettled_in_visible`, one stage
+    /// earlier, on text the split has already classified as visible.
     #[test]
-    fn streaming_tool_parser_holds_partial_and_unclosed_openers() {
+    fn an_unclosed_opener_is_shown_by_the_parse_and_held_by_the_cut() {
+        use crate::chat::ChatCodec;
+        fn cut(t: &str) -> &str {
+            &t[..t.len() - Codec.unsettled_in_visible(t)]
+        }
         assert_eq!(
-            parse_tool_calls_prefix("visible<|tool_call_sta"),
+            parse_tool_calls(cut("visible<|tool_call_sta")),
             ("visible".to_string(), Vec::new())
         );
         assert_eq!(
-            parse_tool_calls_prefix("visible<|tool_call_start|>[ping()"),
+            parse_tool_calls(cut("visible<|tool_call_start|>[ping()")),
             ("visible".to_string(), Vec::new())
         );
-        // A final/non-stream parse loses no malformed model output.
+        // A final parse -- past the cut, at the end of generation -- loses nothing.
         assert_eq!(
             parse_tool_calls("visible<|tool_call_start|>[ping()"),
             ("visible<|tool_call_start|>[ping()".to_string(), Vec::new())
         );
+    }
+
+    /// The RAW cut is about the CHANNEL marker, the VISIBLE cut about the CALL block, and
+    /// they run in that order. A `<|tool_call_start|>` the model writes inside `<think>` is
+    /// prose that never closes: asking the call question on raw text held the reasoning,
+    /// the `</think>` and the whole answer after it to the end of generation.
+    #[test]
+    fn the_two_cuts_ask_one_question_each() {
+        use crate::chat::ChatCodec;
+        assert_eq!(Codec.unsettled_in_raw("answer</thi"), 5);
+        assert_eq!(Codec.unsettled_in_raw("plain text"), 0);
+        assert_eq!(Codec.unsettled_in_raw("a<|tool_call_start|>[ping()"), 0);
+        assert_eq!(Codec.unsettled_in_visible("a<|tool_call_start|>[ping()"), 26);
+        assert_eq!(Codec.unsettled_in_visible("plain text"), 0);
+
+        let text = "<think>I could <|tool_call_start|>[ping()] here</think>the answer";
+        assert_eq!(Codec.unsettled_in_raw(text), 0, "raw text is fully settled");
+        // What the ONE-cut form answered on this text, which is why it stalled: everything
+        // from the opener on, so the `</think>` and the answer after it never went out.
+        assert_eq!(
+            crate::chat::think::unsettled_pair(text, CALL_OPEN, CALL_CLOSE),
+            text.len() - "<think>I could ".len()
+        );
+        let (r, v) = Codec.split_channels(text, false);
+        assert_eq!(v, "the answer");
+        assert!(r.contains(CALL_OPEN), "it stays in the reasoning, as prose");
+        assert_eq!(Codec.unsettled_in_visible(&v), 0);
     }
 }

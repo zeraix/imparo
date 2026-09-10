@@ -20,6 +20,9 @@ pub const CHANNEL_OPEN: &str = "<|channel>";
 pub const CHANNEL_CLOSE: &str = "<channel|>";
 pub const RESP_OPEN: &str = "<|tool_response>";
 pub const RESP_CLOSE: &str = "<tool_response|>";
+/// What OPENS the assistant's turn. `ends_inside` scans only past the last one: a
+/// `<|channel>` in an older turn or in user text is not this turn opening one.
+pub const ASSISTANT_TURN_OPEN: &str = "<|turn>model\n";
 
 fn quoted(s: &str) -> String {
     format!("{Q}{s}{Q}")
@@ -231,11 +234,24 @@ pub fn markers_missing_from(template_src: &str) -> Vec<&'static str> {
 ///
 /// gemma4 emits its reasoning on a named channel. Leaving it in `content` both corrupts
 /// the visible answer and hides tool calls that follow it.
+///
+/// `starts_inside` means this piece BEGINS inside the thought channel, because the previous
+/// piece ended there. It matters only for streaming, which classifies one settled piece at a
+/// time -- but it matters completely: ignoring it files a continued reasoning body as the
+/// visible answer.
 #[must_use]
-pub fn split_channels(text: &str) -> (String, String) {
+pub fn split_channels(text: &str, starts_inside: bool) -> (String, String) {
     let mut reasoning = String::new();
     let mut visible = String::new();
     let mut rest = text;
+    if starts_inside {
+        let Some(end) = rest.find(CHANNEL_CLOSE) else {
+            reasoning.push_str(rest);
+            return (reasoning, visible);
+        };
+        reasoning.push_str(&rest[..end]);
+        rest = &rest[end + CHANNEL_CLOSE.len()..];
+    }
     while let Some(at) = rest.find(CHANNEL_OPEN) {
         visible.push_str(&rest[..at]);
         let after = &rest[at + CHANNEL_OPEN.len()..];
@@ -278,17 +294,23 @@ pub fn partial_marker_len(s: &str, marker: &str) -> usize {
 
 /// Extracts `<|tool_call>call:name{args}<tool_call|>` blocks, returning
 /// (visible_text, tool_calls) where each call is (name, json_arguments).
+///
+/// A streaming caller cuts with `unsettled_in_visible` first; see [`crate::chat::ChatCodec`].
 #[must_use]
 pub fn parse_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
     let mut visible = String::new();
     let mut calls = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find(CALL_OPEN) {
-        visible.push_str(&rest[..at]);
         let after = &rest[at + CALL_OPEN.len()..];
+        // NOTHING IS PUSHED UNTIL THE BLOCK IS KNOWN TO CLOSE. Pushing `rest[..at]` first and
+        // then breaking left `rest` still pointing at the opener, so the tail push below
+        // emitted the text before the call a SECOND time: `abc<|tool_call>x` came back as
+        // `abcabc<|tool_call>x`.
         let Some(end) = after.find(CALL_CLOSE) else {
             break;
         };
+        visible.push_str(&rest[..at]);
         let body = &after[..end];
         if let Some(stripped) = body.strip_prefix("call:") {
             if let Some(brace) = stripped.find('{') {
@@ -386,19 +408,82 @@ impl crate::chat::ChatCodec for Codec {
     ) -> String {
         render(messages, tools, add_generation_prompt)
     }
-    fn split_channels(&self, text: &str) -> (String, String) {
-        split_channels(text)
+    fn split_channels(&self, text: &str, starts_inside: bool) -> (String, String) {
+        split_channels(text, starts_inside)
     }
-    /// A different marker per side: while emitting reasoning the risk is a partial
-    /// CHANNEL_CLOSE, and while emitting visible text it is a partial CHANNEL_OPEN.
-    fn holdback(&self, text: &str, side: crate::chat::Channel) -> usize {
-        partial_marker_len(
-            text,
-            match side {
-                crate::chat::Channel::Reasoning => CHANNEL_CLOSE,
-                crate::chat::Channel::Visible => CHANNEL_OPEN,
-            },
-        )
+    /// gemma4's generation prompt opens a TURN, never the channel: the model emits
+    /// `<|channel>` itself when it reasons. So the answer is read off the prompt like every
+    /// other format, and for this one it is false in practice rather than by assumption.
+    fn prompt_ends_in_reasoning(&self, prompt: &str) -> bool {
+        crate::chat::think::ends_inside(prompt, ASSISTANT_TURN_OPEN, CHANNEL_OPEN, CHANNEL_CLOSE)
+    }
+    /// gemma4 hands the turn to the caller with RESP_OPEN after a tool call. See the trait.
+    fn turn_ends_at(&self, text: &str) -> Option<usize> {
+        text.find(RESP_OPEN)
+    }
+    /// Two things can be mid-arrival in gemma4's raw output, and the longer hold wins:
+    ///
+    /// ```text
+    ///   ...<|chan                       a partial marker of any kind
+    ///   ...<|channel>thou               a channel whose NAME has not arrived
+    /// ```
+    ///
+    /// A channel that is OPEN with a finished name is settled -- `thought` streams as
+    /// reasoning, and any other name's body is dropped, so neither waits for the close.
+    fn unsettled_in_raw(&self, text: &str) -> usize {
+        let mut hold = partial_marker_len(text, CHANNEL_OPEN)
+            .max(partial_marker_len(text, CHANNEL_CLOSE))
+            .max(partial_marker_len(text, RESP_OPEN));
+        // A CHANNEL'S NAME DECIDES WHETHER ITS BODY IS KEPT, and the split reads it up to the
+        // first newline. Classify `<|channel>thou` early and the body is dropped as an unknown
+        // channel, then reclassified as reasoning once the name finishes.
+        if let Some(at) = text.rfind(CHANNEL_OPEN) {
+            let after = &text[at + CHANNEL_OPEN.len()..];
+            let unsettled = match after.find('\n') {
+                // The name line has not arrived: nothing about this channel is decided.
+                None => true,
+                // Named and still open. A `thought` body streams piece by piece -- that is the
+                // point of a thinking channel. Any other name's body is dropped by the split,
+                // so holding it to the close costs nothing and keeps the carried state a bool.
+                Some(nl) => {
+                    !after[nl..].contains(CHANNEL_CLOSE) && after[..nl].trim() != "thought"
+                }
+            };
+            if unsettled {
+                hold = hold.max(text.len() - at);
+            }
+        }
+        hold
+    }
+    fn unsettled_in_visible(&self, text: &str) -> usize {
+        crate::chat::think::unsettled_pair(text, CALL_OPEN, CALL_CLOSE)
+    }
+    /// True when `text` leaves us inside the THOUGHT channel specifically -- the one the
+    /// split keeps. Walked the same way the split walks it, on a settled piece.
+    ///
+    /// `think::state_after` is not enough here: gemma4's channels are NAMED, so "inside a
+    /// channel" and "inside the channel whose body is reasoning" are different answers, and
+    /// `unsettled_in_raw` holds an open channel with any other name rather than cut inside it.
+    fn channel_state_after(&self, text: &str, before: bool) -> bool {
+        let mut rest = text;
+        if before {
+            let Some(end) = rest.find(CHANNEL_CLOSE) else {
+                return true;
+            };
+            rest = &rest[end + CHANNEL_CLOSE.len()..];
+        }
+        while let Some(at) = rest.find(CHANNEL_OPEN) {
+            let after = &rest[at + CHANNEL_OPEN.len()..];
+            let (name, body) = match after.find('\n') {
+                Some(nl) => (&after[..nl], &after[nl + 1..]),
+                None => ("", after),
+            };
+            match body.find(CHANNEL_CLOSE) {
+                Some(end) => rest = &body[end + CHANNEL_CLOSE.len()..],
+                None => return name.trim() == "thought",
+            }
+        }
+        false
     }
     fn parse_tool_calls(&self, text: &str) -> (String, Vec<(String, String)>) {
         parse_tool_calls(text)
@@ -448,7 +533,7 @@ mod tests {
             if !text.is_char_boundary(end) {
                 continue;
             }
-            let (r, v) = split_channels(&text[..end]);
+            let (r, v) = split_channels(&text[..end], false);
             let r_safe = r.len() - partial_marker_len(&r, CHANNEL_CLOSE);
             let v_safe = v.len() - partial_marker_len(&v, CHANNEL_OPEN);
             assert!(
@@ -468,7 +553,7 @@ mod tests {
                 sent_v = v_safe;
             }
         }
-        let (r, v) = split_channels(text);
+        let (r, v) = split_channels(text, false);
         out_r.push_str(&r[sent_r..]);
         out_v.push_str(&v[sent_v..]);
         (out_r, out_v)
@@ -487,9 +572,222 @@ mod tests {
             "<|channel>thought\nends mid-close <chan",
             "unicode caté <|channel>thought\nré—flé<channel|>ok™",
         ] {
-            let whole = split_channels(text);
+            let whole = split_channels(text, false);
             let streamed = stream_split(text);
             assert_eq!(streamed, whole, "text: {text:?}");
+        }
+    }
+
+    /// The turn ENDS at the handover marker, and the text after it is the caller's.
+    ///
+    /// The fixture is what gemma-4-E4B actually generated on the second step of a two-tool
+    /// loop (dev_harness/toolcall_kv.py). Everything from `<|tool_response>` on is the
+    /// model writing the TOOL's answer -- `15C, cloudy` was never returned by any tool.
+    #[test]
+    fn the_turn_ends_where_the_model_hands_it_over() {
+        use crate::chat::ChatCodec;
+        let generated = concat!(
+            r#"<|tool_call>call:get_weather{city:<|"|>Oslo<|"|>}<tool_call|>"#,
+            r#"<|tool_response>response:get_weather{value:<|"|>15C, cloudy<|"|>}<tool_call|>"#,
+            "<|tool_response>",
+        );
+        let at = Codec
+            .turn_ends_at(generated)
+            .expect("the handover marker is in the text");
+        let turn = &generated[..at];
+        assert_eq!(
+            turn,
+            r#"<|tool_call>call:get_weather{city:<|"|>Oslo<|"|>}<tool_call|>"#
+        );
+        let (visible, calls) = Codec.parse_tool_calls(turn);
+        assert_eq!(visible, "", "the turn is the call and nothing else");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "get_weather");
+        assert_eq!(calls[0].1, r#"{"city":"Oslo"}"#);
+        assert!(
+            !visible.contains("15C"),
+            "the fabricated tool answer must not reach the client"
+        );
+    }
+
+    /// An ordinary answer has no handover, so nothing is cut.
+    #[test]
+    fn plain_text_has_no_turn_end() {
+        use crate::chat::ChatCodec;
+        assert_eq!(Codec.turn_ends_at("The capital of France is Paris."), None);
+        assert_eq!(
+            Codec.turn_ends_at("<|channel>thought\nthinking<channel|>an answer"),
+            None
+        );
+    }
+
+    /// The RAW cut answers what the SPLIT cannot decide, and nothing about tool calls.
+    #[test]
+    fn the_raw_cut_holds_markers_and_an_unnamed_channel() {
+        use crate::chat::ChatCodec;
+        let hold = |t: &str| Codec.unsettled_in_raw(t);
+        assert_eq!(hold("answer<|chan"), 6);
+        assert_eq!(hold("answer<|tool_resp"), 11); // the turn-end marker, never content
+        assert_eq!(hold("answer<|"), 2);
+        // A channel whose NAME line has not arrived -- the split reads the name up to the
+        // first newline and keeps only `thought`, so classifying early drops the body.
+        assert_eq!(hold("a<|channel>thou"), 14);
+        assert_eq!(hold("a<|channel>thought\nbody"), 0);
+        assert_eq!(hold("an ordinary answer"), 0);
+        assert_eq!(hold(""), 0);
+        // A CALL OPENER IS NOT THIS CUT'S BUSINESS. Asking here would hold the reasoning
+        // channel hostage to a close that a thinking model is never going to write.
+        assert_eq!(hold("a<|tool_call>call:f{x"), 0);
+    }
+
+    /// The VISIBLE cut answers what the PARSE cannot decide, and only that.
+    #[test]
+    fn the_visible_cut_holds_an_open_call() {
+        use crate::chat::ChatCodec;
+        let hold = |t: &str| Codec.unsettled_in_visible(t);
+        assert_eq!(hold("a<|tool_call>call:f{x"), 20);
+        assert_eq!(hold(r#"a<|tool_call>call:f{x:<|"|>1<|"|>}<tool_call|>"#), 0);
+        assert_eq!(hold("plain answer"), 0);
+        assert_eq!(hold("answer<|tool_c"), 8);
+    }
+
+    /// THE CASE THE ONE-CUT FORM BROKE: a `<|tool_call>` the model writes inside its
+    /// THINKING is prose, and no close is coming. Cutting on raw text held it, and with it
+    /// the `<channel|>` and the entire visible answer, to the end of generation. Split
+    /// first and it never reaches the call cut at all.
+    #[test]
+    fn a_call_marker_inside_reasoning_does_not_stall_the_stream() {
+        use crate::chat::ChatCodec;
+        let text = "<|channel>thought\nmaybe <|tool_call> would help<channel|>the answer";
+        assert_eq!(Codec.unsettled_in_raw(text), 0, "raw text is fully settled");
+        // What the ONE-cut form answered on this text, which is why it stalled: everything
+        // from the opener on, so the `<channel|>` and the answer after it never went out.
+        assert_eq!(
+            crate::chat::think::unsettled_pair(text, CALL_OPEN, CALL_CLOSE),
+            text.len() - "<|channel>thought\nmaybe ".len()
+        );
+        let (r, v) = Codec.split_channels(text, false);
+        assert_eq!(v, "the answer");
+        assert!(r.contains("<|tool_call>"), "it stays in the reasoning, as prose");
+        // And the visible half, which is what the parse sees, has nothing pending.
+        assert_eq!(Codec.unsettled_in_visible(&v), 0);
+    }
+
+    /// Each settled piece says where it leaves the channel for the next one; a piece with
+    /// no marker changes nothing.
+    #[test]
+    fn the_channel_state_carries_from_piece_to_piece() {
+        use crate::chat::ChatCodec;
+        assert!(!Codec.channel_state_after("plain", false));
+        assert!(Codec.channel_state_after("plain", true));
+        assert!(Codec.channel_state_after("x<|channel>thought\n", false));
+        assert!(!Codec.channel_state_after("mid<channel|>after", true));
+    }
+
+    #[test]
+    fn streaming_tool_parse_never_retracts_and_never_leaks() {
+        use crate::chat::ChatCodec;
+        let text = concat!(
+            "before",
+            r#"<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#,
+            "after",
+        );
+        let close_at = text.find(CALL_CLOSE).unwrap() + CALL_CLOSE.len();
+        let (mut prior_visible, mut prior_calls) = (String::new(), 0_usize);
+        for end in 1..=text.len() {
+            if !text.is_char_boundary(end) {
+                continue;
+            }
+            let settled = &text[..end];
+            let settled = &settled[..settled.len() - Codec.unsettled_in_visible(settled)];
+            let (visible, calls) = parse_tool_calls(settled);
+            assert!(visible.starts_with(&prior_visible), "visible retracted at {end}");
+            assert!(!visible.contains(CALL_OPEN), "leaked an opener at {end}");
+            assert!(!visible.contains(CALL_CLOSE), "leaked a close at {end}");
+            assert!(calls.len() >= prior_calls, "a call was retracted at {end}");
+            if end < close_at {
+                assert!(calls.is_empty(), "call completed before its closing marker");
+            }
+            prior_visible = visible;
+            prior_calls = calls.len();
+        }
+        let streamed = parse_tool_calls(text);
+        assert_eq!(streamed.0, "beforeafter");
+        assert_eq!(streamed.1.len(), 1);
+    }
+
+    /// The parse SHOWS what will never close -- dropping it would silently lose text the
+    /// model wrote. Holding it while it might still close is the CUT's job, not a flag here.
+    #[test]
+    fn an_unclosed_call_is_shown_by_the_parse_and_held_by_the_cut() {
+        use crate::chat::ChatCodec;
+        let text = r#"visible<|tool_call>call:get_weather{ci"#;
+        assert_eq!(Codec.parse_tool_calls(text), (text.to_string(), Vec::new()));
+        assert_eq!(Codec.unsettled_in_visible(text), text.len() - "visible".len());
+        // Cut first, and what is left parses to exactly the settled text.
+        let settled = &text[..text.len() - Codec.unsettled_in_visible(text)];
+        assert_eq!(Codec.parse_tool_calls(settled), ("visible".to_string(), Vec::new()));
+    }
+
+    /// The text before an unclosed call was emitted TWICE: `rest[..at]` was pushed before
+    /// the close check, and the break left `rest` still pointing at the opener for the tail
+    /// push. Invisible on a complete answer -- only a call truncated at max_tokens reaches
+    /// the branch -- and wrong on every prefix, which is what streaming parses.
+    #[test]
+    fn an_unclosed_call_does_not_duplicate_the_text_before_it() {
+        assert_eq!(
+            parse_tool_calls("abc<|tool_call>call:x{").0,
+            "abc<|tool_call>call:x{"
+        );
+    }
+
+    /// The SERVER's streaming loop, byte by byte, with each cut in its own stage: the raw
+    /// cut before the split, the visible cut before the parse. What the client ends up with
+    /// must equal one final parse of the whole text, and no delta may carry call markup.
+    #[test]
+    fn the_streamed_visible_text_equals_the_final_one() {
+        use crate::chat::ChatCodec;
+        for text in [
+            r#"plain answer<|tool_call>call:f{a:<|"|>b<|"|>}<tool_call|>"#,
+            concat!(
+                "<|channel>thought\nreasoning<channel|>",
+                r#"visible<|tool_call>call:f{a:<|"|>b<|"|>}<tool_call|>tail"#,
+            ),
+            "no call at all",
+            "<|channel>thought\nunterminated reasoning",
+            // An opener the model writes in its THINKING, which never closes.
+            "<|channel>thought\nI could <|tool_call>call:f{ ...<channel|>the answer",
+        ] {
+            let (mut fed_raw, mut inside) = (0usize, false);
+            let (mut fed_vis, mut vis_split) = (0usize, String::new());
+            let (mut r_out, mut v_out) = (String::new(), String::new());
+            for end in 1..=text.len() {
+                if !text.is_char_boundary(end) {
+                    continue;
+                }
+                let raw_tail = &text[..end][fed_raw..];
+                let settled = &raw_tail[..raw_tail.len() - Codec.unsettled_in_raw(raw_tail)];
+                if !settled.is_empty() {
+                    let (r, v) = Codec.split_channels(settled, inside);
+                    r_out.push_str(&r);
+                    vis_split.push_str(&v);
+                    inside = Codec.channel_state_after(settled, inside);
+                    fed_raw += settled.len();
+                }
+                let vis_tail = &vis_split[fed_vis..];
+                let ready = &vis_tail[..vis_tail.len() - Codec.unsettled_in_visible(vis_tail)];
+                if !ready.is_empty() {
+                    let v = Codec.parse_tool_calls(ready).0;
+                    assert!(!v.contains(CALL_OPEN), "streamed an opener: {v:?}");
+                    v_out.push_str(&v);
+                    fed_vis += ready.len();
+                }
+            }
+            // The tail flush: whatever was still held when generation ended.
+            let (r_final, body) = Codec.split_channels(text, false);
+            let (v_final, _) = Codec.parse_tool_calls(&body);
+            assert!(v_final.starts_with(&v_out), "visible was not a growing prefix: {v_out:?}");
+            assert!(r_final.starts_with(&r_out), "reasoning was not a growing prefix: {r_out:?}");
         }
     }
 

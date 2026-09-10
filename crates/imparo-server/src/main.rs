@@ -8,7 +8,7 @@
 
 // The chat codec comes from the PLAN, not from an architecture named here. It has to be
 // reachable before the model is built: the template sniff below runs at load.
-use imparo_model::chat::{Channel, ChatCodec};
+use imparo_model::chat::ChatCodec;
 mod host_fit;
 mod http;
 mod template;
@@ -646,6 +646,43 @@ re-render says {expect}; branch points will be found by re-rendering (slower)"
 static TEMPLATE: std::sync::OnceLock<Option<template::Template>> =
     std::sync::OnceLock::new();
 
+/// Bytes of `b` that are SETTLED: everything except a trailing UTF-8 sequence still arriving.
+///
+/// `from_utf8_lossy` turns an incomplete trailing sequence into U+FFFD, and the next token
+/// replaces that with the real character -- so the decoded string is not byte-monotone
+/// across prefixes, while every streaming offset assumes it is:
+///
+/// ```text
+///   bytes ..X F0 9F 9F      lossy -> "..X\u{FFFD}"   len 68, streamed through 68
+///   bytes ..X F0 9F 9F 9F   lossy -> "..X🟢"          the char now spans 65..69
+///   -> &v[68..] panics: "start byte index 68 is not a char boundary"
+/// ```
+///
+/// Measured on a Qwen3.8-27B streamed answer that contained an emoji; it killed the request
+/// thread. Cutting the incomplete tail makes the string a strict prefix of the next one, and
+/// the character simply arrives with the token that finishes it.
+///
+/// An INVALID lead byte is not held: it will never complete, so the lossy decode shows its
+/// replacement character now and that never changes.
+fn settled_len(b: &[u8]) -> usize {
+    let n = b.len();
+    for back in 1..=4.min(n) {
+        let c = b[n - back];
+        if c & 0b1100_0000 == 0b1000_0000 {
+            continue; // a continuation byte; its lead is further back
+        }
+        let need = match c {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        return if back >= need { n } else { n - back };
+    }
+    n
+}
+
 /// Renders a chat prompt, and gives the BOS prefix EXACTLY ONE OWNER.
 ///
 /// A template sees the real vocabulary spelling, because that is what the reference
@@ -994,6 +1031,12 @@ fn chat_completions(
             &kwargs,
         )
     };
+    // DOES THE PROMPT LEAVE THE REASONING CHANNEL OPEN? Read once, here, from the text that
+    // was actually rendered -- a template branches on `enable_thinking`, so the same model
+    // ends its prompt inside the channel in one branch and outside it in the other. Both
+    // split sites below take this; neither may assume it. (A raw-ids request renders no
+    // prompt, so there is no channel to be inside.)
+    let starts_in_reasoning = !prompt.is_empty() && chat.prompt_ends_in_reasoning(&prompt);
     // IMPARO_DUMP_PROMPT=1: print the rendered prompt between markers, for byte-diffing
     // against llama-server's /apply-template (task #7).
     if std::env::var("IMPARO_DUMP_PROMPT").is_ok_and(|v| v == "1") {
@@ -1386,6 +1429,26 @@ fn chat_completions(
     // only the index -- the vocab-size logits never cross to the host during decode.
     let t_s = probe.then(Instant::now);
     let (mut sent_reasoning, mut sent_visible) = (0usize, 0usize);
+    // STREAMING FEEDS THE NEW BYTES, NOT THE WHOLE ANSWER (the shape oMLX's output parser
+    // uses). Splitting and parsing all of `emitted` every token is O(n) per token and so
+    // O(n^2) over a response. Instead each stage asks its codec how many TRAILING bytes are
+    // still undecided; everything before that is settled forever, classified once, and never
+    // looked at again.
+    //
+    //   raw ─[unsettled_in_raw]→ split_channels ─→ reasoning ──────────────────→ delta
+    //                                           └→ visible ─[unsettled_in_visible]→ parse → delta
+    //
+    // TWO CUTS, NOT ONE, because they are different questions. Asking "is a call open?" about
+    // RAW text answers it for the reasoning channel too, where a `<tool_call>` the model wrote
+    // in its thinking is prose and will never close -- and holding it holds everything after
+    // it, including the visible answer, to the end of generation.
+    let (mut fed_raw, mut inside) = (0usize, starts_in_reasoning);
+    let (mut fed_vis, mut vis_split) = (0usize, String::new());
+    let (mut reasoning_out, mut visible_out) = (String::new(), String::new());
+    // The turn can end inside the TEXT, not only at an end token -- see
+    // `ChatCodec::turn_ends_at`. Set when it has, so the loop stops after this token's
+    // bytes have been truncated and streamed.
+    let mut turn_ended = false;
     let mut next = sample(&logits, temperature);
     if let Some(t) = t_s {
         t_sample += t.elapsed().as_secs_f64() * 1e3;
@@ -1411,40 +1474,86 @@ fn chat_completions(
         engine
             .tok
             .decode_bytes_into(&generated[generated.len() - 1..], &mut gen_bytes);
-        let piece = String::from_utf8_lossy(&gen_bytes).into_owned();
+        let piece = String::from_utf8_lossy(&gen_bytes[..settled_len(&gen_bytes)]).into_owned();
         if let Some(t) = t_d {
             t_detok += t.elapsed().as_secs_f64() * 1e3;
         }
         let t_e = probe.then(Instant::now);
         if piece.len() > emitted.len() {
             emitted = piece;
+            // WHERE THE MODEL HANDS THE TURN OVER, THE TURN IS OVER. gemma4 finishes a tool
+            // call by writing `<|tool_response>`, the opener of the block a tool RESULT
+            // fills; run past it and the model writes the tool's answer itself. Truncating
+            // HERE rather than after the loop is what makes the stream right too: a delta
+            // already sent cannot be taken back over SSE.
+            //
+            // Searched from `fed_raw`, not from 0: the cut below holds any suffix that could
+            // still grow into a marker, so a COMPLETE handover marker can only lie in the
+            // bytes it has not settled yet. A `find` over the whole answer every token is
+            // the same O(n^2) the split and the parse were just cured of.
+            if let Some(at) = chat.turn_ends_at(&emitted[fed_raw..]) {
+                // The UNTRUNCATED bytes, under the same gate as the dump below: after the
+                // truncation nothing else in the process holds what the model actually
+                // wrote, and that is exactly what a reader of this probe came for.
+                if std::env::var("IMPARO_DUMP_GEN").is_ok_and(|v| v == "1") {
+                    eprintln!("[gen-raw-begin]{emitted}[gen-raw-end]");
+                    let abs = fed_raw + at;
+                    eprintln!("[imparo] turn ends at byte {abs}; the rest is the caller's");
+                }
+                emitted.truncate(fed_raw + at);
+                turn_ended = true;
+            }
+            // THE RAW CUT RUNS IN BOTH MODES, because both need `fed_raw`: streaming
+            // classifies and sends what it settles, and the turn-end search above uses it as
+            // the floor that keeps itself off the whole answer. Non-streaming only advances.
+            let raw_tail = &emitted[fed_raw..];
+            let settled = &raw_tail[..raw_tail.len() - chat.unsettled_in_raw(raw_tail)];
+            if !settled.is_empty() {
+                if streaming {
+                    // Stage 1: reasoning never streams as `content`.
+                    let (r, v) = chat.split_channels(settled, inside);
+                    reasoning_out.push_str(&r);
+                    vis_split.push_str(&v);
+                    inside = chat.channel_state_after(settled, inside);
+                }
+                fed_raw += settled.len();
+            }
             if streaming {
-                // Split on every prefix so reasoning never streams as `content`; the
-                // holdback keeps a marker that straddles two deltas from being emitted
-                // as visible text and then silently reclassified.
-                let (r, v) = chat.split_channels(&emitted);
-                let r_safe = r.len() - chat.holdback(&r, Channel::Reasoning);
-                let v_safe = v.len() - chat.holdback(&v, Channel::Visible);
-                if r_safe > sent_reasoning {
+                // Stage 2: a tool call is not visible text either. Streaming used to skip
+                // this, so a client received the whole call as `content` deltas AND again as
+                // `tool_calls`, while the same request non-streaming returned `content: ""`.
+                // The calls are dropped here and read from the final parse; only the TEXT
+                // between them is streamed.
+                let vis_tail = &vis_split[fed_vis..];
+                let ready = &vis_tail[..vis_tail.len() - chat.unsettled_in_visible(vis_tail)];
+                if !ready.is_empty() {
+                    visible_out.push_str(&chat.parse_tool_calls(ready).0);
+                    fed_vis += ready.len();
+                }
+                // Everything accumulated above is settled, so a delta is simply the part
+                // not yet sent. Nothing is held back HERE any more -- both cuts happened
+                // upstream, each on the text its own question is about.
+                let (r, v) = (&reasoning_out, &visible_out);
+                if r.len() > sent_reasoning {
                     http::sse(
                         stream,
                         &json!({
                         "id": id, "object": "chat.completion.chunk", "model": "imparo",
                         "choices": [{"index": 0,
-                                     "delta": {"reasoning_content": &r[sent_reasoning..r_safe]},
+                                     "delta": {"reasoning_content": &r[sent_reasoning..]},
                                      "finish_reason": null}]}),
                     )?;
-                    sent_reasoning = r_safe;
+                    sent_reasoning = r.len();
                 }
-                if v_safe > sent_visible {
+                if v.len() > sent_visible {
                     http::sse(
                         stream,
                         &json!({
                         "id": id, "object": "chat.completion.chunk", "model": "imparo",
-                        "choices": [{"index": 0, "delta": {"content": &v[sent_visible..v_safe]},
+                        "choices": [{"index": 0, "delta": {"content": &v[sent_visible..]},
                                      "finish_reason": null}]}),
                     )?;
-                    sent_visible = v_safe;
+                    sent_visible = v.len();
                 }
             }
         }
@@ -1453,7 +1562,7 @@ fn chat_completions(
         }
         // The last token needs no forward: its logits would never be read. Computing them
         // anyway spent a full decode step per request.
-        if generated.len() >= max_tokens {
+        if turn_ended || generated.len() >= max_tokens {
             break;
         }
         let pos = prompt_tokens + step;
@@ -1489,7 +1598,14 @@ fn chat_completions(
         .resident
         .extend_from_slice(&generated[..decode_steps.min(generated.len())]);
     engine.resident_conv.clone_from(&conversation);
-    let (reasoning, body) = chat.split_channels(&emitted);
+    // IMPARO_DUMP_GEN=1: the assistant's TURN, before any split or parse -- the companion to
+    // IMPARO_DUMP_PROMPT. A codec defect shows up as a marker landing in the wrong half, and
+    // nothing else on the request path prints it. When the turn ended inside the text, the
+    // bytes past the handover were printed above as `gen-raw`.
+    if std::env::var("IMPARO_DUMP_GEN").is_ok_and(|v| v == "1") {
+        eprintln!("[gen-dump-begin]{emitted}[gen-dump-end]");
+    }
+    let (reasoning, body) = chat.split_channels(&emitted, starts_in_reasoning);
     let (visible, calls) = chat.parse_tool_calls(&body);
     let tool_calls: Vec<Value> = calls
         .iter()
@@ -1569,12 +1685,15 @@ fn chat_completions(
                                  "finish_reason": null}]}),
                 )?;
             }
-            if body.len() > sent_visible {
+            // FLUSH FROM THE PARSED TEXT, the same string the loop streamed from. Sending
+            // `body` (split but unparsed) here would put every tool call back into the
+            // stream at the end, which is most of what this defect was.
+            if visible.len() > sent_visible {
                 http::sse(
                     stream,
                     &json!({
                     "id": id, "object": "chat.completion.chunk", "model": "imparo",
-                    "choices": [{"index": 0, "delta": {"content": &body[sent_visible..]},
+                    "choices": [{"index": 0, "delta": {"content": &visible[sent_visible..]},
                                  "finish_reason": null}]}),
                 )?;
             }
@@ -1772,6 +1891,48 @@ fn chat_completions(
 /// on the GPU inside `forward_next`, which applies the same rule.
 fn sample(logits: &[f32], _temperature: f64) -> u32 {
     imparo_model::ops::argmax_f32(logits)
+}
+
+#[cfg(test)]
+mod streamed_text_tests {
+    use super::settled_len;
+
+    /// The decoded text must be a strict PREFIX of what the next token decodes to, or a
+    /// stream offset taken now lands inside a character later.
+    #[test]
+    fn an_incomplete_trailing_sequence_is_held_until_it_completes() {
+        let emoji = "🟢".as_bytes(); // F0 9F 9F A2, four bytes
+        let mut b = b"ok ".to_vec();
+        assert_eq!(settled_len(&b), 3);
+        for (i, byte) in emoji.iter().enumerate() {
+            b.push(*byte);
+            let want = if i + 1 == emoji.len() { b.len() } else { 3 };
+            assert_eq!(settled_len(&b), want, "after {} emoji bytes", i + 1);
+        }
+        // Every prefix decodes to a prefix of the next -- the property the stream needs.
+        let mut prev = String::new();
+        for n in 1..=b.len() {
+            let now = String::from_utf8_lossy(&b[..settled_len(&b[..n])]).into_owned();
+            assert!(now.starts_with(&prev), "{now:?} does not extend {prev:?}");
+            prev = now;
+        }
+    }
+
+    #[test]
+    fn complete_text_is_never_held() {
+        assert_eq!(settled_len(b""), 0);
+        assert_eq!(settled_len("plain ascii".as_bytes()), 11);
+        assert_eq!(settled_len("caf\u{e9}".as_bytes()), 5);
+        assert_eq!(settled_len("\u{4e16}\u{754c}".as_bytes()), 6);
+    }
+
+    /// An INVALID lead byte never completes, so holding it would stall the stream forever.
+    /// The lossy decode shows its replacement character now, and that never changes.
+    #[test]
+    fn an_invalid_lead_byte_is_not_held() {
+        let b = b"ok \xff";
+        assert_eq!(settled_len(b), b.len());
+    }
 }
 
 #[cfg(test)]

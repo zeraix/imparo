@@ -325,7 +325,8 @@ pub fn batch(
     // chunk of 512 tokens does far more GPU work per dispatch, where extra command
     // buffers may only add commits. Prefill defaults to 0 but is swept by imparo-tune
     // rather than assumed. Layers, not dispatches, so a flush never lands mid-layer.
-    let flush_every = be().flush_layers(b == 1) as usize;
+    let flush_every =
+        crate::gpu_support::flush_layers_bounded(b == 1, wf.plan.layers.len());
     // Decode ramps the first chunks geometrically (1, 2, 4, ... capped at flush_every)
     // instead of a fixed modulus. The GPU is idle until the FIRST commit, so the first
     // chunk's encode is the one that can never be hidden -- at a cadence of 7 that was

@@ -51,7 +51,13 @@ pub fn active() -> Option<&'static dyn Backend> {
     // debug mode: everything built on this trait -- the KV pool, block tables,
     // checkpoints, the disk tier -- is reachable from it, which is the whole reason a
     // host implementation exists next to the reference forward.
-    if std::env::var("IMPARO_BACKEND").is_ok_and(|v| v == "cpu") {
+    // ONE MEANING, TWO SPELLINGS. `IMPARO_GPU=0` is the documented way to say "run on
+    // the CPU deliberately" (see `gpu_requested`), but only `enable_gpu` used to read it:
+    // `active()` still handed back the device backend, so a CPU run reached the GPU
+    // arena path and died on an uninitialised device ("metal arena rc=3") instead of
+    // running anywhere. Both spellings select the host backend here.
+    if std::env::var("IMPARO_BACKEND").is_ok_and(|v| v == "cpu") || !gpu_requested_from_env()
+    {
         static BE: imparo_cpu::CpuBackend = imparo_cpu::CpuBackend;
         return Some(with_page(&BE));
     }
@@ -192,7 +198,17 @@ pub fn enable_gpu(
         .collect();
     hds.sort_unstable();
     hds.dedup();
+    // WHICH GGML TYPE EACH WIRE KIND IS. A backend switches kernels on the wire kind and
+    // decodes by the ggml type; handing over the pairs keeps the mapping stated once, in
+    // imparo-gguf, instead of copied into every backend.
+    be.set_weight_kind_types(&imparo_gguf::weights::wire_kind_types());
     be.set_attention_head_dims(&hds);
+    // The recurrent MATRIX's coordinates, same timing and same reason: the delta kernel
+    // holds one of its rows per lane in registers, and a register array's size must be a
+    // constant expression. Absent (0, 0) when no layer carries one, and then no delta
+    // pipeline is built.
+    let (rec_k, rec_v) = plan.recurrent_dims()?.unwrap_or((0, 0));
+    be.set_recurrent_dims(rec_k, rec_v);
     // The K/V row width goes with each dim: kv heads x head dim. Every K/V tile load in the
     // prefill attention kernels carries that stride, and compiled as a constant it is an
     // immediate in the address arithmetic instead of a uniform read per tile.
@@ -206,13 +222,26 @@ pub fn enable_gpu(
     // Every weight type in the file must have a kernel on this backend; a tile-major kind
     // without readers here (a converted file meant for another backend) is refused by name.
     for (name, t) in &weights.tensors {
-        if !be.serves_weight_type(t.ggml_type) {
+        // The RUNTIME type, not the file's: a load-time repack changes what the backend is
+        // handed, so asking about the file's type refused a k-quant the transform was about
+        // to turn into a layout this backend reads. `runtime_weight_type` is the same
+        // derivation the transform itself uses, so the two cannot disagree.
+        let dims: Vec<u64> = t.ne[..t.n_dims as usize].to_vec();
+        let runtime = crate::backend::runtime_weight_type(name, t.ggml_type, &dims);
+        if !be.serves_weight_type(runtime) {
+            let named = |k: u32| {
+                imparo_gguf::tensor_layout(k).map(|l| l.name).unwrap_or("unknown")
+            };
+            let becomes = if runtime == t.ggml_type {
+                String::new()
+            } else {
+                format!(" (repacked to {} ({runtime}))", named(runtime))
+            };
             return Err(format!(
-                "{name} has ggml type {} ({}), which the {} backend has no kernels for",
+                "{name} has ggml type {} ({}){becomes}, which the {} backend has no \
+                 kernels for",
                 t.ggml_type,
-                imparo_gguf::tensor_layout(t.ggml_type)
-                    .map(|l| l.name)
-                    .unwrap_or("unknown"),
+                named(t.ggml_type),
                 be.device_tag()
             ));
         }
@@ -247,6 +276,9 @@ pub fn enable_gpu(
     // The spans outside the fast tier, validated against the mapping the way the old
     // streamed-tensor list was (sorted, disjoint, in bounds).
     normalize_streamed_spans(weights.byte_len(), placement.slow_spans())?;
+    // Before the mapping is handed over: the repack reads converted tensors from the FILE,
+    // not through the mapping, so those bytes never enter the page cache.
+    be.set_weight_path(weights.source_path());
     // SAFETY: base_ptr/byte_len describe the live weight mmap, which outlives the process;
     // every segment was built from that mapping's own tensor table.
     match unsafe {
@@ -275,13 +307,38 @@ pub fn enable_gpu(
     }
 }
 
-/// The tile-major rule the load-time repack WILL apply to a tensor on this backend, or
-/// None: the transform is off (`IMPARO_LOAD_REPACK=0`), the tensor has no rule or is a
-/// row-gathered role, the rule's kind has no readers anywhere, or the active backend does
-/// not serve it. The tuner asks this so it ranks knobs on the kinds the engine actually
-/// dispatches after load, not the file's (an original Q8_0 file runs the tile-major
-/// kernels once transformed).
+/// A rule as the `Backend` seam's data. THE one place `TmRule` crosses into a backend:
+/// the scale spans first, then the payload spans in source order, so a repack can move
+/// them without knowing which format it is moving.
+///
+/// # Panics
+/// When a rule needs more spans than the seam carries. A format the seam cannot describe
+/// must not be repacked at some other layout by accident.
 #[must_use]
+pub fn block_layout(rule: &imparo_gguf::weights::TmRule) -> imparo_backend::WeightBlockLayout {
+    let pay = rule.payload_spans();
+    let n = rule.scale_spans.len() + pay.len();
+    assert!(
+        n <= imparo_backend::MAX_BLOCK_SPANS,
+        "{}: {n} spans exceeds the backend seam's {}",
+        rule.to_name,
+        imparo_backend::MAX_BLOCK_SPANS
+    );
+    let mut l = imparo_backend::WeightBlockLayout {
+        block_elems: rule.block_elems as u32,
+        block_bytes: rule.block_bytes() as u32,
+        unit_rows: rule.unit_rows as u32,
+        n_spans: n as u32,
+        n_scale_spans: rule.scale_spans.len() as u32,
+        ..Default::default()
+    };
+    for (i, &(off, len)) in rule.scale_spans.iter().chain(pay.iter()).enumerate() {
+        l.span_off[i] = off as u32;
+        l.span_len[i] = len as u32;
+    }
+    l
+}
+
 pub fn load_time_rule(
     name: &str,
     ggml_type: u32,
@@ -349,6 +406,7 @@ fn load_time_repack(
             to_type: rule.to,
             n_in: t.ne[0] as u32,
             n_out: t.ne[1] as u32,
+            layout: block_layout(rule),
         });
     }
     if jobs.is_empty() {

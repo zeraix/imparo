@@ -319,7 +319,8 @@ mod bench {
                 let mut host_out = vec![0.0_f32; n_tok * width];
                 let mut dev_out = vec![0.0_f32; n_tok * width];
                 for call in 0..2 {
-                    imparo_model::ops::shortconv(
+                    imparo_model::ops::causal_conv(
+                        imparo_backend::ConvForm::GatedBcx,
                         &bcx,
                         &cw,
                         &mut host_state,
@@ -330,10 +331,12 @@ mod bench {
                     );
                     be.begin();
                     be.write(BufId::Model0, 0, &bcx);
-                    be.shortconv(
+                    be.causal_conv(
+                        imparo_backend::ConvForm::GatedBcx,
                         BufId::Model0,
                         cw_t.offset as u64,
                         BufId::Recur,
+                        0,
                         0,
                         BufId::O,
                         width as u32,
@@ -411,7 +414,8 @@ mod bench {
                 for k in [1usize, 2, 5] {
                     let mut ref_state = seed.clone();
                     let mut ref_out = vec![0.0_f32; k * width];
-                    imparo_model::ops::shortconv(
+                    imparo_model::ops::causal_conv(
+                        imparo_backend::ConvForm::GatedBcx,
                         &bcx[..k * 3 * width],
                         &cw,
                         &mut ref_state,
@@ -423,7 +427,8 @@ mod bench {
                     be.write(BufId::Recur, 0, &seed);
                     be.begin();
                     be.write(BufId::Model0, 0, &bcx);
-                    be.shortconv_snapshot(
+                    be.causal_conv_snapshot(
+                        imparo_backend::ConvForm::GatedBcx,
                         BufId::Model0,
                         BufId::Recur,
                         0,
@@ -433,10 +438,12 @@ mod bench {
                         kern as u32,
                         k as u32,
                     );
-                    be.shortconv(
+                    be.causal_conv(
+                        imparo_backend::ConvForm::GatedBcx,
                         BufId::Model0,
                         cw_t.offset as u64,
                         BufId::Recur,
+                        0,
                         0,
                         BufId::O,
                         width as u32,
@@ -738,9 +745,13 @@ mod bench {
         if std::env::var("IMPARO_BW").is_ok() {
             let bytes = 256u64 << 20;
             let mut best = (0.0_f64, 0u32, 0u32);
+            // The ladder starts BELOW one threadgroup per core on purpose. A dispatch whose
+            // threadgroup count is fixed by the model -- the delta rule launches one per
+            // value head, 48 -- cannot choose a fat grid, and "the ceiling is 136" was
+            // measured at 72 and above. A narrow dispatch that is starved reads as a slow
+            // kernel, so the ceiling has to be known AT THE SHAPE the kernel runs.
             for tpg in [256u32, 512, 1024] {
-                for mul in [4u32, 8, 16, 32, 64] {
-                    let tgs = 18 * mul;
+                for tgs in [18u32, 36, 48, 54, 72, 144, 288, 576, 1152] {
                     let gbs = m::bw_read(bytes, 4, tgs, tpg);
                     println!("bw_read tpg={tpg:<5} tgs={tgs:<5} {gbs:>7.1} GB/s");
                     if gbs > best.0 {

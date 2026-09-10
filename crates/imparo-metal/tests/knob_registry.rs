@@ -10,12 +10,73 @@ use imparo_backend::{BackendKnobs as _, KnobDecl, ModelFacts, SweepKind};
 use imparo_metal::MetalBackend;
 
 /// Q8_0 = 2 on the wire, so its presence is bit 2 of the mask.
-const Q8_BIT: u32 = 1 << 2;
-const Q4_BIT: u32 = 1 << 1;
+const Q8_BIT: u64 = 1 << 2;
+const Q4_BIT: u64 = 1 << 1;
 /// Q8_0_TM (tile-major, imparo-repack) = 3 on the wire.
-const TM_BIT: u32 = 1 << 3;
+const TM_BIT: u64 = 1 << 3;
 
-fn facts(weight_kinds: u32) -> ModelFacts {
+#[test]
+fn persistent_grid_is_not_ranked_on_independent_matmuls() {
+    for name in ["mega_tgs", "mega_nsg"] {
+        let d = MetalBackend
+            .knob_registry()
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap();
+        assert_eq!(d.category, imparo_backend::KnobCategory::EndToEnd);
+        assert_eq!(d.sweep, SweepKind::External);
+        assert!(
+            d.bit_affecting,
+            "grid geometry can change attention reduction order"
+        );
+    }
+}
+
+#[test]
+fn persistent_grid_covers_lfm2_post_load_tile_major_weights() {
+    for name in ["mega_tgs", "mega_nsg"] {
+        let d = MetalBackend
+            .knob_registry()
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap();
+        let applies = d
+            .applies
+            .expect("persistent grid must declare format eligibility");
+        for mask in [Q4_BIT, TM_BIT, Q8_BIT | TM_BIT, Q4_BIT | TM_BIT] {
+            assert!(
+                applies(&facts(mask)),
+                "{name}: post-load mask {mask:#x} excluded"
+            );
+        }
+        // With repacking disabled, row-major Q8 cannot enter mega_lfm2_entry.
+        for mask in [0, 1, Q8_BIT] {
+            assert!(
+                !applies(&facts(mask)),
+                "{name}: unsupported mask {mask:#x} included"
+            );
+        }
+    }
+}
+
+#[test]
+fn persistent_width_ladder_keeps_intermediate_legal_occupancy_points() {
+    let d = MetalBackend
+        .knob_registry()
+        .iter()
+        .find(|d| d.name == "mega_nsg")
+        .unwrap();
+    let candidates = d.candidates.unwrap();
+    let mut device = imparo_backend::DeviceProfile::default();
+    device.max_threads = 1024;
+    assert_eq!(candidates(&facts(TM_BIT), &device), vec![8, 16, 24, 32]);
+    device.max_threads = 512;
+    assert_eq!(candidates(&facts(TM_BIT), &device), vec![8, 16]);
+    device.max_threads = 256;
+    assert_eq!(candidates(&facts(TM_BIT), &device), vec![8]);
+}
+
+fn facts(weight_kinds: u64) -> ModelFacts {
     // gemma4 E4B's shape, which is the model this registry was tuned against; only
     // `weight_kinds` is under test here.
     ModelFacts {
