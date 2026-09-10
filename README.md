@@ -31,10 +31,10 @@ Supported configurations and measured results are documented below.
 
 ## Why Imparo
 
-- **Reduce trial and error when tuning your hardware.** Imparo's tuning tools
-  measure execution choices and save configurations for reuse. The runtime
-  applies those settings alongside model and hardware facts, selecting paths
-  for the current token batch and context shape.
+- **Execution that fits your hardware and workload.** Hardware limits, model
+  layouts, and request size guide execution choices, helping avoid costly
+  mismatches in short prompts and token generation. Imparo's tuning tools
+  measure execution choices and save configurations for reuse.
 
 - **Spend less time on execution overhead.** Direct backend calls keep the hot
   path compact. On supported Metal paths, megakernel decode combines small GPU
@@ -56,6 +56,10 @@ Supported configurations and measured results are documented below.
   collapsed within a conversation turn. Paged allocation, residency budgets,
   and disk-cache eviction help control redundant state and inactive-cache
   growth as conversations accumulate.
+
+- **Cleaner streaming for agent integrations.** Separate handling of reasoning,
+  visible text, and tool calls helps clients render responses correctly and
+  preserve the handoff to external tools.
 
 - **Explore acceleration with a smaller memory overhead.** Imparo's native
   MTP research reuses target-model components and keeps architecture-specific
@@ -142,6 +146,8 @@ Ahead on every cell but one: LFM2's short-prompt decode ties oMLX (46.6 against 
 Updates below reflect code already merged into the public `main` branch.
 Model and backend availability remains qualification-specific.
 
+- **[2026-09-10]** Extended validation to **Apple M4 Pro**, reproducing the
+  optimization benefits previously demonstrated on **M3 Pro**.
 - **[2026-09-07]** Published Metal megakernel decode for Gemma 4 E4B and LFM2,
   reducing GPU dispatches per token from about 180 to 42 and from 34 to 5,
   respectively, with unsupported layers and failed regions safely returning to
