@@ -1,0 +1,40 @@
+name: Performance or hardware result
+description: Share a speed/memory improvement, a regression, or results on your hardware.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Results on everyday hardware are welcome, including negative results and partial experiments.
+        Share the details you have and label what remains unverified. A chart alone is harder to reproduce than a command and a small table.
+        Please do not upload private prompts, credentials, model weights, or personal cache files.
+  - type: textarea
+    id: finding
+    attributes:
+      label: What did you measure or notice?
+      description: Describe the improvement, regression, or hardware behavior and why it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Hardware and workload
+      description: Fill in what you know. Clearly identify compile-only checks if you did not run on the target hardware.
+      placeholder: |
+        Baseline and candidate commits/engine versions:
+        Hardware, RAM/VRAM, OS, driver/toolchain:
+        Model source/revision and quantization:
+        Prompt/output lengths and context limit:
+        Backend, KV format, cache state, and tuning settings:
+        Thinking/speculative decoding settings, if relevant:
+  - type: textarea
+    id: results
+    attributes:
+      label: Commands, results, and measurement method
+      description: Include units, repetitions, cold/warm state, and whether timing is client-observed or internal. Preliminary results are fine; say if a baseline is not available.
+    validations:
+      required: true
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Correctness and remaining questions
+      description: What output/reference or state-transition checks did you run? If none yet, say so. Mention untested devices, numerical differences, or other limitations.

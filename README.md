@@ -219,7 +219,14 @@ benchmarks, tooling, and documentation.
 Performance contributions should include a reproducible baseline and the
 corresponding correctness checks.
 
-Start with an open [issue](https://github.com/zeraix/imparo/issues).
+New to the codebase? Start with the [contribution guide](CONTRIBUTING.md) for an
+architecture map, development checks, and small ways to help. Documentation fixes
+and hardware reports are welcome; no CLA or copyright transfer is required.
+
+Please follow our [Code of Conduct](CODE_OF_CONDUCT.md). Report security concerns
+privately using the contact in [SECURITY.md](SECURITY.md).
+
+Questions or ideas? Open an [issue](https://github.com/zeraix/imparo/issues/new/choose).
 
 ## License
 

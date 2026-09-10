@@ -1,0 +1,25 @@
+name: Feature or model support
+description: Suggest an improvement, model/backend support, or an integration.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us what you want to make possible. You do not need an implementation plan or a commitment to write the code.
+        For a large change, this is a good place to discuss direction before starting a PR.
+  - type: textarea
+    id: use_case
+    attributes:
+      label: What would you like to do?
+      description: Describe the use case, current limitation, and who would benefit.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant models, hardware, or interfaces
+      description: If applicable, include a public model/specification link, license, target hardware, or API example. Unknown details are fine.
+  - type: textarea
+    id: approach
+    attributes:
+      label: Ideas or alternatives
+      description: Optional. Share possible approaches, existing work, or the part you would like help exploring.

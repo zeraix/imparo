@@ -23,7 +23,17 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST = ROOT / "dev_harness" / "public-export.allowlist"
-EXPECTED_ALLOWLIST_SHA256 = "ea375fffb73d23e9c330409409b59205733a1a8c242af3f3ae3724497d0f8a5d"
+EXPECTED_ALLOWLIST_SHA256 = "b9efb03338169034a63246b88451681e49b70a8ffbc4ba7073156303626b41c7"
+REQUIRED_COMMUNITY_FILES = {
+    ".github/ISSUE_TEMPLATE/bug_report.yml",
+    ".github/ISSUE_TEMPLATE/config.yml",
+    ".github/ISSUE_TEMPLATE/feature_request.yml",
+    ".github/ISSUE_TEMPLATE/performance_report.yml",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+}
 REQUIRED_CONTROL_PLANE = {
     ".gitattributes",
     ".github/workflows/ci.yml",
@@ -210,8 +220,9 @@ class PublicAllowlistTests(unittest.TestCase):
         paths = public_export._parse_allowlist(
             raw, "dev_harness/public-export.allowlist"
         )
-        self.assertEqual(len(paths), 293)
+        self.assertEqual(len(paths), 301)
         self.assertEqual(paths, sorted(paths, key=lambda item: item.encode("utf-8")))
+        self.assertEqual(set(paths) & REQUIRED_COMMUNITY_FILES, REQUIRED_COMMUNITY_FILES)
         self.assertEqual(set(paths) & REQUIRED_CONTROL_PLANE, REQUIRED_CONTROL_PLANE)
         self.assertEqual(
             set(paths) & REQUIRED_PROGRAM_PACK_PUBLIC, REQUIRED_PROGRAM_PACK_PUBLIC

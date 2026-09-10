@@ -1,0 +1,45 @@
+name: Bug report
+description: Something failed, produced incorrect output, or behaved unexpectedly.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Share what you know; an incomplete reproduction is still welcome.
+        For vulnerabilities, please use [private security reporting](https://github.com/zeraix/imparo/blob/main/SECURITY.md).
+        Remove credentials, private prompts, personal paths, and sensitive cache data from logs.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you observe?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How can we reproduce it?
+      description: Steps, launch/build command, a small example, or the last action before the failure. If you cannot reproduce it yet, say so.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the details you have; skip anything unrelated or unknown.
+      placeholder: |
+        Imparo commit or release:
+        OS and Rust/toolchain version:
+        CPU/GPU and RAM/VRAM:
+        Backend (CPU, Metal, CUDA):
+        Model source/revision and quantization:
+        Context length and relevant cache/tuning settings:
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      description: Paste a short, redacted excerpt. Prefer text for compiler errors.
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else that helps?
+      description: For example, whether it worked on another commit or a workaround you found. Optional.

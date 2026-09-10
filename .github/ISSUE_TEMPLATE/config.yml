@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Help getting started or contributing
+    url: https://github.com/zeraix/imparo/blob/main/CONTRIBUTING.md
+    about: Find the architecture map and development checks, or open a blank issue to ask a question.
+  - name: Report a security vulnerability privately
+    url: https://github.com/zeraix/imparo/blob/main/SECURITY.md
+    about: Use the private contact in our security policy, not a public issue.
