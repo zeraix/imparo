@@ -306,7 +306,6 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
     (visible, calls)
 }
 
-
 fn parse_tool_block(body: &str) -> Option<Vec<(String, String)>> {
     let inner = body.trim().strip_prefix('[')?.strip_suffix(']')?;
     if inner.trim().is_empty() {
@@ -614,7 +613,12 @@ impl crate::chat::ChatCodec for Codec {
         split_reasoning(text, starts_inside)
     }
     fn prompt_ends_in_reasoning(&self, prompt: &str) -> bool {
-        crate::chat::think::ends_inside(prompt, ASSISTANT_TURN_OPEN, THINK_OPEN, THINK_CLOSE)
+        crate::chat::think::ends_inside(
+            prompt,
+            ASSISTANT_TURN_OPEN,
+            THINK_OPEN,
+            THINK_CLOSE,
+        )
     }
     /// ChatML ends the assistant's turn at TURN_CLOSE, which is the EOT token -- the decode
     /// loop already stops there, and a tool result arrives as a NEW `<|im_start|>tool` turn
@@ -656,9 +660,15 @@ mod tests {
             ("<|im_start|>assistant\n<think></think>", false),
             ("<|im_start|>assistant\n<think></think>\n\n", false),
             // In USER text, so not the model's.
-            ("<|im_start|>user\n<think><|im_end|>\n<|im_start|>assistant\n", false),
+            (
+                "<|im_start|>user\n<think><|im_end|>\n<|im_start|>assistant\n",
+                false,
+            ),
             // In an OLDER assistant turn, so not this one's.
-            ("<|im_start|>assistant\n<think>old<|im_end|>\n<|im_start|>assistant\n", false),
+            (
+                "<|im_start|>assistant\n<think>old<|im_end|>\n<|im_start|>assistant\n",
+                false,
+            ),
             ("<|im_start|>assistant\n<think></think><think>", true),
         ] {
             assert_eq!(codec.prompt_ends_in_reasoning(prompt), inside, "{prompt:?}");
@@ -908,7 +918,10 @@ mod tests {
         assert_eq!(Codec.unsettled_in_raw("answer</thi"), 5);
         assert_eq!(Codec.unsettled_in_raw("plain text"), 0);
         assert_eq!(Codec.unsettled_in_raw("a<|tool_call_start|>[ping()"), 0);
-        assert_eq!(Codec.unsettled_in_visible("a<|tool_call_start|>[ping()"), 26);
+        assert_eq!(
+            Codec.unsettled_in_visible("a<|tool_call_start|>[ping()"),
+            26
+        );
         assert_eq!(Codec.unsettled_in_visible("plain text"), 0);
 
         let text = "<think>I could <|tool_call_start|>[ping()] here</think>the answer";

@@ -1549,7 +1549,8 @@ inline bool launch(const uint8_t * w, const BlockQ8_1Mmq * x, float * y,
                    FullTileVariant full_tile_variant,
                    uint32_t full_tile_min_efficiency,
                    float * workspace, BlockQ8_1Mmq * epilogue_q8,
-                   cudaStream_t stream, LaunchInfo * info = nullptr) {
+                   cudaStream_t stream, LaunchInfo * info = nullptr,
+                   uint32_t canonical_out = 0) {
     if (info) *info = {};
     if (n_in % 128) return false;
     static const bool configured = [] {
@@ -1725,6 +1726,32 @@ inline bool launch(const uint8_t * w, const BlockQ8_1Mmq * x, float * y,
     const uint32_t efficiency = 100 * ntiles / (sm_count * nwaves);
     const bool canonical_full_tile = canonical_full_tile_requested
         && n_tok == 512 && virtual_token_base % 512 == 0;
+    // A compact output prefix must preserve the reference projection's numeric
+    // branch. The initial admitted family is a boundary-free R128/K128 full tile
+    // at 512 tokens. Lower physical grid efficiency must not introduce Stream-K
+    // seams. Unsupported reference families fail closed rather than changing math.
+    if (canonical_out) {
+        if (canonical_out <= n_out || canonical_out % kRows || n_out % kRows
+            || !stream_k_numeric || !workspace || virtual_schedule || epilogue
+            || row_base || out_stride != n_out || !canonical_full_tile
+            || full_tile_variant != FullTileVariant::Rows128K128) return false;
+        const uint32_t canonical_tiles = (canonical_out / kRows) * grid.y;
+        const uint32_t canonical_waves = (canonical_tiles + sm_count - 1) / sm_count;
+        const uint32_t canonical_efficiency = 100u * canonical_tiles
+            / (sm_count * canonical_waves);
+        if (canonical_tiles < 2 * sm_count || canonical_efficiency < 90
+            || canonical_efficiency < full_tile_min_efficiency) return false;
+        q4_q8_1_full_tile<false, 4><<<ntiles, dim3(32, kWarps),
+            kHalfKSharedBytes, stream>>>(w, x, y, nullptr, n_in, n_out,
+                n_tok, work_n_tok, out_stride, 0);
+        if (info) {
+            info->route = LaunchRoute::FullTile;
+            info->tile_rows = kRows; info->tile_tokens = kTokens;
+            info->logical_tiles = canonical_tiles; info->physical_blocks = ntiles;
+            info->efficiency = canonical_efficiency;
+        }
+        return true;
+    }
     const bool llama_compat = llama_compat_requested && !canonical_full_tile;
     const uint32_t route_efficiency = llama_compat
         ? 90u : full_tile_min_efficiency;

@@ -486,6 +486,7 @@ mod tests {
 
     fn facts() -> ModelFacts {
         ModelFacts {
+            mega_seat: imparo_backend::MegaSeat::None,
             n_embd: 1024,
             n_ff: 4096,
             n_head: 8,

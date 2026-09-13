@@ -1497,7 +1497,8 @@ __global__ void q8_ready_full_tile_direct_r96_w24(
 // direct GELU(gate) * up epilogue without a temporary matrix or extra launch.
 template <uint32_t Rows, bool SharedGate, bool PrefetchPacked,
           bool QuantizeOutput, uint32_t TokenHalves = 1,
-          bool PackedByteSubtract = false, bool WriteDense = true>
+          bool PackedByteSubtract = false, bool WriteDense = true,
+          bool NumericSeams = false>
 __launch_bounds__(512, 1)
 __global__ void q8_ready_paircta_r64(
         const uint16_t * __restrict__ gate_scales16,
@@ -1510,7 +1511,7 @@ __global__ void q8_ready_paircta_r64(
         uint16_t * __restrict__ output_quant_u16,
         float * __restrict__ output_d8_sideplane,
         uint32_t output_token_tiles, uint32_t n_in, uint32_t n_out,
-        uint32_t n_tok, uint32_t dst_stride) {
+        uint32_t n_tok, uint32_t dst_stride, uint32_t numeric_stream_grid = 0) {
 #if __CUDA_ARCH__ >= 800
     using namespace imparo_sm80_mmq;
     static_assert(Rows == 64 || Rows == 128,
@@ -1570,6 +1571,26 @@ __global__ void q8_ready_paircta_r64(
     constexpr uint64_t scale_half_stride =
         uint64_t(kReadyTokenTilesPerCta)
         * kReadyScaleVectorsPerTokenTile;
+    // Physical R64 fusion inherits the reference R128 parent Gate AND Up
+    // Stream-K boundaries. Numerical ownership must not follow the new grid.
+    uint32_t numeric_seam = 0;
+    float prefix[NumericSeams ? 64 : 1];
+    if constexpr (NumericSeams) {
+        static_assert(Rows == 64 && TokenHalves == 1 && !PrefetchPacked);
+        const uint32_t parent_tile = (tile_row / 128u) * ntx + tile_token / kTokens;
+        const uint32_t parent_grid = (n_out / 128u) * ntx;
+        if (numeric_stream_grid) {
+            uint32_t worker = max(1u, uint32_t((uint64_t(parent_tile)
+                * numeric_stream_grid + parent_grid - 1) / parent_grid));
+            if (worker < numeric_stream_grid) {
+                const uint64_t boundary = stream_boundary(worker,
+                    uint64_t(parent_grid) * blocks, numeric_stream_grid, blocks);
+                if (boundary / blocks == parent_tile) {
+                    numeric_seam = uint32_t(boundary % blocks);
+                }
+            }
+        }
+    }
     float partial[64];
 #pragma unroll
     for (uint32_t item = 0; item < 64; ++item) partial[item] = 0.0f;
@@ -1585,6 +1606,15 @@ __global__ void q8_ready_paircta_r64(
 
     for (uint32_t stage_block = 0; stage_block < blocks;
          stage_block += StageBlocks) {
+        if constexpr (NumericSeams) {
+            if (numeric_seam && stage_block == numeric_seam) {
+#pragma unroll
+                for (uint32_t item = 0; item < 64; ++item) {
+                    prefix[item] = partial[item];
+                    partial[item] = 0.0f;
+                }
+            }
+        }
         for (uint32_t half = 0; half < TokenHalves; ++half) {
             stage_ready_activation_cursor_async<KernelWarps * 32>(
                 quant_cursor + half * quant_half_stride,
@@ -1744,6 +1774,14 @@ __global__ void q8_ready_paircta_r64(
         __syncthreads();
     }
 
+    if constexpr (NumericSeams) {
+        if (numeric_seam) {
+#pragma unroll
+            for (uint32_t item = 0; item < 64; ++item) {
+                partial[item] = partial[item] + prefix[item];
+            }
+        }
+    }
     if (projection == 0) {
 #pragma unroll
         for (uint32_t token_group = 0; token_group < 4; ++token_group) {
@@ -2576,7 +2614,8 @@ inline bool launch_q8_ready_paircta_shared_gate_t256(
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
-template <bool PrefetchPacked = false, bool WriteDense = true>
+template <bool PrefetchPacked = false, bool WriteDense = true,
+          bool NumericSeams = false>
 inline bool configure_q8_ready_paircta_shared_gate_q8() {
     static const bool configured = [] {
         constexpr uint32_t shared_bytes = PrefetchPacked
@@ -2584,7 +2623,7 @@ inline bool configure_q8_ready_paircta_shared_gate_q8() {
             : kReadyPairCtaSharedBytes;
         const cudaError_t dynamic = cudaFuncSetAttribute(
             q8_ready_paircta_r64<64, true, PrefetchPacked, true, 1, false,
-                WriteDense>,
+                WriteDense, NumericSeams>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             shared_bytes);
         if (dynamic != cudaSuccess) cudaGetLastError();
@@ -2593,7 +2632,8 @@ inline bool configure_q8_ready_paircta_shared_gate_q8() {
     return configured;
 }
 
-template <bool PrefetchPacked = false, bool WriteDense = true>
+template <bool PrefetchPacked = false, bool WriteDense = true,
+          bool NumericSeams = false>
 inline bool launch_q8_ready_paircta_shared_gate_q8(
         const uint16_t * gate_scales16, const uint4 * gate_nibbles16,
         const uint16_t * up_scales16, const uint4 * up_nibbles16,
@@ -2602,8 +2642,13 @@ inline bool launch_q8_ready_paircta_shared_gate_q8(
         uint16_t * output_quant_u16, float * output_d8_sideplane,
         uint32_t output_token_tiles, uint32_t n_in,
         uint32_t n_out, uint32_t n_tok, uint32_t dst_stride,
-        cudaStream_t stream) {
+        cudaStream_t stream, uint32_t numeric_stream_grid = 0) {
     using namespace imparo_sm80_mmq;
+    if constexpr (NumericSeams) {
+        // Only the measured SM86 N64, R128-parent family is admitted here.
+        if (n_in != 2560 || n_out != 10240 || n_tok != 64
+                || numeric_stream_grid != 30) return false;
+    }
     const uintptr_t bits = reinterpret_cast<uintptr_t>(gate_scales16)
         | reinterpret_cast<uintptr_t>(gate_nibbles16)
         | reinterpret_cast<uintptr_t>(up_scales16)
@@ -2624,7 +2669,7 @@ inline bool launch_q8_ready_paircta_shared_gate_q8(
         return false;
     }
     if (!configure_q8_ready_paircta_shared_gate_q8<
-            PrefetchPacked, WriteDense>()) return false;
+            PrefetchPacked, WriteDense, NumericSeams>()) return false;
     const uint64_t grid = uint64_t(n_out / kReadyCompactRows)
         * ((uint64_t(n_tok) + kTokens - 1) / kTokens);
     if (!grid || grid > uint64_t(UINT32_MAX)) return false;
@@ -2632,13 +2677,13 @@ inline bool launch_q8_ready_paircta_shared_gate_q8(
         ? kReadyPairCtaPrefetchSharedBytes
         : kReadyPairCtaSharedBytes;
     q8_ready_paircta_r64<64, true, PrefetchPacked, true, 1, false,
-        WriteDense>
+        WriteDense, NumericSeams>
         <<<uint32_t(grid), dim3(32, kWarps),
         shared_bytes, stream>>>(
             gate_scales16, gate_nibbles16, up_scales16, up_nibbles16,
             quant_u16, d8_sideplane, token_tiles, dst,
             output_quant_u16, output_d8_sideplane, output_token_tiles,
-            n_in, n_out, n_tok, dst_stride);
+            n_in, n_out, n_tok, dst_stride, numeric_stream_grid);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 

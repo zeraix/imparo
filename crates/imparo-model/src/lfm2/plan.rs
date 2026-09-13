@@ -157,6 +157,8 @@ pub fn build(
         kv_storage_basis: crate::KvStorageBasisPolicy::BackendOverrideOrCanonical,
         weight_residency: crate::WeightResidencyPlan::default(),
         layers,
+        decode_interleave: true,
+        mega_decode: true,
         output: OutputPlan {
             final_norm: true,
             logit_softcap: None,

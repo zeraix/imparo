@@ -22,12 +22,12 @@ use crate::knobs::CUDA_KNOBS;
 use crate::{CUDA_BACKEND_ABI, CudaBackend, CudaRuntimeIdentity};
 
 /// Numerical selector policy, deliberately independent of CUDA's tuning-space version.
-pub const CUDA_SELECTOR_VERSION: u32 = 4;
+pub const CUDA_SELECTOR_VERSION: u32 = 5;
 pub const CUDA_GATE_SUITE: &str = "cuda-llama-fa-q4_0";
 pub const CUDA_Q8_GATE_SUITE: &str = "cuda-llama-fa-q8_0";
 pub const CUDA_GATE_SUITE_VERSION: u32 = 7;
 pub const CUDA_Q8_GATE_SUITE_VERSION: u32 = 1;
-pub const CUDA_ROUTE_IMPLEMENTATION_VERSION: u32 = 4;
+pub const CUDA_ROUTE_IMPLEMENTATION_VERSION: u32 = 5;
 
 const ROUTE_DOMAIN_VERSION: u32 = 2;
 const ROUTE_PARAMETERS_VERSION: u32 = 1;
@@ -183,6 +183,59 @@ fn expected_correctness_with_env(
     validate_identity(identity)?;
     let policy = gate_policy(identity)?;
     let values = validate_candidate(stored)?;
+    let fa2 = stored.knobs.iter().any(|(name, value)| {
+        name == crate::knobs::D64_ATTENTION_KNOB && *value == crate::knobs::D64_FA2_MODE
+    });
+    if fa2
+        && (identity.runtime.device_sm != 86
+            || identity.kv_k != "q8_0"
+            || identity.kv_v != "q8_0")
+    {
+        return Err("FA2 mode requires the qualified SM86 Q8 target route".into());
+    }
+    let finite_history = stored
+        .knobs
+        .iter()
+        .any(|(name, value)| name == crate::knobs::FINITE_HISTORY_KNOB && *value != 0);
+    // A state-changing workflow needs a dedicated route-hit/lifecycle witness.
+    // Existing six numerical logs cannot seal this new route by themselves.
+    let mut suite = if finite_history {
+        format!("{}-finite-history", policy.suite)
+    } else {
+        policy.suite.to_string()
+    };
+    let suite_version = if finite_history || fa2 {
+        1
+    } else {
+        policy.version
+    };
+    if fa2 {
+        suite.push_str("-d64-fa2");
+    }
+    let mut required_gates: Vec<GateRequirement> = policy
+        .gates
+        .iter()
+        .map(|(id, version)| GateRequirement {
+            gate_id: (*id).into(),
+            gate_version: *version,
+        })
+        .collect();
+    if finite_history {
+        required_gates.push(GateRequirement {
+            gate_id: "finite_history_state_reuse".into(),
+            gate_version: 1,
+        });
+    }
+    if fa2 {
+        // Existing short fixed gates do not cover the selected long-KV routes.
+        // The sealer must gain real route/state evidence before admitting this suite.
+        for id in ["fa2_d64_prefill_n512_k4096", "fa2_d64_dspark_m9_n4096"] {
+            required_gates.push(GateRequirement {
+                gate_id: id.into(),
+                gate_version: 1,
+            });
+        }
+    }
     let space_version = CudaBackend.space_version();
     if CUDA_SELECTOR_VERSION == space_version {
         return Err("CUDA selector version must be independent of tuning space".into());
@@ -227,8 +280,8 @@ fn expected_correctness_with_env(
         ),
         parameters_sha256: route_parameters_sha256(exact_bytes, stored, &values),
         numerical_class: NumericalClass::GateBounded {
-            gate_suite: policy.suite.into(),
-            contract_version: policy.version,
+            gate_suite: suite.clone(),
+            contract_version: suite_version,
         },
     };
     route
@@ -236,17 +289,10 @@ fn expected_correctness_with_env(
         .map_err(|error| format!("invalid CUDA numerical route: {error:?}"))?;
     Ok(ExpectedCorrectness {
         fingerprint,
-        gate_suite: policy.suite.into(),
-        gate_suite_version: policy.version,
+        gate_suite: suite,
+        gate_suite_version: suite_version,
         routes: vec![route],
-        required_gates: policy
-            .gates
-            .iter()
-            .map(|(gate_id, gate_version)| GateRequirement {
-                gate_id: (*gate_id).into(),
-                gate_version: *gate_version,
-            })
-            .collect(),
+        required_gates,
         oracle: OracleFingerprint {
             implementation: ORACLE_IMPLEMENTATION.into(),
             revision: ORACLE_REVISION.into(),
@@ -261,8 +307,12 @@ fn validate_environment(
 ) -> Result<(), String> {
     for (key, _) in environment {
         let key = key.to_string_lossy();
-        if key.starts_with("IMPARO_CUDA_")
-            && !ALLOWED_CUDA_ENV.iter().any(|allowed| key == *allowed)
+        if (key.starts_with("IMPARO_CUDA_")
+            && !ALLOWED_CUDA_ENV.iter().any(|allowed| key == *allowed))
+            || matches!(
+                key.as_ref(),
+                "IMPARO_LAB_D64_FA2" | "IMPARO_LAB_D64_FA2_PREFILL"
+            )
         {
             return Err(format!(
                 "CUDA diagnostic environment override is not receiptable: {key}"
@@ -369,6 +419,7 @@ fn declared_value(sweep: SweepKind, values: &[u32], value: u32) -> bool {
         SweepKind::Values | SweepKind::External => values.contains(&value),
         SweepKind::Crossing { ladder, hi, lo }
         | SweepKind::TokenMinCrossing { ladder, hi, lo }
+        | SweepKind::TokenMaxCrossing { ladder, hi, lo }
         | SweepKind::SpanCrossing { ladder, hi, lo } => {
             value == hi || value == lo || ladder.contains(&value)
         }
@@ -531,6 +582,7 @@ mod tests {
                 .unwrap(),
             SweepKind::Crossing { ladder, hi, lo }
             | SweepKind::TokenMinCrossing { ladder, hi, lo }
+            | SweepKind::TokenMaxCrossing { ladder, hi, lo }
             | SweepKind::SpanCrossing { ladder, hi, lo } => ladder
                 .iter()
                 .copied()
@@ -552,6 +604,7 @@ mod tests {
                         }
                         SweepKind::Crossing { ladder, .. }
                         | SweepKind::TokenMinCrossing { ladder, .. }
+                        | SweepKind::TokenMaxCrossing { ladder, .. }
                         | SweepKind::SpanCrossing { ladder, .. } => ladder[0],
                         SweepKind::Derived => {
                             panic!("fixture registry has no derived knobs")
@@ -574,12 +627,42 @@ mod tests {
     }
 
     #[test]
+    fn finite_history_candidate_requires_its_own_state_reuse_gate() {
+        let runtime = runtime_fixture();
+        let mut candidate = stored();
+        let knob = candidate
+            .knobs
+            .iter_mut()
+            .find(|(name, _)| name == crate::knobs::FINITE_HISTORY_KNOB)
+            .unwrap();
+        knob.1 = 0;
+        let plain = build(b"plain", &candidate, &identity(&runtime)).unwrap();
+        candidate
+            .knobs
+            .iter_mut()
+            .find(|(name, _)| name == crate::knobs::FINITE_HISTORY_KNOB)
+            .unwrap()
+            .1 = 64;
+        let changed = build(b"finite", &candidate, &identity(&runtime)).unwrap();
+        assert_eq!(changed.required_gates.len(), plain.required_gates.len() + 1);
+        assert_eq!(
+            changed.required_gates.last().unwrap().gate_id,
+            "finite_history_state_reuse"
+        );
+        assert!(changed.gate_suite.ends_with("-finite-history"));
+        assert_ne!(
+            plain.routes[0].parameters_sha256,
+            changed.routes[0].parameters_sha256
+        );
+    }
+
+    #[test]
     fn complete_expected_and_unsigned_skeleton_match_fixed_contract() {
         let runtime = runtime_fixture();
         let expected = build(b"exact config", &stored(), &identity(&runtime)).unwrap();
         assert_eq!(expected.fingerprint.backend, "cuda");
         assert_eq!(expected.fingerprint.device_sm, 86);
-        assert_eq!(expected.fingerprint.numerical_space_version, 43);
+        assert_eq!(expected.fingerprint.numerical_space_version, 65);
         assert_eq!(expected.fingerprint.selector_version, CUDA_SELECTOR_VERSION);
         assert_ne!(
             expected.fingerprint.selector_version,
@@ -776,6 +859,85 @@ mod tests {
                 .unwrap_err()
                 .contains("illegal")
         );
+    }
+
+    #[test]
+    fn fa2_environment_overrides_cannot_reuse_a_receipt() {
+        for key in ["IMPARO_LAB_D64_FA2", "IMPARO_LAB_D64_FA2_PREFILL"] {
+            for value in ["0", "1"] {
+                assert!(
+                    validate_environment([(
+                        OsString::from(key),
+                        OsString::from(value)
+                    )])
+                    .unwrap_err()
+                    .contains("not receiptable")
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
+    fn fa2_mode_requires_new_coverage_and_rejects_old_or_incomplete_receipts() {
+        use imparo_host::correctness::{
+            ReceiptDecision, ReceiptRejection, validate_receipt,
+        };
+        let runtime = runtime_fixture();
+        let mut input = identity(&runtime);
+        input.kv_k = "q8_0";
+        input.kv_v = "q8_0";
+        let mut candidate = stored();
+        let index = candidate
+            .knobs
+            .iter()
+            .position(|(name, _)| name == crate::knobs::D64_ATTENTION_KNOB)
+            .unwrap();
+        candidate.knobs[index].1 = 1;
+        let old = build(b"mode1", &candidate, &input).unwrap();
+        candidate.knobs[index].1 = 2;
+        let new = build(b"mode2", &candidate, &input).unwrap();
+        assert_eq!(new.required_gates.len(), old.required_gates.len() + 2);
+        assert!(new.gate_suite.ends_with("-d64-fa2"));
+        assert_ne!(
+            new.routes[0].parameters_sha256,
+            old.routes[0].parameters_sha256
+        );
+        assert!(receipt_skeleton(&new).gates.iter().all(|gate| !gate.passed));
+        // Synthetic validator fixtures only: these receipts are never written or sealed.
+        let passing = |expected: &ExpectedCorrectness| {
+            let mut receipt = receipt_skeleton(expected);
+            receipt.producer = "unit-test".into();
+            receipt.producer_version = 1;
+            receipt.issued_unix_seconds = 1;
+            for gate in &mut receipt.gates {
+                gate.passed = true;
+                gate.command_sha256 = "a".repeat(64);
+                gate.output_sha256 = "b".repeat(64);
+            }
+            receipt
+        };
+        assert!(!validate_receipt(Some(&passing(&old)), &new).allows(&new.routes[0]));
+        let mut missing = passing(&new);
+        missing
+            .gates
+            .retain(|gate| !gate.gate_id.starts_with("fa2_d64_"));
+        assert!(matches!(
+            validate_receipt(Some(&missing), &new),
+            ReceiptDecision::SafeFallback(ReceiptRejection::MissingGate(_))
+        ));
+        let mut failed = passing(&new);
+        failed
+            .gates
+            .iter_mut()
+            .find(|gate| gate.gate_id.starts_with("fa2_d64_"))
+            .unwrap()
+            .passed = false;
+        assert!(matches!(
+            validate_receipt(Some(&failed), &new),
+            ReceiptDecision::SafeFallback(ReceiptRejection::GateFailed(_))
+        ));
+        assert!(build(b"mode2-q4", &candidate, &identity(&runtime)).is_err());
     }
 
     #[test]

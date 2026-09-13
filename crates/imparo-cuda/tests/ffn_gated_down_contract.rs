@@ -16,6 +16,95 @@ fn compact(source: &str) -> String {
 }
 
 #[test]
+fn canonical_sidecar_owns_d4_only_after_launch_and_keeps_fallback() {
+    let transaction = compact(braced_item_after(
+        NATIVE,
+        "static uint32_t try_q8_canonical_silu_private_down(",
+    ));
+    for required in [
+        "canonical_mode!=2&&canonical_mode!=3&&canonical_mode!=4",
+        "gate_kind!=2",
+        "up_kind!=2",
+        "down_kind!=2",
+        "n_tok>8",
+        "g.sm_version==86",
+        "g.weights_resident",
+        "!execution().graph_capturing",
+        "!execution().prefill_capture_active",
+        "src!=gated_tmp",
+        "src!=dst",
+        "gated_tmp!=dst",
+        "n_in%256==0",
+        "n_mid%128==0",
+        "n_out%128==0",
+        "||!ensure_q8_scratch_next(",
+        "Sidecar::fused<true><<<",
+        "Sidecar::fused<true,2><<<",
+        "Sidecar::fused<true,4><<<",
+        "Split::fused<2><<<",
+        "Split::fused<4><<<",
+        "Split::fused<8><<<",
+        "canonical_q8_gate_up_token_half_w16",
+        "canonical_q8_gate_up_lanes2",
+        "canonical_q8_gate_up_lanes4",
+        "canonical_q8_gate_up_original",
+        "cooperative_load_lanes2?21:cooperative_load_lanes4?22:17",
+        "own_q8_cache(gated_tmp,n_mid,n_tok,0,Q8_LAYOUT_MMQ_D4)",
+    ] {
+        assert!(transaction.contains(required), "missing {required}");
+    }
+    let launch = transaction.find("if(cooperative_load_lanes2)").unwrap();
+    let publish = transaction.find("publish_q8_scratch_next()").unwrap();
+    let down = transaction.find("imparo_cuda_matmat(down_kind").unwrap();
+    assert!(launch < publish && publish < down);
+    assert!(
+        transaction[..launch]
+            .contains("if(!eligible||execution().pending_error)return0;")
+    );
+    assert!(transaction[launch..publish].contains("set_pending(CUDA_RC_ERROR"));
+    let backend = compact(braced_item_after(CUDA_BACKEND, "fn ffn_gated_down("));
+    assert!(backend.contains("q8_canonical_sidecar_enabled()"));
+    assert!(backend.contains("activation==Epilogue::Siluasu32"));
+    assert!(
+        compact(TUNER_MICRO)
+            .contains("ifcandidate_must_run||canonical_sidecar_selected")
+    );
+}
+
+#[test]
+fn canonical_down_bounds_preserve_scratch_fallback_and_probe_identity() {
+    let native = compact(braced_item_after(
+        NATIVE,
+        "static uint32_t try_q8_canonical_silu_private_down(",
+    ));
+    for required in [
+        "small_max!=0&&n_tok<=small_max",
+        "canonical_load_lanes=tuner_knob(63)",
+        "cooperative_load_lanes2=canonical_load_lanes==2",
+        "cooperative_load_lanes4=canonical_load_lanes==4",
+        "large_min!=0&&n_tok>=large_min",
+        "!large_down||small_down",
+        "uint64_t(1)<<61",
+        "uint64_t(1)<<62",
+        "Down::launch_aligned_whole_k<false,0,false,8,4,64,64,true>",
+        "Down::launch_aligned_whole_k<false,0,false,8,4,128,128,true>",
+        "Down::launch_aligned_whole_k<false,0,false,16,2,128,128,true>",
+        "mark_buf_written(dst)",
+        "canonicalDowncandidatedidnotdispatch",
+        "imparo_cuda_matmat(down_kind,down_off,n_mid,n_out,gated_tmp,dst,n_tok,0)",
+    ] {
+        assert!(native.contains(required), "missing {required}");
+    }
+    let probe = compact(braced_item_after(
+        TUNER_MICRO,
+        "let probe_ffn_candidate = |n_tok: u32|",
+    ));
+    assert!(probe.contains("b.set_activation(s.activation)"));
+    assert!(!probe.contains("b.set_activation(Epilogue::Gelu)"));
+    assert!(probe.contains("reached&&b.validate_tuner_dispatch_proof().is_ok()"));
+}
+
+#[test]
 fn shortconv_fused_route_records_tuner_dispatch_proof() {
     let shortconv =
         braced_item_after(NATIVE, "extern \"C\" void imparo_cuda_shortconv(");
@@ -48,19 +137,25 @@ fn decode_projection_preparation_is_cuda_policy_not_a_cross_backend_default() {
 }
 
 #[test]
-fn lfm2_decode_prepares_each_projection_boundary_without_touching_prefill() {
+fn lfm2_projection_preparation_keeps_decode_and_prefill_policies_separate() {
     let workflow = compact(LFM2_WORKFLOW);
     assert!(workflow.contains(
         "letdecode_projection_preparation=decode&&be().use_decode_projection_preparation();",
     ));
+    assert!(workflow.contains(
+        "letprefill_projection_preparation=!decode&&be().use_prefill_projection_preparation();",
+    ));
+    assert!(workflow.contains(
+        "letprojection_preparation=decode_projection_preparation||prefill_projection_preparation;",
+    ));
     assert_eq!(
         LFM2_WORKFLOW.matches("be().rms_norm_projection(").count(),
-        3,
-        "operator, FFN and final projection boundaries must be explicit",
+        4,
+        "operator, FFN, Prefill-head and Decode-head boundaries must be explicit",
     );
     assert_eq!(
         workflow
-            .matches("ifdecode_projection_preparation&&li!=gpu_probe_layer()")
+            .matches("ifprojection_preparation&&li!=gpu_probe_layer()")
             .count(),
         2,
         "layer probes must retain their established materialized path",
@@ -68,26 +163,32 @@ fn lfm2_decode_prepares_each_projection_boundary_without_touching_prefill() {
     assert!(workflow.contains(
         "ifdecode_projection_preparation{be().rms_norm_projection(BufId::X,BufId::X,",
     ));
+    assert!(workflow.contains(
+        "ifprefill_final_projection_preparation{be().rms_norm_projection(BufId::Cur,BufId::X,",
+    ));
 }
 
 #[test]
 fn capture_local_q8_reuse_requires_current_decode_generation() {
     let cache_match = compact(braced_item_after(NATIVE, "bool q8_cache_matches("));
-    assert!(cache_match.contains("g.graph_capturing"));
+    assert!(cache_match.contains("execution().graph_capturing"));
     assert!(cache_match.contains("g.knobs[52]==0"));
-    assert!(cache_match.contains("!g.forward_decode"));
-    assert!(cache_match.contains("g.prefill_capture_active"));
-    assert!(
-        cache_match
-            .contains("g.q8_owner_capture_generation!=g.graph_capture_generation",)
-    );
+    assert!(cache_match.contains("!execution().forward_decode"));
+    assert!(cache_match.contains("execution().prefill_capture_active"));
+    assert!(cache_match.contains(
+        "execution().q8_owner_capture_generation!=execution().graph_capture_generation",
+    ));
 
+    // The owner stamps a capture generation in a verification capture as well as in a
+    // decode capture, and the matcher accepts the same two; a prefill capture never owns
+    // the cache.
+    assert!(cache_match.contains("&&!execution().verification_capture_active)"));
     let owner = compact(braced_item_after(NATIVE, "void own_q8_cache("));
     assert!(owner.contains(
-        "g.graph_capturing&&g.forward_decode&&!g.prefill_capture_active?g.graph_capture_generation:0",
+        "execution().graph_capturing&&(execution().forward_decode||execution().verification_capture_active)&&!execution().prefill_capture_active?execution().graph_capture_generation:0",
     ));
     let invalidate = compact(braced_item_after(NATIVE, "void invalidate_q8_cache("));
-    assert!(invalidate.contains("g.q8_owner_capture_generation=0;"));
+    assert!(invalidate.contains("execution().q8_owner_capture_generation=0;"));
 }
 
 #[test]
@@ -100,7 +201,7 @@ fn capture_and_policy_changes_fail_closed_for_q8_ownership() {
         .find("cudaStreamBeginCapture(")
         .expect("Decode capture start");
     let generation = begin
-        .find("++g.graph_capture_generation;")
+        .find("++execution().graph_capture_generation;")
         .expect("successful capture generation bump");
     assert!(invalidate < capture && capture < generation);
 
@@ -109,13 +210,13 @@ fn capture_and_policy_changes_fail_closed_for_q8_ownership() {
         "extern \"C\" int imparo_cuda_end(",
     ));
     assert!(end.contains(
-        "cudaStreamEndCapture(g.stream,&captured);g.graph_capturing=false;invalidate_q8_cache();",
+        "cudaStreamEndCapture(g.stream,&captured);execution().graph_capturing=false;invalidate_q8_cache();",
     ));
     let set_knob = compact(braced_item_after(
         NATIVE,
         "extern \"C\" void imparo_cuda_set_knob(",
     ));
-    assert!(set_knob.contains("destroy_decode_graph();"));
+    assert!(set_knob.contains("if(!destroy_all_execution_graphs_checked())"));
     assert!(set_knob.contains("invalidate_q8_cache();"));
     assert!(NATIVE.contains("cudaGraphGetNodes("));
     assert!(NATIVE.contains("dynamic=%zu/%u total=%zu total_ok=%u"));
@@ -230,8 +331,15 @@ fn gemma_workflow_guards_the_entire_legacy_sequence_and_probe_path() {
 #[test]
 fn lfm2_workflow_uses_the_complete_transaction_without_weakening_probes() {
     let workflow = compact(LFM2_WORKFLOW);
+    // The Metal mega-kernel tail may own the FFN as well, but no mega entry is offered on
+    // the probed layer, so its probes still run.
+    assert!(workflow.contains(
+        "letfused_ffn=mega_tail_done||li!=gpu_probe_layer()&&be().ffn_gated_down("
+    ));
     assert!(
-        workflow.contains("letfused_ffn=li!=gpu_probe_layer()&&be().ffn_gated_down(")
+        workflow.contains(
+            "b_tok==1&&!layer_outputs&&li!=gpu_probe_layer()&&be().mega_layer("
+        )
     );
     assert!(
         workflow.contains(
@@ -256,7 +364,7 @@ fn lfm2_workflow_uses_the_complete_transaction_without_weakening_probes() {
 
     let transaction = compact(NATIVE);
     assert!(transaction.contains("try_q8_tm_silu_private_down("));
-    assert!(transaction.contains("g.epilogue=4"));
+    assert!(transaction.contains("execution().epilogue=4"));
     assert!(transaction.contains("launch_aligned_whole_k<true,4>"));
 }
 
@@ -350,7 +458,7 @@ fn sidecar_is_prefill_only_and_validates_logical_grid_before_packing() {
         NATIVE,
         "extern \"C\" uint32_t imparo_cuda_ffn_gated_down(",
     ));
-    assert!(transaction.contains("g.batch_geometry_phase==0"));
+    assert!(transaction.contains("execution().batch_geometry_phase==0"));
     assert!(
         transaction
             .contains("if(!logical_tiles64||logical_tiles64>UINT32_MAX)return0;")
@@ -397,18 +505,22 @@ fn model_sidecar_fit_and_commit_are_all_or_none() {
         "if(!packed_gate||!packed_up||!packed_down)",
     ));
     assert!(incomplete_pack_body.contains("g.ffn_sidecar_model_pack_failed=true;"));
-    assert!(transaction.contains("++g.ffn_sidecar_model_commits;"));
+    assert!(transaction.contains("++execution().ffn_sidecar_model_commits;"));
 
     let end = compact(braced_item_after(
         NATIVE,
         "extern \"C\" int imparo_cuda_end(",
     ));
     assert!(end.contains(
-        "!g.ffn_sidecar_model_ready&&g.ffn_sidecar_model_calls&&g.ffn_sidecar_model_calls==g.kv_layout.layers&&g.ffn_sidecar_model_pack_calls==g.kv_layout.layers&&!g.ffn_sidecar_model_pack_failed&&launch==cudaSuccess&&sync==cudaSuccess&&!g.pending_error"
+        "!g.ffn_sidecar_model_ready&&execution().ffn_sidecar_model_calls&&execution().ffn_sidecar_model_calls==execution().kv_layout.layers&&g.ffn_sidecar_model_pack_calls==execution().kv_layout.layers&&!g.ffn_sidecar_model_pack_failed&&launch==cudaSuccess&&sync==cudaSuccess&&!execution().pending_error"
     ));
     assert!(end.contains("g.ffn_sidecar_model_ready=true;"));
+    // Every FFN layer the forward runs must commit: all layers, or the layer count of an
+    // explicit work demand in a speculative build.
+    assert!(end.contains("uint32_texpected_ffn_layers=execution().kv_layout.layers;"));
+    assert!(end.contains("expected_ffn_layers=execution().work_ffn_layers;"));
     assert!(end.contains(
-        "g.ffn_sidecar_model_calls!=g.ffn_sidecar_model_commits||g.ffn_sidecar_model_commits!=g.kv_layout.layers"
+        "execution().ffn_sidecar_model_calls!=execution().ffn_sidecar_model_commits||execution().ffn_sidecar_model_commits!=expected_ffn_layers"
     ));
     assert!(end.contains("sidecar-onlyFFNmodeladmissionwasnotall-or-none"));
 }
@@ -420,8 +532,7 @@ fn optional_sidecar_yields_to_activation_kv_and_decode_allocations() {
         "bool release_packed_q4_for_priority_allocation() {",
     ));
     for required in [
-        "destroy_decode_graph();",
-        "destroy_prefill_graph();",
+        "if(!destroy_all_execution_graphs_checked())returnfalse;",
         "cudaStreamSynchronize(g.stream)",
         "cudaFree(span.packed)",
         "g.packed_q4_budget_initialized=false;",
@@ -458,9 +569,11 @@ fn optional_sidecar_yields_to_activation_kv_and_decode_allocations() {
     let q8 = compact(braced_item_after(NATIVE, "int ensure_q8_scratch("));
     let attention =
         compact(braced_item_after(NATIVE, "bool ensure_attention_scratch("));
-    assert!(q8.contains("rc==CUDA_RC_OOM&&g.forward_decode"));
+    assert!(q8.contains("rc==CUDA_RC_OOM&&execution().forward_decode"));
     assert!(
-        attention.contains("allocation==cudaErrorMemoryAllocation&&g.forward_decode")
+        attention.contains(
+            "allocation==cudaErrorMemoryAllocation&&execution().forward_decode"
+        )
     );
 
     let begin = compact(braced_item_after(NATIVE, "static void begin_forward("));
@@ -527,9 +640,21 @@ fn prefill_graph_admits_only_the_warmed_receipted_exact128_sidecar() {
         NATIVE,
         "bool prefill_exact128_sidecar_capture_ready(",
     ));
-    assert!(ready.contains("g.graph_capturing&&g.prefill_capture_active"));
-    assert!(ready.contains("tuned_exact128_fast_transaction(n_tok)"));
-    assert!(ready.contains("g.ffn_sidecar_model_ready&&g.prefill_warm_forwards>=2"));
+    assert!(
+        ready.contains(
+            "execution().graph_capturing&&execution().prefill_capture_active"
+        )
+    );
+    assert!(
+        ready.contains("constuint32_tgraph_tokens=execution().prefill_graph_tokens;")
+    );
+    assert!(ready.contains("tuned_exact128_fast_transaction(graph_tokens)"));
+    assert!(ready.contains("execution().materialized_geometry_valid&&execution().materialized_tokens==n_tok"));
+    assert!(
+        ready.contains(
+            "g.ffn_sidecar_model_ready&&execution().prefill_warm_forwards>=2"
+        )
+    );
 
     let native_prepare = compact(braced_item_after(
         NATIVE,
@@ -550,7 +675,7 @@ fn prefill_graph_admits_only_the_warmed_receipted_exact128_sidecar() {
     assert!(ffn.contains("||exact128_graph_capture)"));
     assert!(ffn.contains("exact128FFNGraphincompletepacked-Q4hotset"));
     assert!(ffn.contains("exact128FFNGraphpreflight"));
-    assert!(ffn.contains("g.graph_capture_compatible=false;"));
+    assert!(ffn.contains("execution().graph_capture_compatible=false;"));
 
     let ple = compact(braced_item_after(
         NATIVE,
@@ -560,12 +685,14 @@ fn prefill_graph_admits_only_the_warmed_receipted_exact128_sidecar() {
     assert!(ple.contains("exact128PLEGraphreadyrouteunavailable"));
     assert!(NATIVE.contains("[cuda-prefill-graph] action=capture"));
     assert!(NATIVE.contains("[cuda-prefill-graph] action=discard"));
-    assert!(
-        NATIVE
-            .matches("if (g.graph_capturing && !g.prefill_capture_active)")
-            .count()
-            >= 2
-    );
+    // Outside a prefill capture the PLE route marks the graph incompatible; the attention
+    // route also exempts a verification capture and the d64 parallel Q/K graph.
+    assert!(NATIVE.contains(
+        "if (execution().graph_capturing && !execution().prefill_capture_active)"
+    ));
+    assert!(compact(NATIVE).contains(
+        "if(execution().graph_capturing&&!execution().prefill_capture_active&&!execution().verification_capture_active&&!d64_parallel_qk_graph)execution().graph_capture_compatible=false;"
+    ));
 }
 
 #[test]

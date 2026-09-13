@@ -71,11 +71,11 @@ static_assert(kBlockValues == imparo_sm80_q8_replay::kBlockValues,
 static_assert(kStageBlocks == imparo_sm80_q8_replay::kStageBlocks,
     "planner stage ABI");
 
-template <uint32_t Tokens>
+template <uint32_t Tokens, uint32_t Rows = kRows>
 constexpr uint32_t shared_bytes() {
     static_assert(Tokens >= 8 && Tokens <= 128 && Tokens % 8 == 0,
                   "registered Q8 MMQ token tile");
-    return kRows * kWeightStride
+    return Rows * kWeightStride
         + 2 * Tokens * kActivationStride;
 }
 
@@ -87,6 +87,12 @@ __device__ __forceinline__ int load_q8_word(const uint8_t * values,
 }
 
 enum : uint32_t { kReplaySuffix = 0, kReplayFirstPrefix = 1 };
+// Canonical Q8 records have a two-byte scale and a 34-byte stride, so their
+// payloads are always halfword-aligned but not uniformly word-aligned.
+__device__ __forceinline__ int load_q8_halfwords(const uint8_t *values, uint32_t word) {
+    const auto *p = reinterpret_cast<const uint16_t *>(values + 4 * word);
+    return int(uint32_t(p[0]) | (uint32_t(p[1]) << 16));
+}
 
 
 template <uint32_t Tokens, uint32_t Warps = kWarps>
@@ -119,8 +125,9 @@ __device__ __forceinline__ void stage_activation_group(
 // block interval without changing weight unpack, MMA, scale, or tail semantics.
 template <uint32_t Tokens, bool AlignedWholeK = false, bool TileMajor = false,
           uint32_t Epilogue = 0, bool AsyncTileMajor = false,
-          uint32_t Warps = kWarps>
-__global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
+          uint32_t Warps = kWarps, uint32_t CanonicalLoadLanes = 1,
+          uint32_t Rows = kRows, bool HalfwordLoads = false>
+__device__ __forceinline__ void q8_0_q8_1_mma_tile(
         const uint8_t * __restrict__ w,
         const BlockQ8_1Mmq * __restrict__ x,
         float * __restrict__ y,
@@ -128,40 +135,54 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
         uint32_t n_in, uint32_t n_out, uint32_t n_tok,
         uint32_t out_stride, uint32_t row_base,
         uint32_t physical_grid, uint32_t replay_phase,
-        float * __restrict__ replay_prefix, uint32_t multi_seam) {
+        float * __restrict__ replay_prefix, uint32_t multi_seam, uint32_t logical_tile,
+        uint32_t k_begin = 0, uint32_t k_end = UINT_MAX) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    // Narrow token batches assign one16-row output fragment to every warp.
+    // Keep the Q32 arithmetic and the ascending K reduction unchanged.
+    constexpr bool row_owned = Tokens == 16 && Rows == 64 && Warps == 4
+        && AlignedWholeK && Epilogue == 0;
     constexpr uint32_t token_groups = (Tokens + 31) / 32;
-    constexpr uint32_t row_groups = kRows / 32;
+    constexpr uint32_t row_groups = Rows / 32;
     constexpr uint32_t token_group_partitions = (Warps / 2) / row_groups;
     constexpr uint32_t local_token_groups =
         (token_groups + token_group_partitions - 1) / token_group_partitions;
-    constexpr uint32_t row_fragments = 2;
+    constexpr uint32_t row_fragments = row_owned ? 1 : 2;
     constexpr uint32_t partial_count =
         local_token_groups * 2 * row_fragments * 4;
-    static_assert(Warps == 8 || Warps == 16,
+    static_assert(Warps == 8 || Warps == 16 || row_owned,
                   "registered Q8 MMQ warp count");
     static_assert((Warps / 2) % row_groups == 0,
                   "warp pairs must partition complete row groups");
     static_assert(Epilogue <= 4, "registered Q8 MMQ epilogue");
+    static_assert(Rows == kRows || Rows == 64, "registered Q8 MMQ row tile");
+    static_assert(Rows == kRows || (AlignedWholeK && Epilogue == 0),
+        "smaller row tiles cannot change the replay or quantized-output ABI");
+    static_assert(!HalfwordLoads || (AlignedWholeK && Epilogue == 0),
+        "halfword loading is a canonical aligned laboratory policy");
     static_assert(!AsyncTileMajor || TileMajor,
                   "async weight staging is a tile-major specialization");
+    static_assert(CanonicalLoadLanes == 1 || CanonicalLoadLanes == 2
+        || CanonicalLoadLanes == 4 || CanonicalLoadLanes == 8);
+    static_assert(CanonicalLoadLanes == 1 || (AlignedWholeK && Epilogue == 0),
+        "cooperative canonical loads are an aligned whole-K laboratory policy");
 
     extern __shared__ __align__(16) int8_t shared[];
     int8_t * sx = shared;
-    int8_t * sy = sx + kRows * kWeightStride;
+    int8_t * sy = sx + Rows * kWeightStride;
 
     const uint32_t lane = threadIdx.x;
     const uint32_t warp = threadIdx.y;
     const uint32_t tid = warp * 32 + lane;
     const uint32_t token_tiles = (n_tok + Tokens - 1) / Tokens;
-    const uint32_t first_global_tile = row_base / kRows;
-    const uint32_t global_tile_index = first_global_tile + blockIdx.x;
-    const uint32_t global_tile_row = global_tile_index * kRows;
+    const uint32_t first_global_tile = row_base / Rows;
+    const uint32_t global_tile_index = first_global_tile + logical_tile;
+    const uint32_t global_tile_row = global_tile_index * Rows;
     const int64_t slice_tile_row = int64_t(global_tile_row) - row_base;
     const uint32_t tile_token = blockIdx.y * Tokens;
     const uint32_t blocks = n_in / kBlockValues;
-    uint32_t segment_begin = 0;
-    uint32_t segment_end = blocks;
+    uint32_t segment_begin = k_begin;
+    uint32_t segment_end = k_end == UINT_MAX ? blocks : k_end;
     if constexpr (!AlignedWholeK) {
         const uint64_t logical_tile =
             uint64_t(global_tile_index) * token_tiles + blockIdx.y;
@@ -205,7 +226,41 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
         }
         imparo_sm80_mmq::commit_async_copies();
 
-        constexpr uint32_t staged_blocks = kRows * kStageBlocks;
+        constexpr uint32_t staged_blocks = Rows * kStageBlocks;
+        if constexpr (CanonicalLoadLanes != 1) {
+            // Only global-load ownership changes; shared layout and ascending
+            // scaled MMA accumulation are shared with the incumbent below.
+            const uint32_t word_base = tid % CanonicalLoadLanes;
+            for (uint32_t linear = tid / CanonicalLoadLanes;
+                    linear < staged_blocks; linear += Warps * 32 / CanonicalLoadLanes) {
+                const uint32_t qblock = linear % kStageBlocks;
+                const uint32_t local_row = linear / kStageBlocks;
+                const uint64_t row=uint64_t(slice_tile_row)+local_row;
+                const uint32_t kb=stage_block+qblock;
+                const uint8_t *weight_values;
+                __half weight_scale;
+                if constexpr (TileMajor) {
+                    const uint64_t unit=(row/8)*blocks+kb;
+                    weight_values=w+unit*256+(row&7)*32;
+                    weight_scale=reinterpret_cast<const __half*>(w+uint64_t(n_out)*n_in)[unit*8+(row&7)];
+                } else {
+                    const uint8_t *block=w+(row*blocks+kb)*34;
+                    weight_values=block+2;
+                    weight_scale=*reinterpret_cast<const __half*>(block);
+                }
+                int8_t *values = sx + local_row * kWeightStride + qblock * kBlockValues;
+#pragma unroll
+                for (uint32_t item = 0; item < 8 / CanonicalLoadLanes; ++item) {
+                    const uint32_t word = word_base + item * CanonicalLoadLanes;
+                    reinterpret_cast<int *>(values)[word] = HalfwordLoads
+                        ? load_q8_halfwords(weight_values, word) : load_q8_word(weight_values, word);
+                }
+                if (word_base == 0) {
+                    reinterpret_cast<float *>(sx + local_row * kWeightStride
+                        + kStageValues)[qblock] = __half2float(weight_scale);
+                }
+            }
+        } else {
         for (uint32_t linear = tid; linear < staged_blocks;
              linear += Warps * 32) {
             // TM assigns consecutive lanes to the eight rows of one on-file
@@ -252,7 +307,8 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
 #pragma unroll
                     for (uint32_t word = 0; word < 8; ++word) {
                         reinterpret_cast<int *>(values)[word] =
-                            load_q8_word(weight_values, word);
+                            HalfwordLoads ? load_q8_halfwords(weight_values, word)
+                                : load_q8_word(weight_values, word);
                     }
                 }
                 scale = __half2float(weight_d);
@@ -264,6 +320,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
             }
             reinterpret_cast<float *>(
                 sx + local_row * kWeightStride + kStageValues)[qblock] = scale;
+        }
         }
         if constexpr (AsyncTileMajor) {
             imparo_sm80_mmq::commit_async_copies();
@@ -289,8 +346,9 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
                 for (uint32_t row_fragment = 0;
                      row_fragment < row_fragments; ++row_fragment) {
                     const uint32_t local_row0 =
-                        (warp / (2 * token_group_partitions)) * 32
-                            + row_fragment * 16;
+                        (row_owned ? warp * 16
+                            : (warp / (2 * token_group_partitions)) * 32
+                                + row_fragment * 16);
                     imparo_sm80_mmq::load_a_m16n8k32(
                         af[row_fragment],
                         sx + local_row0 * kWeightStride
@@ -310,15 +368,19 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
                 }
 
 #pragma unroll
-                for (uint32_t token_group =
-                         (warp >> 1) % token_group_partitions;
-                     token_group < token_groups;
-                     token_group += token_group_partitions) {
+                // Keep the accumulator index compile-time constant after
+                // unrolling, including warp-partitioned smaller row tiles.
+                for (uint32_t local_token_group = 0;
+                     local_token_group < local_token_groups;
+                     ++local_token_group) {
+                    const uint32_t token_group = (warp >> 1) % token_group_partitions
+                        + local_token_group * token_group_partitions;
+                    if (token_group >= token_groups) continue;
 #pragma unroll
                     for (uint32_t token_fragment = 0;
                          token_fragment < 2; ++token_fragment) {
                         const uint32_t local_token0 = token_group * 32
-                            + (warp & 1) * 16 + token_fragment * 8;
+                            + (row_owned ? 0 : (warp & 1) * 16) + token_fragment * 8;
                         if (local_token0 >= active_tokens) continue;
 
                         int bf[2];
@@ -346,8 +408,6 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
                                 cf, af[row_fragment], bf);
 #pragma unroll
                             for (uint32_t item = 0; item < 4; ++item) {
-                                const uint32_t local_token_group =
-                                    token_group / token_group_partitions;
                                 const uint32_t sum_index =
                                     (((local_token_group * 2 + token_fragment)
                                         * row_fragments + row_fragment) * 4)
@@ -365,9 +425,12 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
     }
 
 #pragma unroll
-    for (uint32_t token_group = (warp >> 1) % token_group_partitions;
-         token_group < token_groups;
-         token_group += token_group_partitions) {
+    for (uint32_t local_token_group = 0;
+         local_token_group < local_token_groups;
+         ++local_token_group) {
+        const uint32_t token_group = (warp >> 1) % token_group_partitions
+            + local_token_group * token_group_partitions;
+        if (token_group >= token_groups) continue;
 #pragma unroll
         for (uint32_t token_fragment = 0;
              token_fragment < 2; ++token_fragment) {
@@ -377,11 +440,12 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
 #pragma unroll
                 for (uint32_t item = 0; item < 4; ++item) {
                     const uint32_t local_row =
-                        (warp / (2 * token_group_partitions)) * 32
-                        + row_fragment * 16
+                        (row_owned ? warp * 16
+                            : (warp / (2 * token_group_partitions)) * 32
+                                + row_fragment * 16)
                         + imparo_sm80_mmq::accumulator_row(lane, item);
                     const uint32_t local_token = token_group * 32
-                        + (warp & 1) * 16 + token_fragment * 8
+                        + (row_owned ? 0 : (warp & 1) * 16) + token_fragment * 8
                         + imparo_sm80_mmq::accumulator_token(lane, item);
                     const int64_t slice_row = slice_tile_row + local_row;
                     const uint32_t global_row = global_tile_row + local_row;
@@ -391,8 +455,6 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
                             && uint64_t(slice_row) < n_out
                             && global_row < out_stride));
                     if (!valid_output) continue;
-                    const uint32_t local_token_group =
-                        token_group / token_group_partitions;
                     const uint32_t sum_index =
                         (((local_token_group * 2 + token_fragment) * row_fragments
                             + row_fragment) * 4) + item;
@@ -481,6 +543,25 @@ __global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
 #endif
 }
 
+// Preserve the global entry and physical-grid mapping for every existing caller.
+template <uint32_t Tokens, bool AlignedWholeK = false, bool TileMajor = false,
+          uint32_t Epilogue = 0, bool AsyncTileMajor = false,
+          uint32_t Warps = kWarps, uint32_t CanonicalLoadLanes = 1,
+          uint32_t Rows = kRows, bool HalfwordLoads = false>
+__global__ __launch_bounds__(Warps * 32, 1) void q8_0_q8_1_mma(
+        const uint8_t * __restrict__ w,
+        const BlockQ8_1Mmq * __restrict__ x,
+        float * __restrict__ y,
+        BlockQ8_1Mmq * __restrict__ output_q8,
+        uint32_t n_in, uint32_t n_out, uint32_t n_tok,
+        uint32_t out_stride, uint32_t row_base,
+        uint32_t physical_grid, uint32_t replay_phase,
+        float * __restrict__ replay_prefix, uint32_t multi_seam) {
+    q8_0_q8_1_mma_tile<Tokens, AlignedWholeK, TileMajor, Epilogue,
+        AsyncTileMajor, Warps, CanonicalLoadLanes, Rows, HalfwordLoads>(
+            w, x, y, output_q8, n_in, n_out, n_tok, out_stride, row_base,
+            physical_grid, replay_phase, replay_prefix, multi_seam, blockIdx.x);
+}
 __global__ void add_replay_prefix(
         float * y, const float * prefix, uint32_t slice_n_out,
         uint32_t n_tok, uint32_t out_stride, uint32_t row_base) {
@@ -571,20 +652,21 @@ inline LaunchResult launch_tile(
 // and row-tail predicates. Dispatch is default-off and versioned by the tuner;
 // ineligible shapes return to the common MMQ route without changing semantics.
 template <bool TileMajor = false, uint32_t Epilogue = 0,
-          bool AsyncTileMajor = false, uint32_t Warps = kWarps>
+          bool AsyncTileMajor = false, uint32_t Warps = kWarps,
+          uint32_t CanonicalLoadLanes = 1, uint32_t Tokens = 128,
+          uint32_t Rows = kRows, bool HalfwordLoads = false>
 inline LaunchResult launch_aligned_whole_k(
         const uint8_t * w, const BlockQ8_1Mmq * x, float * y,
         BlockQ8_1Mmq * output_q8,
         uint32_t n_in, uint32_t n_out, uint32_t n_tok,
         uint32_t out_stride, uint32_t row_base, cudaStream_t stream,
         imparo_sm80_mmq::LaunchInfo * info = nullptr) {
-    constexpr uint32_t Tokens = 128;
     static_assert(Epilogue == 0 || Epilogue == 2 || Epilogue == 3
         || Epilogue == 4,
         "aligned Q8 MMQ supports only registered SiLU sidecar stores");
     if (!w || !x || !y || n_tok <= 8 || n_in == 0 || n_in % 256 != 0
-        || n_out == 0 || n_out % kRows != 0 || out_stride == 0
-        || out_stride % kRows != 0 || row_base % kRows != 0
+        || n_out == 0 || n_out % Rows != 0 || out_stride == 0
+        || out_stride % Rows != 0 || row_base % Rows != 0
         || row_base > out_stride || n_out > out_stride - row_base
         || ((Epilogue == 3 || Epilogue == 4) && !output_q8)) {
         return LaunchResult::NotSupported;
@@ -596,9 +678,9 @@ inline LaunchResult launch_aligned_whole_k(
     if (configured_device != device) {
         const cudaError_t attr = cudaFuncSetAttribute(
             q8_0_q8_1_mma<
-                Tokens, true, TileMajor, Epilogue, AsyncTileMajor, Warps>,
+                Tokens, true, TileMajor, Epilogue, AsyncTileMajor, Warps, CanonicalLoadLanes, Rows, HalfwordLoads>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            int(shared_bytes<Tokens>()));
+            int(shared_bytes<Tokens, Rows>()));
         configured = attr == cudaSuccess;
         configured_device = device;
         if (!configured) {
@@ -611,18 +693,63 @@ inline LaunchResult launch_aligned_whole_k(
     }
     if (!configured) return LaunchResult::NotSupported;
 
+    // Opt-in qualification of row ownership for the existing aligned M9 path.
+    // The caller's tuner eligibility, D4 producer, stream and fallback still apply.
+    if constexpr (Epilogue == 0 && Tokens == 128 && Rows == 128
+        && (Warps == 8 || Warps == 16)
+        && (CanonicalLoadLanes == 2 || CanonicalLoadLanes == 4)) {
+        static const bool row_owner_requested = [] {
+            const char *v = std::getenv("IMPARO_LAB_Q8_M9_ROW_OWNER");
+            return v && std::strcmp(v, "1") == 0;
+        }();
+        // Tree M16 fits the SAME already-qualified physical 16-row tile.
+        // Preserve ordinary M9 and the caller's tuner/layout/owner admission.
+        static const bool tree_row_owner = [] {
+            const char *v=std::getenv("IMPARO_LAB_Q8_M16_ROW_OWNER");
+            return v && std::strcmp(v,"1")==0;
+        }();
+        if (row_owner_requested && (n_tok == 9 || (n_tok == 16 && tree_row_owner))) {
+            static int row_owner_device = -1;
+            static bool row_owner_sm86 = false;
+            if (row_owner_device != device) {
+                int major = 0, minor = 0;
+                if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device)
+                        != cudaSuccess
+                    || cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device)
+                        != cudaSuccess) return LaunchResult::Error;
+                row_owner_sm86 = major == 8 && minor == 6;
+                row_owner_device = device;
+            }
+            if (row_owner_sm86) {
+                const auto narrow = launch_aligned_whole_k<TileMajor,0,false,4,
+                    CanonicalLoadLanes,16,64,HalfwordLoads>(w,x,y,output_q8,
+                        n_in,n_out,n_tok,out_stride,row_base,stream,info);
+                if (narrow == LaunchResult::Launched) {
+                    static const bool trace = std::getenv("IMPARO_Q8_ROW_OWNER_TRACE") != nullptr;
+                    static bool traced = false;
+                    if (trace && !traced) {
+                        std::fprintf(stderr,"[q8-row-owner] tokens=%u in=%u out=%u lanes=%u ctas=%u warps=4 shared=24064\n",
+                            n_tok,n_in,n_out,CanonicalLoadLanes,n_out/64);
+                        traced = true;
+                    }
+                }
+                if (narrow != LaunchResult::NotSupported) return narrow;
+            }
+        }
+    }
+
     const uint32_t token_tiles = (n_tok + Tokens - 1) / Tokens;
-    const uint32_t row_tiles = n_out / kRows;
-    q8_0_q8_1_mma<Tokens, true, TileMajor, Epilogue, AsyncTileMajor, Warps>
+    const uint32_t row_tiles = n_out / Rows;
+    q8_0_q8_1_mma<Tokens, true, TileMajor, Epilogue, AsyncTileMajor, Warps, CanonicalLoadLanes, Rows, HalfwordLoads>
         <<<dim3(row_tiles, token_tiles),
-        dim3(32, Warps), shared_bytes<Tokens>(), stream>>>(
+        dim3(32, Warps), shared_bytes<Tokens, Rows>(), stream>>>(
             w, x, y, output_q8, n_in, n_out, n_tok, out_stride, row_base,
             0, kReplaySuffix, nullptr, 0);
     if (cudaPeekAtLastError() != cudaSuccess) return LaunchResult::Error;
     if (info) {
         *info = {};
         info->route = imparo_sm80_mmq::LaunchRoute::GridTile;
-        info->tile_rows = kRows;
+        info->tile_rows = Rows;
         info->tile_tokens = Tokens;
         info->logical_tiles = row_tiles * token_tiles;
         info->physical_blocks = info->logical_tiles;
@@ -643,7 +770,7 @@ inline LaunchResult launch(
         const imparo_sm80_q8_replay::ReplayPlan & plan,
         float * replay_prefix, cudaStream_t stream,
         imparo_sm80_mmq::LaunchInfo * info = nullptr) {
-    if (!w || !x || !y || n_tok <= 8 || n_in == 0 || n_in % 128 != 0
+    if (!w || !x || !y || n_tok == 0 || n_in == 0 || n_in % 128 != 0
         || n_out == 0 || out_stride == 0 || row_base > out_stride
         || n_out > out_stride - row_base) {
         return LaunchResult::Error;

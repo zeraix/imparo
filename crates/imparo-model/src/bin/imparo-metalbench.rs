@@ -482,7 +482,8 @@ mod bench {
         //
         // The token counts are chosen to reach each route and each edge:
         //   1    the decode GEMV
-        //   4    the narrow token tile (<= q8_gemv_max_tok, default 8)
+        //   4    the narrow token tile (the check raises the one-row GEMV boundary to 8
+        //        for itself; the engine never dispatches this kernel by default)
         //   32   the wide GEMM, exact token grid
         //   33   the wide GEMM with a partial token tile (the masked write-back)
         //   64   two full token tiles
@@ -498,6 +499,10 @@ mod bench {
             ];
             let mut checked = 0usize;
             let mut fails = 0usize;
+            // The Q8 token tile sits above the engine's one-row GEMV boundary
+            // (g_gemv_max_tok in the bridge). Raised to 8 for the Q8 tensors so the kernel
+            // is exercised; the Q4 control keeps the engine's boundary; put back below.
+            let saved_gemv_max = m::gemv_max_tok_current();
             let mut worst = 0.0_f64;
             for name in names {
                 let Some(t) = w.get(name).copied() else {
@@ -545,6 +550,7 @@ mod bench {
                     ]
                 };
                 for (n_tok, cfa, cfb, shape, is_gemm) in combos {
+                    m::set_gemv_max_tok(if wire == 2 { 8 } else { saved_gemv_max });
                     if wire == 2 {
                         if is_gemm == 1 {
                             m::set_st_gemm_shape(shape);
@@ -610,7 +616,7 @@ mod bench {
                         if n_tok > 1 { "gemm" } else { "gemv" }
                     } else if n_tok == 1 {
                         "gemv"
-                    } else if n_tok <= m::q8_gemv_max_tok() {
+                    } else if n_tok <= m::gemv_max_tok_current() {
                         "tile"
                     } else {
                         "gemm"
@@ -644,6 +650,7 @@ mod bench {
                     );
                 }
             }
+            m::set_gemv_max_tok(saved_gemv_max);
             if checked == 0 {
                 return Err(
                     "quant check found no quantised tensor in this model".into()
@@ -750,8 +757,10 @@ mod bench {
             // value head, 48 -- cannot choose a fat grid, and "the ceiling is 136" was
             // measured at 72 and above. A narrow dispatch that is starved reads as a slow
             // kernel, so the ceiling has to be known AT THE SHAPE the kernel runs.
-            for tpg in [256u32, 512, 1024] {
-                for tgs in [18u32, 36, 48, 54, 72, 144, 288, 576, 1152] {
+            for tpg in [128u32, 256, 512, 1024] {
+                for tgs in
+                    [18u32, 36, 48, 54, 72, 144, 288, 576, 1152, 2304, 4608, 9216]
+                {
                     let gbs = m::bw_read(bytes, 4, tgs, tpg);
                     println!("bw_read tpg={tpg:<5} tgs={tgs:<5} {gbs:>7.1} GB/s");
                     if gbs > best.0 {
@@ -887,14 +896,18 @@ mod bench {
                     continue;
                 };
                 let wire = kind as u32;
-                if wire != 1 && wire != 2 && wire != 3 {
+                // Every quantized 2-D projection: Q4_0 / Q8_0 / Q8_0_TM take their own
+                // GEMVs, the block quants (Q4_K, IQ4_XS, ...) the tile-major brick GEMV.
+                // F32 (norm vectors are 1-D anyway) and the embedding are skipped.
+                if wire == 0 {
                     continue;
                 }
-                let suffix = name
-                    .splitn(3, '.')
-                    .nth(2)
-                    .unwrap_or(name.as_str())
-                    .to_string();
+                // Group by ROLE AND KIND: a UD mix gives the same projection a different
+                // quant in different layers, and the rate per byte is the format's.
+                let suffix = format!(
+                    "{}@{kind:?}",
+                    name.splitn(3, '.').nth(2).unwrap_or(name.as_str())
+                );
                 groups.entry(suffix).or_default().push((
                     wire,
                     t.offset as u64,
@@ -906,7 +919,8 @@ mod bench {
             }
             if groups.is_empty() {
                 return Err(
-                    "IMPARO_BENCH_GEMV: no 2-D Q8 projection in this model".into()
+                    "IMPARO_BENCH_GEMV: no quantized 2-D projection in this model"
+                        .into(),
                 );
             }
             m::alloc(m::buf::X, max_in * 4).map_err(|e| format!("alloc {e}"))?;
@@ -958,9 +972,21 @@ mod bench {
                     .clamp(1, 64);
                 let (best, mean, n) = sample(reps, 300_000.0)?;
                 let (wire, _, n_in, n_out) = tensors[0];
+                // Bytes per dispatch from the format's block size, so the row carries
+                // the rate the kernel sustained against the 136 GB/s ordinary-grid wall.
+                let bytes = w
+                    .tensors
+                    .iter()
+                    .find(|(nm, tt)| {
+                        tt.n_dims == 2
+                            && tt.offset as u64 == tensors[0].1
+                            && nm.as_str() != "token_embd.weight"
+                    })
+                    .map_or(0.0, |(_, tt)| tt.bytes as f64);
                 println!(
-                    "gemv probe  {suffix:<28} kind={wire} {n_in:>5}->{n_out:<6} x{:<2} min {best:>7.1} us  mean {mean:>7.1} us  ({n} dispatches)",
-                    tensors.len()
+                    "gemv probe  {suffix:<36} kind={wire:<2} {n_in:>5}->{n_out:<6} x{:<2} min {best:>7.1} us  mean {mean:>7.1} us  {:>6.1} GB/s at min  ({n} dispatches)",
+                    tensors.len(),
+                    bytes / best / 1e3
                 );
             }
             return Ok(());

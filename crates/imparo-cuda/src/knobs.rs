@@ -1,7 +1,7 @@
 //! CUDA launch parameters consumed by native kernels.
 //!
-//! A parameter belongs here only after the native launch reads the corresponding
-//! slot. Keeping the slot constants beside the declarations makes the stored tuner
+//! Native launch parameters have an explicit slot. Workflow parameters are
+//! separately identified and require whole-model admission, never a fake native slot. Keeping the slot constants beside the declarations makes the stored tuner
 //! configuration an auditable contract instead of a second, implicit knob table.
 
 use crate::ffi::{imparo_cuda_knob, imparo_cuda_set_knob};
@@ -12,9 +12,8 @@ use imparo_backend::{
 const SLOT_GEMV_WARPS: u32 = 6;
 const SLOT_ATTN_THREADS: u32 = 7;
 const SLOT_RMS_THREADS: u32 = 8;
-// Slots 9 and 10 are intentionally unassigned. Never reuse them without bumping the
-// CUDA space version: persisted host configs address knobs by name, while native code
-// addresses the same choices by slot.
+const SLOT_DIRECT_Q8_KV_PREPARE_MIN_TOKENS: u32 = 9;
+const SLOT_ROW_LOCAL_PREFILL_TAIL_MAX_TOKENS: u32 = 10;
 const SLOT_MMQ_FULL_ROWS: u32 = 11;
 const SLOT_MMQ_FULL_TILE_MIN_EFFICIENCY: u32 = 12;
 const SLOT_ATTN_D256_WORKSPACE_MIB: u32 = 13;
@@ -64,10 +63,63 @@ const SLOT_PREFILL_PROJECTION_Q8_D4: u32 = 56;
 const SLOT_PREFILL_DOWN_Q4_LAYER_MASK: u32 = 57;
 const SLOT_ROW_LOCAL_PREFILL_TAIL_ROWS: u32 = 58;
 const SLOT_PREFILL_HEAD_POST_THREADS: u32 = 59;
+const SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR: u32 = 60;
+const SLOT_MMQ_Q8_CANONICAL_DOWN_LARGE_MIN_TOKENS: u32 = 61;
+const SLOT_MMQ_Q8_CANONICAL_DOWN_SMALL_MAX_TOKENS: u32 = 62;
+const SLOT_MMQ_Q8_CANONICAL_LOAD_LANES: u32 = 63;
+
+pub(crate) const PREFILL_BCX_SHORTCONV_READY_KNOB: &str = "prefill_bcx_shortconv_ready";
+static PREFILL_BCX_SHORTCONV_READY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) const FINITE_HISTORY_KNOB: &str = "finite_history_prefill_tail_rows";
+static FINITE_HISTORY_ROWS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn is_workflow_knob(name: &str) -> bool {
+    name == FINITE_HISTORY_KNOB || name == PREFILL_BCX_SHORTCONV_READY_KNOB
+}
+
+pub(crate) fn reset_workflow_defaults() {
+    FINITE_HISTORY_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
+    PREFILL_BCX_SHORTCONV_READY.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn prefill_bcx_shortconv_ready_value() -> u32 {
+    PREFILL_BCX_SHORTCONV_READY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn apply_prefill_bcx_shortconv_ready(value: u32) {
+    PREFILL_BCX_SHORTCONV_READY
+        .store(u32::from(value == 1), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn prefill_bcx_shortconv_ready_enabled() -> bool {
+    prefill_bcx_shortconv_ready_value() == 1
+}
+
+fn finite_history_rows_value() -> u32 {
+    FINITE_HISTORY_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn apply_finite_history_rows(value: u32) {
+    // Only the fully screened minimum64 route is a formal candidate. The wider
+    // experimental grid remains separate and cannot receive receipt authority.
+    FINITE_HISTORY_ROWS.store(
+        if value == 64 { 64 } else { 0 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn finite_history_prefill_tail_rows() -> Option<u32> {
+    let rows = finite_history_rows_value();
+    (rows != 0).then_some(rows)
+}
 
 pub(crate) fn slot_for_name(name: &str) -> Option<u32> {
     CUDA_KNOBS
         .iter()
+        .filter(|decl| !is_workflow_knob(decl.name))
         .position(|decl| decl.name == name)
         .and_then(|registry_index| {
             const SLOTS: &[u32] = &[
@@ -122,13 +174,44 @@ pub(crate) fn slot_for_name(name: &str) -> Option<u32> {
                 SLOT_PREFILL_PROJECTION_Q8_D4,
                 SLOT_PREFILL_DOWN_Q4_LAYER_MASK,
                 SLOT_ROW_LOCAL_PREFILL_TAIL_ROWS,
+                SLOT_ROW_LOCAL_PREFILL_TAIL_MAX_TOKENS,
                 SLOT_PREFILL_HEAD_POST_THREADS,
+                SLOT_DIRECT_Q8_KV_PREPARE_MIN_TOKENS,
+                SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR,
+                SLOT_MMQ_Q8_CANONICAL_LOAD_LANES,
+                SLOT_MMQ_Q8_CANONICAL_DOWN_LARGE_MIN_TOKENS,
+                SLOT_MMQ_Q8_CANONICAL_DOWN_SMALL_MAX_TOKENS,
             ];
             SLOTS.get(registry_index).copied()
         })
 }
 
-const CUDA_SPACE_VERSION: u32 = 49;
+// Space 63 adds an independently receipted finite-history workflow schedule
+// and corrects the v62 mode4 candidate to its actual Gate/Up selector.
+// Space 64 adds an external Prefill BCX/ShortConv ready-task capability.
+// Space 65 gives the source-build FA2 candidate a persistent, receipt-bound mode.
+// Space66 adds the explicitly bit-affecting D512 four-CTA/SM laboratory mode.
+#[cfg(feature = "cuda-speculative")]
+const D256_VEC_MODES: &[u32] = &[0, 1, 2];
+#[cfg(not(feature = "cuda-speculative"))]
+const D256_VEC_MODES: &[u32] = &[0, 1];
+const CUDA_SPACE_VERSION: u32 = 68;
+pub(crate) const D64_ATTENTION_KNOB: &str = "attn_d64_mma_prefill";
+pub(crate) const D64_FA2_MODE: u32 = 2;
+// The provider is currently linked only by the owner laboratory source build.
+const D64_ATTENTION_MODES: &[u32] = if cfg!(feature = "cuda-speculative") {
+    &[0, 1, D64_FA2_MODE]
+} else {
+    &[0, 1]
+};
+const ROW_LOCAL_TAIL_TOKEN_LADDER: &[u32] = &[64, 128, 192, 256, 384, 512];
+const CANONICAL_DOWN_TOKEN_LADDER: &[u32] = &[9, 32, 64, 128, 192, 256, 384, 512];
+// Mode3 keeps the original partitions and overlaps packed-KV tile copies with MMA.
+const D512_MMA_MODES: &[u32] = if cfg!(feature = "cuda-speculative") {
+    &[0, 1, 2, 3]
+} else {
+    &[0, 1]
+};
 const D512_SCHEDULE_KEYS: u32 = 256;
 const D512_MMA_CONSERVATIVE_FLOOR: u32 = 4 * D512_SCHEDULE_KEYS;
 const D512_MMA_SPAN_LADDER: &[u32] =
@@ -163,6 +246,26 @@ pub(crate) fn ffn_sidecar_min_tokens() -> u32 {
 #[must_use]
 pub(crate) fn q8_tm_silu_pair_enabled() -> bool {
     unsafe { imparo_cuda_knob(SLOT_MMQ_Q8_TM_SILU_PAIR) != 0 }
+}
+
+#[must_use]
+pub(crate) fn q8_canonical_gate_up_pair_enabled() -> bool {
+    unsafe {
+        matches!(
+            imparo_cuda_knob(SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR),
+            1 | 2 | 3 | 4
+        )
+    }
+}
+
+#[must_use]
+pub(crate) fn q8_canonical_sidecar_enabled() -> bool {
+    unsafe {
+        matches!(
+            imparo_cuda_knob(SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR),
+            2 | 3 | 4
+        )
+    }
 }
 
 #[must_use]
@@ -205,7 +308,12 @@ pub(crate) fn prefill_down_q4_layer_mask() -> u32 {
 }
 
 #[must_use]
-pub(crate) fn row_local_prefill_tail_rows() -> u32 {
+pub(crate) fn row_local_prefill_tail_rows(n_tok: u32) -> u32 {
+    let max_tokens =
+        unsafe { imparo_cuda_knob(SLOT_ROW_LOCAL_PREFILL_TAIL_MAX_TOKENS) };
+    if max_tokens == 0 || n_tok > max_tokens {
+        return 64;
+    }
     match unsafe { imparo_cuda_knob(SLOT_ROW_LOCAL_PREFILL_TAIL_ROWS) } {
         1 | 4 | 8 | 16 | 32 | 64 => unsafe {
             imparo_cuda_knob(SLOT_ROW_LOCAL_PREFILL_TAIL_ROWS)
@@ -491,7 +599,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
     value_knob!(
         "attn_d256_vec",
         SLOT_ATTN_D256_VEC,
-        &[0, 1],
+        D256_VEC_MODES,
         false,
         Wl::AttentionDecodeDeep,
         bit_affecting = true,
@@ -518,7 +626,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
     value_knob!(
         "attn_d512_mma",
         SLOT_ATTN_D512_MMA,
-        &[0, 1],
+        D512_MMA_MODES,
         false,
         Wl::AttentionDecodeDeep,
         bit_affecting = true,
@@ -553,7 +661,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
     value_knob!(
         "attn_d64_mma_prefill",
         SLOT_ATTN_D64_MMA_PREFILL,
-        &[0, 1],
+        D64_ATTENTION_MODES,
         false,
         Wl::AttentionPrefillDeep,
         bit_affecting = true,
@@ -766,7 +874,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
     value_knob!(
         "mmq_q8_aligned_whole_k",
         SLOT_MMQ_Q8_ALIGNED_WHOLE_K,
-        &[0, 1],
+        &[0, 1, 2],
         false,
         Wl::PrefillGemm,
         bit_affecting = false,
@@ -960,10 +1068,15 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         candidates: None,
         after: &["mmq_q8_aligned_whole_k"],
         cross_check: None,
-        applies: Some(|m| m.n_embd % 32 == 0 && m.weight_kinds & (1 << 3) != 0),
+        // Both canonical Q8_0 (kind 2) and device-repacked Q8_0_TM (kind 3)
+        // consume the same D4 activation producer. Keep selection external and
+        // receipted: applicability only exposes the candidate to the tuner.
+        applies: Some(|m| {
+            m.n_embd % 32 == 0 && m.weight_kinds & ((1 << 2) | (1 << 3)) != 0
+        }),
         tuple: None,
         category: KnobCategory::EndToEnd,
-        values: &[0, 1, 2],
+        values: &[0, 1, 2, 3],
         apply: slot!(SLOT_PREFILL_PROJECTION_Q8_D4).0,
         current: slot!(SLOT_PREFILL_PROJECTION_Q8_D4).1,
         screened: false,
@@ -993,7 +1106,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
     KnobDecl {
         name: "row_local_prefill_tail_rows",
         legal: None,
-        bit_affecting: false,
+        bit_affecting: true,
         derive: None,
         candidates: None,
         after: &[],
@@ -1002,15 +1115,42 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
             m.n_experts == 0
                 && m.n_embd % 128 == 0
                 && m.n_ff % 256 == 0
-                && m.weight_kinds & (1 << 3) != 0
+                && m.weight_kinds & ((1 << 2) | (1 << 3)) != 0
         }),
-        tuple: None,
+        tuple: Some("row_local_prefill_tail"),
         category: KnobCategory::Benched,
         values: &[0, 1, 4, 8, 16, 32, 64],
         apply: slot!(SLOT_ROW_LOCAL_PREFILL_TAIL_ROWS).0,
         current: slot!(SLOT_ROW_LOCAL_PREFILL_TAIL_ROWS).1,
         screened: false,
         sweep: Sw::Values,
+        workload: Wl::PrefillFfnTransaction,
+    },
+    KnobDecl {
+        name: "row_local_prefill_tail_max_tokens",
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &["row_local_prefill_tail_rows"],
+        cross_check: None,
+        applies: Some(|m| {
+            m.n_experts == 0
+                && m.n_embd % 128 == 0
+                && m.n_ff % 256 == 0
+                && m.weight_kinds & ((1 << 2) | (1 << 3)) != 0
+        }),
+        tuple: Some("row_local_prefill_tail"),
+        category: KnobCategory::EndToEnd,
+        values: &[],
+        apply: slot!(SLOT_ROW_LOCAL_PREFILL_TAIL_MAX_TOKENS).0,
+        current: slot!(SLOT_ROW_LOCAL_PREFILL_TAIL_MAX_TOKENS).1,
+        screened: false,
+        sweep: Sw::TokenMaxCrossing {
+            ladder: ROW_LOCAL_TAIL_TOKEN_LADDER,
+            hi: 512,
+            lo: 0,
+        },
         workload: Wl::PrefillFfnTransaction,
     },
     KnobDecl {
@@ -1030,6 +1170,167 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         screened: false,
         sweep: Sw::External,
         workload: Wl::AttentionPrefill,
+    },
+    KnobDecl {
+        name: "direct_q8_kv_prepare_min_tokens",
+        legal: None,
+        // The candidate is admitted only after byte-identical Q8 cache and
+        // model-output evidence. The threshold is still kept external because
+        // its value must be selected on the complete attention transaction.
+        bit_affecting: false,
+        derive: None,
+        candidates: None,
+        after: &["prefill_head_post_threads"],
+        cross_check: None,
+        applies: Some(|m| m.head_dim == 64),
+        tuple: None,
+        category: KnobCategory::EndToEnd,
+        values: &[0, 128, 256, 512],
+        apply: slot!(SLOT_DIRECT_Q8_KV_PREPARE_MIN_TOKENS).0,
+        current: slot!(SLOT_DIRECT_Q8_KV_PREPARE_MIN_TOKENS).1,
+        screened: false,
+        sweep: Sw::External,
+        workload: Wl::AttentionPrefill,
+    },
+    KnobDecl {
+        name: "mmq_q8_canonical_gate_up_pair",
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &["mmq_q8_aligned_whole_k"],
+        cross_check: None,
+        applies: Some(|m| {
+            m.n_experts == 0
+                && m.n_embd % 256 == 0
+                && m.n_ff % 128 == 0
+                && m.weight_kinds & (1 << 2) != 0
+        }),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[0, 1, 2, 3, 4],
+        apply: slot!(SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR).0,
+        current: slot!(SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR).1,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::PrefillFfnTransaction,
+    },
+    KnobDecl {
+        name: "mmq_q8_canonical_load_lanes",
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &["mmq_q8_canonical_gate_up_pair"],
+        cross_check: None,
+        applies: Some(|m| {
+            m.n_experts == 0
+                && m.n_embd % 256 == 0
+                && m.n_ff % 128 == 0
+                && m.weight_kinds & (1 << 2) != 0
+        }),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[0, 2, 4, 8],
+        apply: slot!(SLOT_MMQ_Q8_CANONICAL_LOAD_LANES).0,
+        current: slot!(SLOT_MMQ_Q8_CANONICAL_LOAD_LANES).1,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::PrefillFfnTransaction,
+    },
+    KnobDecl {
+        name: "mmq_q8_canonical_down_large_min_tokens",
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &["mmq_q8_canonical_load_lanes"],
+        cross_check: None,
+        applies: Some(|m| {
+            m.n_experts == 0
+                && m.n_embd % 256 == 0
+                && m.n_ff % 256 == 0
+                && m.weight_kinds & (1 << 2) != 0
+        }),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: slot!(SLOT_MMQ_Q8_CANONICAL_DOWN_LARGE_MIN_TOKENS).0,
+        current: slot!(SLOT_MMQ_Q8_CANONICAL_DOWN_LARGE_MIN_TOKENS).1,
+        screened: false,
+        sweep: Sw::TokenMinCrossing {
+            ladder: CANONICAL_DOWN_TOKEN_LADDER,
+            hi: 9,
+            lo: 0,
+        },
+        workload: Wl::PrefillFfnTransaction,
+    },
+    KnobDecl {
+        name: "mmq_q8_canonical_down_small_max_tokens",
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &["mmq_q8_canonical_down_large_min_tokens"],
+        cross_check: None,
+        applies: Some(|m| {
+            m.n_experts == 0
+                && m.n_embd % 256 == 0
+                && m.n_ff % 256 == 0
+                && m.weight_kinds & (1 << 2) != 0
+        }),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: slot!(SLOT_MMQ_Q8_CANONICAL_DOWN_SMALL_MAX_TOKENS).0,
+        current: slot!(SLOT_MMQ_Q8_CANONICAL_DOWN_SMALL_MAX_TOKENS).1,
+        screened: false,
+        sweep: Sw::TokenMaxCrossing {
+            ladder: CANONICAL_DOWN_TOKEN_LADDER,
+            hi: 512,
+            lo: 0,
+        },
+        workload: Wl::PrefillFfnTransaction,
+    },
+    KnobDecl {
+        name: PREFILL_BCX_SHORTCONV_READY_KNOB,
+        legal: None,
+        bit_affecting: false,
+        derive: None,
+        candidates: None,
+        after: &["prefill_projection_q8_d4"],
+        cross_check: None,
+        // Native capability checks the recurrent operation and exact supported shape.
+        // Only whole-model route/state evidence may admit this external candidate.
+        applies: Some(|m| m.n_embd == 2048 && m.weight_kinds & (1 << 2) != 0),
+        tuple: None,
+        category: KnobCategory::EndToEnd,
+        values: &[0, 1],
+        apply: apply_prefill_bcx_shortconv_ready,
+        current: prefill_bcx_shortconv_ready_value,
+        screened: false,
+        sweep: Sw::External,
+        workload: Wl::PrefillFfnTransaction,
+    },
+    KnobDecl {
+        name: FINITE_HISTORY_KNOB,
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &[],
+        cross_check: None,
+        // Model workflow proves finite-history applicability. This external
+        // candidate must additionally pass the dedicated state/route-hit gate.
+        applies: None,
+        tuple: None,
+        category: KnobCategory::EndToEnd,
+        values: &[0, 64],
+        apply: apply_finite_history_rows,
+        current: finite_history_rows_value,
+        screened: false,
+        sweep: Sw::External,
+        workload: Wl::PrefillFfnTransaction,
     },
 ];
 impl BackendKnobs for crate::CudaBackend {
@@ -1114,6 +1415,24 @@ impl BackendKnobs for crate::CudaBackend {
     /// Version 45 adds a receipt-bound per-layer map for admission-time Q8-TileMajor
     /// to Q4 Down shadows. Zero keeps every Prefill projection on its original Q8
     /// route; accepted maps are tied to the complete model.forward gate.
+    /// Version 50 adds a default-off canonical Q8 Gate/Up/SiLU pair. Its complete
+    /// FFN transaction is measured using model-derived weights and activation;
+    /// previous configuration receipts cannot authorize this additional choice.
+    /// Version 51 adds value 2: cooperative canonical weight loads with direct
+    /// D4 output to Down. Value 1 keeps the dense paired incumbent; zero is safe.
+    // Version 52 adds two default-off transaction-measured canonical Down bounds.
+    /// Version 56 adds value 2 to aligned whole-K Q8: canonical R128/T128 with
+    /// four cooperative halfword load lanes. Values 0/1 keep their prior meaning.
+    /// Version 59 retires the rejected canonical Stage-4 runtime threshold and
+    /// assigns its slot to the Gate/Up cooperative-load lane count. Zero retains
+    /// the established eight-lane loader; 2/4/8 are explicit tuner candidates.
+    /// Version 60 adds the exact 256-thread x2 Add/RMS/D4 projection schedule.
+    /// Version 61 adds canonical transaction mode 3, which retains the D4 sidecar
+    /// producer and assigns its Down projection to the exact 16-warp schedule.
+    /// Version 62 adds mode 4, which also splits each Gate/Up projection's T128
+    /// tile across two warps while preserving the canonical arithmetic order.
+    /// Version 64 adds the default-off, externally admitted Prefill BCX/ShortConv
+    /// ready-task capability while retaining all native knob slots and D4 modes.
     fn space_version(&self) -> u32 {
         CUDA_SPACE_VERSION
     }
@@ -1176,21 +1495,45 @@ mod tests {
         SLOT_PREFILL_PROJECTION_Q8_D4,
         SLOT_PREFILL_DOWN_Q4_LAYER_MASK,
         SLOT_ROW_LOCAL_PREFILL_TAIL_ROWS,
+        SLOT_ROW_LOCAL_PREFILL_TAIL_MAX_TOKENS,
         SLOT_PREFILL_HEAD_POST_THREADS,
+        SLOT_DIRECT_Q8_KV_PREPARE_MIN_TOKENS,
+        SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR,
+        SLOT_MMQ_Q8_CANONICAL_LOAD_LANES,
+        SLOT_MMQ_Q8_CANONICAL_DOWN_LARGE_MIN_TOKENS,
+        SLOT_MMQ_Q8_CANONICAL_DOWN_SMALL_MAX_TOKENS,
     ];
 
     #[test]
+    fn workflow_parameter_has_no_native_slot_and_requires_whole_model_admission() {
+        let d = CUDA_KNOBS
+            .iter()
+            .find(|d| d.name == FINITE_HISTORY_KNOB)
+            .unwrap();
+        assert_eq!(slot_for_name(d.name), None);
+        assert_eq!(d.values, &[0, 64]);
+        assert!(d.bit_affecting);
+        assert_eq!(d.category, KnobCategory::EndToEnd);
+        assert_eq!(d.sweep, Sw::External);
+        assert!(d.derive.is_none() && d.candidates.is_none());
+    }
+
+    #[test]
     fn registry_covers_each_consumed_slot_once() {
-        assert_eq!(CUDA_KNOBS.len(), CONSUMED_SLOTS.len());
-        for (decl, slot) in CUDA_KNOBS.iter().zip(CONSUMED_SLOTS) {
+        let native: Vec<_> = CUDA_KNOBS
+            .iter()
+            .filter(|d| !is_workflow_knob(d.name))
+            .collect();
+        assert_eq!(native.len(), CONSUMED_SLOTS.len());
+        for (decl, slot) in native.iter().zip(CONSUMED_SLOTS) {
             assert_eq!(slot_for_name(decl.name), Some(*slot), "{}", decl.name);
         }
         assert_eq!(
             CONSUMED_SLOTS.iter().copied().collect::<HashSet<_>>().len(),
             CONSUMED_SLOTS.len()
         );
-        assert!(!CONSUMED_SLOTS.contains(&9));
-        assert!(!CONSUMED_SLOTS.contains(&10));
+        assert!(CONSUMED_SLOTS.contains(&9));
+        assert!(CONSUMED_SLOTS.contains(&10));
         assert_eq!(
             CUDA_KNOBS
                 .iter()
@@ -1238,8 +1581,112 @@ mod tests {
     }
 
     #[test]
+    fn every_registry_dependency_precedes_its_consumer() {
+        for (i, decl) in CUDA_KNOBS.iter().enumerate() {
+            for dependency in decl.after {
+                let position = CUDA_KNOBS
+                    .iter()
+                    .position(|other| other.name == *dependency);
+                assert!(
+                    position.is_some_and(|j| j < i),
+                    "{} dependency {} is absent or declared too late",
+                    decl.name,
+                    dependency
+                );
+            }
+        }
+        assert_eq!(
+            slot_for_name("direct_q8_kv_prepare_min_tokens"),
+            Some(SLOT_DIRECT_Q8_KV_PREPARE_MIN_TOKENS)
+        );
+    }
+
+    #[test]
+    fn fa2_mode_uses_existing_slot_and_is_absent_without_provider() {
+        let decl = CUDA_KNOBS
+            .iter()
+            .find(|k| k.name == D64_ATTENTION_KNOB)
+            .unwrap();
+        assert_eq!(slot_for_name(decl.name), Some(37));
+        assert!(decl.bit_affecting);
+        assert_eq!(&decl.values[..2], &[0, 1]);
+        assert_eq!(
+            decl.values.contains(&D64_FA2_MODE),
+            cfg!(feature = "cuda-speculative")
+        );
+    }
+
+    #[test]
     fn registry_bump_invalidates_pre_boundary_cuda_configs() {
-        assert_eq!(CUDA_SPACE_VERSION, 49);
+        assert_eq!(CUDA_SPACE_VERSION, 68);
+    }
+
+    #[test]
+    fn canonical_gate_up_pair_is_measured_and_receipt_bound() {
+        let decl = CUDA_KNOBS
+            .iter()
+            .find(|decl| decl.name == "mmq_q8_canonical_gate_up_pair")
+            .unwrap();
+        assert_eq!(slot_for_name(decl.name), Some(60));
+        assert!(decl.bit_affecting);
+        assert_eq!(decl.values, &[0, 1, 2, 3, 4]);
+        assert_eq!(decl.after, &["mmq_q8_aligned_whole_k"]);
+        assert_eq!(decl.workload, Wl::PrefillFfnTransaction);
+        assert_eq!(decl.sweep, Sw::Values);
+        assert_eq!((decl.current)(), 0);
+        let native = include_str!("../native/imparo_cuda.cu");
+        assert!(native.contains("g.knobs[60] = 0;"));
+        assert!(
+            native.contains("const bool canonical_pair_tuned = tuner_knob(60) >= 1 && tuner_knob(60) <= 4;")
+        );
+        assert!(native.contains("canonical Gate/Up candidate did not dispatch"));
+    }
+
+    #[test]
+    fn canonical_load_lanes_are_measured_and_default_to_incumbent() {
+        let decl = CUDA_KNOBS
+            .iter()
+            .find(|decl| decl.name == "mmq_q8_canonical_load_lanes")
+            .unwrap();
+        assert_eq!(slot_for_name(decl.name), Some(63));
+        assert!(decl.bit_affecting);
+        assert_eq!(decl.after, &["mmq_q8_canonical_gate_up_pair"]);
+        assert_eq!(decl.workload, Wl::PrefillFfnTransaction);
+        assert_eq!((decl.current)(), 0);
+        assert_eq!(decl.values, &[0, 2, 4, 8]);
+        assert_eq!(decl.sweep, Sw::Values);
+        let native = include_str!("../native/imparo_cuda.cu");
+        assert!(native.contains("g.knobs[63] = 0;"));
+        assert!(
+            native.contains("const uint32_t canonical_load_lanes = tuner_knob(63);")
+        );
+        assert!(native.contains("Sidecar::fused<true,2>"));
+    }
+
+    #[test]
+    fn canonical_down_bounds_measure_complete_ffn_and_default_off() {
+        for (name, slot, small) in [
+            ("mmq_q8_canonical_down_large_min_tokens", 61, false),
+            ("mmq_q8_canonical_down_small_max_tokens", 62, true),
+        ] {
+            let d = CUDA_KNOBS.iter().find(|d| d.name == name).unwrap();
+            assert_eq!(slot_for_name(name), Some(slot));
+            assert!(d.bit_affecting);
+            assert_eq!((d.current)(), 0);
+            assert_eq!(d.workload, Wl::PrefillFfnTransaction);
+            assert_eq!(d.category, KnobCategory::Benched);
+            match d.sweep {
+                Sw::TokenMinCrossing { ladder, hi, lo } => {
+                    assert!(!small);
+                    assert_eq!((ladder, hi, lo), (CANONICAL_DOWN_TOKEN_LADDER, 9, 0));
+                }
+                Sw::TokenMaxCrossing { ladder, hi, lo } => {
+                    assert!(small);
+                    assert_eq!((ladder, hi, lo), (CANONICAL_DOWN_TOKEN_LADDER, 512, 0));
+                }
+                _ => panic!("Down must use a transaction-aware threshold"),
+            }
+        }
     }
 
     #[test]
@@ -1289,9 +1736,43 @@ mod tests {
         assert!(decl.bit_affecting);
         assert_eq!(decl.category, KnobCategory::EndToEnd);
         assert_eq!(decl.sweep, Sw::External);
-        assert_eq!(decl.values, &[0, 1, 2]);
+        assert_eq!(decl.values, &[0, 1, 2, 3]);
         assert_eq!(slot_for_name(decl.name), Some(56));
         assert_eq!((decl.current)(), 0);
+
+        let applies = decl
+            .applies
+            .expect("canonical and tile-major Q8 producer predicate");
+        let mut facts = imparo_backend::ModelFacts {
+            n_embd: 2560,
+            n_ff: 10240,
+            n_head: 32,
+            n_kv: 8,
+            head_dim: 64,
+            deep_head_dim: 64,
+            n_experts: 0,
+            n_layers: 30,
+            layer_dispatches: 30,
+            weight_kinds: 1 << 2,
+            mega_seat: imparo_backend::MegaSeat::None,
+        };
+        assert!(
+            applies(&facts),
+            "canonical Q8_0 must expose the D4 candidate"
+        );
+        facts.weight_kinds = 1 << 3;
+        assert!(applies(&facts), "tile-major Q8_0 must retain the candidate");
+        facts.weight_kinds = 1 << 1;
+        assert!(
+            !applies(&facts),
+            "unrelated quant types must remain excluded"
+        );
+        facts.weight_kinds = 1 << 2;
+        facts.n_embd = 2559;
+        assert!(
+            !applies(&facts),
+            "the D4 alignment contract remains mandatory"
+        );
     }
 
     #[test]
@@ -1320,15 +1801,31 @@ mod tests {
             .iter()
             .find(|decl| decl.name == "row_local_prefill_tail_rows")
             .expect("row-local Prefill tail registry entry");
-        assert!(!decl.bit_affecting);
+        assert!(decl.bit_affecting);
         assert_eq!(decl.category, KnobCategory::Benched);
         assert_eq!(decl.values, &[0, 1, 4, 8, 16, 32, 64]);
         assert_eq!(slot_for_name(decl.name), Some(58));
         assert_eq!((decl.current)(), 0);
-        assert_eq!(row_local_prefill_tail_rows(), 64);
+        assert_eq!(row_local_prefill_tail_rows(128), 64);
+
+        let max = CUDA_KNOBS
+            .iter()
+            .find(|decl| decl.name == "row_local_prefill_tail_max_tokens")
+            .expect("row-local Prefill tail threshold entry");
+        assert_eq!(slot_for_name(max.name), Some(10));
+        assert!(max.bit_affecting);
+        assert_eq!(max.after, &["row_local_prefill_tail_rows"]);
+        assert_eq!(max.tuple, Some("row_local_prefill_tail"));
+        assert_eq!(max.category, KnobCategory::EndToEnd);
+        assert!(matches!(
+            max.sweep,
+            Sw::TokenMaxCrossing { hi: 512, lo: 0, .. }
+        ));
+        assert_eq!((max.current)(), 0);
 
         let native = include_str!("../native/imparo_cuda.cu");
         assert!(native.contains("g.knobs[58] = 0;"));
+        assert!(native.contains("g.knobs[10] = 0;"));
     }
 
     #[test]
@@ -1379,7 +1876,7 @@ mod tests {
             native.contains("const bool specialized_decode = tuner_knob(36) != 0;")
         );
         assert_eq!(native.matches("specialized_decode &&").count(), 4);
-        assert!(native.contains("(!g.forward_decode || specialized_decode)"));
+        assert!(native.contains("(!execution().forward_decode || specialized_decode)"));
         assert!(native.contains("start_pos % selected_d512_query_tokens == 0"));
     }
 
@@ -1410,6 +1907,7 @@ mod tests {
         assert_eq!(decl.workload, Wl::AttentionDecodeDeep);
         let applies = decl.applies.expect("D64 Q8 vector shape predicate");
         assert!(applies(&imparo_backend::ModelFacts {
+            mega_seat: imparo_backend::MegaSeat::None,
             n_embd: 0,
             n_ff: 0,
             n_head: 32,
@@ -1422,6 +1920,7 @@ mod tests {
             weight_kinds: 0,
         }));
         assert!(!applies(&imparo_backend::ModelFacts {
+            mega_seat: imparo_backend::MegaSeat::None,
             n_embd: 0,
             n_ff: 0,
             n_head: 32,
@@ -1449,6 +1948,7 @@ mod tests {
 
         let applies = decl.applies.expect("D64 Q8 GQA4 shape predicate");
         let facts = imparo_backend::ModelFacts {
+            mega_seat: imparo_backend::MegaSeat::None,
             n_embd: 0,
             n_ff: 0,
             n_head: 32,
@@ -1486,6 +1986,7 @@ mod tests {
 
         let applies = decl.applies.expect("dense Q8_0_TM Decode FFN predicate");
         let mut facts = imparo_backend::ModelFacts {
+            mega_seat: imparo_backend::MegaSeat::None,
             n_embd: 2048,
             n_ff: 10752,
             n_head: 32,
@@ -1522,11 +2023,12 @@ mod tests {
             .find(|decl| decl.name == "mmq_q8_aligned_whole_k")
             .expect("aligned whole-K Q8 MMQ registry entry");
         assert!(!decl.bit_affecting);
-        assert_eq!(decl.values, &[0, 1]);
+        assert_eq!(decl.values, &[0, 1, 2]);
         assert_eq!(decl.workload, Wl::PrefillGemm);
         assert_eq!(decl.tuple, None);
         let applies = decl.applies.expect("Q8 weight-kind predicate");
         let mut facts = imparo_backend::ModelFacts {
+            mega_seat: imparo_backend::MegaSeat::None,
             n_embd: 2048,
             n_ff: 10752,
             n_head: 32,
@@ -1545,6 +2047,8 @@ mod tests {
         let native = include_str!("../native/imparo_cuda.cu");
         assert!(native.contains("g.knobs[42] = 0;"));
         assert!(native.contains("tuner_knob(42) != 0"));
+        assert!(native.contains("const bool canonical_cooperative_h16 = wkind == 2"));
+        assert!(native.contains("false, 0, false, 8, 4, 128, 128, true"));
         assert!(native.contains("launch_aligned_whole_k("));
     }
 
@@ -1587,6 +2091,7 @@ mod tests {
 
         let applies = decl.applies.expect("dense Q8_0_TM FFN predicate");
         let mut facts = imparo_backend::ModelFacts {
+            mega_seat: imparo_backend::MegaSeat::None,
             n_embd: 2048,
             n_ff: 10752,
             n_head: 32,
@@ -1664,6 +2169,7 @@ mod tests {
 
         let applies = decl.applies.expect("dense Q8_0_TM FFN predicate");
         let mut facts = imparo_backend::ModelFacts {
+            mega_seat: imparo_backend::MegaSeat::None,
             n_embd: 2048,
             n_ff: 10752,
             n_head: 32,

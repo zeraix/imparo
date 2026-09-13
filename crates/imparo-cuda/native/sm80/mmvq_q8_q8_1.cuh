@@ -216,6 +216,24 @@ __global__ void q8_0_tm_q8_1_single(
     }
 }
 
+#if defined(IMPARO_CUDA_SPECULATIVE)
+// K<=256: the incumbent has useful work only in warp0. Pack4 independent
+// rows into one CTA while retaining its Q32 dot and XOR reduction order.
+__global__ void q8_0_q8_1_short_k(const uint8_t*w,const BlockQ8_1*x,float*y,
+ uint32_t n_in,uint32_t n_out,uint32_t out_stride,uint32_t row_base) {
+ const unsigned lane=threadIdx.x,row=blockIdx.x*4+threadIdx.y,blocks=n_in/32;
+ float partial=0.0f;
+ const unsigned block=lane/4,iqs=2*(lane&3);
+ if(row<n_out && block<blocks) {
+  const uint8_t*q=w+(uint64_t(row)*blocks+block)*34;
+  partial+=dot_q8_0_q8_1_half(q+2,*reinterpret_cast<const __half*>(q),x+block,iqs);
+ }
+ partial=__fadd_rn(partial,0.0f);partial=__fadd_rn(partial,0.0f);partial=__fadd_rn(partial,0.0f);
+ const float sum=warp_sum_xor(partial);
+ if(lane==0&&row<n_out)y[row_base+row]=sum;
+}
+#endif
+
 template <uint32_t NCols, uint32_t NWarps, uint32_t NRows, bool TileMajor>
 inline void launch_shape(const uint8_t * w, const BlockQ8_1 * x, float * y,
                          uint32_t n_in, uint32_t n_out,
@@ -247,6 +265,21 @@ inline void launch(const uint8_t * w, const BlockQ8_1 * x, float * y,
                    uint32_t n_in, uint32_t n_out, uint32_t n_tok,
                    uint32_t out_stride, uint32_t row_base,
                    cudaStream_t stream) {
+#if defined(IMPARO_CUDA_SPECULATIVE)
+    const char * short_k = std::getenv("IMPARO_LAB_Q8_SHORT_K_ROWS");
+    if (n_tok == 1 && n_in == 256 && n_out != 0
+            && short_k && short_k[0] == '1' && short_k[1] == '\0') {
+        q8_0_q8_1_short_k<<<(n_out + 3) / 4, dim3(32, 4), 0, stream>>>(
+            w, x, y, n_in, n_out, out_stride, row_base);
+        static bool traced = false;
+        const char * trace = std::getenv("IMPARO_Q8_SHORT_K_TRACE");
+        if (!traced && trace && trace[0] == '1') {
+            std::fprintf(stderr, "[q8-short-k] in=%u out=%u rows_per_cta=4\n", n_in, n_out);
+            traced = true;
+        }
+        return;
+    }
+#endif
     launch_layout<false>(w, x, y, n_in, n_out, n_tok,
                          out_stride, row_base, stream);
 }

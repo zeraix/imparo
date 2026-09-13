@@ -520,7 +520,9 @@ impl Backend for CpuBackend {
         let mut state = c.buf(op.state)[so..so + shape.state_elems()].to_vec();
         let v_width = shape.v_heads * shape.value_dim;
         let mut out = vec![0.0_f32; n * v_width];
-        ops::delta_net(&qkv, &log_decay, &beta, &mut state, &mut out, shape, n, op.eps);
+        ops::delta_net(
+            &qkv, &log_decay, &beta, &mut state, &mut out, shape, n, op.eps,
+        );
         let so_out = op.state_out_off as usize;
         c.buf(op.state)[so_out..so_out + state.len()].copy_from_slice(&state);
         let d = c.buf(op.out);

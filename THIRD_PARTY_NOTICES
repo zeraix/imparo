@@ -21,3 +21,18 @@ CUDA toolkit, driver, and LLVM-related components have their own licenses and
 redistribution terms. A release requires human review of exact artifacts, SBOM,
 provenance, and applicable terms before publication. This notice records the
 engineering boundary; it is not legal approval or a grant of third-party rights.
+
+FlashInfer attention header subset
+---------------------------------
+
+Project: FlashInfer (https://github.com/flashinfer-ai/flashinfer)
+Source: 0.6.16.post3 installed headers, as recorded in
+crates/imparo-cuda/native/sm80/d64_fa2/vendor-provenance.json.
+Most copied headers are Apache-2.0; fp16.h is MIT and retains the Marat Dukhan
+and Advanced Micro Devices copyright notices. The copied subset, its original
+notices and compatibility-change provenance remain together under d64_fa2/.
+Apache LICENSE, upstream NOTICE and MIT permission terms are retained under
+d64_fa2/vendor/flashinfer/ and d64_fa2/vendor/flashinfer/licenses/.
+The notice source is fixed FlashInfer v0.6.16 commit
+8da13a29c85f7e5b1c81878d933f84ae9fc4afa9; this does not relabel installed
+.post3 headers as byte-identical to that source tag.

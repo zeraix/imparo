@@ -6,6 +6,9 @@
         return;
     }
 
+#if defined(IMPARO_D512_PACKED_PIPELINE)
+    if (window || ring || (kv_width/32*18)%16) return;
+#endif
     const uint32_t warp = threadIdx.x >> 5;
     const uint32_t lane = threadIdx.x & 31;
     const uint32_t query_pair = lane & 3;
@@ -14,13 +17,21 @@
 
     // Q_B is 8 query columns x 16 dimensions in shared-memory row-major
     // storage; load_b8x8 interprets it as the column-major MMA B operand.
+#if defined(IMPARO_D512_PACKED_PIPELINE)
+    __shared__ __align__(16) uint8_t packed_k[2][kWarps][16*288];
+    __shared__ __align__(16) uint8_t packed_v[2][kWarps][16*288];
+#endif
     __shared__ __align__(16) __half2 q_tile[kWarps][8 * 8];
     __shared__ __align__(16) __half2 k_tile[kWarps][16 * 8];
     __shared__ __align__(16) __half2 value_tile[kWarps][16 * 8];
 #if defined(IMPARO_D512_PAGED)
     __shared__ uint32_t physical_keys[kWarps][kKeysPerWarp];
 #endif
+#if defined(IMPARO_D512_PV_F32)
+    __shared__ __align__(16) float result_tile[kWarps][kColumns * 16];
+#else
     __shared__ __align__(16) __half result_tile[kWarps][kColumns * 16];
+#endif
     __shared__ float partition_max[kWarps][kColumns];
     __shared__ float partition_sum[kWarps][kColumns];
     __shared__ float partition_scale[kWarps][kColumns];
@@ -39,6 +50,9 @@
         }
         const uint32_t kvh = logical_tile;
 
+#if defined(IMPARO_D512_PV_F32)
+        KqC16x8 numerator[kOutputTiles]{};
+#else
         PvC16x4 numerator[kOutputTiles];
 #pragma unroll
         for (uint32_t output_tile = 0;
@@ -46,10 +60,22 @@
             numerator[output_tile].x[0] = __float2half2_rn(0.0f);
             numerator[output_tile].x[1] = __float2half2_rn(0.0f);
         }
+#endif
         float running_max[2] = {kInitialMax, kInitialMax};
         float running_sum[2] = {0.0f, 0.0f};
 
+#if defined(IMPARO_D512_PACKED_PIPELINE)
+        if (group_begin < group_end)
+            prefetch_packed_tile(kc,vc,packed_k[0][warp],packed_v[0][warp],group_begin,warp,lane,kvh,kv_width,valid_span);
+#endif
         for (uint32_t group = group_begin; group < group_end; ++group) {
+#if defined(IMPARO_D512_PACKED_PIPELINE)
+            const unsigned stage = (group-group_begin)&1u;
+            asm volatile("cp.async.wait_group 0;");
+            __syncwarp();
+            if (group+1 < group_end)
+                prefetch_packed_tile(kc,vc,packed_k[stage^1][warp],packed_v[stage^1][warp],group+1,warp,lane,kvh,kv_width,valid_span);
+#endif
 #if defined(IMPARO_D512_PAGED)
             if (lane < kKeysPerWarp) {
                 const uint32_t logical = group * kKeyBatch
@@ -88,8 +114,13 @@
 #else
                             key;
 #endif
+#if defined(IMPARO_D512_PACKED_PIPELINE)
+                        value = load_q4_pair(packed_k[stage][warp],512,key_row,
+                            d0 + 2 * pair);
+#else
                         value = load_q4_pair(kc, kv_width, physical_key,
                             uint64_t(kvh) * kHeadDim + d0 + 2 * pair);
+#endif
 #else
                         value = *reinterpret_cast<const __half2 *>(kc
 #if defined(IMPARO_D512_PAGED)
@@ -161,10 +192,16 @@
 #pragma unroll
             for (uint32_t output_tile = 0;
                  output_tile < kOutputTiles; ++output_tile) {
+#if defined(IMPARO_D512_PV_F32)
+#pragma unroll
+                for (uint32_t l = 0; l < 4; ++l)
+                    numerator[output_tile].x[l] *= (l & 1) ? scale1 : scale0;
+#else
                 numerator[output_tile].x[0] = __hmul2(
                     numerator[output_tile].x[0], half_scale);
                 numerator[output_tile].x[1] = __hmul2(
                     numerator[output_tile].x[1], half_scale);
+#endif
             }
 
             const KqB8x8 probabilities = probability_b(scores);
@@ -185,9 +222,14 @@
 #else
                             key;
 #endif
+#if defined(IMPARO_D512_PACKED_PIPELINE)
+                        value = load_q4_pair(packed_v[stage][warp],512,key_row,
+                            output_tile * 16 + 2 * output_pair);
+#else
                         value = load_q4_pair(vc, kv_width, physical_key,
                             uint64_t(kvh) * kHeadDim
                                 + output_tile * 16 + 2 * output_pair);
+#endif
 #else
                         value = *reinterpret_cast<const __half2 *>(vc
 #if defined(IMPARO_D512_PAGED)
@@ -204,8 +246,12 @@
                 __syncwarp();
                 Half16x8 value_a;
                 load_half16x8_trans(value_a, value_tile[warp], 8, lane);
+#if defined(IMPARO_D512_PV_F32)
+                mma_kq_ncols8(numerator[output_tile], value_a, probabilities);
+#else
                 mma_vp_ncols8(
                     numerator[output_tile], value_a, probabilities);
+#endif
                 __syncwarp();
             }
         }
@@ -218,7 +264,7 @@
                     0xffffffffu, running_sum[index], offset);
             }
         }
-        if (lane < 4) {
+        if (lane < 2) {
             const uint32_t column0 = 2 * lane;
             partition_max[warp][column0] = running_max[0];
             partition_sum[warp][column0] = running_sum[0];
@@ -227,7 +273,7 @@
         }
         __syncthreads();
 
-        if (warp == 0 && lane < kColumns) {
+        if (warp == 0 && lane < kLiveColumns) {
             const float max0 = partition_max[0][lane];
             const float max1 = partition_max[1][lane];
             const float max_value = fmaxf(max0, max1);
@@ -248,32 +294,48 @@
 #pragma unroll
         for (uint32_t output_tile = 0;
              output_tile < kOutputTiles; ++output_tile) {
+#if defined(IMPARO_D512_PV_F32)
+#pragma unroll
+            for (uint32_t l = 0; l < 4; ++l) {
+                const uint32_t column = kq_column(lane, l);
+                if (column < kLiveColumns)
+                    result_tile[warp][column * 16 + kq_key_row(lane, l)] = numerator[output_tile].x[l];
+            }
+#else
             const uint32_t output_row0 = pv_output_row(lane, 0);
             const uint32_t output_row1 = pv_output_row(lane, 1);
             const uint32_t column0 = 2 * query_pair;
-            result_tile[warp][column0 * 16 + output_row0]
-                = __low2half(numerator[output_tile].x[0]);
-            result_tile[warp][(column0 + 1) * 16 + output_row0]
-                = __high2half(numerator[output_tile].x[0]);
-            result_tile[warp][column0 * 16 + output_row1]
-                = __low2half(numerator[output_tile].x[1]);
-            result_tile[warp][(column0 + 1) * 16 + output_row1]
-                = __high2half(numerator[output_tile].x[1]);
+            if (column0 < kLiveColumns) {
+                result_tile[warp][column0 * 16 + output_row0]
+                    = __low2half(numerator[output_tile].x[0]);
+                result_tile[warp][(column0 + 1) * 16 + output_row0]
+                    = __high2half(numerator[output_tile].x[0]);
+                result_tile[warp][column0 * 16 + output_row1]
+                    = __low2half(numerator[output_tile].x[1]);
+                result_tile[warp][(column0 + 1) * 16 + output_row1]
+                    = __high2half(numerator[output_tile].x[1]);
+            }
+#endif
             __syncthreads();
             if (warp == 0) {
-                for (uint32_t e = lane; e < kColumns * 16; e += 32) {
+                for (uint32_t e = lane; e < kLiveColumns * 16; e += 32) {
                     const uint32_t column = e >> 4;
                     const uint32_t output = output_tile * 16 + (e & 15);
+#if defined(IMPARO_D512_PV_F32)
+                    float value = fmaf(partition_scale[0][column], result_tile[0][e], 0.0f);
+                    value = fmaf(partition_scale[1][column], result_tile[1][e], value);
+#else
                     float value = fmaf(partition_scale[0][column],
                         __half2float(result_tile[0][e]), 0.0f);
                     value = fmaf(partition_scale[1][column],
                         __half2float(result_tile[1][e]), value);
+#endif
                     slot_base[uint64_t(column) * kHeadDim + output] = value;
                 }
             }
             __syncthreads();
         }
-        if (threadIdx.x < kColumns) {
+        if (threadIdx.x < kLiveColumns) {
             slot_base[kSlotNumeratorFloats + threadIdx.x]
                 = segment_max[threadIdx.x];
             slot_base[kSlotNumeratorFloats + kColumns + threadIdx.x]

@@ -259,7 +259,7 @@ mod mega_kernels {
             program.len()
         );
         o += "    constant MegaEntryG * prog   [[buffer(0)]],   // the layer's entry; the program form indexes it at runtime (task #153)\n    device atomic_uint * sync    [[buffer(1)]],   // word 4 the barrier counter, 13 exit, 15 error; the block's scratch from MEGA_SYNC_HDR\n    constant MegaToken & tok     [[buffer(2)]],\n    constant float * freqs       [[buffer(3)]],   // the model's rope factor table (a 1-float dummy when it has none)\n    threadgroup float4 * xn      [[threadgroup(0)]], // n_embd floats: the row every threadgroup forms\n    uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],\n    uint lane [[thread_index_in_simdgroup]], uint sgid [[simdgroup_index_in_threadgroup]],\n    uint nsg  [[simdgroups_per_threadgroup]])\n{\n";
-        o += "    threadgroup float partial[32];\n    const uint sub  = lane % LANES_PER_ROW;\n    const uint slot = lane / LANES_PER_ROW;\n    const uint sg_global = tgid * nsg + sgid;\n    const uint tcount    = nsg * 32u;\n    device atomic_uint * ctr  = sync + 4;\n    device atomic_uint * exitc = sync + 13;\n    device atomic_uint * err  = sync + 15;\n    threadgroup uint tg_err;\n    if (mega_enter(err, tok.entry_bytes, (uint)sizeof(MegaEntryG), &tg_err, tid)) { return; }\n    // The block's own scratch: attention partials live in the sync buffer, never in an activation\n    // buffer (the arena overlaps its groups, task #148), past MEGA_SYNC_HDR so no plain store\n    // shares a cache line with the barrier counters.\n    device float * apart = (device float *)(sync + MEGA_SYNC_HDR);\n    uint phase = 0u;\n    // The program form (task #153) walks tok.n_entries consecutive entries in this one dispatch,\n    // a grid barrier between them; the per-layer form is the loop at one entry, prog[0].\n    const uint n_entries = MEGA_PROGRAM ? max(tok.n_entries, 1u) : 1u;\n    for (uint ei = 0u; ei < n_entries; ++ei) {\n    constant MegaEntryG & ent = prog[MEGA_PROGRAM ? tok.entry_index + ei : 0u];\n    const uint dbg_seq = min(tok.dbg_seq + ei, 63u);\n";
+        o += "    threadgroup float partial[32];\n    const uint sub  = lane % LANES_PER_ROW;\n    const uint slot = lane / LANES_PER_ROW;\n    const uint sg_global = tgid * nsg + sgid;\n    const uint tcount    = nsg * 32u;\n    device atomic_uint * ctr  = sync + 4;\n    device atomic_uint * exitc = sync + 13;\n    device atomic_uint * err  = sync + 15;\n    threadgroup uint tg_err;\n    if (mega_enter(err, tok.entry_bytes, (uint)sizeof(MegaEntryG), &tg_err, tid)) { return; }\n    // The block's own scratch: attention partials live in the sync buffer, never in an activation\n    // buffer (the arena overlaps its groups, task #148), past MEGA_SYNC_HDR so no plain store\n    // shares a cache line with the barrier counters.\n    device float * apart = (device float *)(sync + MEGA_SYNC_HDR);\n    uint phase = 0u;\n    // THE ADMISSION PROBE (task #203). tok.probe != 0 means: arrive at ONE grid barrier with\n    // that many x1024 spins as the wait, then leave. No entry is read and nothing outside the\n    // sync words is written, so a grid this GPU will NOT hold resident costs one short cap and\n    // no state -- the failure this dispatch exists to provoke is the cheapest one in the engine.\n    // It must run on THIS pipeline: admission is this kernel's register footprint, and a trivial\n    // probe kernel admits about 2.7x more (handoff/mac-m4-mega-admission.md).\n    if (tok.probe != 0u) {\n        mega_step(ctr, phase, tok.n_tg, err, tid, tgid, tok.probe * 1024u);\n        mega_exit(ctr, exitc, tok.n_tg, tid);\n        return;\n    }\n    // The program form (task #153) walks tok.n_entries consecutive entries in this one dispatch,\n    // a grid barrier between them; the per-layer form is the loop at one entry, prog[0].\n    const uint n_entries = MEGA_PROGRAM ? max(tok.n_entries, 1u) : 1u;\n    for (uint ei = 0u; ei < n_entries; ++ei) {\n    constant MegaEntryG & ent = prog[MEGA_PROGRAM ? tok.entry_index + ei : 0u];\n    const uint dbg_seq = min(tok.dbg_seq + ei, 63u);\n";
         o += &format!(
             "    // An entry every threadgroup must read the same way: its n_tg is the dispatch's and its\n    // widths are non-zero (a zero row stride would loop forever). Otherwise report and leave.\n    if ({entry_check}) {{\n        mega_fail_entry(err, dbg_seq, tgid, tid);\n        return;\n    }}\n"
         );
@@ -313,17 +313,20 @@ mod mega_kernels {
                 .map(|x| (x.rows, x.call))
                 .collect()
         };
-        let most = progs.iter().map(|(_, p)| declared(p).len()).max().unwrap_or(0).max(1);
-        let mut o = String::from(
-            concat!(
+        let most = progs
+            .iter()
+            .map(|(_, p)| declared(p).len())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let mut o = String::from(concat!(
             "// Generated by build.rs from mega_program.rs -- do not edit.\n",
             "#pragma once\n#include <cstdint>\n",
             "// A phase that strides tile-major UNITS over the grid declares the entry word\n",
             "// holding its output row count. `out` receives one row count per such phase; the\n",
             "// caller turns rows into items and picks the grid so every phase's last wave is\n",
             "// nearly full. A program that declares nothing returns 0 and runs at its seat.\n",
-        )
-        );
+        ));
         o += &format!("constexpr uint32_t MEGA_GRID_ROWS_MAX = {most}u;\n");
         o += "static inline uint32_t mega_phase_rows(uint32_t arch, const uint32_t * u, uint32_t * out) {\n    uint32_t n = 0u;\n    switch (arch) {\n";
         for (i, (name, p)) in progs.iter().enumerate() {

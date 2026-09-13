@@ -306,7 +306,8 @@ LFM2's row 8 is not noise. Three repeats, spread under 0.4 ms: 8 rows takes 90.5
 where 12 takes 60.8 -- strictly less work, more time, which is a code path and not a
 machine. `use_gemm = n_tok > g_q8_gemv_max_tok` with the default 8 keeps a 8-row batch
 on the token tile. The knob is declared `Sw::Crossing`, so the tuner owns the fix once
-its crossing sweep is ported (task #5).
+its crossing sweep is ported (task #5). (Since 2026-09-11 the boundary is one row in every
+family and no longer a knob: docs/kv-identity-grid.md.)
 
 ## Unified KV pool (2026-08-22)
 
@@ -540,12 +541,13 @@ the rules for changing them -- are in docs/metal_kernel.md.
 
 ## Matmul routing
 
-One comparison chain in `matmat`; both boundaries are tuner-owned (hostconfig v11):
+One comparison chain in `matmat`. The GEMV/GEMM boundary is ONE ROW in every weight family
+and is not a knob (the KV identity rule, docs/kv-identity-grid.md); the narrow/wide tile
+boundary is tuner-owned:
 
 ```
 n_tok == 1                  -> GEMV                  (decode fast path; lanes/nr0 tuned)
-n_tok 2  .. gemv_max_tok    -> GEMV, multi-token     (measured 1 on M3 Pro: band empty)
-n_tok    .. nb8_max         -> nb8 narrow GEMM 64x8  (measured 47 on M3 Pro)
+n_tok 2  .. nb8_max         -> nb8 narrow GEMM 64x8  (measured 47 on M3 Pro)
 n_tok  > nb8_max            -> wide GEMM, 64-token tiles
                                + tail: floor-to-64 main pass, remainder 1..nb8_max
                                  through nb8 in the same encode (same k-order as the

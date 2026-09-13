@@ -41,7 +41,7 @@ fn step1_surface_is_optional_without_pretending_partial_support() {
 #[test]
 fn tuner_mode_is_fail_closed_and_graph_isolated() {
     assert!(BACKEND.contains("fn tuner_requires_device_timing(&self) -> bool"));
-    assert!(NATIVE.contains("!g.tuner_mode && g.decode_prepared"));
+    assert!(NATIVE.contains("!g.tuner_mode && execution().decode_prepared"));
     let setter = NATIVE
         .split("extern \"C\" int imparo_cuda_set_tuner_mode")
         .nth(1)
@@ -55,9 +55,9 @@ fn tuner_mode_is_fail_closed_and_graph_isolated() {
 #[test]
 fn step1_preserves_current_e4b_identity_and_dormant_program_pack() {
     let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
-    assert_eq!(catalog["backend_abi"].as_u64(), Some(26));
-    assert_eq!(imparo_cuda::CUDA_BACKEND_ABI, 26);
+    assert_eq!(catalog["backend_abi"].as_u64(), Some(34));
+    assert_eq!(imparo_cuda::CUDA_BACKEND_ABI, 34);
     #[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
-    assert_eq!(imparo_cuda::CudaBackend.space_version(), 34);
+    assert_eq!(imparo_cuda::CudaBackend.space_version(), 64);
     assert!(PROGRAM_PROFILE_IDENTITY.contains("identity_ready: false"));
 }

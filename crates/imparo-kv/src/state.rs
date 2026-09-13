@@ -185,7 +185,12 @@ pub struct KvState {
 /// `elems` is 0 for a model without one, and then this is empty and every path below is
 /// a no-op -- which is why gemma4 sees no change at all.
 #[must_use]
-pub fn capture_recurrent(be: &dyn Backend, elems: usize, from: BufId, off: u64) -> Vec<u8> {
+pub fn capture_recurrent(
+    be: &dyn Backend,
+    elems: usize,
+    from: BufId,
+    off: u64,
+) -> Vec<u8> {
     if elems == 0 {
         return Vec::new();
     }
@@ -226,6 +231,25 @@ pub fn restore_recurrent(
     Ok(())
 }
 
+// A canonical window is consecutive positions. Split only at a physical ring
+// wrap so backends can move a whole byte range instead of synchronizing each row.
+fn ring_runs(
+    base: usize,
+    positions: usize,
+    ring: usize,
+    mut copy: impl FnMut(usize, usize, usize),
+) {
+    debug_assert!(ring.is_power_of_two());
+    let mask = ring - 1;
+    let mut done = 0;
+    while done < positions {
+        let slot = (base + done) & mask;
+        let rows = (positions - done).min(ring - slot);
+        copy(done, slot, rows);
+        done += rows;
+    }
+}
+
 /// Captures canonical state at `boundary` (device idle; the caller aligned the
 /// boundary to the unit grid and its ring slack).
 #[must_use]
@@ -257,22 +281,20 @@ pub fn capture(
                 let n = boundary - base;
                 let mut k = vec![0u8; n * g.k_stride];
                 let mut v = vec![0u8; n * g.v_stride];
-                let mask = ring - 1;
-                for (i, p) in (base..boundary).enumerate() {
-                    let slot = p & mask;
+                ring_runs(base, n, ring, |i, slot, rows| {
                     be.read_kv_bytes(
                         g.layer,
                         false,
                         (slot * g.k_stride) as u64,
-                        &mut k[i * g.k_stride..(i + 1) * g.k_stride],
+                        &mut k[i * g.k_stride..(i + rows) * g.k_stride],
                     );
                     be.read_kv_bytes(
                         g.layer,
                         true,
                         (slot * g.v_stride) as u64,
-                        &mut v[i * g.v_stride..(i + 1) * g.v_stride],
+                        &mut v[i * g.v_stride..(i + rows) * g.v_stride],
                     );
-                }
+                });
                 window.push(KvLayerState {
                     layer: g.layer,
                     base_pos: base,
@@ -361,22 +383,20 @@ pub fn capture_delta(
         let n = boundary - base;
         let mut k = vec![0u8; n * g.k_stride];
         let mut v = vec![0u8; n * g.v_stride];
-        let mask = ring - 1;
-        for (i, p) in (base..boundary).enumerate() {
-            let slot = p & mask;
+        ring_runs(base, n, ring, |i, slot, rows| {
             be.read_kv_bytes(
                 g.layer,
                 false,
                 (slot * g.k_stride) as u64,
-                &mut k[i * g.k_stride..(i + 1) * g.k_stride],
+                &mut k[i * g.k_stride..(i + rows) * g.k_stride],
             );
             be.read_kv_bytes(
                 g.layer,
                 true,
                 (slot * g.v_stride) as u64,
-                &mut v[i * g.v_stride..(i + 1) * g.v_stride],
+                &mut v[i * g.v_stride..(i + rows) * g.v_stride],
             );
-        }
+        });
         window.push(KvLayerState {
             layer: g.layer,
             base_pos: base,
@@ -478,22 +498,20 @@ pub fn restore(
         let StateKind::Window { ring, .. } = g.kind else {
             continue;
         };
-        let mask = ring - 1;
-        for i in 0..ls.positions {
-            let slot = (ls.base_pos + i) & mask;
+        ring_runs(ls.base_pos, ls.positions, ring, |i, slot, rows| {
             be.write_kv_bytes(
                 ls.layer,
                 false,
                 (slot * g.k_stride) as u64,
-                &ls.k[i * g.k_stride..(i + 1) * g.k_stride],
+                &ls.k[i * g.k_stride..(i + rows) * g.k_stride],
             );
             be.write_kv_bytes(
                 ls.layer,
                 true,
                 (slot * g.v_stride) as u64,
-                &ls.v[i * g.v_stride..(i + 1) * g.v_stride],
+                &ls.v[i * g.v_stride..(i + rows) * g.v_stride],
             );
-        }
+        });
     }
     Ok(())
 }
@@ -1005,6 +1023,49 @@ pub fn state_from_links(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ring_transfers_match_position_major_oracle_and_preserve_other_bytes() {
+        for ring in [1usize, 2, 8, 64, 1024] {
+            for base in [0, ring - 1, ring, ring + 5, 3 * ring + 1] {
+                for rows in [0, 1, ring / 2, ring, ring + 1] {
+                    for stride in [1usize, 3, 18, 34] {
+                        let physical: Vec<u8> =
+                            (0..ring * stride).map(|i| (i * 73 + 19) as u8).collect();
+                        let expected: Vec<u8> = (base..base + rows)
+                            .flat_map(|p| {
+                                let slot = p % ring;
+                                physical[slot * stride..(slot + 1) * stride]
+                                    .iter()
+                                    .copied()
+                            })
+                            .collect();
+                        let mut captured = vec![0; rows * stride];
+                        ring_runs(base, rows, ring, |i, slot, n| {
+                            captured[i * stride..(i + n) * stride].copy_from_slice(
+                                &physical[slot * stride..(slot + n) * stride],
+                            );
+                        });
+                        assert_eq!(captured, expected);
+                        let mut restored = vec![0xa5; ring * stride];
+                        let mut oracle = restored.clone();
+                        for (i, row) in expected.chunks_exact(stride).enumerate() {
+                            let slot = (base + i) % ring;
+                            oracle[slot * stride..(slot + 1) * stride]
+                                .copy_from_slice(row);
+                        }
+                        ring_runs(base, rows, ring, |i, slot, n| {
+                            restored[slot * stride..(slot + n) * stride]
+                                .copy_from_slice(
+                                    &captured[i * stride..(i + n) * stride],
+                                );
+                        });
+                        assert_eq!(restored, oracle);
+                    }
+                }
+            }
+        }
+    }
+
     /// ONE BLOB FORMAT. A whole state and a chain link are the same bytes.
     ///
     /// They were two: `checkpoint_blob` (whole window, with `UEND`) from `--spill` and

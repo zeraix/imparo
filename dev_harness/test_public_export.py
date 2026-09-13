@@ -23,7 +23,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST = ROOT / "dev_harness" / "public-export.allowlist"
-EXPECTED_ALLOWLIST_SHA256 = "b9efb03338169034a63246b88451681e49b70a8ffbc4ba7073156303626b41c7"
+EXPECTED_ALLOWLIST_SHA256 = "084389f4e27b23baf40c4a9bf57e116c571fcce89454aeed2019c6f57b0c7726"
 REQUIRED_COMMUNITY_FILES = {
     ".github/ISSUE_TEMPLATE/bug_report.yml",
     ".github/ISSUE_TEMPLATE/config.yml",
@@ -220,7 +220,7 @@ class PublicAllowlistTests(unittest.TestCase):
         paths = public_export._parse_allowlist(
             raw, "dev_harness/public-export.allowlist"
         )
-        self.assertEqual(len(paths), 301)
+        self.assertEqual(len(paths), 317)
         self.assertEqual(paths, sorted(paths, key=lambda item: item.encode("utf-8")))
         self.assertEqual(set(paths) & REQUIRED_COMMUNITY_FILES, REQUIRED_COMMUNITY_FILES)
         self.assertEqual(set(paths) & REQUIRED_CONTROL_PLANE, REQUIRED_CONTROL_PLANE)

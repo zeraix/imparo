@@ -34,12 +34,12 @@ mod release_contract_tests {
         );
         assert_eq!(
             message,
-            b"imparo-cuda-backend-v1\x00windows-x86_64\x0086\x0026\x00123\x00abcd"
+            b"imparo-cuda-backend-v1\x00windows-x86_64\x0086\x0034\x00123\x00abcd"
         );
     }
 
     #[test]
-    fn abi_26_exports_paging_host_transfer_lfm2_program_and_prefill_cache_surfaces() {
+    fn abi_34_exports_paging_host_transfer_lfm2_program_and_prefill_cache_surfaces() {
         let exports = include_str!("../native/imparo_cuda.def");
         for symbol in [
             "imparo_cuda_alloc_kv_layout",
@@ -144,3 +144,19 @@ pub use backend_impl::{
     CudaBackend, correctness_receipt_template, install_correctness_identity,
     prepare_tuner_lab,
 };
+
+#[cfg(all(feature = "cuda-speculative", feature = "cuda-dynamic"))]
+compile_error!("cuda-speculative requires the static backend, not a dynamic plugin");
+#[cfg(feature = "cuda-owner-lab")]
+pub mod owner_lab;
+
+#[cfg(feature = "cuda-speculative")]
+pub mod dspark;
+#[cfg(feature = "cuda-speculative")]
+pub mod gemma4_mtp;
+
+#[cfg(feature = "cuda-speculative")]
+pub mod tree;
+
+#[cfg(feature = "cuda-speculative")]
+mod execution;

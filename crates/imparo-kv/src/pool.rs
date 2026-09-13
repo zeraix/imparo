@@ -112,6 +112,9 @@ pub struct ConvState {
     /// requests in flight for several of them a single note is one conversation's answer
     /// given to another. The pool takes it at switch-out and installs it at switch-in.
     recur_note: Option<(usize, Vec<u8>)>,
+    /// One captured pre-generation resume point for the current request. Unlike
+    /// a user-turn boundary, this does not consume the turn-history budget.
+    prompt_anchor: Option<CkptKey>,
 }
 
 pub struct PoolMode {
@@ -713,13 +716,24 @@ impl PoolMode {
             // Deltas depend on their ancestors (design: "eviction is not
             // independent per entry"): evict the oldest entry nothing chains
             // from, and never the entry just inserted.
-            let depended: std::collections::BTreeSet<CkptKey> =
+            let mut depended: std::collections::BTreeSet<CkptKey> =
                 self.window_ckpts.values().filter_map(|e| e.prev).collect();
+            // The active request's input anchor must survive until write-through,
+            // even with capacity1. Older conversations are not pinned: their
+            // anchors are durable and remain eligible for ordinary eviction.
+            if let Some(anchor) = self
+                .active
+                .as_ref()
+                .and_then(|label| self.convs.get(label))
+                .and_then(|conv| conv.prompt_anchor)
+            {
+                depended.insert(anchor);
+            }
             let Some(pos) = self.ckpt_order[..self.ckpt_order.len() - 1]
                 .iter()
                 .position(|h| !depended.contains(h))
             else {
-                break; // whole cap is one live chain; allow the overshoot
+                break; // live chain or active prompt anchor: bounded overshoot
             };
             let old = self.ckpt_order.remove(pos);
             self.window_ckpts.remove(&old);
@@ -812,6 +826,9 @@ impl PoolMode {
         label: &str,
         pk: PendingCkpt,
     ) {
+        if model.kv_window_reuse_allowed(pk.boundary) == Some(false) {
+            return; // Never publish overwritten rows as a checkpoint.
+        }
         let mut delta = model.kv_capture_delta(pk.boundary, pk.from);
         let unit_end = pk.boundary / grid_tokens() * grid_tokens();
         if pk.boundary > unit_end {
@@ -1235,6 +1252,10 @@ impl PoolMode {
     ) -> Result<usize, String> {
         self.backend = model.backend();
         self.shape = crate::CheckpointShape::of(&model.kv_state_geometry());
+        // Choose the actual restart boundary BEFORE installing attention and
+        // recurrent state. Rounding the returned position in the caller would
+        // leave the device at another position (513 input: restore512/run448).
+        let resume_limit = crate::identity::resume_point(ids.len(), ids.len());
         // Two views of this prompt, both from its tokens: `grid` is prefix(p) at every
         // multiple of grid_tokens(), which is what a stored boundary is matched against;
         // `hashes` is the resident tiling's ids, which is what residency is keyed on.
@@ -1262,7 +1283,7 @@ impl PoolMode {
         // Fast path: pure append of the ACTIVE conversation -- tables and windows are
         // already live; only the tail may need room. Not extended to any conversation
         // holding its region: a recurrent model's state is one device buffer with a
-        // per-conversation note, and this path never restores it.
+        // per-conversation note. Its exact resume snapshot is installed below.
         if self.active.as_deref() == Some(label) {
             if let Some(c) = self.convs.get(label) {
                 if !c.tokens.is_empty()
@@ -1273,17 +1294,56 @@ impl PoolMode {
                     // token prefix matches, so identical bytes land on identical slots.
                     let resume =
                         crate::identity::resume_point(c.tokens.len(), ids.len());
-                    let need_units = upper
-                        .div_ceil(grid_tokens())
-                        .saturating_sub(c.sealed_units + self.convs[label].tail.len());
-                    if need_units > 0 {
-                        let more = self.alloc_units(need_units, label, store, disk)?;
-                        self.convs.get_mut(label).unwrap().tail.extend(more);
+                    let recurrent = model.recurrent_elems();
+                    let note = if recurrent > 0
+                        && resume > 0
+                        && matches!(self.shape, crate::CheckpointShape::Snapshots)
+                    {
+                        model.kv_recurrent_note().filter(|(at, bytes)| {
+                            *at == resume && bytes.len() == recurrent.saturating_mul(4)
+                        })
+                    } else {
+                        None
+                    };
+                    // A pure token append can still rewind the execution position
+                    // to the identity grid. Attention rows remain resident, but a
+                    // recurrent buffer at the old tip is not the state at resume.
+                    // Use the exact independent snapshot or let general restore
+                    // find an earlier usable checkpoint. Position0 is reset by forward.
+                    let live_at_resume = model.kv_runtime().filled == resume;
+                    if (recurrent == 0
+                        || resume == 0
+                        || live_at_resume
+                        || note.is_some())
+                        && model.kv_window_reuse_allowed(resume).unwrap_or(true)
+                    {
+                        let need_units = upper.div_ceil(grid_tokens()).saturating_sub(
+                            c.sealed_units + self.convs[label].tail.len(),
+                        );
+                        if need_units > 0 {
+                            let more =
+                                self.alloc_units(need_units, label, store, disk)?;
+                            self.convs.get_mut(label).unwrap().tail.extend(more);
+                        }
+                        let tail = self.convs[label].tail.clone();
+                        let _ = self.probe(&cid(label), hashes)?;
+                        self.apply_tables(model, label, &tail)?;
+                        if let Some((at, bytes)) = note {
+                            let before = model.kv_runtime().filled;
+                            model.kv_resume(&KvState {
+                                boundary: at,
+                                full: Vec::new(),
+                                window: Vec::new(),
+                                recurrent: bytes,
+                            })?;
+                            if crate::log_on() {
+                                eprintln!(
+                                    "[imparo] kv append recurrent restore {before}->{at}"
+                                );
+                            }
+                        }
+                        return Ok(resume);
                     }
-                    let tail = self.convs[label].tail.clone();
-                    let _ = self.probe(&cid(label), hashes)?;
-                    self.apply_tables(model, label, &tail)?;
-                    return Ok(resume);
                 }
             }
         }
@@ -1304,8 +1364,12 @@ impl PoolMode {
         let mut k_at = 0;
         let mut k_state: Option<KvState> = None;
         let mut k_tail: Vec<crate::KvLayerState> = Vec::new();
-        for key in self.matching_ckpts(None, hashes, ids, usize::MAX, hit.indexed_units)
+        for key in
+            self.matching_ckpts(None, hashes, ids, resume_limit, hit.indexed_units)
         {
+            if key.1 % grid_tokens() != 0 {
+                continue;
+            }
             if let Some(st) = self.try_assemble(model, key) {
                 k_at = key.1;
                 k_tail.clone_from(&self.window_ckpts[&key].delta.tail);
@@ -1381,7 +1445,7 @@ impl PoolMode {
                         // both have a boundary -- but resuming off the grid does not
                         // reproduce a cold pass. Skip the boundary, keep the store.
                         || b % grid_tokens() != 0
-                        || b > ids.len()
+                        || b > resume_limit
                         || b <= k_at
                         || c.tail.len() != b - unit_end
                         || ids[unit_end..b] != c.tail[..]
@@ -1489,8 +1553,8 @@ impl PoolMode {
                             "needs more units than we agree on"
                         } else if b % grid_tokens() != 0 {
                             "not on this build's resume grid"
-                        } else if b > ids.len() {
-                            "past the end of this prompt"
+                        } else if b > resume_limit {
+                            "past the legal prompt resume boundary"
                         } else if b <= k_at {
                             "not deeper than the resident checkpoint"
                         } else if c.tail.len() != b - ue || ids[ue..b] != c.tail[..] {
@@ -1752,7 +1816,8 @@ impl PoolMode {
         let live_window = ours
             && resume <= tip_before
             && tip_before - resume <= self.slack
-            && restored_windows.is_some();
+            && restored_windows.is_some()
+            && model.kv_window_reuse_allowed(resume).unwrap_or(true);
         let mut state = restored_windows.unwrap_or(KvState {
             boundary: 0,
             full: Vec::new(),
@@ -1824,6 +1889,7 @@ impl PoolMode {
                 // Whatever this switch-in put on the device: a restore seeds it, and an
                 // adoption from resident blocks carries the previous note forward.
                 recur_note: prior_note,
+                prompt_anchor: None,
             },
         );
         // General-path rewind/restore replaces its old unsealed tail. Those
@@ -1844,10 +1910,9 @@ impl PoolMode {
         // A resume past the prompt is not a slow path, it is a slice out of bounds one
         // frame later. Everything above proves its own boundary against `ids`; this
         // says so once, where it is cheap to check and impossible to miss.
-        if resume > ids.len() {
+        if resume > resume_limit || resume % grid_tokens() != 0 {
             return Err(format!(
-                "kv pool: resume {resume} exceeds the {} prompt tokens",
-                ids.len()
+                "kv pool: resume {resume} violates grid/limit {resume_limit}"
             ));
         }
         Ok(resume)
@@ -1893,12 +1958,10 @@ impl PoolMode {
         // where a user message starts, so that every sealed boundary is also an extent
         // cut. Two positions, both of them boundaries the design already names.
         //
-        // A cut at the PROMPT end was tried as a third: it splits the user message off
-        // from the generated reply, and the reasoning was that a client re-sends the
-        // conversation rather than the raw stream. It earns nothing. The branch point
-        // already lands there -- measured on the shape workload, the prompt end and the
-        // branch both snapped to 512 -- so with it removed the disk is byte-identical
-        // (same 5 extents, same hashes) and every gate number is unchanged.
+        // A separately captured prompt anchor may add one more cut. Decode can
+        // cross the next grid boundary, so its final checkpoint can be too late
+        // to replay the original prompt after restart. That anchor is bounded
+        // separately from user-turn history and only captured before decode.
         record_cut(&mut c.cuts, cut);
         // Superseded records die uncaptured; what stays must remain capturable
         // from the rings (filled - boundary <= slack), which the eager-capture
@@ -2318,7 +2381,17 @@ impl PoolMode {
                     && tokens.get(ue..b).is_some_and(|t| t == c.tail)
             });
             kept.sort_by_key(|c| c.boundary);
-            cap_ckpts(&mut kept, self.disk_ckpt_cap, shape);
+            let prompt_anchor = self
+                .convs
+                .get(label)
+                .and_then(|c| c.prompt_anchor)
+                .map(|(_, boundary)| boundary as u64);
+            cap_ckpts_with_prompt_anchor(
+                &mut kept,
+                self.disk_ckpt_cap,
+                shape,
+                prompt_anchor,
+            );
             let keyless = self.convs.get(label).is_some_and(|c| c.keyless);
             let m = Manifest {
                 boundary: boundary as u64,
@@ -2719,6 +2792,57 @@ conversation restored from"
             .map_or(0, |&l| self.resident.free_blocks(l))
     }
 
+    /// Preserve the already-noted recurrent state before decode can overwrite it.
+    /// Only snapshot models are supported: no window delta or ancestor is inferred.
+    /// At most one extra durable anchor is retained for this conversation's request.
+    pub fn note_prompt_checkpoint<T: PoolTenant + ?Sized>(
+        &mut self,
+        model: &T,
+        label: &str,
+        hashes: &[UnitHash],
+        ids: &[u32],
+    ) -> Option<usize> {
+        self.convs.get_mut(label)?.prompt_anchor = None;
+        if !matches!(self.shape, crate::CheckpointShape::Snapshots) {
+            return None;
+        }
+        let (boundary, bytes) = model.kv_recurrent_note()?;
+        let boundary = prompt_replay_boundary(
+            model.recurrent_elems(),
+            model.kv_runtime().filled,
+            ids.len(),
+            boundary,
+            bytes.len(),
+            grid_tokens(),
+        )?;
+        let units = boundary / grid_tokens();
+        let tip = *hashes.get(units.checked_sub(1)?)?;
+        let key = (tip, boundary);
+        // An existing turn anchor already protects this position. Do not demote it.
+        if !self.window_ckpts.contains_key(&key) {
+            self.capture_ckpt(
+                model,
+                label,
+                PendingCkpt {
+                    tip,
+                    prev: None,
+                    boundary,
+                    from: 0,
+                    tokens: Vec::new(),
+                    turn: false,
+                },
+            );
+        }
+        let entry = self.window_ckpts.get(&key)?;
+        if entry.delta.recurrent.len() != bytes.len() {
+            return None;
+        }
+        let conv = self.convs.get_mut(label)?;
+        record_cut(&mut conv.cuts, boundary);
+        conv.prompt_anchor = Some(key);
+        Some(boundary)
+    }
+
     /// Record a branch point and capture it NOW (the server does this mid-prefill
     /// only when the boundary would slide out of ring reach before a switch-out
     /// could reach it -- which is always, for a recurrent model).
@@ -3071,6 +3195,46 @@ fn record_cut(cuts: &mut Vec<usize>, at: usize) {
     }
     if let Err(i) = cuts.binary_search(&at) {
         cuts.insert(i, at);
+    }
+}
+
+fn prompt_replay_boundary(
+    recurrent_elems: usize,
+    filled: usize,
+    prompt: usize,
+    boundary: usize,
+    bytes: usize,
+    grid: usize,
+) -> Option<usize> {
+    (recurrent_elems > 0
+        && filled == prompt
+        && boundary > 0
+        && boundary <= prompt.saturating_sub(2)
+        && grid > 0
+        && boundary % grid == 0
+        && recurrent_elems.checked_mul(4) == Some(bytes))
+    .then_some(boundary)
+}
+
+fn cap_ckpts_with_prompt_anchor(
+    kept: &mut Vec<crate::store::Ckpt>,
+    cap: usize,
+    shape: crate::CheckpointShape,
+    anchor: Option<u64>,
+) {
+    // `kept` has already passed current-stream identity and extent-tail checks.
+    // Only independent snapshots can be kept without extending a window chain.
+    let prompt = if matches!(shape, crate::CheckpointShape::Snapshots) {
+        anchor.and_then(|at| kept.iter().find(|c| c.boundary == at).cloned())
+    } else {
+        None
+    };
+    cap_ckpts(kept, cap, shape);
+    if let Some(prompt) = prompt {
+        if !kept.iter().any(|c| c.boundary == prompt.boundary) {
+            kept.push(prompt);
+            kept.sort_by_key(|c| c.boundary);
+        }
     }
 }
 
@@ -3442,6 +3606,7 @@ mod lifecycle_tests {
                 keyless: false,
                 adopted: None,
                 recur_note: None,
+                prompt_anchor: None,
             },
         );
         mode.recent.push(label.to_string());
@@ -3709,6 +3874,7 @@ mod lifecycle_tests {
                 keyless: false,
                 adopted: None,
                 recur_note: None,
+                prompt_anchor: None,
             },
         );
 
@@ -3827,6 +3993,7 @@ mod lifecycle_tests {
                 keyless: false,
                 adopted: None,
                 recur_note: None,
+                prompt_anchor: None,
             },
         );
         mode.end("c", vec![7; units * g], &hashes).unwrap();
@@ -3838,6 +4005,32 @@ mod lifecycle_tests {
             "the branch, then this request's end"
         );
         assert!(cuts.windows(2).all(|w| w[0] < w[1]), "strictly ascending");
+    }
+
+    #[test]
+    fn active_prompt_anchor_survives_a_capacity_one_tip_but_is_not_pinned_forever() {
+        let mut pool = mode(PoolAddressing::Shared, 4);
+        pool.ckpt_cap = 1;
+        let tip = UnitHash([42; 16]);
+        let delta = |boundary| crate::KvDelta {
+            boundary,
+            from: 0,
+            window: Vec::new(),
+            tail: Vec::new(),
+            recurrent: vec![1; 4],
+        };
+        pool.convs.insert("a".into(), conv_holding(tip));
+        pool.active = Some("a".into());
+        pool.remember_delta(tip, None, delta(1472), Vec::new(), false);
+        pool.convs.get_mut("a").unwrap().prompt_anchor = Some((tip, 1472));
+        pool.remember_delta(tip, None, delta(1536), Vec::new(), false);
+        assert!(pool.window_ckpts.contains_key(&(tip, 1472)));
+        assert!(pool.window_ckpts.contains_key(&(tip, 1536)));
+        assert_eq!(pool.window_ckpts.len(), 2);
+        pool.active = Some("b".into());
+        pool.remember_delta(UnitHash([43; 16]), None, delta(1600), Vec::new(), false);
+        assert_eq!(pool.window_ckpts.len(), 1);
+        assert!(!pool.window_ckpts.contains_key(&(tip, 1472)));
     }
 
     fn conv_holding(hash: UnitHash) -> ConvState {
@@ -3854,6 +4047,7 @@ mod lifecycle_tests {
             keyless: false,
             adopted: None,
             recur_note: None,
+            prompt_anchor: None,
         }
     }
 
@@ -3911,6 +4105,92 @@ mod tests {
     use super::{cap_ckpts, cuts_for_switch_in};
     use crate::store::{Ckpt, Cut};
     use crate::{Manifest, UnitHash};
+
+    #[test]
+    fn a_prompt_anchor_must_leave_the_forward_tail_before_state_is_restored() {
+        for prompt in [65, 513, 577] {
+            let note = prompt - 1;
+            assert_eq!(
+                super::prompt_replay_boundary(4, prompt, prompt, note, 16, 64),
+                None
+            );
+            assert!(crate::identity::resume_point(note, prompt) < note);
+            assert_eq!(
+                super::prompt_replay_boundary(4, prompt + 1, prompt + 1, note, 16, 64),
+                Some(note)
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_snapshot_requires_exact_available_state_and_grid() {
+        assert_eq!(
+            super::prompt_replay_boundary(4, 1518, 1518, 1472, 16, 64),
+            Some(1472)
+        );
+        for (n, filled, prompt, at, bytes, grid) in [
+            (0, 1518, 1518, 1472, 0, 64),
+            (4, 1536, 1518, 1472, 16, 64),
+            (4, 1518, 1518, 1536, 16, 64),
+            (4, 1518, 1518, 1473, 16, 64),
+            (4, 1518, 1518, 1472, 12, 64),
+            (4, 1518, 1518, 0, 16, 64),
+            (4, 1518, 1518, 1472, 16, 0),
+        ] {
+            assert_eq!(
+                super::prompt_replay_boundary(n, filled, prompt, at, bytes, grid),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_anchor_survives_decode_tip_without_spending_turn_budget() {
+        let mut kept = vec![
+            ck(64, 0, true),
+            ck(128, 0, true),
+            ck(1408, 0, false),
+            ck(1472, 0, false),
+            ck(1536, 0, false),
+        ];
+        super::cap_ckpts_with_prompt_anchor(
+            &mut kept,
+            1,
+            crate::CheckpointShape::Snapshots,
+            Some(1472),
+        );
+        assert_eq!(
+            kept.iter().map(|c| c.boundary).collect::<Vec<_>>(),
+            vec![128, 1472, 1536]
+        );
+        assert!(!kept.iter().find(|c| c.boundary == 1472).unwrap().turn);
+        kept.push(ck(1600, 0, false));
+        super::cap_ckpts_with_prompt_anchor(
+            &mut kept,
+            1,
+            crate::CheckpointShape::Snapshots,
+            Some(1536),
+        );
+        assert_eq!(
+            kept.iter().map(|c| c.boundary).collect::<Vec<_>>(),
+            vec![128, 1536, 1600]
+        );
+    }
+
+    #[test]
+    fn absent_prompt_anchor_does_not_invent_a_checkpoint() {
+        let mut kept = vec![ck(1472, 0, false), ck(1536, 0, false)];
+        super::cap_ckpts_with_prompt_anchor(
+            &mut kept,
+            20,
+            crate::CheckpointShape::Snapshots,
+            Some(1408),
+        );
+        assert_eq!(
+            kept.iter().map(|c| c.boundary).collect::<Vec<_>>(),
+            vec![1536]
+        );
+    }
 
     fn ck(boundary: u64, from: u64, turn: bool) -> Ckpt {
         Ckpt {

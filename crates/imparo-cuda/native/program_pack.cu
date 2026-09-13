@@ -233,7 +233,7 @@ bool ensure_program_driver(ProgramDriverApi & api) {
 }
 
 int ensure_program_context(ProgramCatalog & catalog) {
-    const bool capturing = g.graph_capturing;
+    const bool capturing = execution().graph_capturing;
     // Runtime initialization uses cudaFree(nullptr), and context switching is also
     // host lifecycle work. Neither belongs inside stream capture. Install/freeze
     // must have established the exact primary context and sole stream beforehand.
@@ -395,14 +395,15 @@ bool fatal_driver_launch(CUresult result) {
 }
 
 int quiesce_program_catalog(ProgramCatalog & catalog) {
-    if (g.graph_capturing || g.forward_active) return CUDA_RC_INVALID;
+    if (execution_graphs_borrowed()) return CUDA_RC_INVALID;
+    if (execution().graph_capturing || execution().forward_active) return CUDA_RC_INVALID;
     const int context_rc = ensure_program_context(catalog);
     if (context_rc) return context_rc;
     if (g.stream && cudaStreamSynchronize(g.stream) != cudaSuccess) {
         catalog.poisoned = true;
         return CUDA_RC_ERROR;
     }
-    if (!destroy_decode_graph_checked()) {
+    if (!destroy_all_execution_graphs_checked()) {
         catalog.poisoned = true;
         return CUDA_RC_ERROR;
     }
@@ -428,7 +429,7 @@ int program_pack_install_impl(
     }
     std::lock_guard<std::mutex> lock(program_catalog.mutex);
     if (program_catalog.poisoned || program_catalog.frozen
-        || g.graph_capturing || g.forward_active) return CUDA_RC_INVALID;
+        || execution().graph_capturing || execution().forward_active) return CUDA_RC_INVALID;
     const int context_rc = ensure_program_context(program_catalog);
     if (context_rc) return context_rc;
     int driver_version = 0;
@@ -558,7 +559,7 @@ int program_bind_impl(const uint8_t group_id[32], const uint8_t variant_id[32]) 
         || !bytes_nonzero(variant_id, 32)) return CUDA_RC_INVALID;
     std::lock_guard<std::mutex> lock(program_catalog.mutex);
     if (program_catalog.poisoned || !program_catalog.frozen
-        || g.graph_capturing || g.forward_active) return CUDA_RC_INVALID;
+        || execution().graph_capturing || execution().forward_active) return CUDA_RC_INVALID;
     bool group_known = false;
     for (const ProgramFunction & candidate : program_catalog.functions) {
         group_known = group_known
@@ -606,7 +607,7 @@ int program_bind_impl(const uint8_t group_id[32], const uint8_t variant_id[32]) 
 
 int program_freeze_impl() {
     std::lock_guard<std::mutex> lock(program_catalog.mutex);
-    if (program_catalog.poisoned || g.graph_capturing || g.forward_active
+    if (program_catalog.poisoned || execution().graph_capturing || execution().forward_active
         || program_catalog.modules.empty() || program_catalog.functions.empty()) {
         return CUDA_RC_INVALID;
     }
@@ -690,10 +691,10 @@ bool add_program_dynamic_graph_node(
     }
     if (!has_replay_update) return false;
     dynamic.params.kernelParams = dynamic.args.data();
-    g.decode_graph_nodes.push_back(std::move(dynamic));
+    execution().decode_graph_nodes.push_back(std::move(dynamic));
     // Rebuild argument pointers from their final owner; the scanner never keeps
     // pointers into the synchronous launch wire or driver-owned temporary storage.
-    DynamicGraphNode & owned = g.decode_graph_nodes.back();
+    DynamicGraphNode & owned = execution().decode_graph_nodes.back();
     for (uint32_t i = 0; i < function->argument_count; ++i) {
         const uint32_t kind = function->argument_schema[i].kind;
         const bool narrow = kind == IMPARO_CUDA_PROGRAM_SCALAR_I32
@@ -716,7 +717,7 @@ int update_program_dynamic_graph_node(
         DynamicGraphNode & dynamic, uint32_t) noexcept try {
     std::lock_guard<std::mutex> lock(program_catalog.mutex);
     if (program_catalog.poisoned || !program_catalog.frozen
-        || !g.decode_graph_exec || !dynamic.node || dynamic.args.empty()) {
+        || !execution().decode_graph_exec || !dynamic.node || dynamic.args.empty()) {
         return CUDA_RC_INVALID;
     }
     CUDA_KERNEL_NODE_PARAMS params = {};
@@ -730,7 +731,7 @@ int update_program_dynamic_graph_node(
     params.sharedMemBytes = dynamic.params.sharedMemBytes;
     params.kernelParams = dynamic.args.data();
     return program_catalog.driver.graph_exec_kernel_node_set_params(
-        reinterpret_cast<CUgraphExec>(g.decode_graph_exec),
+        reinterpret_cast<CUgraphExec>(execution().decode_graph_exec),
         reinterpret_cast<CUgraphNode>(dynamic.node), &params) == CUDA_SUCCESS
         ? 0 : CUDA_RC_ERROR;
 } catch (...) {
@@ -755,7 +756,7 @@ int program_launch_impl(
         || launch->grid_x > program_catalog.max_grid[0]
         || launch->grid_y > program_catalog.max_grid[1]
         || launch->grid_z > program_catalog.max_grid[2]
-        || (g.graph_capturing && function->graph_capture == 0)) {
+        || (execution().graph_capturing && function->graph_capture == 0)) {
         return CUDA_RC_INVALID;
     }
     bool selected = false;
@@ -798,9 +799,9 @@ int program_launch_impl(
         function->block[0], function->block[1], function->block[2],
         launch->dynamic_shared_bytes, reinterpret_cast<CUstream>(g.stream),
         parameters, nullptr);
-    if (result == CUDA_SUCCESS && g.graph_capturing
+    if (result == CUDA_SUCCESS && execution().graph_capturing
         && function->graph_capture == 2) {
-        ++g.graph_expected_dynamic_nodes;
+        ++execution().graph_expected_dynamic_nodes;
     }
     if (fatal_driver_launch(result)) program_catalog.poisoned = true;
     return result == CUDA_SUCCESS ? 0 : CUDA_RC_ERROR;
@@ -808,7 +809,7 @@ int program_launch_impl(
 
 int program_reset_impl() {
     std::lock_guard<std::mutex> lock(program_catalog.mutex);
-    if (program_catalog.poisoned || g.graph_capturing || g.forward_active) {
+    if (program_catalog.poisoned || execution().graph_capturing || execution().forward_active) {
         return CUDA_RC_INVALID;
     }
     if (program_catalog.modules.empty()) {

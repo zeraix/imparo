@@ -49,31 +49,31 @@ int program_test_synchronize_impl() {
 int program_test_graph_begin_impl() {
     std::lock_guard<std::mutex> lock(program_catalog.mutex);
     if (program_catalog.poisoned || !program_catalog.frozen
-        || g.graph_capturing || g.forward_active || g.decode_graph
-        || g.decode_graph_exec || program_test_context()) {
+        || execution().graph_capturing || execution().forward_active || execution().decode_graph
+        || execution().decode_graph_exec || program_test_context()) {
         return CUDA_RC_INVALID;
     }
     if (cudaStreamBeginCapture(g.stream, cudaStreamCaptureModeThreadLocal)
             != cudaSuccess) {
         return CUDA_RC_ERROR;
     }
-    g.decode_graph_nodes.clear();
-    g.graph_expected_dynamic_nodes = 0;
-    g.graph_capturing = true;
+    execution().decode_graph_nodes.clear();
+    execution().graph_expected_dynamic_nodes = 0;
+    execution().graph_capturing = true;
     return 0;
 }
 
 int program_test_graph_end_replay_impl(uint32_t replay_count) {
-    if (!g.graph_capturing || !replay_count) return CUDA_RC_INVALID;
-    const cudaError_t end = cudaStreamEndCapture(g.stream, &g.decode_graph);
-    g.graph_capturing = false;
-    if (end != cudaSuccess || !g.decode_graph) {
+    if (!execution().graph_capturing || !replay_count) return CUDA_RC_INVALID;
+    const cudaError_t end = cudaStreamEndCapture(g.stream, &execution().decode_graph);
+    execution().graph_capturing = false;
+    if (end != cudaSuccess || !execution().decode_graph) {
         (void)destroy_decode_graph_checked();
         return 101;
     }
-    if (cudaGraphInstantiate(&g.decode_graph_exec, g.decode_graph,
+    if (cudaGraphInstantiate(&execution().decode_graph_exec, execution().decode_graph,
                             nullptr, nullptr, 0) != cudaSuccess
-        || !g.decode_graph_exec) {
+        || !execution().decode_graph_exec) {
         (void)destroy_decode_graph_checked();
         return 102;
     }
@@ -82,7 +82,7 @@ int program_test_graph_end_replay_impl(uint32_t replay_count) {
         return 103;
     }
     for (uint32_t replay = 0; replay < replay_count; ++replay) {
-        if (cudaGraphLaunch(g.decode_graph_exec, g.stream) != cudaSuccess) {
+        if (cudaGraphLaunch(execution().decode_graph_exec, g.stream) != cudaSuccess) {
             return 104;
         }
     }
@@ -92,11 +92,11 @@ int program_test_graph_end_replay_impl(uint32_t replay_count) {
 }
 
 int program_test_graph_replay_impl(uint32_t decode_start_pos) {
-    if (!g.decode_graph || !g.decode_graph_exec || g.graph_capturing
-        || g.forward_active) return CUDA_RC_INVALID;
+    if (!execution().decode_graph || !execution().decode_graph_exec || execution().graph_capturing
+        || execution().forward_active) return CUDA_RC_INVALID;
     const int update = update_decode_graph_nodes(decode_start_pos);
     if (update) return update;
-    if (cudaGraphLaunch(g.decode_graph_exec, g.stream) != cudaSuccess) {
+    if (cudaGraphLaunch(execution().decode_graph_exec, g.stream) != cudaSuccess) {
         return CUDA_RC_ERROR;
     }
     return cudaStreamSynchronize(g.stream) == cudaSuccess ? 0 : CUDA_RC_ERROR;
@@ -144,5 +144,5 @@ extern "C" int imparo_cuda_program_test_graph_replay(
 }
 
 extern "C" uint32_t imparo_cuda_program_test_graph_alive(void) noexcept {
-    return (g.decode_graph || g.decode_graph_exec) ? 1u : 0u;
+    return (execution().decode_graph || execution().decode_graph_exec) ? 1u : 0u;
 }

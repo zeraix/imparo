@@ -134,6 +134,11 @@ pub trait ChatCodec: Sync {
     /// rule stated once instead of a flag here that restates it.
     fn parse_tool_calls(&self, text: &str) -> (String, Vec<(String, String)>);
 
+    /// Visible stable fragment only: streaming does not need to materialize arguments.
+    fn tool_visible<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        std::borrow::Cow::Owned(self.parse_tool_calls(text).0)
+    }
+
     /// The exact text that OPENS a user turn in this format.
     ///
     /// The server needs the token where the last user message starts, to put a
@@ -174,7 +179,12 @@ pub mod think {
     /// No marker at all means outside too: a format that never opened the channel never
     /// entered it.
     #[must_use]
-    pub fn ends_inside(prompt: &str, assistant_prefix: &str, open: &str, close: &str) -> bool {
+    pub fn ends_inside(
+        prompt: &str,
+        assistant_prefix: &str,
+        open: &str,
+        close: &str,
+    ) -> bool {
         let turn = prompt
             .rsplit_once(assistant_prefix)
             .map_or("", |(_, turn)| turn);
@@ -224,7 +234,12 @@ pub mod think {
     /// marker, because the generated deltas then begin inside the channel and usually
     /// contain only the closing one.
     #[must_use]
-    pub fn split(text: &str, open: &str, close: &str, starts_inside: bool) -> (String, String) {
+    pub fn split(
+        text: &str,
+        open: &str,
+        close: &str,
+        starts_inside: bool,
+    ) -> (String, String) {
         let mut reasoning = String::new();
         let mut visible = String::new();
         let mut rest = text;

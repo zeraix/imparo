@@ -283,7 +283,10 @@ impl RecurrentState {
         let mut s = vec![Vec::new(); n];
         if allocate {
             for l in &plan.layers {
-                if let crate::Attention::Recurrent { r_elems, s_elems, .. } = l.attention {
+                if let crate::Attention::Recurrent {
+                    r_elems, s_elems, ..
+                } = l.attention
+                {
                     r[l.index as usize] = vec![0.0; r_elems as usize];
                     s[l.index as usize] = vec![0.0; s_elems as usize];
                 }

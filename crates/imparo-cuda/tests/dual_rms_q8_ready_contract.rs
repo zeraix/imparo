@@ -30,8 +30,8 @@ fn dual_rms_route_remains_lab_only_and_commits_after_launch() {
         .find("extern \"C\" uint32_t imparo_cuda_rms_norm_add_dual_project")
         .expect("native dual RMS entry");
     let body = &NATIVE[entry..];
-    assert!(body.contains("g.sm_version != 86 || g.graph_capturing"));
-    assert!(body.contains("|| g.prefill_capture_active"));
+    assert!(body.contains("g.sm_version != 86 || execution().graph_capturing"));
+    assert!(body.contains("|| execution().prefill_capture_active"));
     assert!(body.contains("std::getenv(\"IMPARO_GPU_PROBE\") != nullptr"));
     let launch = body
         .find("imparo_sm86_dual_rms_q8_ready::launch(")

@@ -175,24 +175,21 @@ fn with_object_arguments(messages: &[serde_json::Value]) -> Vec<serde_json::Valu
 }
 
 /// Python `json.dumps` formatting (see the filter registration for why).
-fn py_tojson(value: Value, kwargs: Kwargs) -> Result<String, Error> {
+#[allow(clippy::needless_pass_by_value)] // minijinja has no ArgType for &Kwargs
+fn py_tojson(value: &Value, kwargs: Kwargs) -> Result<String, Error> {
     let indent: Option<usize> = kwargs.get("indent")?;
     kwargs.assert_all_used()?;
-    let json = serde_json::to_value(&value)
+    let json = serde_json::to_value(value)
         .map_err(|e| Error::new(ErrorKind::InvalidOperation, e.to_string()))?;
     let mut out = Vec::new();
-    let r = match indent {
-        Some(n) => {
-            let pad = " ".repeat(n);
-            let f = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
-            let mut ser = serde_json::Serializer::with_formatter(&mut out, f);
-            serde::Serialize::serialize(&json, &mut ser)
-        }
-        None => {
-            let mut ser =
-                serde_json::Serializer::with_formatter(&mut out, PySeparators {});
-            serde::Serialize::serialize(&json, &mut ser)
-        }
+    let r = if let Some(n) = indent {
+        let pad = " ".repeat(n);
+        let f = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+        let mut ser = serde_json::Serializer::with_formatter(&mut out, f);
+        serde::Serialize::serialize(&json, &mut ser)
+    } else {
+        let mut ser = serde_json::Serializer::with_formatter(&mut out, PySeparators {});
+        serde::Serialize::serialize(&json, &mut ser)
     };
     r.map_err(|e| Error::new(ErrorKind::InvalidOperation, e.to_string()))?;
     String::from_utf8(out)

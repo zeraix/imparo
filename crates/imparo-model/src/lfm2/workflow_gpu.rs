@@ -16,7 +16,7 @@ use crate::ModelPlan;
 use crate::gpu_support::{
     BufferRequirement, Placement, be, gprobe, gpu_probe_layer,
     half_activation_mirror_requirements, kv_dequant_scratch_requirements, kvq_mask_on,
-    scores_needed, tail_align, tail_split, tail_split_min_rows,
+    layer_skip_log, scores_needed, tail_align, tail_split, tail_split_min_rows,
 };
 use crate::kv::{KvType, effective_workflow_kv_route, had_nrot, ring_mask};
 use crate::lfm2::Lfm2;
@@ -181,6 +181,57 @@ pub fn buffer_requirements(
     requirements
 }
 
+/// Rows needed before a suffix of finite-history mixers. Intermediate prefix
+/// outputs inside the retained suffix may be dead; every observable state and
+/// final row must lie beyond the accumulated history. An interior checkpoint
+/// expands the same contiguous suffix backwards rather than joining disjoint
+/// windows or treating unrelated rows as adjacent tokens.
+fn finite_history_tail(
+    plan: &ModelPlan,
+    batch: u32,
+    logits: bool,
+    checkpoint: Option<u32>,
+    minimum: u32,
+    align: u32,
+) -> Option<(usize, u32, u32)> {
+    if batch < 128 || plan.config.n_embd == 0 {
+        return None;
+    }
+    let last_attention = plan
+        .layers
+        .iter()
+        .rposition(|l| !matches!(l.attention, crate::Attention::Recurrent { .. }))?;
+    if last_attention + 1 == plan.layers.len() {
+        return None;
+    }
+    let mut history = 0_u32;
+    for layer in &plan.layers[last_attention + 1..] {
+        let crate::Attention::Recurrent {
+            r_elems,
+            s_elems: 0,
+            key_dim: 0,
+            value_dim: 0,
+        } = layer.attention
+        else {
+            return None;
+        };
+        if r_elems == 0 || r_elems % plan.config.n_embd != 0 {
+            return None;
+        }
+        history = history.checked_add(r_elems / plan.config.n_embd)?;
+    }
+    let mut needed = history.checked_add(u32::from(logits))?.max(minimum);
+    if let Some(k) = checkpoint {
+        if k == 0 || k > batch {
+            return None;
+        }
+        needed = needed.max(batch.checked_sub(k)?.checked_add(history)?);
+    }
+    let (start, rows) = tail_split_min_rows(batch, align, needed)?;
+    // Backend copy_range is not a memmove. No zero-benefit or overlapping move.
+    (start >= rows && start > 0).then_some((last_attention, start, rows))
+}
+
 /// LFM2's layer graph on the device.
 ///
 /// ```text
@@ -223,6 +274,53 @@ pub fn batch(
     let n_ff = c.n_ff;
     let eps = c.norm_eps;
     let b = u32::try_from(tokens.len()).map_err(|_| "batch too large")?;
+    let layer_outputs = wf
+        .state
+        .layer_outputs
+        .as_ref()
+        .is_some_and(crate::layer_outputs::LayerOutputCapture::active);
+    // This configured target Prefill policy fixes the crop boundary independently
+    // of whether a feature subscriber is active. Otherwise attaching a drafter
+    // changes the target's attention/FFN shapes before verification even begins.
+    let post_layer_tail = b > 1
+        && std::env::var("IMPARO_LAB_CAPTURE_AWARE_PREFILL_TAIL").as_deref() == Ok("1");
+    let row_argmax = wf.state.output_demand == crate::OutputDemand::RowArgmax;
+    let greedy_return =
+        wf.state.output_demand == crate::OutputDemand::GreedyVerification;
+    let all_logits = wf.state.output_demand.requires_all_positions();
+    if greedy_return
+        && (!be().supports_greedy_verification()
+            || wf.state.verification_prefix_tokens != tokens.len()
+            || argmax)
+    {
+        return Err(
+            "device greedy verification requires admitted complete prefix state".into(),
+        );
+    }
+    let last_logits = wf.state.output_demand == crate::OutputDemand::LastToken;
+    if all_logits && argmax {
+        return Err("all-position logits cannot request scalar argmax".into());
+    }
+    let verification_prefix_tokens = wf.state.verification_prefix_tokens;
+    let verification_recurrent_elems = if verification_prefix_tokens != 0 {
+        if verification_prefix_tokens != tokens.len() || !all_logits {
+            return Err(
+                "verification prefix snapshots require the complete all-logits batch"
+                    .into(),
+            );
+        }
+        let elems = wf.plan.recurrent_elems() as u64;
+        // Snapshot offsets use u32 float elements. Check before encoding any work.
+        elems
+            .checked_mul(u64::from(b) + 1)
+            .filter(|&elems| u32::try_from(elems).is_ok())
+            .ok_or_else(|| {
+                "verification prefix snapshot range exceeds u32".to_string()
+            })?;
+        elems
+    } else {
+        0
+    };
     let sp = u32::try_from(start_pos).map_err(|_| "start_pos too large")?;
     let recur = wf.plan.recurrent_layout();
     let act = wf.plan.layers[0].ffn.activation().epilogue();
@@ -232,6 +330,10 @@ pub fn batch(
     // narrower chunks, violating the same per-batch contract Gemma4 uses.
     wf.gpu_fit_batch(tokens.len())?;
     let decode = b == 1;
+    // A replayable single-plane step keeps checkpoint writes outside its graph.
+    // Capturing an armed/unarmed step must not freeze that request's snapshot flag.
+    let external_decode_snapshot =
+        decode && wf.state.recur_planes == 1 && wf.state.pipe.is_none();
     let decode_projection_preparation =
         decode && be().use_decode_projection_preparation();
     let prefill_projection_preparation =
@@ -239,7 +341,11 @@ pub fn batch(
     let projection_preparation =
         decode_projection_preparation || prefill_projection_preparation;
     let replayed = if decode {
-        be().decode_prepare(tokens[0], sp, argmax)
+        // Active observers need each layer callback and fresh host capture metadata.
+        // CUDA's prepare argmax bit also gates both graph replay and new capture;
+        // the actual output argmax below remains unchanged. Keep decode preparation
+        // and arithmetic while preventing graphs from retaining observer-owned buffers.
+        be().decode_prepare(tokens[0], sp, argmax && !layer_outputs)
             .map_err(|rc| format!("LFM2 GPU decode prepare failed rc={rc}"))?
     } else {
         false
@@ -247,6 +353,7 @@ pub fn batch(
     if replayed {
         be().end()
             .map_err(|rc| format!("LFM2 GPU forward failed rc={rc}"))?;
+        finish_decode_snapshot(wf, external_decode_snapshot)?;
         if argmax {
             out.resize(1, 0.0);
             be().read(BufId::Tmp, 0, out);
@@ -315,16 +422,56 @@ pub fn batch(
     };
 
     let n_layers_total = wf.plan.layers.len();
-    let flush_every = crate::gpu_support::flush_layers_bounded(b == 1, n_layers_total);
-    let tail = if wf.state.logits_wanted && b >= 128 {
+    let flush_every = crate::gpu_support::flush_layers_bounded(b, n_layers_total);
+    let tail = if last_logits && !layer_outputs && !post_layer_tail && b >= 128 {
         tail_split(b, tail_align())
     } else {
         None
     };
-    let row_local_tail = if wf.state.logits_wanted && b > 1 {
-        tail_split_min_rows(b, 1, be().row_local_prefill_tail_rows())
+    let mut row_local_tail =
+        if last_logits && !layer_outputs && !post_layer_tail && b > 1 {
+            tail_split_min_rows(b, 1, be().row_local_prefill_tail_rows(b))
+        } else {
+            None
+        };
+    let proposed_history_tail = if !all_logits
+        && (!layer_outputs || post_layer_tail)
+        && gpu_probe_layer() == usize::MAX
+    {
+        be().finite_history_prefill_tail_rows().and_then(|minimum| {
+            finite_history_tail(
+                &wf.plan,
+                b,
+                wf.state.output_demand.wants_logits(),
+                wf.state.recur_snap,
+                minimum,
+                tail_align(),
+            )
+        })
     } else {
         None
+    };
+    // Dense feature subscribers need the full cut-layer residual. The selected
+    // target policy uses that same boundary when no subscriber is active.
+    let deferred_history_tail = if post_layer_tail {
+        proposed_history_tail.filter(|&(li, _, _)| {
+            !wf.state
+                .layer_outputs
+                .as_ref()
+                .is_some_and(|c| c.observes_after(li as u32))
+        })
+    } else {
+        None
+    };
+    let history_tail = if layer_outputs || post_layer_tail {
+        None
+    } else {
+        proposed_history_tail
+    };
+    let mut recurrent_snapshot = if external_decode_snapshot {
+        None
+    } else {
+        wf.state.recur_snap
     };
     let mut b = b;
     let mut sp = sp;
@@ -340,6 +487,7 @@ pub fn batch(
         let b_tok = b;
         let mega_entry = |mixer: imparo_backend::Lfm2MegaMixer| -> bool {
             b_tok == 1
+                && !layer_outputs
                 && li != gpu_probe_layer()
                 && be().mega_layer(&imparo_backend::MegaEntry {
                     layer: imparo_backend::MegaLayer::Lfm2(
@@ -381,8 +529,8 @@ pub fn batch(
                     .map_err(|_| "conv kernel width")?;
                 // A checkpoint armed inside a one-token batch sits at that token: the
                 // kernel writes the advanced history to the snapshot too.
-                let snap = wf.state.recur_snap.map(|_| (BufId::RecurSnap, r_off));
-                (wf.state.logits_wanted || li + 1 != n_layers_total)
+                let snap = recurrent_snapshot.map(|_| (BufId::RecurSnap, r_off));
+                (wf.state.output_demand.wants_logits() || li + 1 != n_layers_total)
                     && mega_entry(imparo_backend::Lfm2MegaMixer::ShortConv {
                         op_norm_off: lw.op_norm.offset,
                         in_kind: wkind(in_proj),
@@ -425,7 +573,7 @@ pub fn batch(
                 } else {
                     had_nrot("IMPARO_HAD_V", kv_quant_route.value, hd)?
                 };
-                (wf.state.logits_wanted || li + 1 != n_layers_total)
+                (wf.state.output_demand.wants_logits() || li + 1 != n_layers_total)
                     && mega_entry(imparo_backend::Lfm2MegaMixer::Attention {
                         op_norm_off: lw.op_norm.offset,
                         wq_kind: wkind(wq),
@@ -576,9 +724,21 @@ pub fn batch(
                         None,
                         qk_hadamard_nrot,
                     );
-                    be().head_norm_rope_hadamard(
+                }
+                let v_hadamard_nrot = if KvType::v() == KvType::F16 {
+                    0
+                } else {
+                    had_nrot("IMPARO_HAD_V", kv_quant_route.value, hd)?
+                };
+                let ring = ring_mask(layer.attention, wf.state.kv_ring_batch);
+                let direct_kv = li != gpu_probe_layer()
+                    && KvType::k() == KvType::Q8_0
+                    && KvType::v() == KvType::Q8_0
+                    && be().kv_head_postprocess_store(
                         BufId::K,
+                        BufId::V,
                         k_norm.offset,
+                        false,
                         hd,
                         eps,
                         n_kv,
@@ -588,16 +748,31 @@ pub fn batch(
                         rope_base,
                         None,
                         qk_hadamard_nrot,
+                        v_hadamard_nrot,
+                        li as u32,
+                        ring,
                     );
-                }
-                // Match the common llama attention graph: rotate Q/K/V before the
-                // Q scale, store the rotated K/V bytes, and invert V after attention.
-                if KvType::v() != KvType::F16 {
-                    be().hadamard(
-                        BufId::V,
-                        b * kw,
-                        had_nrot("IMPARO_HAD_V", kv_quant_route.value, hd)?,
-                    );
+                if !direct_kv {
+                    if li != gpu_probe_layer() {
+                        be().head_norm_rope_hadamard(
+                            BufId::K,
+                            k_norm.offset,
+                            hd,
+                            eps,
+                            n_kv,
+                            sp,
+                            b,
+                            rope_dim,
+                            rope_base,
+                            None,
+                            qk_hadamard_nrot,
+                        );
+                    }
+                    // Match the common llama attention graph: rotate Q/K/V before the
+                    // Q scale, store the rotated K/V bytes, and invert V after attention.
+                    if v_hadamard_nrot != 0 {
+                        be().hadamard(BufId::V, b * kw, v_hadamard_nrot);
+                    }
                 }
                 // Read-only post-Hadamard/pre-quant witnesses. `gprobe` is inert
                 // unless IMPARO_GPU_PROBE is set and never modifies the buffer.
@@ -628,13 +803,45 @@ pub fn batch(
                         qw as usize,
                     );
                 }
-                let ring = ring_mask(layer.attention, wf.state.kv_ring_batch);
-                be().kv_store(BufId::K, li as u32, kw, sp, b, false, ring);
-                be().kv_store(BufId::V, li as u32, kw, sp, b, true, ring);
+                if !direct_kv {
+                    be().kv_store(BufId::K, li as u32, kw, sp, b, false, ring);
+                    be().kv_store(BufId::V, li as u32, kw, sp, b, true, ring);
+                }
+                if let Some((cut_layer, r0, bt)) = history_tail {
+                    if li == cut_layer {
+                        // All attention KV rows are already durable. The later
+                        // finite-history states observe only the proven suffix.
+                        be().copy_range(
+                            BufId::X,
+                            0,
+                            BufId::X,
+                            r0 * n_embd,
+                            bt * n_embd,
+                        );
+                        be().copy_range(BufId::Q, 0, BufId::Q, r0 * qw, bt * qw);
+                        recurrent_snapshot = recurrent_snapshot.map(|k| k - r0);
+                        if wf.state.output_demand.wants_logits() {
+                            row_local_tail = tail_split_min_rows(
+                                bt,
+                                1,
+                                be().row_local_prefill_tail_rows(b),
+                            )
+                            .filter(|&(start, rows)| start >= rows && start > 0);
+                        }
+                        if layer_skip_log() {
+                            eprintln!(
+                                "[imparo] finite-history tail after KV layer {li}: rows {r0}..{b}, retained={bt}, logits_wanted={}, snapshot={recurrent_snapshot:?}",
+                                wf.state.output_demand.wants_logits()
+                            );
+                        }
+                        sp += r0;
+                        b = bt;
+                    }
+                }
                 // The final layer's KV stores are this non-final chunk's last
                 // externally visible state writes. Its remaining attention and FFN
                 // feed only logits which the chunk loop discards.
-                if li + 1 == n_layers_total && !wf.state.logits_wanted {
+                if li + 1 == n_layers_total && !wf.state.output_demand.wants_logits() {
                     break;
                 }
                 if li + 1 == n_layers_total {
@@ -708,60 +915,86 @@ pub fn batch(
             ) => {
                 let kern = u32::try_from(conv.w.len() / n_embd as usize)
                     .map_err(|_| "conv kernel width")?;
-                be().matmat(
-                    wkind(in_proj),
-                    in_proj.offset as u64,
-                    n_embd,
-                    3 * n_embd,
-                    BufId::Cur,
-                    BCX,
-                    b,
-                );
-                if li == gpu_probe_layer() {
-                    gprobe("conv.in_proj", BCX, 0, (3 * n_embd) as usize);
-                    gprobe("conv.in_proj_full", BCX, 0, (b * 3 * n_embd) as usize);
-                    gprobe(
-                        "conv.in_proj_last",
-                        BCX,
-                        u64::from(b - 1) * u64::from(3 * n_embd),
-                        (3 * n_embd) as usize,
-                    );
-                }
-                // A checkpoint boundary inside this batch: write the state as of that
-                // position aside BEFORE the advance overwrites the pre-batch history,
-                // which the answer needs whenever the boundary is nearer than `kern - 1`
-                // tokens in. One dispatch of `n_embd` threads; the batch runs on.
-                if let Some(k) = wf.state.recur_snap {
-                    be().causal_conv_snapshot(
-                        imparo_backend::ConvForm::GatedBcx,
+                let projected_shortconv = plane_in == plane_out
+                    && recurrent_snapshot.is_none()
+                    && verification_prefix_tokens == 0
+                    && std::env::var_os("IMPARO_GPU_PROBE").is_none()
+                    && be().matmat_shortconv(
+                        wkind(in_proj),
+                        in_proj.offset as u64,
+                        conv.offset,
+                        BufId::Cur,
                         BCX,
                         BufId::Recur,
                         r_off + plane_in,
-                        BufId::RecurSnap,
-                        r_off,
+                        BufId::Attn,
                         n_embd,
                         kern,
-                        k,
+                        b,
+                    );
+                if !projected_shortconv {
+                    be().matmat(
+                        wkind(in_proj),
+                        in_proj.offset as u64,
+                        n_embd,
+                        3 * n_embd,
+                        BufId::Cur,
+                        BCX,
+                        b,
+                    );
+                    if li == gpu_probe_layer() {
+                        gprobe("conv.in_proj", BCX, 0, (3 * n_embd) as usize);
+                        gprobe("conv.in_proj_full", BCX, 0, (b * 3 * n_embd) as usize);
+                    }
+                    if let Some(k) = recurrent_snapshot {
+                        be().causal_conv_snapshot(
+                            imparo_backend::ConvForm::GatedBcx,
+                            BCX,
+                            BufId::Recur,
+                            r_off + plane_in,
+                            BufId::RecurSnap,
+                            r_off,
+                            n_embd,
+                            kern,
+                            k,
+                        );
+                    }
+                    if verification_prefix_tokens != 0 {
+                        for k in 1..b {
+                            let snap_off = ((u64::from(k) + 1)
+                                * verification_recurrent_elems
+                                + u64::from(r_off))
+                                as u32;
+                            be().causal_conv_snapshot(
+                                imparo_backend::ConvForm::GatedBcx,
+                                BCX,
+                                BufId::Recur,
+                                r_off + plane_in,
+                                BufId::RecurSnap,
+                                snap_off,
+                                n_embd,
+                                kern,
+                                k,
+                            );
+                        }
+                    }
+                    be().causal_conv(
+                        imparo_backend::ConvForm::GatedBcx,
+                        BCX,
+                        conv.offset,
+                        BufId::Recur,
+                        r_off + plane_in,
+                        r_off + plane_out,
+                        BufId::Attn,
+                        n_embd,
+                        kern,
+                        b,
                     );
                 }
-                // ATTN is the scratch: on a recurrent layer nothing attends, and it is
-                // sized n_head * head_dim = 2048, exactly the model width.
-                be().causal_conv(
-                    imparo_backend::ConvForm::GatedBcx,
-                    BCX,
-                    conv.offset,
-                    BufId::Recur,
-                    r_off + plane_in,
-                    r_off + plane_out,
-                    BufId::Attn,
-                    n_embd,
-                    kern,
-                    b,
-                );
                 // ShortConv advances the recurrent state. On a non-final Prefill
                 // chunk, the last layer's out projection and FFN are dead once that
                 // state write is complete.
-                if li + 1 == n_layers_total && !wf.state.logits_wanted {
+                if li + 1 == n_layers_total && !wf.state.output_demand.wants_logits() {
                     break;
                 }
                 if li + 1 == n_layers_total {
@@ -1035,6 +1268,9 @@ pub fn batch(
             be().add(BufId::X, BufId::O, b * n_embd);
         }
         operator_norm_ready = next_operator_norm_fused;
+        if let Some(capture) = &wf.state.layer_outputs {
+            capture.record(li as u32, sp, b, BufId::X)?;
+        }
         if li == gpu_probe_layer() {
             gprobe("l_out", BufId::X, 0, n_embd as usize);
             gprobe("l_out_full", BufId::X, 0, (b * n_embd) as usize);
@@ -1048,6 +1284,23 @@ pub fn batch(
                 n_embd as usize,
             );
         }
+        if let Some((cut_layer, r0, retained)) = deferred_history_tail {
+            if li == cut_layer {
+                // record() above has published every required dense row. Only
+                // suffix X remains live; recompute the next norm at the new width
+                // instead of reusing its full-width prepared projection metadata.
+                be().copy_range(BufId::X, 0, BufId::X, r0 * n_embd, retained * n_embd);
+                recurrent_snapshot = recurrent_snapshot.map(|k| k - r0);
+                sp += r0;
+                b = retained;
+                operator_norm_ready = false;
+                if layer_skip_log() {
+                    eprintln!(
+                        "[imparo] post-layer finite-history tail after layer {li}: retained={retained} start={sp}"
+                    );
+                }
+            }
+        }
         if flush_every > 0 && (li + 1) % flush_every == 0 && li + 1 < n_layers_total {
             be().flush();
         }
@@ -1056,12 +1309,18 @@ pub fn batch(
     // anything after the loop reads their output.
     be().mega_program_end();
 
-    // ---- last token only: the final norm and the tied lm_head, same command buffer --
-    if !wf.state.logits_wanted {
-        return be()
-            .end()
-            .map_err(|rc| format!("lfm2 forward failed rc={rc}"));
+    // Final norm/head cover every requested position in the same command buffer.
+    if !wf.state.output_demand.wants_logits() {
+        be().end()
+            .map_err(|rc| format!("lfm2 forward failed rc={rc}"))?;
+        crate::gpu_support::prefill_region_ended();
+        return finish_decode_snapshot(wf, external_decode_snapshot);
     }
+    let output_rows = if all_logits { b } else { 1 };
+    let output_start = if all_logits { 0 } else { b - 1 };
+    let output_words = output_rows
+        .checked_mul(c.vocab_size)
+        .ok_or_else(|| "all-position logits count exceeds u32".to_string())?;
     let prefill_final_projection_preparation = prefill_projection_preparation;
     let (lm_head_src, lm_head_src_row) = if prefill_final_projection_preparation {
         be().rms_norm_projection(
@@ -1070,9 +1329,9 @@ pub fn batch(
             wf.w.output_norm.offset,
             n_embd,
             eps,
-            1,
+            output_rows,
             n_embd,
-            (b - 1) * n_embd,
+            output_start * n_embd,
         );
         (BufId::Cur, 0)
     } else if decode_projection_preparation {
@@ -1093,11 +1352,11 @@ pub fn batch(
             wf.w.output_norm.offset,
             n_embd,
             eps,
-            1,
+            output_rows,
             n_embd,
-            (b - 1) * n_embd,
+            output_start * n_embd,
         );
-        (BufId::X, b - 1)
+        (BufId::X, output_start)
     };
     be().matmat_from(
         embd_kind,
@@ -1106,11 +1365,11 @@ pub fn batch(
         c.vocab_size,
         lm_head_src,
         BufId::Logits,
-        1,
+        output_rows,
         lm_head_src_row,
     );
     if let Some(cap) = wf.plan.output.logit_softcap {
-        be().softcap(BufId::Logits, cap, c.vocab_size);
+        be().softcap(BufId::Logits, cap, output_words);
     }
     if let Some(p) = pipe {
         // The pick feeds the next step's gather and the host's slot; the region is
@@ -1126,20 +1385,69 @@ pub fn batch(
             .end_async()
             .map_err(|rc| format!("lfm2 pipelined step failed rc={rc}"));
     }
-    if argmax {
+    if row_argmax {
+        #[cfg(feature = "cuda-speculative")]
+        unsafe {
+            imparo_cuda::tree::argmax_rows(
+                BufId::Logits as u32,
+                BufId::Tmp as u32,
+                c.vocab_size,
+                b,
+            );
+        }
+        #[cfg(not(feature = "cuda-speculative"))]
+        return Err("row argmax requires the admitted CUDA adapter".into());
+    }
+    if greedy_return {
+        be().verify_greedy_and_restore(
+            BufId::Logits,
+            BufId::Tokens,
+            BufId::Tmp,
+            BufId::Recur,
+            BufId::RecurSnap,
+            c.vocab_size,
+            b,
+            wf.plan.recurrent_elems(),
+        )
+        .map_err(|rc| format!("lfm2 device greedy verification rc={rc}"))?;
+    } else if argmax {
         be().argmax(BufId::Logits, BufId::Tmp, c.vocab_size);
     }
     be().end()
         .map_err(|rc| format!("lfm2 forward failed rc={rc}"))?;
+    crate::gpu_support::prefill_region_ended();
+    finish_decode_snapshot(wf, external_decode_snapshot)?;
 
-    if argmax {
+    if row_argmax {
+        out.resize(b as usize, 0.0);
+        be().read(BufId::Tmp, 0, out);
+    } else if greedy_return {
+        out.resize(3, 0.0);
+        be().read(BufId::Tmp, 0, out);
+    } else if argmax {
         out.resize(1, 0.0);
         be().read(BufId::Tmp, 0, out);
     } else {
-        out.resize(c.vocab_size as usize, 0.0);
+        out.resize(output_words as usize, 0.0);
         be().read(BufId::Logits, 0, out);
     }
     Ok(())
+}
+
+/// Preserve the boundary state only after all recurrent layers have advanced.
+/// Both a newly captured graph and a replay finish before this copy; no snapshot
+/// node can then overwrite the saved boundary during later unarmed replays.
+fn finish_decode_snapshot(wf: &Lfm2, external: bool) -> Result<(), String> {
+    if !external || wf.state.recur_snap != Some(1) {
+        return Ok(());
+    }
+    let n = wf.plan.recurrent_elems();
+    let (_, plane_out) = wf.state.recur_decode_planes();
+    let offset = n
+        .checked_mul(plane_out)
+        .ok_or("LFM2 snapshot plane overflow")?;
+    be().copy_range_after_forward(BufId::RecurSnap, 0, BufId::Recur, offset, n)
+        .map_err(|rc| format!("LFM2 decode snapshot failed rc={rc}"))
 }
 
 fn should_fuse_epilogue(n_tok: u32, backend_supports_activation: bool) -> bool {
@@ -1167,13 +1475,56 @@ fn fuse_epilogue_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BCX, buffer_requirements};
+    use super::{BCX, buffer_requirements, finite_history_tail};
     use crate::gpu_support::Placement;
     use crate::{
         Activation, Attention, EmbedPlan, Ffn, KvSource, LayerPlan, ModelConfig,
         ModelPlan, OutputPlan,
     };
     use imparo_backend::BufId;
+
+    #[test]
+    fn finite_history_tail_covers_checkpoint_and_rejects_overlapping_moves() {
+        let p = plan();
+        assert_eq!(
+            finite_history_tail(&p, 512, false, None, 64, 16),
+            Some((27, 448, 64))
+        );
+        assert_eq!(
+            finite_history_tail(&p, 512, true, Some(450), 64, 16),
+            Some((27, 432, 80))
+        );
+        assert_eq!(finite_history_tail(&p, 512, true, Some(256), 64, 16), None);
+        assert_eq!(finite_history_tail(&p, 512, true, Some(1), 64, 16), None);
+        assert_eq!(finite_history_tail(&p, 512, true, Some(513), 64, 16), None);
+        assert_eq!(
+            finite_history_tail(&p, 129, true, None, 16, 16),
+            Some((27, 112, 17))
+        );
+        assert_eq!(finite_history_tail(&p, 65, true, None, 16, 16), None);
+    }
+
+    #[test]
+    fn finite_history_tail_does_not_cross_a_later_attention_or_unknown_state() {
+        let mut p = plan();
+        p.layers[29].attention = p.layers[27].attention;
+        assert_eq!(finite_history_tail(&p, 512, true, None, 64, 16), None);
+        p = plan();
+        p.layers[29].attention = Attention::Recurrent {
+            r_elems: 4096,
+            s_elems: 1,
+            key_dim: 1,
+            value_dim: 1,
+        };
+        assert_eq!(finite_history_tail(&p, 512, true, None, 64, 16), None);
+        p.layers[29].attention = Attention::Recurrent {
+            r_elems: 4097,
+            s_elems: 0,
+            key_dim: 0,
+            value_dim: 0,
+        };
+        assert_eq!(finite_history_tail(&p, 512, true, None, 64, 16), None);
+    }
 
     /// LFM2.5-2.6B's real geometry, small enough to write down: 30 blocks, 8 attention at
     /// [2,5,9,13,17,21,24,27] and 22 recurrent, n_embd 2048, head_dim 64, l_cache 3.
@@ -1225,6 +1576,8 @@ mod tests {
             kv_storage_basis: crate::KvStorageBasisPolicy::BackendOverrideOrCanonical,
             weight_residency: crate::WeightResidencyPlan::default(),
             layers,
+            decode_interleave: true,
+            mega_decode: true,
             output: OutputPlan {
                 final_norm: true,
                 logit_softcap: None,

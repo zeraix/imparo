@@ -190,7 +190,8 @@ IMPARO_Q8_REPLAY_HD constexpr uint32_t pinned_physical_grid(
 
 IMPARO_Q8_REPLAY_HD constexpr ReplayPlan make_plan(
         uint32_t n_in, uint32_t out_stride, uint32_t n_tok,
-        uint32_t sm_count, const PlanLimits & limits) {
+        uint32_t sm_count, const PlanLimits & limits,
+        bool allow_short_replay = false) {
     ReplayPlan plan{};
     if (!n_in || !out_stride || !n_tok || !sm_count || n_in % 32 != 0) {
         plan.status = PlanStatus::InvalidShape;
@@ -200,7 +201,7 @@ IMPARO_Q8_REPLAY_HD constexpr ReplayPlan make_plan(
         plan.status = PlanStatus::NotApplicable;
         return plan;
     }
-    if (n_tok <= 8) {
+    if (n_tok <= 8 && !allow_short_replay) {
         plan.status = PlanStatus::NotApplicable;
         return plan;
     }

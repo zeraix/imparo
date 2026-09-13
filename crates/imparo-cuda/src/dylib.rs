@@ -5,6 +5,8 @@ use std::ffi::c_char;
 use std::ffi::c_void;
 use std::path::Path;
 
+// On systems other than Windows and Linux `open` always fails, so no handle is ever read.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(crate) struct Library(*mut c_void);
 
 // A loaded module is process-global OS state. Symbol calls are synchronized by the

@@ -7,6 +7,8 @@ license.workspace = true
 
 [features]
 cuda = ["imparo-model/cuda"]
+cuda-speculative = ["imparo-model/cuda-speculative"]
+cuda-owner-lab = ["cuda-speculative", "imparo-model/cuda-owner-lab"]
 cuda-dynamic = ["imparo-model/cuda-dynamic"]
 
 [dependencies]

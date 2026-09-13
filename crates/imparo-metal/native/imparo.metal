@@ -532,8 +532,9 @@ constant uint WF_ROWMAJOR = 0u;
 constant uint WF_Q4_K = 12u, WF_Q5_K = 13u, WF_Q6_K = 14u;
 constant uint WF_Q3_K = 11u, WF_IQ4_NL = 20u, WF_IQ4_XS = 23u;
 constant uint WF_IQ3_S = 21u;
-constant uint WF_IQ2_XS = 17u, WF_IQ3_XXS = 18u, WF_IQ2_S = 22u;
+constant uint WF_IQ2_XS = 17u, WF_IQ3_XXS = 18u, WF_IQ2_S = 22u, WF_IQ2_XXS = 16u;
 constant uint WF_Q2_K = 10u;
+constant uint WF_Q4_1 = 3u, WF_Q5_0 = 6u, WF_Q5_1 = 7u, WF_IQ1_S = 19u, WF_IQ1_M = 29u;
 
 // The sign table IQ2_XS and IQ3_XXS share: a 7-bit index whose EIGHTH sign is the parity
 // of the other seven. llama.cpp writes it out as ksigns_iq2xs[128]; it is one expression,
@@ -549,10 +550,19 @@ constant char KVALUES_IQ4NL[16] = {
 // The 6-bit sub-block scale and min for sub-block j of a Q4_K / Q5_K super-block, unpacked
 // from the 12 packed bytes (llama.cpp's get_scale_min_k4): the first four pairs are plain
 // 6-bit fields, the last four steal their top two bits from the first four's spare bits.
-inline void k_scale_min(uint j, device const uchar * q, thread uint & sc, thread uint & m) {
-    if (j < 4u) { sc = q[j] & 63u;                          m = q[j + 4u] & 63u; }
-    else        { sc = (q[j + 4u] & 0xFu) | ((q[j - 4u] >> 6) << 4);
-                  m  = (q[j + 4u] >> 4)   | ((q[j]      >> 6) << 4); }
+// The k-quant 6-bit scale and min of sub-block j from the header's three scale words
+// (bytes 4..15 of a Q4_K / Q5_K block as little-endian uints). Fields 0..3 are the low
+// six bits of bytes 0..3 (scales) and 4..7 (mins); fields 4..7 take their low nibble from
+// bytes 8..11 and their top two bits from the first eight bytes. Branch-free: both forms
+// are computed and `j < 4` picks one, so the eight lanes of a block, whose j differ, do
+// not split into two paths.
+inline void k_scale_min(uint j, uint y, uint z, uint w, thread uint & sc, thread uint & m) {
+    const uint sh = (j & 3u) * 8u;
+    const uint by = (y >> sh) & 0xFFu, bz = (z >> sh) & 0xFFu, bw = (w >> sh) & 0xFFu;
+    const uint s_lo = by & 63u,                          m_lo = bz & 63u;
+    const uint s_hi = (bw & 0xFu) | ((by >> 6) << 4),    m_hi = (bw >> 4) | ((bz >> 6) << 4);
+    sc = j < 4u ? s_lo : s_hi;
+    m  = j < 4u ? m_lo : m_hi;
 }
 
 // IQ3_S's codebook, 512 entries of four packed byte levels. Transcribed from the
@@ -623,6 +633,252 @@ constant uint IQ3S_GRID[512] = {
     0x0f030509u, 0x0f030907u, 0x0f03090bu, 0x0f050103u, 0x0f050109u, 0x0f050301u, 0x0f05030du, 0x0f050503u,
     0x0f050701u, 0x0f050b03u, 0x0f070105u, 0x0f070705u, 0x0f07070bu, 0x0f070b07u, 0x0f090103u, 0x0f09010bu,
     0x0f090307u, 0x0f090501u, 0x0f090b01u, 0x0f0b0505u, 0x0f0b0905u, 0x0f0d0105u, 0x0f0d0703u, 0x0f0f0101u,
+};
+
+// IQ2_XXS's codebook: 256 entries of eight packed byte levels (ggml-common.h
+// iq2xxs_grid). Dead-stripped unless a pipeline compiles with WFMT == WF_IQ2_XXS.
+constant ulong IQ2XXS_GRID[256] = {
+    0x0808080808080808ul, 0x080808080808082bul, 0x0808080808081919ul, 0x0808080808082b08ul,
+    0x0808080808082b2bul, 0x0808080808190819ul, 0x0808080808191908ul, 0x08080808082b0808ul,
+    0x08080808082b082bul, 0x08080808082b2b08ul, 0x08080808082b2b2bul, 0x0808080819080819ul,
+    0x0808080819081908ul, 0x0808080819190808ul, 0x0808080819192b08ul, 0x08080808192b0819ul,
+    0x08080808192b1908ul, 0x080808082b080808ul, 0x080808082b08082bul, 0x080808082b082b2bul,
+    0x080808082b2b082bul, 0x0808081908080819ul, 0x0808081908081908ul, 0x0808081908190808ul,
+    0x0808081908191919ul, 0x0808081919080808ul, 0x080808192b081908ul, 0x080808192b192b08ul,
+    0x0808082b08080808ul, 0x0808082b0808082bul, 0x0808082b082b082bul, 0x0808082b2b08082bul,
+    0x0808190808080819ul, 0x0808190808081908ul, 0x0808190808190808ul, 0x08081908082b0819ul,
+    0x08081908082b1908ul, 0x0808190819080808ul, 0x080819081908082bul, 0x0808190819082b08ul,
+    0x08081908192b0808ul, 0x080819082b080819ul, 0x080819082b081908ul, 0x080819082b190808ul,
+    0x080819082b2b1908ul, 0x0808191908080808ul, 0x080819190808082bul, 0x0808191908082b08ul,
+    0x08081919082b0808ul, 0x080819191908192bul, 0x08081919192b2b19ul, 0x080819192b080808ul,
+    0x080819192b190819ul, 0x0808192b08082b19ul, 0x0808192b08190808ul, 0x0808192b19080808ul,
+    0x0808192b2b081908ul, 0x0808192b2b2b1908ul, 0x08082b0808080808ul, 0x08082b0808081919ul,
+    0x08082b0808082b08ul, 0x08082b0808191908ul, 0x08082b08082b2b08ul, 0x08082b0819080819ul,
+    0x08082b0819081908ul, 0x08082b0819190808ul, 0x08082b081919082bul, 0x08082b082b082b08ul,
+    0x08082b1908081908ul, 0x08082b1919080808ul, 0x08082b2b0808082bul, 0x08082b2b08191908ul,
+    0x0819080808080819ul, 0x0819080808081908ul, 0x0819080808190808ul, 0x08190808082b0819ul,
+    0x0819080819080808ul, 0x08190808192b0808ul, 0x081908082b081908ul, 0x081908082b190808ul,
+    0x081908082b191919ul, 0x0819081908080808ul, 0x0819081908082b08ul, 0x08190819082b0808ul,
+    0x0819081919190808ul, 0x0819081919192b2bul, 0x081908192b080808ul, 0x0819082b082b1908ul,
+    0x0819082b19081919ul, 0x0819190808080808ul, 0x0819190808082b08ul, 0x08191908082b0808ul,
+    0x08191908082b1919ul, 0x0819190819082b19ul, 0x081919082b080808ul, 0x0819191908192b08ul,
+    0x08191919192b082bul, 0x0819192b08080808ul, 0x0819192b0819192bul, 0x08192b0808080819ul,
+    0x08192b0808081908ul, 0x08192b0808190808ul, 0x08192b0819080808ul, 0x08192b082b080819ul,
+    0x08192b1908080808ul, 0x08192b1908081919ul, 0x08192b192b2b0808ul, 0x08192b2b19190819ul,
+    0x082b080808080808ul, 0x082b08080808082bul, 0x082b080808082b2bul, 0x082b080819081908ul,
+    0x082b0808192b0819ul, 0x082b08082b080808ul, 0x082b08082b08082bul, 0x082b0819082b2b19ul,
+    0x082b081919082b08ul, 0x082b082b08080808ul, 0x082b082b0808082bul, 0x082b190808080819ul,
+    0x082b190808081908ul, 0x082b190808190808ul, 0x082b190819080808ul, 0x082b19081919192bul,
+    0x082b191908080808ul, 0x082b191919080819ul, 0x082b1919192b1908ul, 0x082b192b2b190808ul,
+    0x082b2b0808082b08ul, 0x082b2b08082b0808ul, 0x082b2b082b191908ul, 0x082b2b2b19081908ul,
+    0x1908080808080819ul, 0x1908080808081908ul, 0x1908080808190808ul, 0x1908080808192b08ul,
+    0x19080808082b0819ul, 0x19080808082b1908ul, 0x1908080819080808ul, 0x1908080819082b08ul,
+    0x190808081919192bul, 0x19080808192b0808ul, 0x190808082b080819ul, 0x190808082b081908ul,
+    0x190808082b190808ul, 0x1908081908080808ul, 0x19080819082b0808ul, 0x19080819192b0819ul,
+    0x190808192b080808ul, 0x190808192b081919ul, 0x1908082b08080819ul, 0x1908082b08190808ul,
+    0x1908082b19082b08ul, 0x1908082b1919192bul, 0x1908082b192b2b08ul, 0x1908190808080808ul,
+    0x1908190808082b08ul, 0x19081908082b0808ul, 0x190819082b080808ul, 0x190819082b192b19ul,
+    0x190819190819082bul, 0x19081919082b1908ul, 0x1908192b08080808ul, 0x19082b0808080819ul,
+    0x19082b0808081908ul, 0x19082b0808190808ul, 0x19082b0819080808ul, 0x19082b0819081919ul,
+    0x19082b1908080808ul, 0x19082b1919192b08ul, 0x19082b19192b0819ul, 0x19082b192b08082bul,
+    0x19082b2b19081919ul, 0x19082b2b2b190808ul, 0x1919080808080808ul, 0x1919080808082b08ul,
+    0x1919080808190819ul, 0x1919080808192b19ul, 0x19190808082b0808ul, 0x191908082b080808ul,
+    0x191908082b082b08ul, 0x1919081908081908ul, 0x191908191908082bul, 0x191908192b2b1908ul,
+    0x1919082b2b190819ul, 0x191919082b190808ul, 0x191919082b19082bul, 0x1919191908082b2bul,
+    0x1919192b08080819ul, 0x1919192b19191908ul, 0x19192b0808080808ul, 0x19192b0808190819ul,
+    0x19192b0808192b19ul, 0x19192b08192b1908ul, 0x19192b1919080808ul, 0x19192b2b08082b08ul,
+    0x192b080808081908ul, 0x192b080808190808ul, 0x192b080819080808ul, 0x192b0808192b2b08ul,
+    0x192b081908080808ul, 0x192b081919191919ul, 0x192b082b08192b08ul, 0x192b082b192b0808ul,
+    0x192b190808080808ul, 0x192b190808081919ul, 0x192b191908190808ul, 0x192b19190819082bul,
+    0x192b19192b081908ul, 0x192b2b081908082bul, 0x2b08080808080808ul, 0x2b0808080808082bul,
+    0x2b08080808082b2bul, 0x2b08080819080819ul, 0x2b0808082b08082bul, 0x2b08081908081908ul,
+    0x2b08081908192b08ul, 0x2b08081919080808ul, 0x2b08082b08190819ul, 0x2b08190808080819ul,
+    0x2b08190808081908ul, 0x2b08190808190808ul, 0x2b08190808191919ul, 0x2b08190819080808ul,
+    0x2b081908192b0808ul, 0x2b08191908080808ul, 0x2b0819191908192bul, 0x2b0819192b191908ul,
+    0x2b08192b08082b19ul, 0x2b08192b19080808ul, 0x2b08192b192b0808ul, 0x2b082b080808082bul,
+    0x2b082b1908081908ul, 0x2b082b2b08190819ul, 0x2b19080808081908ul, 0x2b19080808190808ul,
+    0x2b190808082b1908ul, 0x2b19080819080808ul, 0x2b1908082b2b0819ul, 0x2b1908190819192bul,
+    0x2b1908192b080808ul, 0x2b19082b19081919ul, 0x2b19190808080808ul, 0x2b191908082b082bul,
+    0x2b19190819081908ul, 0x2b19191919190819ul, 0x2b192b082b080819ul, 0x2b192b19082b0808ul,
+    0x2b2b08080808082bul, 0x2b2b080819190808ul, 0x2b2b08082b081919ul, 0x2b2b081908082b19ul,
+    0x2b2b082b08080808ul, 0x2b2b190808192b08ul, 0x2b2b2b0819190808ul, 0x2b2b2b1908081908ul,
+};
+
+// IQ1_S / IQ1_M's codebook: 2048 entries of eight levels in {-1, 0, 1}, two bits each
+// (level + 1), from ggml-common.h's iq1s_grid; the same numbers as gguf-py's grid_hex and as
+// ggml's GPU table, which packs them four bits apart.
+constant ushort IQ1S_GRID[2048] = {
+    0x0000, 0x0002, 0x0005, 0x0008, 0x000a, 0x0011, 0x0015, 0x0020, 0x0022, 0x0028, 0x002a, 0x0045,
+    0x0051, 0x0054, 0x0056, 0x0065, 0x0080, 0x0082, 0x0088, 0x008a, 0x0095, 0x00a0, 0x00a2, 0x00a8,
+    0x00aa, 0x0104, 0x0105, 0x0111, 0x0114, 0x0116, 0x0119, 0x011a, 0x0125, 0x0141, 0x0146, 0x0149,
+    0x0152, 0x0155, 0x015a, 0x0161, 0x0164, 0x0166, 0x0168, 0x0185, 0x0191, 0x0194, 0x0196, 0x01a5,
+    0x0200, 0x0202, 0x0208, 0x020a, 0x0215, 0x0220, 0x0222, 0x0228, 0x022a, 0x0245, 0x0251, 0x0259,
+    0x0264, 0x0269, 0x0280, 0x0282, 0x0288, 0x028a, 0x0291, 0x0295, 0x0299, 0x02a0, 0x02a2, 0x02a8,
+    0x02aa, 0x0411, 0x0414, 0x0416, 0x0425, 0x0441, 0x0449, 0x0455, 0x045a, 0x0464, 0x0465, 0x0491,
+    0x0499, 0x04a5, 0x0501, 0x0504, 0x0505, 0x0506, 0x0515, 0x0518, 0x051a, 0x0529, 0x0540, 0x0545,
+    0x054a, 0x0550, 0x0551, 0x0554, 0x0555, 0x0556, 0x0559, 0x0560, 0x0562, 0x0565, 0x0568, 0x056a,
+    0x0581, 0x0591, 0x0595, 0x0598, 0x059a, 0x05a1, 0x05a4, 0x05a5, 0x05a6, 0x05a9, 0x0614, 0x0619,
+    0x0641, 0x0644, 0x0650, 0x0652, 0x0655, 0x0658, 0x0660, 0x0661, 0x0666, 0x0669, 0x0685, 0x0691,
+    0x0694, 0x0699, 0x0800, 0x0802, 0x0808, 0x080a, 0x0815, 0x0820, 0x0822, 0x0828, 0x082a, 0x0845,
+    0x0851, 0x0856, 0x0865, 0x0880, 0x0882, 0x0888, 0x088a, 0x0895, 0x08a0, 0x08a2, 0x08a8, 0x08aa,
+    0x0905, 0x0911, 0x0914, 0x0919, 0x0924, 0x0925, 0x0941, 0x0950, 0x0951, 0x0955, 0x0961, 0x0964,
+    0x0969, 0x0991, 0x0994, 0x0996, 0x0999, 0x09a5, 0x0a00, 0x0a02, 0x0a08, 0x0a0a, 0x0a15, 0x0a20,
+    0x0a22, 0x0a28, 0x0a2a, 0x0a45, 0x0a51, 0x0a59, 0x0a61, 0x0a65, 0x0a80, 0x0a82, 0x0a85, 0x0a88,
+    0x0a8a, 0x0a95, 0x0aa0, 0x0aa2, 0x0aa8, 0x0aaa, 0x1010, 0x1011, 0x1014, 0x1019, 0x1024, 0x1025,
+    0x1041, 0x1044, 0x1050, 0x1055, 0x1058, 0x1061, 0x1064, 0x1065, 0x1069, 0x1091, 0x1094, 0x1096,
+    0x10a1, 0x10a5, 0x1101, 0x1104, 0x1106, 0x1109, 0x1110, 0x1112, 0x1115, 0x1118, 0x1121, 0x1124,
+    0x1129, 0x1145, 0x114a, 0x1150, 0x1151, 0x1152, 0x1154, 0x1155, 0x1156, 0x1159, 0x1160, 0x1165,
+    0x1184, 0x1192, 0x1195, 0x11a1, 0x11a4, 0x1211, 0x1214, 0x1216, 0x1225, 0x1240, 0x1246, 0x1249,
+    0x1252, 0x1255, 0x1258, 0x125a, 0x1264, 0x1266, 0x1285, 0x1291, 0x1294, 0x1296, 0x12a5, 0x1401,
+    0x1406, 0x1409, 0x1414, 0x1415, 0x1418, 0x1419, 0x1421, 0x1426, 0x1441, 0x1445, 0x1446, 0x1448,
+    0x144a, 0x1451, 0x1454, 0x1455, 0x1456, 0x1459, 0x1462, 0x1465, 0x1468, 0x1484, 0x1489, 0x1490,
+    0x1494, 0x1495, 0x1498, 0x1499, 0x149a, 0x14a1, 0x14a4, 0x14a5, 0x14a9, 0x1502, 0x1505, 0x150a,
+    0x1511, 0x1514, 0x1515, 0x1516, 0x1519, 0x1520, 0x1522, 0x1525, 0x1528, 0x152a, 0x1541, 0x1544,
+    0x1545, 0x1546, 0x1551, 0x1552, 0x1554, 0x1555, 0x1556, 0x1559, 0x155a, 0x1561, 0x1564, 0x1565,
+    0x1566, 0x1569, 0x1580, 0x1582, 0x1584, 0x1585, 0x1588, 0x158a, 0x1590, 0x1591, 0x1594, 0x1595,
+    0x1596, 0x1599, 0x159a, 0x15a0, 0x15a2, 0x15a5, 0x1601, 0x1604, 0x1605, 0x1606, 0x1615, 0x1616,
+    0x1618, 0x161a, 0x1621, 0x1626, 0x1640, 0x1642, 0x1644, 0x1645, 0x1648, 0x164a, 0x1651, 0x1655,
+    0x1656, 0x1658, 0x1659, 0x1661, 0x1664, 0x1665, 0x1668, 0x1669, 0x166a, 0x1686, 0x168a, 0x1692,
+    0x1695, 0x16a4, 0x16a9, 0x1811, 0x1816, 0x1825, 0x1841, 0x1844, 0x1846, 0x1849, 0x1850, 0x1855,
+    0x1858, 0x185a, 0x1860, 0x1861, 0x1864, 0x1866, 0x1869, 0x1885, 0x1891, 0x1894, 0x18a5, 0x1910,
+    0x1912, 0x1915, 0x191a, 0x1921, 0x1925, 0x1942, 0x1944, 0x1945, 0x1948, 0x1951, 0x1954, 0x1955,
+    0x1956, 0x1959, 0x195a, 0x1960, 0x1965, 0x196a, 0x1989, 0x1991, 0x1992, 0x1995, 0x1998, 0x19a1,
+    0x19a6, 0x19a9, 0x1a09, 0x1a16, 0x1a24, 0x1a26, 0x1a44, 0x1a46, 0x1a49, 0x1a50, 0x1a52, 0x1a55,
+    0x1a58, 0x1a61, 0x1a66, 0x1a69, 0x1a85, 0x1a91, 0x1a96, 0x1a9a, 0x2000, 0x2002, 0x2008, 0x200a,
+    0x2015, 0x2020, 0x2022, 0x2025, 0x2028, 0x202a, 0x2045, 0x2051, 0x2059, 0x2061, 0x2065, 0x2080,
+    0x2082, 0x2088, 0x208a, 0x2095, 0x20a0, 0x20a2, 0x20a5, 0x20a8, 0x20aa, 0x2105, 0x2111, 0x2114,
+    0x2119, 0x2125, 0x2142, 0x2144, 0x2149, 0x2155, 0x2158, 0x215a, 0x2161, 0x2164, 0x2165, 0x2166,
+    0x2185, 0x2190, 0x2196, 0x2199, 0x21a5, 0x2201, 0x2208, 0x220a, 0x2211, 0x2215, 0x2220, 0x2222,
+    0x2228, 0x222a, 0x2245, 0x2251, 0x2256, 0x2259, 0x2265, 0x2281, 0x2288, 0x228a, 0x2291, 0x2295,
+    0x22a0, 0x22a2, 0x22a8, 0x22aa, 0x2405, 0x2414, 0x2416, 0x2419, 0x2425, 0x2444, 0x2445, 0x2446,
+    0x2449, 0x2452, 0x2455, 0x2458, 0x245a, 0x2466, 0x2485, 0x2491, 0x2494, 0x2499, 0x24a1, 0x24a5,
+    0x2509, 0x2515, 0x2521, 0x2529, 0x2540, 0x2545, 0x2548, 0x2551, 0x2554, 0x2555, 0x2559, 0x2562,
+    0x2565, 0x2568, 0x2589, 0x2590, 0x2594, 0x2595, 0x2598, 0x259a, 0x25a1, 0x25a4, 0x25a6, 0x25a9,
+    0x2605, 0x2610, 0x2612, 0x2619, 0x2625, 0x2641, 0x2649, 0x2655, 0x2660, 0x2661, 0x2669, 0x2684,
+    0x2686, 0x2690, 0x269a, 0x2800, 0x2802, 0x2808, 0x280a, 0x2815, 0x2820, 0x2822, 0x2828, 0x282a,
+    0x2845, 0x2851, 0x2854, 0x2865, 0x2880, 0x2882, 0x2888, 0x288a, 0x28a0, 0x28a2, 0x28a8, 0x28aa,
+    0x2909, 0x2911, 0x2914, 0x2919, 0x2925, 0x2946, 0x2949, 0x2952, 0x2955, 0x2961, 0x2964, 0x2966,
+    0x2969, 0x2985, 0x2990, 0x2996, 0x2999, 0x29a4, 0x29a5, 0x2a00, 0x2a02, 0x2a08, 0x2a0a, 0x2a20,
+    0x2a22, 0x2a28, 0x2a2a, 0x2a45, 0x2a51, 0x2a56, 0x2a59, 0x2a65, 0x2a80, 0x2a82, 0x2a88, 0x2a8a,
+    0x2a95, 0x2aa0, 0x2aa2, 0x2aa8, 0x2aaa, 0x4005, 0x4011, 0x4016, 0x4025, 0x4049, 0x4052, 0x4055,
+    0x4058, 0x405a, 0x4061, 0x4064, 0x4066, 0x4094, 0x4099, 0x40a1, 0x40a6, 0x4100, 0x4101, 0x4104,
+    0x4106, 0x4109, 0x4112, 0x4115, 0x4116, 0x4118, 0x411a, 0x4121, 0x4126, 0x4129, 0x4145, 0x4148,
+    0x414a, 0x4151, 0x4154, 0x4155, 0x4156, 0x4159, 0x415a, 0x4165, 0x4168, 0x416a, 0x4181, 0x4184,
+    0x4186, 0x4190, 0x4192, 0x4195, 0x41a0, 0x41a1, 0x41a2, 0x4205, 0x4211, 0x4214, 0x4216, 0x4225,
+    0x4241, 0x4252, 0x4255, 0x425a, 0x4264, 0x4269, 0x4289, 0x4294, 0x42a5, 0x4401, 0x4415, 0x4419,
+    0x4429, 0x4445, 0x4448, 0x444a, 0x4451, 0x4454, 0x4455, 0x4456, 0x4461, 0x4462, 0x4465, 0x4468,
+    0x446a, 0x4481, 0x4486, 0x4489, 0x4490, 0x4492, 0x4495, 0x44a0, 0x44a1, 0x44a9, 0x4501, 0x4502,
+    0x4505, 0x450a, 0x4511, 0x4514, 0x4515, 0x4516, 0x4519, 0x4520, 0x4525, 0x452a, 0x4541, 0x4544,
+    0x4545, 0x4546, 0x4549, 0x4550, 0x4551, 0x4554, 0x4555, 0x4556, 0x4558, 0x4559, 0x4561, 0x4564,
+    0x4565, 0x4566, 0x4569, 0x4582, 0x4584, 0x4585, 0x4588, 0x4591, 0x4594, 0x4595, 0x4596, 0x4599,
+    0x459a, 0x45a5, 0x45a8, 0x45aa, 0x4601, 0x4605, 0x4609, 0x4614, 0x4615, 0x4618, 0x461a, 0x4621,
+    0x4624, 0x4629, 0x4640, 0x4642, 0x4645, 0x4648, 0x4650, 0x4651, 0x4652, 0x4655, 0x4656, 0x4659,
+    0x4662, 0x4665, 0x4668, 0x4681, 0x4685, 0x468a, 0x4694, 0x4695, 0x46a1, 0x46a4, 0x46a6, 0x4805,
+    0x4811, 0x4815, 0x481a, 0x4825, 0x4842, 0x4849, 0x4850, 0x4855, 0x4858, 0x4861, 0x4864, 0x4866,
+    0x4869, 0x4885, 0x4891, 0x4894, 0x4896, 0x4899, 0x48a5, 0x4901, 0x4905, 0x4906, 0x490a, 0x4910,
+    0x4914, 0x4915, 0x4918, 0x4921, 0x4924, 0x4926, 0x4940, 0x4945, 0x494a, 0x4951, 0x4952, 0x4954,
+    0x4955, 0x4956, 0x4959, 0x4960, 0x4962, 0x4965, 0x4966, 0x496a, 0x4986, 0x4989, 0x4992, 0x4995,
+    0x4996, 0x4998, 0x49a1, 0x49a4, 0x49a6, 0x49a9, 0x4a16, 0x4a44, 0x4a46, 0x4a49, 0x4a55, 0x4a58,
+    0x4a5a, 0x4a64, 0x4a69, 0x4a94, 0x4aa5, 0x5001, 0x5004, 0x5005, 0x5006, 0x5009, 0x5012, 0x5015,
+    0x501a, 0x5021, 0x5024, 0x5029, 0x5040, 0x5045, 0x5048, 0x5051, 0x5054, 0x5055, 0x5056, 0x5059,
+    0x5065, 0x5068, 0x5086, 0x5089, 0x5095, 0x5098, 0x50a0, 0x50a1, 0x50a6, 0x50a9, 0x5105, 0x5108,
+    0x5109, 0x510a, 0x5111, 0x5114, 0x5115, 0x5116, 0x5118, 0x5119, 0x5120, 0x5125, 0x5126, 0x5128,
+    0x512a, 0x5141, 0x5144, 0x5145, 0x5146, 0x5149, 0x5150, 0x5151, 0x5152, 0x5154, 0x5155, 0x5156,
+    0x5158, 0x5159, 0x515a, 0x5161, 0x5164, 0x5165, 0x5166, 0x5169, 0x5182, 0x5185, 0x5191, 0x5194,
+    0x5195, 0x5196, 0x5199, 0x51a0, 0x51a5, 0x51aa, 0x5201, 0x5206, 0x5212, 0x5215, 0x521a, 0x5221,
+    0x5224, 0x5242, 0x5245, 0x524a, 0x5251, 0x5254, 0x5255, 0x5256, 0x5259, 0x5262, 0x5265, 0x5285,
+    0x5290, 0x5292, 0x5295, 0x5299, 0x529a, 0x52a4, 0x5404, 0x5405, 0x5411, 0x5414, 0x5415, 0x5416,
+    0x5418, 0x5419, 0x5421, 0x5425, 0x5428, 0x542a, 0x5441, 0x5444, 0x5445, 0x5446, 0x5449, 0x544a,
+    0x5450, 0x5451, 0x5454, 0x5455, 0x5456, 0x5458, 0x5459, 0x545a, 0x5461, 0x5462, 0x5464, 0x5465,
+    0x5466, 0x5469, 0x5480, 0x5488, 0x548a, 0x5491, 0x5494, 0x5495, 0x5496, 0x5499, 0x54a1, 0x54a4,
+    0x54a5, 0x54aa, 0x5501, 0x5502, 0x5504, 0x5505, 0x5506, 0x5509, 0x5510, 0x5511, 0x5512, 0x5514,
+    0x5515, 0x5516, 0x5519, 0x551a, 0x5521, 0x5524, 0x5525, 0x5526, 0x5529, 0x5540, 0x5541, 0x5542,
+    0x5544, 0x5545, 0x5546, 0x5548, 0x5549, 0x5550, 0x5551, 0x5552, 0x5554, 0x5555, 0x5556, 0x5558,
+    0x5559, 0x555a, 0x5560, 0x5561, 0x5564, 0x5565, 0x5566, 0x5568, 0x5569, 0x556a, 0x5581, 0x5584,
+    0x5585, 0x5589, 0x558a, 0x5590, 0x5591, 0x5594, 0x5595, 0x5596, 0x5598, 0x5599, 0x55a1, 0x55a4,
+    0x55a5, 0x55a6, 0x55a9, 0x5600, 0x5601, 0x5602, 0x5604, 0x5606, 0x5608, 0x5609, 0x5611, 0x5614,
+    0x5615, 0x5618, 0x5619, 0x5620, 0x5621, 0x5622, 0x5624, 0x5625, 0x5626, 0x5628, 0x5629, 0x5641,
+    0x5645, 0x5646, 0x5648, 0x5649, 0x564a, 0x5650, 0x5651, 0x5652, 0x5654, 0x5655, 0x5656, 0x5658,
+    0x5659, 0x565a, 0x5661, 0x5664, 0x5665, 0x5669, 0x5682, 0x5685, 0x5686, 0x5688, 0x5689, 0x568a,
+    0x5691, 0x5695, 0x569a, 0x56a2, 0x56a5, 0x56a6, 0x56a8, 0x56a9, 0x5804, 0x5805, 0x5806, 0x5809,
+    0x5810, 0x5815, 0x5818, 0x5821, 0x582a, 0x5845, 0x5848, 0x584a, 0x5851, 0x5854, 0x5855, 0x5856,
+    0x5858, 0x5859, 0x5860, 0x5862, 0x5864, 0x5865, 0x5882, 0x5889, 0x5890, 0x5892, 0x5895, 0x5898,
+    0x58a1, 0x58a9, 0x5901, 0x5902, 0x5905, 0x590a, 0x5911, 0x5914, 0x5915, 0x5916, 0x5919, 0x5925,
+    0x5941, 0x5944, 0x5945, 0x5946, 0x5949, 0x5950, 0x5951, 0x5952, 0x5954, 0x5955, 0x5956, 0x5958,
+    0x5959, 0x595a, 0x5961, 0x5964, 0x5965, 0x5966, 0x5969, 0x5981, 0x5985, 0x5989, 0x5991, 0x5994,
+    0x5995, 0x5996, 0x5998, 0x5999, 0x59a5, 0x5a04, 0x5a08, 0x5a15, 0x5a1a, 0x5a20, 0x5a25, 0x5a26,
+    0x5a29, 0x5a45, 0x5a48, 0x5a49, 0x5a51, 0x5a55, 0x5a56, 0x5a58, 0x5a59, 0x5a62, 0x5a65, 0x5a68,
+    0x5a6a, 0x5a81, 0x5a8a, 0x5a92, 0x5a95, 0x5a96, 0x5a98, 0x5a9a, 0x5aa1, 0x6005, 0x6014, 0x6016,
+    0x6019, 0x6025, 0x6044, 0x6050, 0x6055, 0x6056, 0x6058, 0x605a, 0x6061, 0x6064, 0x6066, 0x6069,
+    0x6081, 0x6096, 0x60a5, 0x6101, 0x6104, 0x6106, 0x6109, 0x6112, 0x6115, 0x6121, 0x6122, 0x6126,
+    0x6129, 0x6145, 0x6149, 0x6151, 0x6155, 0x6156, 0x6159, 0x6165, 0x6166, 0x616a, 0x6184, 0x618a,
+    0x6192, 0x6195, 0x61a1, 0x61a6, 0x61a9, 0x6211, 0x6216, 0x6219, 0x6240, 0x6241, 0x6246, 0x6255,
+    0x6256, 0x6258, 0x6260, 0x6285, 0x6291, 0x6296, 0x62a5, 0x6411, 0x6412, 0x6415, 0x6416, 0x641a,
+    0x6421, 0x6426, 0x6429, 0x6440, 0x6442, 0x6445, 0x6448, 0x644a, 0x6451, 0x6454, 0x6455, 0x6456,
+    0x6459, 0x645a, 0x6460, 0x6462, 0x6465, 0x6484, 0x6485, 0x6489, 0x6490, 0x6492, 0x6494, 0x6495,
+    0x6496, 0x6498, 0x649a, 0x64a1, 0x64a4, 0x64a9, 0x6505, 0x6508, 0x650a, 0x6511, 0x6515, 0x6516,
+    0x6519, 0x6544, 0x6545, 0x6546, 0x6549, 0x6550, 0x6551, 0x6554, 0x6555, 0x6556, 0x6559, 0x6561,
+    0x6564, 0x6565, 0x6566, 0x6569, 0x6586, 0x6589, 0x658a, 0x6591, 0x6595, 0x6596, 0x6599, 0x659a,
+    0x65a2, 0x65a5, 0x65a6, 0x65a8, 0x6602, 0x6609, 0x6615, 0x6620, 0x6626, 0x6628, 0x6629, 0x6640,
+    0x6645, 0x6648, 0x664a, 0x6651, 0x6654, 0x6655, 0x6656, 0x6658, 0x665a, 0x6660, 0x6665, 0x6668,
+    0x6680, 0x6682, 0x6685, 0x668a, 0x6694, 0x6696, 0x6698, 0x6699, 0x66a0, 0x66a4, 0x66a6, 0x66aa,
+    0x6816, 0x6819, 0x6825, 0x6841, 0x6852, 0x6855, 0x685a, 0x6861, 0x6869, 0x6885, 0x6891, 0x6898,
+    0x68a6, 0x6901, 0x6904, 0x6910, 0x6915, 0x6921, 0x6924, 0x6926, 0x6929, 0x6940, 0x6941, 0x6945,
+    0x6946, 0x6948, 0x6951, 0x6954, 0x6955, 0x6956, 0x6959, 0x6960, 0x6965, 0x696a, 0x6982, 0x6984,
+    0x698a, 0x6995, 0x69a1, 0x69a4, 0x69a5, 0x69a9, 0x6a11, 0x6a16, 0x6a18, 0x6a41, 0x6a44, 0x6a49,
+    0x6a50, 0x6a55, 0x6a58, 0x6a5a, 0x6a64, 0x6a65, 0x6a69, 0x6a86, 0x6a94, 0x6a98, 0x6a9a, 0x6aa6,
+    0x8000, 0x8002, 0x8008, 0x800a, 0x8020, 0x8022, 0x8028, 0x802a, 0x8045, 0x8050, 0x8051, 0x8054,
+    0x8056, 0x8059, 0x8065, 0x8080, 0x8082, 0x8088, 0x808a, 0x8095, 0x80a0, 0x80a2, 0x80a8, 0x80aa,
+    0x8105, 0x8111, 0x8114, 0x8116, 0x8119, 0x8125, 0x8141, 0x8144, 0x8149, 0x8150, 0x8152, 0x8155,
+    0x8156, 0x8158, 0x8159, 0x8164, 0x8166, 0x8169, 0x8185, 0x8189, 0x8194, 0x8196, 0x8199, 0x81a5,
+    0x8200, 0x8202, 0x8208, 0x820a, 0x8215, 0x8220, 0x8222, 0x8228, 0x822a, 0x8251, 0x8254, 0x8259,
+    0x8265, 0x8280, 0x8282, 0x8288, 0x828a, 0x8295, 0x82a0, 0x82a2, 0x82a8, 0x82aa, 0x8414, 0x8419,
+    0x8441, 0x8444, 0x8451, 0x8455, 0x845a, 0x8461, 0x8464, 0x8469, 0x8494, 0x8499, 0x8501, 0x8509,
+    0x8512, 0x8515, 0x851a, 0x8526, 0x8529, 0x8540, 0x8541, 0x8545, 0x8548, 0x8551, 0x8554, 0x8555,
+    0x8556, 0x8559, 0x855a, 0x8565, 0x8566, 0x8568, 0x856a, 0x8581, 0x8584, 0x8586, 0x8589, 0x8590,
+    0x8592, 0x8595, 0x8598, 0x85a6, 0x8611, 0x8616, 0x8619, 0x8625, 0x8641, 0x8644, 0x8649, 0x864a,
+    0x8650, 0x8655, 0x8659, 0x865a, 0x8661, 0x8666, 0x866a, 0x8685, 0x8691, 0x869a, 0x86a4, 0x8800,
+    0x8802, 0x8808, 0x880a, 0x8815, 0x8820, 0x8822, 0x8828, 0x882a, 0x8841, 0x8845, 0x8851, 0x8854,
+    0x8859, 0x8865, 0x8869, 0x8880, 0x8882, 0x8888, 0x888a, 0x8895, 0x88a0, 0x88a2, 0x88a8, 0x88aa,
+    0x8905, 0x8906, 0x8911, 0x8914, 0x8916, 0x8925, 0x8941, 0x8944, 0x8946, 0x8949, 0x8950, 0x8952,
+    0x8955, 0x895a, 0x8961, 0x8964, 0x8985, 0x8996, 0x8999, 0x89a5, 0x8a00, 0x8a02, 0x8a08, 0x8a0a,
+    0x8a15, 0x8a20, 0x8a22, 0x8a28, 0x8a2a, 0x8a45, 0x8a51, 0x8a54, 0x8a56, 0x8a80, 0x8a82, 0x8a88,
+    0x8a8a, 0x8a95, 0x8aa0, 0x8aa2, 0x8aa8, 0x8aaa, 0x9005, 0x9011, 0x9016, 0x9018, 0x9019, 0x9025,
+    0x9041, 0x9046, 0x9049, 0x9055, 0x9058, 0x905a, 0x9069, 0x906a, 0x9085, 0x9091, 0x9094, 0x9096,
+    0x9099, 0x90a5, 0x9101, 0x9104, 0x9106, 0x9109, 0x9110, 0x9115, 0x9118, 0x911a, 0x9121, 0x9124,
+    0x9126, 0x9129, 0x9140, 0x9145, 0x9150, 0x9151, 0x9154, 0x9155, 0x9156, 0x9159, 0x9162, 0x9165,
+    0x9184, 0x9186, 0x9192, 0x9195, 0x9198, 0x91a1, 0x91a4, 0x91a6, 0x91a9, 0x9205, 0x9211, 0x9214,
+    0x9219, 0x9225, 0x9244, 0x9246, 0x9249, 0x9250, 0x9252, 0x9255, 0x9258, 0x9266, 0x9269, 0x9285,
+    0x9294, 0x9296, 0x92a9, 0x9401, 0x9404, 0x9406, 0x9410, 0x9415, 0x9418, 0x9426, 0x9440, 0x944a,
+    0x9451, 0x9454, 0x9455, 0x9456, 0x9458, 0x9459, 0x9460, 0x9461, 0x9462, 0x9465, 0x9484, 0x9486,
+    0x9492, 0x9494, 0x9495, 0x9498, 0x94a1, 0x94a9, 0x9500, 0x9505, 0x9508, 0x950a, 0x9510, 0x9511,
+    0x9514, 0x9515, 0x9516, 0x9519, 0x9521, 0x9525, 0x9529, 0x952a, 0x9541, 0x9544, 0x9545, 0x9546,
+    0x9549, 0x9550, 0x9551, 0x9552, 0x9554, 0x9555, 0x9556, 0x9558, 0x9559, 0x955a, 0x9561, 0x9564,
+    0x9565, 0x9566, 0x9569, 0x9581, 0x9585, 0x9588, 0x9591, 0x9592, 0x9594, 0x9595, 0x9596, 0x9599,
+    0x959a, 0x95a0, 0x95a2, 0x95a5, 0x95a8, 0x95aa, 0x9601, 0x9604, 0x9610, 0x9615, 0x9619, 0x9620,
+    0x9626, 0x9629, 0x9645, 0x9648, 0x9649, 0x9651, 0x9652, 0x9655, 0x9656, 0x9659, 0x9665, 0x9668,
+    0x9682, 0x9684, 0x9689, 0x968a, 0x9692, 0x9694, 0x9695, 0x96a4, 0x96a6, 0x96a9, 0x9805, 0x9816,
+    0x9819, 0x9825, 0x9841, 0x9846, 0x9850, 0x9852, 0x9855, 0x9856, 0x985a, 0x9864, 0x9865, 0x9885,
+    0x9891, 0x9896, 0x9899, 0x98a5, 0x9904, 0x9906, 0x9909, 0x9910, 0x9912, 0x9915, 0x9918, 0x991a,
+    0x9920, 0x9921, 0x9924, 0x9926, 0x9940, 0x9942, 0x9945, 0x9948, 0x994a, 0x9951, 0x9954, 0x9955,
+    0x9956, 0x9959, 0x9962, 0x9965, 0x9966, 0x996a, 0x9981, 0x9984, 0x9990, 0x9992, 0x9995, 0x999a,
+    0x99a1, 0x99a6, 0x9a05, 0x9a15, 0x9a25, 0x9a44, 0x9a46, 0x9a49, 0x9a50, 0x9a55, 0x9a58, 0x9a61,
+    0x9a85, 0x9a91, 0x9a94, 0x9a95, 0x9a96, 0xa000, 0xa002, 0xa008, 0xa00a, 0xa015, 0xa020, 0xa022,
+    0xa028, 0xa02a, 0xa045, 0xa051, 0xa054, 0xa056, 0xa059, 0xa080, 0xa082, 0xa088, 0xa08a, 0xa095,
+    0xa0a0, 0xa0a2, 0xa0a8, 0xa0aa, 0xa105, 0xa109, 0xa111, 0xa114, 0xa116, 0xa119, 0xa11a, 0xa146,
+    0xa149, 0xa151, 0xa155, 0xa158, 0xa15a, 0xa161, 0xa164, 0xa185, 0xa190, 0xa192, 0xa196, 0xa199,
+    0xa202, 0xa208, 0xa20a, 0xa210, 0xa219, 0xa222, 0xa228, 0xa22a, 0xa245, 0xa251, 0xa256, 0xa259,
+    0xa265, 0xa280, 0xa282, 0xa288, 0xa28a, 0xa295, 0xa2a0, 0xa2a2, 0xa2a8, 0xa2aa, 0xa419, 0xa425,
+    0xa441, 0xa444, 0xa450, 0xa454, 0xa455, 0xa458, 0xa45a, 0xa461, 0xa465, 0xa466, 0xa468, 0xa469,
+    0xa485, 0xa506, 0xa509, 0xa510, 0xa512, 0xa515, 0xa518, 0xa526, 0xa529, 0xa542, 0xa545, 0xa551,
+    0xa554, 0xa555, 0xa556, 0xa559, 0xa565, 0xa56a, 0xa581, 0xa584, 0xa585, 0xa586, 0xa589, 0xa592,
+    0xa595, 0xa598, 0xa605, 0xa611, 0xa616, 0xa61a, 0xa621, 0xa625, 0xa644, 0xa646, 0xa64a, 0xa652,
+    0xa655, 0xa656, 0xa658, 0xa660, 0xa662, 0xa686, 0xa690, 0xa695, 0xa696, 0xa699, 0xa6a1, 0xa6a4,
+    0xa6a6, 0xa800, 0xa802, 0xa808, 0xa80a, 0xa820, 0xa822, 0xa828, 0xa82a, 0xa851, 0xa854, 0xa856,
+    0xa859, 0xa880, 0xa882, 0xa888, 0xa88a, 0xa895, 0xa8a0, 0xa8a2, 0xa8a8, 0xa8aa, 0xa905, 0xa914,
+    0xa919, 0xa921, 0xa925, 0xa941, 0xa950, 0xa955, 0xa95a, 0xa961, 0xa966, 0xa969, 0xa990, 0xa996,
+    0xaa00, 0xaa02, 0xaa08, 0xaa0a, 0xaa20, 0xaa22, 0xaa28, 0xaa2a, 0xaa51, 0xaa54, 0xaa56, 0xaa80,
+    0xaa82, 0xaa88, 0xaa8a, 0xaa95, 0xaaa0, 0xaaa2, 0xaaa8, 0xaaaa,
 };
 
 // IQ2_XS's codebook: 512 entries of eight packed byte levels. Dead-stripped unless a
@@ -1054,13 +1310,19 @@ constant uint IQ3XXS_GRID[256] = {
     0x3e1c1c1cu, 0x3e1c3404u, 0x3e24140cu, 0x3e24240cu, 0x3e2c0404u, 0x3e2c0414u, 0x3e2c1424u, 0x3e341c04u,
 };
 
-// The 32 values of SUB-BLOCK `sub` of one tile-major block, as half.
+// The 32 values of SUB-BLOCK `sub` of one tile-major block, as T.
+//
+// T is only the final conversion: every arm computes the value in float, and the consumer
+// picks T. The prefill GEMM stages half, because its matrix multiply works in half and one
+// rounding is the price of that. The decode GEMV, the row gather and the mega-kernel unit
+// stage float, because what they do with the value is float; a half there would round the
+// weight and buy nothing (docs/dequant-precision.md).
 //
 // `sc` is the row's scale bytes at the unit head, `pay` its payload bytes. For a 32-element
 // format `sub` is always 0; for a 256-element super-block it selects one of eight.
-template <uint F>
+template <uint F, typename T>
 inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint sub,
-                       thread half out[32])
+                       thread T out[32], bool a16)
 {
     // PROBE (diagnostic only, IMPARO_WFMT_PROBE): remove the UNPACK ARITHMETIC and keep
     // the TRAFFIC. It reads the same bytes the real path reads -- the scale header and the
@@ -1099,9 +1361,18 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
     if (F == WF_Q4_K) {
         // d, dmin, scales[12]. Sub-blocks pair into the low and high nibbles of one
         // 32-byte group, which is why RT_K = 64 maps onto exactly one pair.
-        const half d    = as_type<half>((ushort)(sc[0] | (sc[1] << 8)));
-        const half dmin = as_type<half>((ushort)(sc[2] | (sc[3] << 8)));
-        uint s, m; k_scale_min(sub, sc + 4u, s, m);
+        //
+        // READ AS 16-BYTE WORDS, NOT BYTES. The header is 16 bytes and the pair's payload
+        // 32, and both sit on 16-byte boundaries in either layout (a row-major block is
+        // 144 bytes; the tile-major unit puts headers at slot*16 and payloads at
+        // 128 + slot*128). Byte loads cost one instruction each, so a lane spent ~38 load
+        // instructions on 48 bytes; three loads do the same. The nibble is then a shift
+        // by 0 or 4 instead of a lane-divergent select, and the scale unpack takes its
+        // bytes from the words without the j < 4 branch. Same arithmetic, same bits.
+        const uint4 h = *((device const uint4 *)sc);
+        const half d    = as_type<half>((ushort)(h.x & 0xFFFFu));
+        const half dmin = as_type<half>((ushort)(h.x >> 16));
+        uint s, m; k_scale_min(sub, h.y, h.z, h.w, s, m);
         // ONE ROUNDING, NOT THREE. The result must be half -- it feeds the MMA operands --
         // but the ARITHMETIC does not have to be. An affine format is `ds * v - off`, and
         // `off = dmin * m` is the SAME for all 32 values of a sub-block, so rounding it to
@@ -1112,29 +1383,37 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
         // not safe here. Computing in float and converting once costs nothing: the value
         // was going to be converted anyway.
         const float ds = float(d) * float(s), off = float(dmin) * float(m);
-        device const uchar * q = pay + (sub >> 1) * 32u;
-        const bool hi = (sub & 1u) != 0u;
+        device const uint4 * q4 = (device const uint4 *)(pay + (sub >> 1) * 32u);
+        const uint4 p0 = q4[0], p1 = q4[1];
+        const uint shift = (sub & 1u) * 4u;
         #pragma unroll
         for (uint l = 0; l < 32u; ++l) {
-            const uint v = hi ? (q[l] >> 4) : (q[l] & 0xFu);
-            out[l] = half(ds * float(v) - off);
+            const uint word = l < 16u ? p0[l >> 2] : p1[(l >> 2) & 3u];
+            const uint v = (word >> ((l & 3u) * 8u + shift)) & 0xFu;
+            out[l] = T(ds * float(v) - off);
         }
         return;
     }
     if (F == WF_Q5_K) {
-        // Same header; the payload opens with the 32-byte high-bit plane, then qs.
-        const half d    = as_type<half>((ushort)(sc[0] | (sc[1] << 8)));
-        const half dmin = as_type<half>((ushort)(sc[2] | (sc[3] << 8)));
-        uint s, m; k_scale_min(sub, sc + 4u, s, m);
+        // Same header; the payload opens with the 32-byte high-bit plane, then qs. Read as
+        // 16-byte words like Q4_K (a block is 176 bytes, the unit's payloads sit at
+        // 128 + slot * 160), the fifth bit taken from the plane by a shift.
+        const uint4 h = *((device const uint4 *)sc);
+        const half d    = as_type<half>((ushort)(h.x & 0xFFFFu));
+        const half dmin = as_type<half>((ushort)(h.x >> 16));
+        uint s, m; k_scale_min(sub, h.y, h.z, h.w, s, m);
         const float ds = float(d) * float(s), off = float(dmin) * float(m);   // see Q4_K
-        device const uchar * qh = pay;
-        device const uchar * q  = pay + 32u + (sub >> 1) * 32u;
-        const bool hi = (sub & 1u) != 0u;
-        const uchar bit = (uchar)(1u << sub);
+        device const uint4 * qh4 = (device const uint4 *)pay;
+        device const uint4 * q4  = (device const uint4 *)(pay + 32u + (sub >> 1) * 32u);
+        const uint4 h0 = qh4[0], h1 = qh4[1], p0 = q4[0], p1 = q4[1];
+        const uint shift = (sub & 1u) * 4u;
         #pragma unroll
         for (uint l = 0; l < 32u; ++l) {
-            const uint v = (hi ? (q[l] >> 4) : (q[l] & 0xFu)) + ((qh[l] & bit) ? 16u : 0u);
-            out[l] = half(ds * float(v) - off);
+            const uint bsh  = (l & 3u) * 8u;
+            const uint word = l < 16u ? p0[l >> 2] : p1[(l >> 2) & 3u];
+            const uint hw   = l < 16u ? h0[l >> 2] : h1[(l >> 2) & 3u];
+            const uint v = ((word >> (bsh + shift)) & 0xFu) + (((hw >> (bsh + sub)) & 1u) << 4);
+            out[l] = T(ds * float(v) - off);
         }
         return;
     }
@@ -1145,15 +1424,40 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
         const uint n = sub >> 2, c = sub & 3u;
         const half d = as_type<half>((ushort)(sc[16] | (sc[17] << 8)));
         device const char * s8 = (device const char *)sc + n * 8u;
-        device const uchar * ql = pay + n * 64u + ((c & 1u) * 32u);
-        device const uchar * qh = pay + 128u + n * 32u;
         const uint shift = 2u * c, sidx = 2u * c;
-        const bool hi = c >= 2u;
-        #pragma unroll
-        for (uint l = 0; l < 32u; ++l) {
-            const int q = (int)((hi ? (ql[l] >> 4) : (ql[l] & 0xFu))
-                              | (((qh[l] >> shift) & 3u) << 4)) - 32;
-            out[l] = half(float(d) * float((int)s8[(l >> 4) + sidx]) * float(q));
+        // The two sub-scales once: values 0..15 take s8[sidx], 16..31 s8[sidx + 1], and
+        // d * s is the same product the per-value form computed before multiplying q.
+        const float ds0 = float(d) * float((int)s8[sidx]);
+        const float ds1 = float(d) * float((int)s8[sidx + 1u]);
+        // ds * (q - 32) as fma(ds, q, -32 ds): one rounding, -32 ds exact, same float.
+        const float c0 = -32.0f * ds0, c1 = -32.0f * ds1;
+        const uint shift4 = (c >= 2u) ? 4u : 0u;
+        if (a16) {
+            // ql's 32 bytes and qh's 32 as 16-byte words (tile-major payloads at
+            // unit + 144 + slot * 192); a row-major block is 210 bytes, byte path below.
+            device const uint4 * ql4 = (device const uint4 *)(pay + n * 64u + ((c & 1u) * 32u));
+            device const uint4 * qh4 = (device const uint4 *)(pay + 128u + n * 32u);
+            const uint4 l0 = ql4[0], l1 = ql4[1], h0 = qh4[0], h1 = qh4[1];
+            #pragma unroll
+            for (uint k = 0; k < 8u; ++k) {
+                const uint lw = k < 4u ? l0[k] : l1[k & 3u];
+                const uint hw = k < 4u ? h0[k] : h1[k & 3u];
+                const float ds = k < 4u ? ds0 : ds1, cc = k < 4u ? c0 : c1;
+                const uchar4 v6 = as_type<uchar4>(((lw >> shift4) & 0x0F0F0F0Fu)
+                                                | (((hw >> shift) & 0x03030303u) << 4));
+                out[4u * k]      = T(fma(ds, float(v6.x), cc));
+                out[4u * k + 1u] = T(fma(ds, float(v6.y), cc));
+                out[4u * k + 2u] = T(fma(ds, float(v6.z), cc));
+                out[4u * k + 3u] = T(fma(ds, float(v6.w), cc));
+            }
+        } else {
+            device const uchar * ql = pay + n * 64u + ((c & 1u) * 32u);
+            device const uchar * qh = pay + 128u + n * 32u;
+            #pragma unroll
+            for (uint l = 0; l < 32u; ++l) {
+                const uint v6 = ((ql[l] >> shift4) & 0xFu) | (((qh[l] >> shift) & 3u) << 4);
+                out[l] = T(fma(l < 16u ? ds0 : ds1, float(v6), l < 16u ? c0 : c1));
+            }
         }
         return;
     }
@@ -1161,30 +1465,72 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
         // scales[12] then d at the unit head; hmask[32] then qs[64] in the payload. The
         // third bit is INVERTED: a CLEAR hmask bit subtracts 4.
         const uint n = sub >> 2, j = sub & 3u;
-        const half d = as_type<half>((ushort)(sc[12] | (sc[13] << 8)));
+        // The 14 header bytes as seven 16-bit words: the scale run starts on an even byte
+        // in both layouts (tile-major slot * 14; row-major block 110, scales at 96).
+        device const ushort * sh = (device const ushort *)sc;
+        const half d = as_type<half>(sh[6]);
         // The 12 bytes hold 16 six-bit fields: four low nibbles per word, top two bits of
         // every field in the last word.
         uint aux[4];
-        for (uint i = 0; i < 3u; ++i) {
-            const uint b = i * 4u;
-            aux[i] = (uint)sc[b] | ((uint)sc[b+1] << 8) | ((uint)sc[b+2] << 16) | ((uint)sc[b+3] << 24);
-        }
+        aux[0] = (uint)sh[0] | ((uint)sh[1] << 16);
+        aux[1] = (uint)sh[2] | ((uint)sh[3] << 16);
+        aux[2] = (uint)sh[4] | ((uint)sh[5] << 16);
         const uint km1 = 0x03030303u, km2 = 0x0f0f0f0fu, tmp = aux[2];
         aux[2] = ((aux[0] >> 4) & km2) | (((tmp >> 4) & km1) << 4);
         aux[3] = ((aux[1] >> 4) & km2) | (((tmp >> 6) & km1) << 4);
         aux[0] = (aux[0] & km2)        | (((tmp     ) & km1) << 4);
         aux[1] = (aux[1] & km2)        | (((tmp >> 2) & km1) << 4);
-        device const uchar * hm = pay;
-        device const uchar * q  = pay + 32u + n * 32u;
-        const uchar mbit = (uchar)(1u << (n * 4u + j));
+        // THE TWO SUB-SCALES ONCE, NOT PER VALUE. Values 0..15 take field is0 and 16..31
+        // the next one; is0 is even, so both fields sit in one word, picked by selects
+        // and split by a shift. Indexing aux[] with a lane-varying subscript per value
+        // made the compiler keep the array in memory and read it back 32 times per
+        // sub-block: 84 GB/s against a 136 GB/s wall.
+        const uint is0 = n * 8u + j * 2u;
+        const uint wi = is0 >> 2;
+        const uint w = wi == 0u ? aux[0] : wi == 1u ? aux[1] : wi == 2u ? aux[2] : aux[3];
+        const uint fs = (is0 & 3u) * 8u;
+        const int sv0 = (int)(char)((w >> fs) & 0xFFu) - 32;
+        const int sv1 = (int)(char)((w >> (fs + 8u)) & 0xFFu) - 32;
+        const float dl0 = float(d) * float(sv0), dl1 = float(d) * float(sv1);
+        // A value is its two qs bits plus 4 when its hmask bit is SET, minus 4: the
+        // clear-bit-subtracts-4 rule as one integer v3 = q2 | hbit << 2, and dl * (v3 - 4)
+        // as fma(dl, v3, -4 dl) -- one rounding either way, and -4 dl is exact, so the
+        // float is the one the select form produced.
+        const uint mb = n * 4u + j;
         const uint shift = 2u * j;
-        #pragma unroll
-        for (uint l = 0; l < 32u; ++l) {
-            const uint is = n * 8u + j * 2u + (l >> 4);
-            const int sv = (int)(char)((aux[is >> 2] >> ((is & 3u) * 8u)) & 0xFFu) - 32;
-            const float dl = float(d) * float(sv);
-            const float sub4 = (hm[l] & mbit) ? 0.0f : 4.0f;
-            out[l] = half(dl * (float((q[l] >> shift) & 3u) - sub4));
+        const float c0 = -4.0f * dl0, c1 = -4.0f * dl1;
+        if (a16) {
+            // hmask[32] and this chunk's qs[32] as 16-byte words (tile-major payloads sit
+            // at unit + 112 + slot * 96); the row-major block is 110 bytes and takes the
+            // byte path below. ONE SHIFT PER WORD: the four values of a word are masked
+            // together and read out as bytes by reinterpretation, not shifted out one
+            // by one -- the per-value shift-and-select form ran at 96 GB/s.
+            device const uint4 * hm4 = (device const uint4 *)pay;
+            device const uint4 * q4  = (device const uint4 *)(pay + 32u + n * 32u);
+            const uint4 m0 = hm4[0], m1 = hm4[1], p0 = q4[0], p1 = q4[1];
+            #pragma unroll
+            for (uint k = 0; k < 8u; ++k) {
+                const uint qw = k < 4u ? p0[k] : p1[k & 3u];
+                const uint mw = k < 4u ? m0[k] : m1[k & 3u];
+                const float dl = k < 4u ? dl0 : dl1, c = k < 4u ? c0 : c1;
+                // The four values' bits merged at the word level: two qs bits per byte,
+                // the hmask bit moved into bit 2 of its byte.
+                const uchar4 v3 = as_type<uchar4>(((qw >> shift) & 0x03030303u)
+                                                | (((mw >> mb) & 0x01010101u) << 2));
+                out[4u * k]      = T(fma(dl, float(v3.x), c));
+                out[4u * k + 1u] = T(fma(dl, float(v3.y), c));
+                out[4u * k + 2u] = T(fma(dl, float(v3.z), c));
+                out[4u * k + 3u] = T(fma(dl, float(v3.w), c));
+            }
+        } else {
+            device const uchar * hm = pay;
+            device const uchar * q  = pay + 32u + n * 32u;
+            #pragma unroll
+            for (uint l = 0; l < 32u; ++l) {
+                const float dl = l < 16u ? dl0 : dl1, c = l < 16u ? c0 : c1;
+                const uint v3 = ((q[l] >> shift) & 3u) | (((hm[l] >> mb) & 1u) << 2);
+                out[l] = T(fma(dl, float(v3), c));
+            }
         }
         return;
     }
@@ -1199,8 +1545,8 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
         device const uchar * q = pay + sub * 16u;
         #pragma unroll
         for (uint j = 0; j < 16u; ++j) {
-            out[j]      = half(dl * float((int)KVALUES_IQ4NL[q[j] & 0xFu]));
-            out[j + 16] = half(dl * float((int)KVALUES_IQ4NL[q[j] >> 4]));
+            out[j]      = T(dl * float((int)KVALUES_IQ4NL[q[j] & 0xFu]));
+            out[j + 16] = T(dl * float((int)KVALUES_IQ4NL[q[j] >> 4]));
         }
         return;
     }
@@ -1232,8 +1578,8 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
             for (uint j = 0; j < 4u; ++j) {
                 const float v1 = float((g1 >> (8u * j)) & 0xFFu);
                 const float v2 = float((g2 >> (8u * j)) & 0xFFu);
-                out[l * 8u + j]      = half((sgn & (1u << j))        ? -db * v1 : db * v1);
-                out[l * 8u + j + 4u] = half((sgn & (1u << (j + 4u))) ? -db * v2 : db * v2);
+                out[l * 8u + j]      = T((sgn & (1u << j))        ? -db * v1 : db * v1);
+                out[l * 8u + j + 4u] = T((sgn & (1u << (j + 4u))) ? -db * v2 : db * v2);
             }
         }
         return;
@@ -1256,7 +1602,32 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
             #pragma unroll
             for (uint l = 0; l < 16u; ++l) {
                 const uint v = ((uint)q[half_i * 16u + l] >> shift) & 3u;
-                out[half_i * 16u + l] = half(dl * float(v) - ml);
+                out[half_i * 16u + l] = T(dl * float(v) - ml);
+            }
+        }
+        return;
+    }
+    if (F == WF_IQ2_XXS) {
+        // The leanest codebook. A sub-block's 32 values are two 32-bit words of the payload:
+        // four 8-bit grid indices (eight levels each), then four 7-bit sign indices with the
+        // 4-bit scale in the top nibble, read as (0.5 + s) * 0.25 like IQ2_XS. `sc` is d
+        // alone -- one span, so a row-major block is served by the same two pointers.
+        const half d = as_type<half>((ushort)(sc[0] | (sc[1] << 8)));
+        device const uchar * q = pay + sub * 8u;
+        const uint w0 = (uint)q[0] | ((uint)q[1] << 8) | ((uint)q[2] << 16) | ((uint)q[3] << 24);
+        const uint w1 = (uint)q[4] | ((uint)q[5] << 8) | ((uint)q[6] << 16) | ((uint)q[7] << 24);
+        const float db = float(d) * (0.5f + float(w1 >> 28)) * 0.25f;
+        #pragma unroll
+        for (uint l = 0; l < 4u; ++l) {
+            const ulong gg = IQ2XXS_GRID[(w0 >> (8u * l)) & 0xFFu];
+            const uint g0 = (uint)gg, g1 = (uint)(gg >> 32);
+            const uint sgn = (uint)ksign_iq((uchar)((w1 >> (7u * l)) & 127u));
+            #pragma unroll
+            for (uint j = 0; j < 4u; ++j) {
+                const float v0 = db * float((g0 >> (8u * j)) & 0xFFu);
+                const float v1 = db * float((g1 >> (8u * j)) & 0xFFu);
+                out[l * 8u + j]      = T((sgn & (1u << j))        ? -v0 : v0);
+                out[l * 8u + j + 4u] = T((sgn & (1u << (j + 4u))) ? -v1 : v1);
             }
         }
         return;
@@ -1283,8 +1654,8 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
             for (uint j = 0; j < 4u; ++j) {
                 const float v0 = dl * float((g0 >> (8u * j)) & 0xFFu);
                 const float v1 = dl * float((g1 >> (8u * j)) & 0xFFu);
-                out[l * 8u + j]      = half((sgn & (1u << j))        ? -v0 : v0);
-                out[l * 8u + j + 4u] = half((sgn & (1u << (j + 4u))) ? -v1 : v1);
+                out[l * 8u + j]      = T((sgn & (1u << j))        ? -v0 : v0);
+                out[l * 8u + j + 4u] = T((sgn & (1u << (j + 4u))) ? -v1 : v1);
             }
         }
         return;
@@ -1311,8 +1682,8 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
             for (uint j = 0; j < 4u; ++j) {
                 const float v0 = dl * float((g0 >> (8u * j)) & 0xFFu);
                 const float v1 = dl * float((g1 >> (8u * j)) & 0xFFu);
-                out[l * 8u + j]      = half((sgn & (1u << j))        ? -v0 : v0);
-                out[l * 8u + j + 4u] = half((sgn & (1u << (j + 4u))) ? -v1 : v1);
+                out[l * 8u + j]      = T((sgn & (1u << j))        ? -v0 : v0);
+                out[l * 8u + j + 4u] = T((sgn & (1u << (j + 4u))) ? -v1 : v1);
             }
         }
         return;
@@ -1336,8 +1707,95 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
             for (uint j = 0; j < 4u; ++j) {
                 const float v1 = db * float((g1 >> (8u * j)) & 0xFFu);
                 const float v2 = db * float((g2 >> (8u * j)) & 0xFFu);
-                out[l * 8u + j]      = half((sgn & (1u << j))        ? -v1 : v1);
-                out[l * 8u + j + 4u] = half((sgn & (1u << (j + 4u))) ? -v2 : v2);
+                out[l * 8u + j]      = T((sgn & (1u << j))        ? -v1 : v1);
+                out[l * 8u + j + 4u] = T((sgn & (1u << (j + 4u))) ? -v2 : v2);
+            }
+        }
+        return;
+    }
+    if (F == WF_Q4_1 || F == WF_Q5_1) {
+        // THE AFFINE LEGACY PAIR, one 32-value block: q * d + m with `sc` = d then m. Q5_1's
+        // payload opens with a 32-bit word whose bit j is element j's fifth bit, then the
+        // sixteen nibble bytes; byte j's low nibble is element j and its high nibble element
+        // j + 16, as in every legacy format. Byte loads only: a Q5_1 unit's payload rows sit
+        // 20 bytes apart, so `a16` does not hold for it.
+        const float d = float(as_type<half>((ushort)(sc[0] | (sc[1] << 8))));
+        const float m = float(as_type<half>((ushort)(sc[2] | (sc[3] << 8))));
+        const bool q5 = F == WF_Q5_1;
+        const uint qh = q5 ? ((uint)pay[0] | ((uint)pay[1] << 8) | ((uint)pay[2] << 16)
+                              | ((uint)pay[3] << 24)) : 0u;
+        device const uchar * q = pay + (q5 ? 4u : 0u);
+        #pragma unroll
+        for (uint j = 0; j < 16u; ++j) {
+            const uint x0 = ((uint)q[j] & 0xFu) | (((qh >> j) & 1u) << 4);
+            const uint x1 = ((uint)q[j] >> 4)   | (((qh >> (j + 16u)) & 1u) << 4);
+            out[j]      = T(fma(d, float(x0), m));
+            out[j + 16] = T(fma(d, float(x1), m));
+        }
+        return;
+    }
+    if (F == WF_Q5_0) {
+        // THE SYMMETRIC 5-BIT LEGACY BLOCK: ((q | fifth bit) - 16) * d with `sc` = d; the
+        // payload is laid out as Q5_1's (the fifth-bit word, then the nibbles).
+        const float d = float(as_type<half>((ushort)(sc[0] | (sc[1] << 8))));
+        const uint qh = (uint)pay[0] | ((uint)pay[1] << 8) | ((uint)pay[2] << 16)
+                      | ((uint)pay[3] << 24);
+        device const uchar * q = pay + 4u;
+        #pragma unroll
+        for (uint j = 0; j < 16u; ++j) {
+            const int x0 = (int)(((uint)q[j] & 0xFu) | (((qh >> j) & 1u) << 4)) - 16;
+            const int x1 = (int)(((uint)q[j] >> 4)   | (((qh >> (j + 16u)) & 1u) << 4)) - 16;
+            out[j]      = T(d * float(x0));
+            out[j + 16] = T(d * float(x1));
+        }
+        return;
+    }
+    if (F == WF_IQ1_S) {
+        // THE 1.56-BIT CODEBOOK. A sub-block's 32 values are four 11-bit grid indices -- eight
+        // bits in qs, three in the sub-block's qh word -- each selecting eight levels in
+        // {-1, 0, 1}; the same word holds an odd 3-bit scale (2s + 1) and the sign of a
+        // +-0.125 delta added to every level. `sc` is d alone; the payload is qs[32] then the
+        // eight qh words.
+        const float d = float(as_type<half>((ushort)(sc[0] | (sc[1] << 8))));
+        device const uchar * qs = pay + sub * 4u;
+        const uint qh = (uint)pay[32u + 2u * sub] | ((uint)pay[33u + 2u * sub] << 8);
+        const float dl = d * float(2u * ((qh >> 12) & 7u) + 1u);
+        const float delta = (qh & 0x8000u) != 0u ? -0.125f : 0.125f;
+        #pragma unroll
+        for (uint l = 0; l < 4u; ++l) {
+            const uint g = (uint)IQ1S_GRID[(uint)qs[l] | (((qh >> (3u * l)) & 7u) << 8)];
+            #pragma unroll
+            for (uint j = 0; j < 8u; ++j) {
+                out[l * 8u + j] = T(dl * (float((g >> (2u * j)) & 3u) - 1.0f + delta));
+            }
+        }
+        return;
+    }
+    if (F == WF_IQ1_M) {
+        // IQ1_S's codebook with TWO scales per 32 values (one per half) and a delta sign per 8.
+        // The f16 super-block scale has no field: its sixteen bits are the top nibbles of the
+        // four scale words that close the block, which is `sc` here; the other twelve bits of
+        // word k hold the 3-bit scales of sub-blocks 2k and 2k + 1. The payload is qs[32] then
+        // qh[16], each qh byte carrying two indices' top three bits and delta signs.
+        const uint s0 = (uint)sc[0] | ((uint)sc[1] << 8), s1 = (uint)sc[2] | ((uint)sc[3] << 8);
+        const uint s2 = (uint)sc[4] | ((uint)sc[5] << 8), s3 = (uint)sc[6] | ((uint)sc[7] << 8);
+        const float d = float(as_type<half>((ushort)((s0 >> 12) | ((s1 >> 8) & 0x00F0u)
+                                                    | ((s2 >> 4) & 0x0F00u) | (s3 & 0xF000u))));
+        const uint sw = (uint)sc[2u * (sub >> 1)] | ((uint)sc[2u * (sub >> 1) + 1u] << 8);
+        const uint sh = 6u * (sub & 1u);
+        const float dl1 = d * float(2u * ((sw >> sh) & 7u) + 1u);
+        const float dl2 = d * float(2u * ((sw >> (sh + 3u)) & 7u) + 1u);
+        device const uchar * qs = pay + sub * 4u;
+        device const uchar * qh = pay + 32u + sub * 2u;
+        #pragma unroll
+        for (uint l = 0; l < 4u; ++l) {
+            const uint hb = (uint)qh[l >> 1] >> (4u * (l & 1u));
+            const uint g = (uint)IQ1S_GRID[(uint)qs[l] | ((hb & 7u) << 8)];
+            const float delta = (hb & 8u) != 0u ? -0.125f : 0.125f;
+            const float dl = l < 2u ? dl1 : dl2;
+            #pragma unroll
+            for (uint j = 0; j < 8u; ++j) {
+                out[l * 8u + j] = T(dl * (float((g >> (2u * j)) & 3u) - 1.0f + delta));
             }
         }
         return;
@@ -1346,20 +1804,20 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
         const half d = as_type<half>((ushort)(sc[0] | (sc[1] << 8)));
         #pragma unroll
         for (uint j = 0; j < 16u; ++j) {
-            out[j]      = half(float(d) * float((int)KVALUES_IQ4NL[pay[j] & 0xFu]));
-            out[j + 16] = half(float(d) * float((int)KVALUES_IQ4NL[pay[j] >> 4]));
+            out[j]      = T(float(d) * float((int)KVALUES_IQ4NL[pay[j] & 0xFu]));
+            out[j + 16] = T(float(d) * float((int)KVALUES_IQ4NL[pay[j] >> 4]));
         }
         return;
     }
     #pragma unroll
-    for (uint l = 0; l < 32u; ++l) { out[l] = half(0.0h); }
+    for (uint l = 0; l < 32u; ++l) { out[l] = T(0.0h); }
 }
 
 // Geometry of the tile-major unit for format F, mirroring TmRule. Sub-blocks per block is
 // block_elems / 32, so a legacy format is one and a super-block is eight.
 template <uint F>
 inline uint tm_block_elems_t() {
-    return (F == WF_IQ4_NL) ? 32u : 256u;
+    return (F == WF_IQ4_NL || F == WF_Q4_1 || F == WF_Q5_0 || F == WF_Q5_1) ? 32u : 256u;
 }
 template <uint F>
 inline uint tm_block_bytes_t() {
@@ -1370,9 +1828,15 @@ inline uint tm_block_bytes_t() {
     if (F == WF_Q3_K)   { return 110u; }
     if (F == WF_IQ4_XS) { return 136u; }
     if (F == WF_IQ2_XS)  { return 74u; }
+    if (F == WF_IQ2_XXS) { return 66u; }
     if (F == WF_IQ2_S)   { return 82u; }
     if (F == WF_IQ3_XXS) { return 98u; }
     if (F == WF_Q2_K)    { return 84u; }
+    if (F == WF_IQ1_S)   { return 50u; }
+    if (F == WF_IQ1_M)   { return 56u; }
+    if (F == WF_Q4_1)    { return 20u; }
+    if (F == WF_Q5_0)    { return 22u; }
+    if (F == WF_Q5_1)    { return 24u; }
     return 18u;                                    // IQ4_NL
 }
 // Byte offset of the scale run inside a ROW-MAJOR block. Every format this brick reads
@@ -1383,7 +1847,8 @@ template <uint F>
 inline uint tm_scale_src_off_t() {
     if (F == WF_Q6_K) { return 192u; }
     if (F == WF_Q3_K) { return 96u; }
-    return 0u;                                     // Q4_K, Q5_K, IQ4_XS, IQ4_NL
+    if (F == WF_IQ1_M) { return 48u; }
+    return 0u;                                     // every other format
 }
 template <uint F>
 inline uint tm_scale_bytes_t() {
@@ -1393,10 +1858,13 @@ inline uint tm_scale_bytes_t() {
     if (F == WF_Q3_K)   { return 14u; }
     if (F == WF_IQ4_XS) { return 8u; }
     if (F == WF_IQ2_XS)  { return 10u; }        // d (2) + the 8 sub-scale bytes
+    if (F == WF_IQ2_XXS) { return 2u; }         // d alone; scales ride in the payload words
     if (F == WF_IQ2_S)   { return 18u; }        // d (2) + qh (8) + scales (8)
     if (F == WF_IQ3_XXS) { return 34u; }        // d (2) + the 8 scale-and-sign words
     if (F == WF_Q2_K)    { return 20u; }        // scales[16] + d + dmin
-    return 2u;                                     // IQ4_NL
+    if (F == WF_IQ1_M)   { return 8u; }         // the four scale words; d in their top nibbles
+    if (F == WF_Q4_1 || F == WF_Q5_1) { return 4u; }   // d, m
+    return 2u;                                     // d alone: IQ4_NL, Q5_0, IQ1_S
 }
 
 // THE FORMAT LIST, written once. Every brick above is a template over the format, so its
@@ -1429,13 +1897,20 @@ inline uint tm_scale_bytes_t() {
     case WF_IQ3_S:   { constexpr uint FMT = WF_IQ3_S;   __VA_ARGS__ }                 \
     case WF_IQ3_XXS: { constexpr uint FMT = WF_IQ3_XXS; __VA_ARGS__ }                 \
     case WF_IQ2_XS:  { constexpr uint FMT = WF_IQ2_XS;  __VA_ARGS__ }                 \
+    case WF_IQ2_XXS: { constexpr uint FMT = WF_IQ2_XXS; __VA_ARGS__ }                 \
     case WF_IQ2_S:   { constexpr uint FMT = WF_IQ2_S;   __VA_ARGS__ }                 \
+    case WF_Q4_1:    { constexpr uint FMT = WF_Q4_1;    __VA_ARGS__ }                 \
+    case WF_Q5_0:    { constexpr uint FMT = WF_Q5_0;    __VA_ARGS__ }                 \
+    case WF_Q5_1:    { constexpr uint FMT = WF_Q5_1;    __VA_ARGS__ }                 \
+    case WF_IQ1_S:   { constexpr uint FMT = WF_IQ1_S;   __VA_ARGS__ }                 \
+    case WF_IQ1_M:   { constexpr uint FMT = WF_IQ1_M;   __VA_ARGS__ }                 \
     default:         { constexpr uint FMT = WF_ROWMAJOR; __VA_ARGS__ }                \
     }
 
+template <typename T>
 inline void tm_sub32_fmt(uint f, device const uchar * sc, device const uchar * pay, uint sub,
-                         thread half out[32]) {
-    TM_BY_FORMAT(f, tm_sub32_t<FMT>(sc, pay, sub, out); return;)
+                         thread T out[32], bool a16) {
+    TM_BY_FORMAT(f, tm_sub32_t<FMT, T>(sc, pay, sub, out, a16); return;)
 }
 inline uint tm_block_elems_fmt(uint f)   { TM_BY_FORMAT(f, return tm_block_elems_t<FMT>();) }
 inline uint tm_block_bytes_fmt(uint f)   { TM_BY_FORMAT(f, return tm_block_bytes_t<FMT>();) }
@@ -1443,17 +1918,28 @@ inline uint tm_scale_src_off_fmt(uint f) { TM_BY_FORMAT(f, return tm_scale_src_o
 inline uint tm_scale_bytes_fmt(uint f)   { TM_BY_FORMAT(f, return tm_scale_bytes_t<FMT>();) }
 
 // The pipeline's own format: what every existing caller compiles to.
+// `a16`: the caller's payload pointers sit on 16-byte boundaries. A TILE-MAJOR unit
+// guarantees it when the format's payload per block is a multiple of 16 -- every format
+// but Q5_0 and Q5_1, whose 20-byte payload rows the tile-major callers flag all the same,
+// so their arms ignore the flag -- and a row-major block only when its byte size is one
+// (Q4_K 144, Q5_K 176; not Q3_K 110, Q6_K 210, IQ4_XS 136). The arms that need it take
+// 16-byte loads under the flag and byte loads without; the always-aligned arms ignore it.
+template <typename T>
 inline void tm_sub32(device const uchar * sc, device const uchar * pay, uint sub,
-                     thread half out[32]) { tm_sub32_fmt(WFMT, sc, pay, sub, out); }
+                     thread T out[32], bool a16) { tm_sub32_fmt<T>(WFMT, sc, pay, sub, out, a16); }
 inline uint tm_block_elems()   { return tm_block_elems_fmt(WFMT); }
 inline uint tm_block_bytes()   { return tm_block_bytes_fmt(WFMT); }
 inline uint tm_scale_src_off() { return tm_scale_src_off_fmt(WFMT); }
 inline uint tm_scale_bytes()   { return tm_scale_bytes_fmt(WFMT); }
 
+constant bool BLK_PROBE_HALF [[function_constant(24)]];
+
 // THE BRICK'S GATE. Decodes a ROW-MAJOR block row through `tm_sub32` -- the same brick the
 // prefill GEMM, the decode GEMV and the row gather call -- so a test can diff it against
 // the CPU row codec, which is itself pinned bit-exact against llama.cpp's own dequantiser
-// (crates/imparo-cpu/tests/quant_rows.rs, worst relative error 0e0).
+// (crates/imparo-cpu/tests/quant_rows.rs, worst relative error 0e0). BLK_PROBE_HALF picks
+// the output under test: half, as the prefill GEMM stages it, or float, as the decode GEMV,
+// the row gather and the mega-kernel unit stage it.
 //
 // A transcription is a CLAIM. This is where the claim is checked, and it is checked before
 // a forward is built on top of it: a wrong nibble pairing or a flipped sign reads as
@@ -1472,9 +1958,17 @@ kernel void imparo_blk_decode_probe(
     const uint sub_per_block = tm_block_elems() / 32u;
     const uint blk = sb / sub_per_block, sub = sb % sub_per_block;
     const uint sc_bytes = tm_scale_bytes();
-    half v[32];
-    tm_sub32(scales + blk * sc_bytes, payload + blk * (tm_block_bytes() - sc_bytes), sub, v);
-    for (uint l = 0; l < 32u; ++l) { out[sb * 32u + l] = float(v[l]); }
+    device const uchar * sc = scales + blk * sc_bytes;
+    device const uchar * pay = payload + blk * (tm_block_bytes() - sc_bytes);
+    if (BLK_PROBE_HALF) {
+        half v[32];
+        tm_sub32(sc, pay, sub, v, false);
+        for (uint l = 0; l < 32u; ++l) { out[sb * 32u + l] = float(v[l]); }
+    } else {
+        float v[32];
+        tm_sub32(sc, pay, sub, v, false);
+        for (uint l = 0; l < 32u; ++l) { out[sb * 32u + l] = v[l]; }
+    }
 }
 
 // WQ is the WEIGHT FORMAT this instantiation stages: 4 for Q4_0 (18-byte blocks, nibble
@@ -1515,8 +2009,10 @@ static void rt_gemm(
     //
     // Four blocks is 72 contiguous bytes per row per chunk. The staged tile grows with
     // RT_K, which is why it is HALF here: 128 x (rows+2) halves is 16.9 KB, where float
-    // would be 33.8 and would not fit. Half is exact for Q4_0 -- (x-8)*d with d already
-    // fp16 and |x-8| <= 8 only shifts the exponent.
+    // would be 33.8 and would not fit. Half costs Q4_0 one rounding: (x-8)*d is exact in
+    // float (a 4-bit integer times d's 16 bits) and the tile holds it rounded once to
+    // half. It is not exact in half: a factor of 3, 5, 6 or 7 needs more mantissa bits
+    // than half has.
     // k-chunk depth follows the row tile, so the staged tile stays around 16 KB whatever
     // the shape. Both terms of the traffic matter and they pull opposite ways:
     //   activations = (n_out / RT_ROWS) x RT_TOKENS x n_in x 4
@@ -1651,7 +2147,7 @@ static void rt_gemm(
                         device const uchar * b = base
                             + ((ulong)row * blocks_tm + blk) * bb_bytes;
                         const uint so = tm_scale_src_off();
-                        tm_sub32(b + so, b + (so == 0u ? sc_bytes : 0u), sub, v);
+                        tm_sub32(b + so, b + (so == 0u ? sc_bytes : 0u), sub, v, false);
                     } else {
                         const ulong unit = ((ulong)(row / TM_UNIT_ROWS) * blocks_tm + blk)
                                          * (ulong)(TM_UNIT_ROWS * bb_bytes);
@@ -1659,7 +2155,7 @@ static void rt_gemm(
                         tm_sub32(base + unit + (ulong)slot * sc_bytes,
                                  base + unit + (ulong)TM_UNIT_ROWS * sc_bytes
                                       + (ulong)slot * pay_bytes,
-                                 sub, v);
+                                 sub, v, true);
                     }
                 } else {
                     #pragma unroll
@@ -1932,27 +2428,42 @@ static void rt_gemm(
     // n_out / RT_ROWS threadgroups each pull the whole tile from device, 40 times over for
     // ffn_down -- so the cap was costing far more than the masking was worth.
     //
-    // Rows never straddle the end: n_out is a multiple of 64 for every matmul that
-    // REACHES THIS KERNEL. That is a property of the route, not of any one model, and it
-    // is worth stating that way -- qwen35 has two projections per gated-delta layer at
-    // n_out = v_heads = 48, and the reason they are harmless is that 48 columns are not
-    // convertible to tile-major, so those weights stay row-major and never arrive here.
-    // Checked rather than assumed (IMPARO_WFMT_LOG on a 64-token prefill, 2026-09-09):
-    // every tile-major matmat is n_out in {1024, 5120, 6144, 10240, 12288, 17408}.
-    // A model that DID send a non-multiple here would silently write past each row.
+    // Rows CAN straddle the end. Every tile-major matmul of the first files had n_out a
+    // multiple of 64, and this store wrote its whole 64-row tile on that assumption; a
+    // file whose 48-wide gated-delta projections (ssm_alpha, ssm_beta) are block quants
+    // (byteshape's IQ4_XS-4.40bpw: IQ4_XS, Q5_K, Q6_K, IQ3_XXS on them) sends n_out = 48
+    // here, and the unguarded tile wrote columns 48..63 of every token into the next
+    // token's row -- one prompt token agreed with the CPU backend, two or more did not
+    // (docs/evidence/bracket/2026-09-11-27b-dequant-tables.md). A tile-major n_out is a
+    // multiple of 8 (the unit), so an 8x8 tile is whole or absent: skip the absent ones.
+    // The full-tile case keeps the unconditional loop (the same code as before).
     //
     // Tokens can straddle, so the caller rounds the activation buffers up to a whole token
     // tile; rows past the token count receive values nothing reads.
     // A GATED dispatch always has an activation (the host refuses it otherwise), so it
     // never takes the straight store: its rows are gate and up halves, not outputs.
     if (epilogue == 0u && !GATED) {
+        if (nrow == RT_ROWS) {
+            #pragma unroll
+            for (uint i = 0; i < NA; ++i) {
+                #pragma unroll
+                for (uint j = 0; j < NB; ++j) {
+                    simdgroup_store(mc[i * NB + j],
+                                    y + (ulong)(t0 + ty + i * 8u) * n_out + r0 + rx + j * 8u,
+                                    n_out);
+                }
+            }
+            return;
+        }
         #pragma unroll
         for (uint i = 0; i < NA; ++i) {
             #pragma unroll
             for (uint j = 0; j < NB; ++j) {
-                simdgroup_store(mc[i * NB + j],
-                                y + (ulong)(t0 + ty + i * 8u) * n_out + r0 + rx + j * 8u,
-                                n_out);
+                if (rx + j * 8u < nrow) {
+                    simdgroup_store(mc[i * NB + j],
+                                    y + (ulong)(t0 + ty + i * 8u) * n_out + r0 + rx + j * 8u,
+                                    n_out);
+                }
             }
         }
         return;
@@ -4246,8 +4757,20 @@ kernel void imparo_bw_read(
     uint tgid [[threadgroup_position_in_grid]])
 {
     uint4 acc = uint4(0u);
+    // EVERY REP READS A DIFFERENT ADDRESS SET. A rep that re-read the thread's own set
+    // measured the cache, not the bus: once a threadgroup's set fit the core's cache (a
+    // grid of 2.4M threads over 256 MB is 7 loads per thread) the probe reported 380 to
+    // 560 GB/s on a 153.6 GB/s bus, and the "153 at the fattest grid" it reported before
+    // was the same reuse at 1.1x. Rotating the set by a rep-sized stride keeps the
+    // whole buffer between one address and its re-read, which no cache holds.
+    const uint off = n4 / (reps > 0u ? reps : 1u);
     for (uint r = 0u; r < reps; ++r) {
-        for (uint i = gid; i < n4; i += gsz) { acc += src[i]; }
+        const uint shift = r * off;
+        for (uint i = gid; i < n4; i += gsz) {
+            uint j = i + shift;
+            if (j >= n4) { j -= n4; }
+            acc += src[j];
+        }
     }
     const uint sum = acc.x + acc.y + acc.z + acc.w;
     // Never taken for real data, but the compiler cannot prove it, so the loads stay.
@@ -6795,6 +7318,10 @@ template [[host_name("imparo_attention_decode_stream_dk256")]] kernel imparo_att
 template [[host_name("imparo_attention_decode_stream_dk512")]] kernel imparo_attn_decode_stream_kt imparo_attention_decode_stream_t<512u>;
 // GQA row sharing, two query heads per threadgroup (full-attention geometry).
 template [[host_name("imparo_attention_decode_stream_dk512_g2")]] kernel imparo_attn_decode_stream_kt imparo_attention_decode_stream_t<512u, 2u>;
+// hd 256 (Qwen3.8-27B's full-attention layers: 24 query heads over 4 KV heads, six per
+// KV head): 2 and 3 fit the threadgroup budget (HQ x 1416 floats at nsg 4), 6 does not.
+template [[host_name("imparo_attention_decode_stream_dk256_g2")]] kernel imparo_attn_decode_stream_kt imparo_attention_decode_stream_t<256u, 2u>;
+template [[host_name("imparo_attention_decode_stream_dk256_g3")]] kernel imparo_attn_decode_stream_kt imparo_attention_decode_stream_t<256u, 3u>;
 
 // Sliced decode attention, GROUPED BY KV HEAD.
 //
@@ -7997,7 +8524,14 @@ constant uint DVD = IMPARO_DELTA_VD;              // value coordinate = V head w
 // register-resident state amortising across the token loop and decode has no token loop,
 // so the REASON for 32 does not carry even though the answer does. More rows per simdgroup
 // at unchanged parallelism means more value HEADS per threadgroup, a different change.
-constant uint DELTA_SGS = 32u;
+// The simdgroup count is a build-time macro (IMPARO_DELTA_SGS, injected by the host with
+// the staging depth) so the threadgroup's width can be re-measured beside the projections
+// it is now issued next to: a 1024-thread threadgroup fills a core, and a kernel that
+// fills 14 cores twice over leaves the GEMV beside it nowhere to run.
+#ifndef IMPARO_DELTA_SGS
+#define IMPARO_DELTA_SGS 32
+#endif
+constant uint DELTA_SGS = IMPARO_DELTA_SGS;
 constant uint DELTA_TPT = DELTA_SGS * 32u;
 constant uint DSTAGE = IMPARO_DELTA_STAGE;        // tokens staged per group
 constant uint DROWS = (DVD + DELTA_SGS - 1u) / DELTA_SGS;   // state rows per simdgroup
@@ -8039,6 +8573,14 @@ kernel void imparo_delta_net(
     device const float * nrm    [[buffer(12)]],
     device float * gate         [[buffer(13)]],
     constant uint & fuse_epi    [[buffer(14)]],
+    // THE BOUNDARY SNAPSHOT. A checkpoint boundary `snap_row` tokens into this batch:
+    // the matrix as it stands after that token's update is written to `snap` (the
+    // snapshot plane's copy of this layer's region) and the rule carries on. 0 = none.
+    // The matrix lives in registers for the whole batch and is stored once at the end,
+    // so without this a checkpoint inside a chunk carried the convolution history and
+    // NO matrix -- a conversation adopting another's prefix ran from zeros.
+    device float * snap         [[buffer(15)]],
+    constant uint & snap_row    [[buffer(16)]],
     uint h    [[threadgroup_position_in_grid]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -8206,6 +8748,20 @@ kernel void imparo_delta_net(
                 }
             }
 #endif
+            // The state after this token IS the checkpoint's, when the boundary sits
+            // here: every thread stores the elements it owns, the same rows and columns
+            // the final store below covers. Uniform across the threadgroup; one 64 KB
+            // store per head on the one token of a batch that reaches a boundary.
+            if (t0 + tt + 1u == snap_row) {
+                device float * S_snap = snap + (ulong)h * DVD * DKD;
+                for (uint r = 0u; r < DROWS; ++r) {
+                    const uint j = sg + r * DELTA_SGS;
+                    for (uint c = 0u; c < DCOLS; ++c) {
+                        const uint i = lane * DCOLS + c;
+                        if (j < DVD && i < DKD) { S_snap[(ulong)j * DKD + i] = s[r][c]; }
+                    }
+                }
+            }
         }
         // The staging arrays are rewritten by the next group, so no simdgroup may run
         // ahead into them while another is still reading. It also PUBLISHES tout, which
@@ -8718,11 +9274,16 @@ kernel void imparo_blk_gemv(
         for (uint i = 0u; i < BLK_GEMV_NR; ++i) { acc[i] = 0.0f; }
         for (uint sb = lane; sb < subs; sb += 32u) {
             const uint blk = sb / sub_per_block, sub = sb % sub_per_block;
-            device const float * xs = xb + sb * 32u;
             // The x values ONCE for all BLK_GEMV_NR rows: they are the same 32 floats,
             // and holding them in registers is what makes the extra rows nearly free.
+            // Eight 16-byte loads: a row is n_in floats (a multiple of 32) from the
+            // buffer's start, so every sub-block's 32 floats begin 128-byte aligned.
+            device const float4 * xs4 = (device const float4 *)(xb + sb * 32u);
             float xv[32];
-            for (uint j = 0u; j < 32u; ++j) { xv[j] = xs[j]; }
+            for (uint j = 0u; j < 8u; ++j) {
+                const float4 t = xs4[j];
+                xv[4u * j] = t.x; xv[4u * j + 1u] = t.y; xv[4u * j + 2u] = t.z; xv[4u * j + 3u] = t.w;
+            }
             for (uint i = 0u; i < BLK_GEMV_NR; ++i) {
                 const uint rr = r + i;
                 if (rr >= n_out) { break; }
@@ -8741,10 +9302,10 @@ kernel void imparo_blk_gemv(
                     pay = weights + w_offset + unit
                         + (ulong)TM_UNIT_ROWS * sc_bytes + (ulong)slot * pay_bytes;
                 }
-                half v[32];
-                tm_sub32(sc, pay, sub, v);
+                float v[32];
+                tm_sub32(sc, pay, sub, v, !WFMT_ROW);
                 float part = 0.0f;
-                for (uint j = 0; j < 32u; ++j) { part += float(v[j]) * xv[j]; }
+                for (uint j = 0; j < 32u; ++j) { part += v[j] * xv[j]; }
                 acc[i] += part;
             }
         }
@@ -8790,10 +9351,10 @@ kernel void imparo_blk_gather_rows(
     device const uchar * sc = b + so;
     device const uchar * pay = b + (so == 0u ? tm_scale_bytes() : 0u);
 
-    half v[32];
-    tm_sub32(sc, pay, sub, v);
+    float v[32];
+    tm_sub32(sc, pay, sub, v, false);
     device float * out = y + (ulong)dst_off + (ulong)t * width + sb * 32u;
-    for (uint l = 0; l < 32u; ++l) { out[l] = float(v[l]) * scale; }
+    for (uint l = 0; l < 32u; ++l) { out[l] = v[l] * scale; }
 }
 
 kernel void imparo_ple_combine(
@@ -9057,7 +9618,7 @@ inline void mega_barrier(device atomic_uint * ctr, uint target, device atomic_ui
 // the word is sticky and every later dispatch leaves at entry, so a failed region costs one
 // spin cap (design doc, constraint 4).
 inline void mega_step(device atomic_uint * ctr, thread uint & phase, uint n_tg, device atomic_uint * err,
-                      uint tid, uint tgid) {
+                      uint tid, uint tgid, uint spin_max = MEGA_SPIN_MAX) {
     phase += 1u;
     const uint target = phase * n_tg;
     threadgroup_barrier(mem_flags::mem_device);
@@ -9072,7 +9633,7 @@ inline void mega_step(device atomic_uint * ctr, thread uint & phase, uint n_tg, 
         uint spins = 0u;
         if (atomic_load_explicit(err, memory_order_relaxed) == 0u) {
             while (atomic_load_explicit(ctr, memory_order_relaxed) < target) {
-                if (++spins > MEGA_SPIN_MAX) {
+                if (++spins > spin_max) {
                     const uint seen = atomic_load_explicit(ctr, memory_order_relaxed);
                     const uint arrived = (seen + n_tg >= target) ? min(seen + n_tg - target, 255u) : 0u;
                     atomic_store_explicit(err, 1u | ((phase & 0xfffu) << 4) | (arrived << 16) | (tgid << 24), memory_order_relaxed);
@@ -9337,76 +9898,6 @@ inline float mega_q4_row_partial_tg(device const uchar * row, threadgroup const 
     return acc[0];
 }
 
-kernel void imparo_mega_ffn(
-    device const uchar * w_gate [[buffer(0)]],
-    device const uchar * w_up   [[buffer(1)]],
-    device const uchar * w_down [[buffer(2)]],
-    device const float * x      [[buffer(3)]],   // n_in: the FFN input row
-    device float       * g      [[buffer(4)]],   // n_mid scratch: gate, then act(gate) * up
-    device float       * u      [[buffer(5)]],   // n_mid scratch: up
-    device float       * y      [[buffer(6)]],   // n_out: the down projection
-    device atomic_uint * sync   [[buffer(7)]],   // [0] barrier 1, [1] barrier 2, [2] exit, [3] error
-    constant ulong & gate_off [[buffer(8)]],  constant ulong & up_off [[buffer(9)]],
-    constant ulong & down_off [[buffer(10)]],
-    constant uint & n_in  [[buffer(11)]], constant uint & n_mid [[buffer(12)]],
-    constant uint & n_out [[buffer(13)]], constant uint & n_tg  [[buffer(14)]],
-    uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]], uint sgid [[simdgroup_index_in_threadgroup]],
-    uint nsg  [[simdgroups_per_threadgroup]])
-{
-    const uint rows_per_simd = 32u / LANES_PER_ROW;
-    const uint sub  = lane % LANES_PER_ROW;
-    const uint slot = lane / LANES_PER_ROW;
-    const uint sg_global = tgid * nsg + sgid;
-    const uint sg_total  = n_tg * nsg;
-    const uint tcount    = nsg * 32u;
-
-    // ---- phase 1: gate rows [0, n_mid) and up rows [n_mid, 2 n_mid) from x ----
-    {
-        const uint blocks = n_in / QK4_0;
-        device const float4 * xs = (device const float4 *)x;
-        for (uint r = sg_global * rows_per_simd + slot; r < 2u * n_mid; r += sg_total * rows_per_simd) {
-            const bool is_up = r >= n_mid;
-            const uint rr = is_up ? r - n_mid : r;
-            device const uchar * row = (is_up ? (w_up + up_off) : (w_gate + gate_off))
-                                     + (ulong)rr * blocks * Q4_0_BYTES;
-            float acc = mega_q4_row_partial(row, xs, blocks, sub);
-            acc = lane_group_sum(acc);
-            if (sub == 0u) { if (is_up) { u[rr] = acc; } else { g[rr] = acc; } }
-        }
-    }
-    mega_barrier(sync, n_tg, sync + 3, tid);
-
-    // ---- phase 2: g = act(g) * u (imparo_act_mul's expression) ----
-    for (uint i = tgid * tcount + tid; i < n_mid; i += n_tg * tcount) {
-        g[i] = imparo_act_f(g[i]) * u[i];
-    }
-    mega_barrier(sync + 1, n_tg, sync + 3, tid);
-
-    // ---- phase 3: down rows [0, n_out) from g ----
-    {
-        const uint blocks = n_mid / QK4_0;
-        device const float4 * xs = (device const float4 *)g;
-        for (uint r = sg_global * rows_per_simd + slot; r < n_out; r += sg_total * rows_per_simd) {
-            device const uchar * row = w_down + down_off + (ulong)r * blocks * Q4_0_BYTES;
-            float acc = mega_q4_row_partial(row, xs, blocks, sub);
-            acc = lane_group_sum(acc);
-            if (sub == 0u) { y[r] = acc; }
-        }
-    }
-
-    // ---- exit: the last threadgroup out resets the counters for the next dispatch ----
-    threadgroup_barrier(mem_flags::mem_device);
-    if (tid == 0u) {
-        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-        if (atomic_fetch_add_explicit(sync + 2, 1u, memory_order_relaxed) == n_tg - 1u) {
-            atomic_store_explicit(sync + 0, 0u, memory_order_relaxed);
-            atomic_store_explicit(sync + 1, 0u, memory_order_relaxed);
-            atomic_store_explicit(sync + 2, 0u, memory_order_relaxed);
-            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-        }
-    }
-}
 #endif
 
 
@@ -9414,8 +9905,8 @@ kernel void imparo_mega_ffn(
 // MEGA FFN+PLE BLOCK (task #141, stage 2a): from the FFN input to the end of the layer as ONE
 // persistent dispatch -- gate|up, act*mul, down, post-FFN norm+add, PLE gate, act*row, PLE
 // proj, and the tail (post_norm + residual*scale, then the next layer's input norm). Ten
-// dispatches today, seven software barriers here. Same barrier/counter contract as
-// imparo_mega_ffn (words 4..15 of the sync buffer: barriers 4..12, exit 13, error 15).
+// dispatches today, seven software barriers here. Barrier/counter contract: words 4..15 of
+// the sync buffer (barriers 4..12, exit 13, error 15), see mega_step / mega_exit.
 //
 // The two norm phases run on threadgroup 0 and reproduce imparo_rms_norm_add_row exactly:
 // that kernel is launched with `norm_t` threads for the width (the host's rule), each thread
@@ -9903,8 +10394,10 @@ struct MegaEntryG {
 };
 struct MegaToken {
     uint start_pos, dbg_slot, n_tg, entry_bytes;   // entry_bytes: the host's sizeof(entry), refused on drift
-    uint dbg_seq, entry_index, n_entries, pad3;    // dbg_seq: this dispatch's index in the region (debug records);
-                                                   // entry_index / n_entries: the program form's entry (task #153)
+    uint dbg_seq, entry_index, n_entries, probe;   // dbg_seq: this dispatch's index in the region (debug records);
+                                                   // entry_index / n_entries: the program form's entry (task #153);
+                                                   // probe: non-zero = the admission probe (task #203), and its
+                                                   // spin budget in units of 1024 iterations
 };
 
 
@@ -10340,10 +10833,10 @@ inline void mega_blk_unit(device const uchar * wb, uint blocks, uint un, XS x,
         float xv[32];
         for (uint j = 0u; j < 32u; ++j) { xv[j] = float(x[sb * 32u + j]); }
         for (uint r = 0u; r < TM_UNIT_ROWS; ++r) {
-            half v[32];
-            tm_sub32_t<F>(ub + (ulong)r * sc_bytes, pay0 + (ulong)r * pay_bytes, sub, v);
+            float v[32];
+            tm_sub32_t<F, float>(ub + (ulong)r * sc_bytes, pay0 + (ulong)r * pay_bytes, sub, v, true);
             float part = 0.0f;
-            for (uint j = 0u; j < 32u; ++j) { part += float(v[j]) * xv[j]; }
+            for (uint j = 0u; j < 32u; ++j) { part += v[j] * xv[j]; }
             acc[r] += part;
         }
     }

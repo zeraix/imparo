@@ -37,6 +37,12 @@ pub trait PoolTenant {
     /// wrong numbers, which is a failure that reads as success.
     fn recurrent_elems(&self) -> usize;
 
+    /// Physical history in the currently selected window region. None preserves
+    /// legacy tenants; a certified false forbids both reuse and checkpoint capture.
+    fn kv_window_reuse_allowed(&self, _boundary: usize) -> Option<bool> {
+        None
+    }
+
     /// The device this tenant computes on, when there is one.
     ///
     /// The pool needs it to advise pages and to move rows; `imparo-backend` is already a

@@ -24,10 +24,10 @@ const PROGRAM_EXPORTS: [&str; 6] = [
 ];
 
 #[test]
-fn backend_abi_26_has_exactly_six_generic_program_exports() {
+fn backend_abi_34_has_exactly_six_generic_program_exports() {
     let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
-    assert_eq!(catalog["backend_abi"].as_u64(), Some(26));
-    assert_eq!(imparo_cuda::CUDA_BACKEND_ABI, 26);
+    assert_eq!(catalog["backend_abi"].as_u64(), Some(34));
+    assert_eq!(imparo_cuda::CUDA_BACKEND_ABI, 34);
 
     let actual: Vec<_> = EXPORTS
         .lines()
@@ -105,7 +105,7 @@ fn bridge_is_one_data_only_unity_boundary() {
         "cuFuncGetAttribute",
         "cuLaunchKernel",
         "reinterpret_cast<CUstream>(g.stream)",
-        "destroy_decode_graph_checked()",
+        "destroy_all_execution_graphs_checked()",
     ] {
         assert!(NATIVE.contains(marker), "native bridge lost {marker}");
     }

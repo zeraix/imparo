@@ -9,11 +9,12 @@
 // The chat codec comes from the PLAN, not from an architecture named here. It has to be
 // reachable before the model is built: the template sniff below runs at load.
 use imparo_model::chat::ChatCodec;
+#[cfg(feature = "cuda-speculative")]
+mod draft_pairing;
 mod host_fit;
 mod http;
 mod template;
 
-use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -32,6 +33,8 @@ struct Engine {
     /// `KvPoolMember` method -- checked across both files before widening, not assumed --
     /// so naming the concrete type bought nothing and cost every other model.
     model: Box<dyn imparo_model::Model + Send>,
+    #[cfg(feature = "cuda-speculative")]
+    draft_spec: Option<Arc<imparo_model::speculative::DraftSpec>>,
     tok: Tokenizer,
     /// This architecture's chat format: how a prompt is rendered without a template, and
     /// how the output is split back into reasoning, text and tool calls.
@@ -65,6 +68,17 @@ struct Engine {
     /// continuation cache (docs/unified-kv-pool.md). Emptied whenever the cache is
     /// overwritten or a forward fails mid-flight.
     resident: Vec<u32>,
+}
+
+#[cfg(feature = "cuda-speculative")]
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Err(e) = self.model.clear_draft_cache() {
+            // Do not unmap shared weights after a failed GPU retirement.
+            eprintln!("fatal draft cache retirement: {e}");
+            std::process::abort();
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -149,10 +163,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cache_key_type: Option<String> = None;
     let mut cache_value_type: Option<String> = None;
     let mut template_file: Option<PathBuf> = None;
+    let mut draft_pairing_path: Option<PathBuf> = None;
+    let mut draft_kind: Option<String> = None;
+    let mut draft_mask_token: Option<u32> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "-m" | "--model" => model_path = args.next().map(PathBuf::from),
+            "--draft-pairing" => {
+                draft_pairing_path = Some(PathBuf::from(
+                    args.next()
+                        .ok_or("--draft-pairing requires a manifest path")?,
+                ));
+            }
+            "--draft-kind" => {
+                draft_kind = Some(
+                    args.next()
+                        .ok_or("--draft-kind requires dspark or gemma4-mtp")?,
+                );
+            }
+            "--draft-mask-token" => {
+                draft_mask_token = Some(
+                    args.next()
+                        .ok_or("--draft-mask-token requires an integer")?
+                        .parse()
+                        .map_err(|_| "invalid --draft-mask-token")?,
+                );
+            }
             "--port" => port = args.next().and_then(|v| v.parse().ok()).unwrap_or(port),
             "-c" | "--ctx" => {
                 context_length = args
@@ -173,9 +210,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     }
+    #[cfg(not(feature = "cuda-speculative"))]
+    if draft_pairing_path.is_some()
+        || draft_kind.is_some()
+        || draft_mask_token.is_some()
+    {
+        return Err(
+            "draft pairing currently requires the cuda-speculative build feature"
+                .into(),
+        );
+    }
     let path = model_path.ok_or(
         "usage: imparo-server -m MODEL.gguf [--port N] [-c N] \
-                                 [--cache-type-k T] [--cache-type-v T]",
+                                 [--cache-type-k T] [--cache-type-v T] [--draft-pairing PATH --draft-kind dspark|gemma4-mtp] [--draft-mask-token ID]",
     )?;
     // Only configure when a flag was given: with no flags the engine falls back to the
     // IMPARO_CTK/IMPARO_CTV environment (probe binaries and harnesses use that), and
@@ -199,13 +246,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // From the PLAN, and before the model exists: the template sniff below runs at load.
     let chat = imparo_model::chat::codec(&plan)?;
     imparo_model::host::log_footprint("plan");
-    let mut weights = Weights::open_with(&document, &path)?;
+    #[cfg(feature = "cuda-speculative")]
+    let pairing = draft_pairing::load(
+        &path,
+        &plan.config.architecture,
+        draft_pairing_path.as_deref(),
+        draft_kind.as_deref(),
+        draft_mask_token,
+    )?;
+    #[cfg(feature = "cuda-speculative")]
+    let backing = pairing
+        .as_ref()
+        .map_or(path.as_path(), |(p, _)| p.as_path());
+    #[cfg(not(feature = "cuda-speculative"))]
+    let backing = path.as_path();
+    let mut weights = Weights::open_with(&document, backing)?;
     imparo_model::backend::enable_gpu(
         &mut weights,
         &plan,
         context_length,
         imparo_model::prefill_batch(),
     )?;
+    #[cfg(feature = "cuda-speculative")]
+    draft_pairing::apply_knobs()?;
     // Chat template (task #15). Source order: --chat-template-file, then the
     // GGUF-embedded tokenizer.chat_template, then this architecture's own codec.
     // A user FILE that fails to compile is fatal (they asked for it); an embedded
@@ -573,6 +636,8 @@ re-render says {expect}; branch points will be found by re-rendering (slower)"
     let disk = store.clone().map(imparo_kv::disk::DiskQueue::new);
     let engine = Arc::new(Mutex::new(Engine {
         model,
+        #[cfg(feature = "cuda-speculative")]
+        draft_spec: pairing.map(|(_, spec)| Arc::new(spec)),
         tok,
         chat,
         bos_text,
@@ -671,8 +736,8 @@ fn settled_len(b: &[u8]) -> usize {
         if c & 0b1100_0000 == 0b1000_0000 {
             continue; // a continuation byte; its lead is further back
         }
+        // ASCII and a byte that cannot lead a sequence both count as one.
         let need = match c {
-            0x00..=0x7F => 1,
             0xC0..=0xDF => 2,
             0xE0..=0xEF => 3,
             0xF0..=0xF7 => 4,
@@ -905,6 +970,42 @@ fn erase_conversations(
     )
 }
 
+/// Read-only service witness, enabled only by an explicit local dump directory.
+/// File I/O is outside reported prefill/decode intervals and is never a speed gate.
+fn dump_service_prefill_witness(
+    model: &dyn imparo_model::Model,
+    logits: &[f32],
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(root) = std::env::var_os("IMPARO_SERVICE_STATE_DUMP_DIR") else {
+        return Ok(None);
+    };
+    static INDEX: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    let index = INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let folder = PathBuf::from(root).join(format!("request-{index:03}"));
+    std::fs::create_dir_all(&folder)?;
+    let raw: Vec<u8> = logits
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    std::fs::write(folder.join("logits.raw"), raw)?;
+    let boundary = model.kv_runtime().filled;
+    let live = model
+        .kv_recurrent_blob(boundary)
+        .ok_or_else(|| std::io::Error::other("missing service recurrent state"))?;
+    std::fs::write(folder.join("live.raw"), &live)?;
+    let checkpoint = model.kv_recurrent_note();
+    if let Some((_, bytes)) = &checkpoint {
+        std::fs::write(folder.join("checkpoint.raw"), bytes)?;
+    }
+    let meta = json!({"live_boundary":boundary,"logit_count":logits.len(),
+        "recurrent_elements":model.plan().recurrent_elems(),
+        "checkpoint_boundary":checkpoint.as_ref().map(|(at,_)|*at),
+        "checkpoint_bytes":checkpoint.as_ref().map(|(_,bytes)|bytes.len())});
+    std::fs::write(folder.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+    Ok(Some(folder))
+}
+
 fn parse_raw_input_ids(
     body: &Value,
     enabled: bool,
@@ -1036,7 +1137,8 @@ fn chat_completions(
     // ends its prompt inside the channel in one branch and outside it in the other. Both
     // split sites below take this; neither may assume it. (A raw-ids request renders no
     // prompt, so there is no channel to be inside.)
-    let starts_in_reasoning = !prompt.is_empty() && chat.prompt_ends_in_reasoning(&prompt);
+    let starts_in_reasoning =
+        !prompt.is_empty() && chat.prompt_ends_in_reasoning(&prompt);
     // IMPARO_DUMP_PROMPT=1: print the rendered prompt between markers, for byte-diffing
     // against llama-server's /apply-template (task #7).
     if std::env::var("IMPARO_DUMP_PROMPT").is_ok_and(|v| v == "1") {
@@ -1255,9 +1357,9 @@ fn chat_completions(
                 conversation == "default",
                 new_conversation,
             ) {
-                // A checkpoint boundary is wherever a turn ended, which is not a grid
-                // point; resuming below it recomputes a few tokens and is exact.
-                Ok(r) => pool_pos = Some(imparo_model::kv::resume_point(r, ids.len())),
+                // The pool installed state AT this legal grid boundary. Never
+                // resnap only the position after recurrent state was restored.
+                Ok(r) => pool_pos = Some(r),
                 Err(e) => {
                     eprintln!("[imparo] kv pool begin failed ({e}); cold path");
                     pool_pos = Some(0);
@@ -1314,6 +1416,50 @@ fn chat_completions(
     // pool off there is no disk restore, and the pool is on wherever the backend
     // declares `paged_reads`.
     let start_pos = pool_pos.unwrap_or(start_pos);
+    // The single-resident path needs the same exact recurrent restoration as
+    // Pool.begin. A snapped token position alone does not rewind ShortConv.
+    let start_pos = if pool_pos.is_none()
+        && start_pos > 0
+        && engine.model.plan().recurrent_elems() > 0
+        && engine.model.kv_runtime().filled != start_pos
+    {
+        let before = engine.model.kv_runtime().filled;
+        let needed = engine.model.plan().recurrent_elems() as usize * 4;
+        let window_ok = !engine
+            .model
+            .plan()
+            .layers
+            .iter()
+            .any(|l| matches!(l.attention, imparo_model::Attention::Window { .. }))
+            || engine.model.kv_window_reuse_allowed(start_pos) == Some(true);
+        if let Some((at, recurrent)) =
+            engine.model.kv_recurrent_note().filter(|(at, b)| {
+                *at == start_pos
+                    && b.len() == needed
+                    && start_pos <= before
+                    && window_ok
+            })
+        {
+            engine
+                .model
+                .kv_resume(&imparo_kv::KvState {
+                    boundary: at,
+                    full: Vec::new(),
+                    window: Vec::new(),
+                    recurrent,
+                })
+                .map_err(std::io::Error::other)?;
+            eprintln!("[imparo] legacy recurrent restore {before}->{at}");
+            at
+        } else {
+            eprintln!(
+                "[imparo] legacy recurrent checkpoint unavailable at {start_pos}; cold prefill"
+            );
+            0
+        }
+    } else {
+        start_pos
+    };
 
     let id = format!("chatcmpl-imparo-{prompt_tokens}");
     if streaming {
@@ -1383,216 +1529,547 @@ fn chat_completions(
             prefill_from = branch;
         }
     }
-    if let Err(e) =
-        engine
-            .model
-            .forward_into(&ids[prefill_from..], prefill_from, &mut logits)
-    {
-        return http::json(stream, 500, &json!({"error": e}));
+    let prompt_anchor_lab =
+        std::env::var("IMPARO_KV_PROMPT_ANCHOR_LAB").as_deref() == Ok("1");
+    // Request a boundary the NEXT replay can use, not merely the latest grid
+    // crossed. For513 tokens the service needs448;512 leaves an invalid one-token
+    // tail. The model captures it inside its existing batch without another cut.
+    let checkpoint = (prompt_anchor_lab && engine.model.plan().recurrent_elems() > 0)
+        .then(|| imparo_model::kv::resume_point(ids.len(), ids.len()))
+        .filter(|at| *at >= prefill_from);
+    struct Generation {
+        prefill_ms: f64,
+        service_witness: Option<PathBuf>,
+        generated: Vec<u32>,
+        decode_steps: usize,
+        decode_ms: f64,
+        t_sample: f64,
+        t_detok: f64,
+        t_send: f64,
+        probe: bool,
+        emitted: String,
+        sent_reasoning: usize,
+        sent_visible: usize,
+        frames: Vec<u8>,
+        pipelined: bool,
+        queued: bool,
     }
-    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
-    // IMPARO_KV_DIGEST=1: the cache as the prefill left it, BEFORE a single token is
-    // generated -- so two conversations with the same prompt can be compared over the
-    // whole prompt, not just the part they share.
-    {
-        let Engine { model, pool, .. } = &mut *engine;
-        if let (Some(pl), Some(l)) = (pool.as_ref(), effective_label.as_deref()) {
-            pl.digest(&**model, l, prompt_tokens);
-        }
-    }
-    // Read the submission profile at the prefill boundary so prefill and decode are
-    // attributed separately -- they have completely different shapes and averaging them
-    // would hide whichever one is stalling.
-    imparo_model::host::prof_log("prefill", prefill_ms);
+    #[cfg(feature = "cuda-speculative")]
+    let cache_draft =
+        std::env::var("IMPARO_LAB_DRAFT_CACHE_RESUME").as_deref() != Ok("0");
+    #[cfg(feature = "cuda-speculative")]
+    let draft_spec = engine
+        .draft_spec
+        .as_ref()
+        .filter(|spec| {
+            draft_pairing::request_enabled(&body)
+                && temperature == 0.0
+                && ((prefill_from == 0 && start_pos == 0)
+                    || (cache_draft
+                        && !new_conversation
+                        && engine.resident_conv == conversation
+                        && prefill_from == start_pos
+                        && spec.can_resume(&ids, prefill_from)))
+                && spec.can_start(
+                    ids.len(),
+                    max_tokens,
+                    engine.model.kv_runtime().capacity,
+                )
+                && !pool_branch.as_ref().is_some_and(|(_, _, _, eager)| *eager)
+        })
+        .map(Arc::clone);
+    let mut outstanding_pipeline = false;
+    let generation_result = {
+        let Engine {
+            model: target,
+            tok,
+            pool,
+            root,
+            ..
+        } = &mut *engine;
+        let mut generate = |model: &mut dyn imparo_model::Model,
+                            mut draft: Option<
+            &mut dyn imparo_model::speculative::DraftProvider,
+        >|
+         -> std::io::Result<_> {
+            if let Some(p) = draft.as_deref_mut() {
+                p.initialize_at(prefill_from)
+                    .map_err(std::io::Error::other)?;
+                p.set_capture(true).map_err(std::io::Error::other)?;
+            }
+            #[cfg(feature = "cuda-speculative")]
+            if let Some(p) = draft.as_deref_mut() {
+                let mut committed = prefill_from;
+                let mut chunks = 0;
+                model
+                    .forward_prefill_observed(
+                        &ids[prefill_from..],
+                        prefill_from,
+                        &mut logits,
+                        checkpoint,
+                        &mut |at, chunk| {
+                            if at != committed {
+                                return Err(
+                                    "noncontiguous draft Prefill history".into()
+                                );
+                            }
+                            p.commit(at, chunk)?;
+                            committed = at + chunk.len();
+                            chunks += 1;
+                            Ok(())
+                        },
+                    )
+                    .map_err(std::io::Error::other)?;
+                if committed != ids.len() {
+                    return Err(std::io::Error::other(
+                        "incomplete draft prompt history",
+                    ));
+                }
+                eprintln!("[imparo] draft prompt_history={committed} chunks={chunks}");
+            } else {
+                model
+                    .forward_into_with_checkpoint(
+                        &ids[prefill_from..],
+                        prefill_from,
+                        &mut logits,
+                        checkpoint,
+                    )
+                    .map_err(std::io::Error::other)?;
+            }
+            #[cfg(not(feature = "cuda-speculative"))]
+            model
+                .forward_into_with_checkpoint(
+                    &ids[prefill_from..],
+                    prefill_from,
+                    &mut logits,
+                    checkpoint,
+                )
+                .map_err(std::io::Error::other)?;
+            // Laboratory state-retention candidate. Capture before decode advances the
+            // recurrent note past the original prompt; include the cost in prefill time.
+            if prompt_anchor_lab {
+                let hashes = imparo_kv::unit_ids(root, &ids);
+                if let (Some(pl), Some(label)) =
+                    (pool.as_mut(), effective_label.as_deref())
+                {
+                    if let Some(at) =
+                        pl.note_prompt_checkpoint(&*model, label, &hashes, &ids)
+                    {
+                        if imparo_model::log_on() {
+                            eprintln!(
+                                "[imparo] prompt replay anchor={at} prompt={prompt_tokens}"
+                            );
+                        }
+                    }
+                }
+            }
+            let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
+            let service_witness = dump_service_prefill_witness(&*model, &logits)?;
+            if let Some(folder) = &service_witness {
+                std::fs::write(
+                    folder.join("input-ids.json"),
+                    serde_json::to_vec(&ids)?,
+                )?;
+            }
+            // IMPARO_KV_DIGEST=1: the cache as the prefill left it, BEFORE a single token is
+            // generated -- so two conversations with the same prompt can be compared over the
+            // whole prompt, not just the part they share.
+            {
+                if let (Some(pl), Some(l)) = (pool.as_ref(), effective_label.as_deref())
+                {
+                    pl.digest(&*model, l, prompt_tokens);
+                }
+            }
+            // Read the submission profile at the prefill boundary so prefill and decode are
+            // attributed separately -- they have completely different shapes and averaging them
+            // would hide whichever one is stalling.
+            imparo_model::host::prof_log("prefill", prefill_ms);
 
-    let end_sequence_token = engine.tok.eos;
-    let end_turn_token = engine.tok.eot;
-    let mut generated: Vec<u32> = Vec::new();
-    let mut emitted = String::new();
-    // The generated text's bytes, appended per token: decoding the WHOLE prefix each step
-    // was quadratic in generation length (review #116, D7).
-    let mut gen_bytes: Vec<u8> = Vec::new();
-    let t_decode = Instant::now();
-    // Counts forwards, not tokens. The first token is free -- it comes from the prefill
-    // logits -- so N tokens cost N-1 decode steps, and llama.cpp reports its decode rate
-    // over exactly that (n_gen - 1). Dividing N tokens by N-1 forwards would report a rate
-    // 1/(N-1) too high against it.
-    let mut decode_steps = 0_usize;
-    // Between two forwards the GPU is idle. `gpu_busy` sits ~0.7 ms/token under wall, so
-    // whatever runs here is on the critical path just as much as a kernel is.
-    let (mut t_sample, mut t_detok, mut t_send) = (0.0_f64, 0.0_f64, 0.0_f64);
-    // Read once, outside the loop: the clock reads themselves are the probe's cost, so
-    // gating only the print would leave six of them per token in the measured build.
-    let probe = std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1");
-    // The FIRST pick is made on the host from the prefill logits; every later one comes
-    // back from `forward_next`, which runs the same greedy pick on the GPU and returns
-    // only the index -- the vocab-size logits never cross to the host during decode.
-    let t_s = probe.then(Instant::now);
-    let (mut sent_reasoning, mut sent_visible) = (0usize, 0usize);
-    // STREAMING FEEDS THE NEW BYTES, NOT THE WHOLE ANSWER (the shape oMLX's output parser
-    // uses). Splitting and parsing all of `emitted` every token is O(n) per token and so
-    // O(n^2) over a response. Instead each stage asks its codec how many TRAILING bytes are
-    // still undecided; everything before that is settled forever, classified once, and never
-    // looked at again.
-    //
-    //   raw ─[unsettled_in_raw]→ split_channels ─→ reasoning ──────────────────→ delta
-    //                                           └→ visible ─[unsettled_in_visible]→ parse → delta
-    //
-    // TWO CUTS, NOT ONE, because they are different questions. Asking "is a call open?" about
-    // RAW text answers it for the reasoning channel too, where a `<tool_call>` the model wrote
-    // in its thinking is prose and will never close -- and holding it holds everything after
-    // it, including the visible answer, to the end of generation.
-    let (mut fed_raw, mut inside) = (0usize, starts_in_reasoning);
-    let (mut fed_vis, mut vis_split) = (0usize, String::new());
-    let (mut reasoning_out, mut visible_out) = (String::new(), String::new());
-    // The turn can end inside the TEXT, not only at an end token -- see
-    // `ChatCodec::turn_ends_at`. Set when it has, so the loop stops after this token's
-    // bytes have been truncated and streamed.
-    let mut turn_ended = false;
-    let mut next = sample(&logits, temperature);
-    if let Some(t) = t_s {
-        t_sample += t.elapsed().as_secs_f64() * 1e3;
-    }
-    // PIPELINED DECODE (docs/decode-turnaround.md): the step that consumes `next` is
-    // queued before `next` is emitted, and the step after it is queued before this one's
-    // pick is read, so the GPU never waits for the host between tokens. The host learns
-    // each token one step late; on a stop the one step still queued is discarded.
-    let pipelined = engine.model.decode_pipelined() && max_tokens > 1;
-    let mut queued = false;
-    if pipelined {
-        match engine.model.queue_step(Some(next), prompt_tokens) {
-            Ok(()) => queued = true,
-            Err(e) => return http::json(stream, 500, &json!({"error": e})),
-        }
-    }
-    for step in 0..max_tokens {
-        if Some(next) == end_sequence_token || Some(next) == end_turn_token {
-            break;
-        }
-        generated.push(next);
-        let t_d = probe.then(Instant::now);
-        engine
-            .tok
-            .decode_bytes_into(&generated[generated.len() - 1..], &mut gen_bytes);
-        let piece = String::from_utf8_lossy(&gen_bytes[..settled_len(&gen_bytes)]).into_owned();
-        if let Some(t) = t_d {
-            t_detok += t.elapsed().as_secs_f64() * 1e3;
-        }
-        let t_e = probe.then(Instant::now);
-        if piece.len() > emitted.len() {
-            emitted = piece;
-            // WHERE THE MODEL HANDS THE TURN OVER, THE TURN IS OVER. gemma4 finishes a tool
-            // call by writing `<|tool_response>`, the opener of the block a tool RESULT
-            // fills; run past it and the model writes the tool's answer itself. Truncating
-            // HERE rather than after the loop is what makes the stream right too: a delta
-            // already sent cannot be taken back over SSE.
+            let end_sequence_token = tok.eos;
+            let end_turn_token = tok.eot;
+            let mut generated: Vec<u32> = Vec::new();
+            let mut emitted = String::new();
+            // The generated text's bytes, appended per token: decoding the WHOLE prefix each step
+            // was quadratic in generation length (review #116, D7).
+            let mut gen_bytes: Vec<u8> = Vec::new();
+            let t_decode = Instant::now();
+            // Counts forwards, not tokens. The first token is free -- it comes from the prefill
+            // logits -- so N tokens cost N-1 decode steps, and llama.cpp reports its decode rate
+            // over exactly that (n_gen - 1). Dividing N tokens by N-1 forwards would report a rate
+            // 1/(N-1) too high against it.
+            let mut decode_steps = 0_usize;
+            // Between two forwards the GPU is idle. `gpu_busy` sits ~0.7 ms/token under wall, so
+            // whatever runs here is on the critical path just as much as a kernel is.
+            let (mut t_sample, mut t_detok, mut t_send) = (0.0_f64, 0.0_f64, 0.0_f64);
+            // Read once, outside the loop: the clock reads themselves are the probe's cost, so
+            // gating only the print would leave six of them per token in the measured build.
+            let probe = std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1");
+            // The FIRST pick is made on the host from the prefill logits; every later one comes
+            // back from `forward_next`, which runs the same greedy pick on the GPU and returns
+            // only the index -- the vocab-size logits never cross to the host during decode.
+            let t_s = probe.then(Instant::now);
+            let (mut sent_reasoning, mut sent_visible) = (0usize, 0usize);
+            // The token's SSE frames, serialised here and written once (task #202).
+            let mut frames: Vec<u8> = Vec::with_capacity(512);
+            // STREAMING FEEDS THE NEW BYTES, NOT THE WHOLE ANSWER (the shape oMLX's output parser
+            // uses). Splitting and parsing all of `emitted` every token is O(n) per token and so
+            // O(n^2) over a response. Instead each stage asks its codec how many TRAILING bytes are
+            // still undecided; everything before that is settled forever, classified once, and never
+            // looked at again.
             //
-            // Searched from `fed_raw`, not from 0: the cut below holds any suffix that could
-            // still grow into a marker, so a COMPLETE handover marker can only lie in the
-            // bytes it has not settled yet. A `find` over the whole answer every token is
-            // the same O(n^2) the split and the parse were just cured of.
-            if let Some(at) = chat.turn_ends_at(&emitted[fed_raw..]) {
-                // The UNTRUNCATED bytes, under the same gate as the dump below: after the
-                // truncation nothing else in the process holds what the model actually
-                // wrote, and that is exactly what a reader of this probe came for.
-                if std::env::var("IMPARO_DUMP_GEN").is_ok_and(|v| v == "1") {
-                    eprintln!("[gen-raw-begin]{emitted}[gen-raw-end]");
-                    let abs = fed_raw + at;
-                    eprintln!("[imparo] turn ends at byte {abs}; the rest is the caller's");
-                }
-                emitted.truncate(fed_raw + at);
-                turn_ended = true;
+            //   raw ─[unsettled_in_raw]→ split_channels ─→ reasoning ──────────────────→ delta
+            //                                           └→ visible ─[unsettled_in_visible]→ parse → delta
+            //
+            // TWO CUTS, NOT ONE, because they are different questions. Asking "is a call open?" about
+            // RAW text answers it for the reasoning channel too, where a `<tool_call>` the model wrote
+            // in its thinking is prose and will never close -- and holding it holds everything after
+            // it, including the visible answer, to the end of generation.
+            let (mut fed_raw, mut inside) = (0usize, starts_in_reasoning);
+            let (mut fed_vis, mut vis_split) = (0usize, String::new());
+            let (mut reasoning_out, mut visible_out) = (String::new(), String::new());
+            // The turn can end inside the TEXT, not only at an end token -- see
+            // `ChatCodec::turn_ends_at`. Set when it has, so the loop stops after this token's
+            // bytes have been truncated and streamed.
+            let mut turn_ended = false;
+            let mut next = sample(&logits, temperature);
+            if let Some(t) = t_s {
+                t_sample += t.elapsed().as_secs_f64() * 1e3;
             }
-            // THE RAW CUT RUNS IN BOTH MODES, because both need `fed_raw`: streaming
-            // classifies and sends what it settles, and the turn-end search above uses it as
-            // the floor that keeps itself off the whole answer. Non-streaming only advances.
-            let raw_tail = &emitted[fed_raw..];
-            let settled = &raw_tail[..raw_tail.len() - chat.unsettled_in_raw(raw_tail)];
-            if !settled.is_empty() {
-                if streaming {
-                    // Stage 1: reasoning never streams as `content`.
-                    let (r, v) = chat.split_channels(settled, inside);
-                    reasoning_out.push_str(&r);
-                    vis_split.push_str(&v);
-                    inside = chat.channel_state_after(settled, inside);
+            let stops: Vec<u32> = [end_sequence_token, end_turn_token]
+                .into_iter()
+                .flatten()
+                .collect();
+            let mut cursor = if let Some(provider) = draft.as_deref_mut() {
+                Some(
+                    imparo_model::speculative::GreedyCursor::new(
+                        model,
+                        provider,
+                        prompt_tokens,
+                        next,
+                        max_tokens,
+                        &stops,
+                    )
+                    .map_err(std::io::Error::other)?,
+                )
+            } else {
+                None
+            };
+            // PIPELINED DECODE (docs/decode-turnaround.md): the step that consumes `next` is
+            // queued before `next` is emitted, and the step after it is queued before this one's
+            // pick is read, so the GPU never waits for the host between tokens. The host learns
+            // each token one step late; on a stop the one step still queued is discarded.
+            let pipelined =
+                cursor.is_none() && model.decode_pipelined() && max_tokens > 1;
+            let mut queued = false;
+            if pipelined {
+                match model.queue_step(Some(next), prompt_tokens) {
+                    Ok(()) => {
+                        queued = true;
+                        outstanding_pipeline = true;
+                    }
+                    Err(e) => return Err(std::io::Error::other(e)),
                 }
-                fed_raw += settled.len();
             }
-            if streaming {
-                // Stage 2: a tool call is not visible text either. Streaming used to skip
-                // this, so a client received the whole call as `content` deltas AND again as
-                // `tool_calls`, while the same request non-streaming returned `content: ""`.
-                // The calls are dropped here and read from the final parse; only the TEXT
-                // between them is streamed.
-                let vis_tail = &vis_split[fed_vis..];
-                let ready = &vis_tail[..vis_tail.len() - chat.unsettled_in_visible(vis_tail)];
-                if !ready.is_empty() {
-                    visible_out.push_str(&chat.parse_tool_calls(ready).0);
-                    fed_vis += ready.len();
+            for step in 0..max_tokens {
+                if let (Some(c), Some(provider)) =
+                    (cursor.as_mut(), draft.as_deref_mut())
+                {
+                    if let Some(token) =
+                        c.next(model, provider).map_err(std::io::Error::other)?
+                    {
+                        next = token;
+                    } else {
+                        decode_steps = c.consumed;
+                        break;
+                    }
+                    decode_steps = c.consumed;
                 }
-                // Everything accumulated above is settled, so a delta is simply the part
-                // not yet sent. Nothing is held back HERE any more -- both cuts happened
-                // upstream, each on the text its own question is about.
-                let (r, v) = (&reasoning_out, &visible_out);
-                if r.len() > sent_reasoning {
-                    http::sse(
-                        stream,
-                        &json!({
+                if Some(next) == end_sequence_token || Some(next) == end_turn_token {
+                    break;
+                }
+                generated.push(next);
+                let t_d = probe.then(Instant::now);
+                tok.decode_bytes_into(
+                    &generated[generated.len() - 1..],
+                    &mut gen_bytes,
+                );
+                let piece =
+                    String::from_utf8_lossy(&gen_bytes[..settled_len(&gen_bytes)])
+                        .into_owned();
+                if let Some(t) = t_d {
+                    t_detok += t.elapsed().as_secs_f64() * 1e3;
+                }
+                let t_e = probe.then(Instant::now);
+                if piece.len() > emitted.len() {
+                    emitted = piece;
+                    // WHERE THE MODEL HANDS THE TURN OVER, THE TURN IS OVER. gemma4 finishes a tool
+                    // call by writing `<|tool_response>`, the opener of the block a tool RESULT
+                    // fills; run past it and the model writes the tool's answer itself. Truncating
+                    // HERE rather than after the loop is what makes the stream right too: a delta
+                    // already sent cannot be taken back over SSE.
+                    //
+                    // Searched from `fed_raw`, not from 0: the cut below holds any suffix that could
+                    // still grow into a marker, so a COMPLETE handover marker can only lie in the
+                    // bytes it has not settled yet. A `find` over the whole answer every token is
+                    // the same O(n^2) the split and the parse were just cured of.
+                    if let Some(at) = chat.turn_ends_at(&emitted[fed_raw..]) {
+                        // The UNTRUNCATED bytes, under the same gate as the dump below: after the
+                        // truncation nothing else in the process holds what the model actually
+                        // wrote, and that is exactly what a reader of this probe came for.
+                        if std::env::var("IMPARO_DUMP_GEN").is_ok_and(|v| v == "1") {
+                            eprintln!("[gen-raw-begin]{emitted}[gen-raw-end]");
+                            let abs = fed_raw + at;
+                            eprintln!(
+                                "[imparo] turn ends at byte {abs}; the rest is the caller's"
+                            );
+                        }
+                        emitted.truncate(fed_raw + at);
+                        turn_ended = true;
+                    }
+                    // THE RAW CUT RUNS IN BOTH MODES, because both need `fed_raw`: streaming
+                    // classifies and sends what it settles, and the turn-end search above uses it as
+                    // the floor that keeps itself off the whole answer. Non-streaming only advances.
+                    let raw_tail = &emitted[fed_raw..];
+                    let settled =
+                        &raw_tail[..raw_tail.len() - chat.unsettled_in_raw(raw_tail)];
+                    if !settled.is_empty() {
+                        if streaming {
+                            // Stage 1: reasoning never streams as `content`.
+                            let (r, v) = chat.split_channels(settled, inside);
+                            reasoning_out.push_str(&r);
+                            vis_split.push_str(&v);
+                            inside = chat.channel_state_after(settled, inside);
+                        }
+                        fed_raw += settled.len();
+                    }
+                    if streaming {
+                        // Stage 2: a tool call is not visible text either. Streaming used to skip
+                        // this, so a client received the whole call as `content` deltas AND again as
+                        // `tool_calls`, while the same request non-streaming returned `content: ""`.
+                        // The calls are dropped here and read from the final parse; only the TEXT
+                        // between them is streamed.
+                        let vis_tail = &vis_split[fed_vis..];
+                        let ready = &vis_tail
+                            [..vis_tail.len() - chat.unsettled_in_visible(vis_tail)];
+                        if !ready.is_empty() {
+                            visible_out.push_str(&chat.parse_tool_calls(ready).0);
+                            fed_vis += ready.len();
+                        }
+                        // Everything accumulated above is settled, so a delta is simply the part
+                        // not yet sent. Nothing is held back HERE any more -- both cuts happened
+                        // upstream, each on the text its own question is about.
+                        // ONE WRITE PER TOKEN: both deltas are framed into `frames` and go out
+                        // together (task #202); the buffer is reused across the response.
+                        let (r, v) = (&reasoning_out, &visible_out);
+                        if r.len() > sent_reasoning {
+                            http::sse_frame(
+                                &mut frames,
+                                &json!({
                         "id": id, "object": "chat.completion.chunk", "model": "imparo",
                         "choices": [{"index": 0,
                                      "delta": {"reasoning_content": &r[sent_reasoning..]},
                                      "finish_reason": null}]}),
-                    )?;
-                    sent_reasoning = r.len();
-                }
-                if v.len() > sent_visible {
-                    http::sse(
-                        stream,
-                        &json!({
+                            )?;
+                            sent_reasoning = r.len();
+                        }
+                        if v.len() > sent_visible {
+                            http::sse_frame(
+                                &mut frames,
+                                &json!({
                         "id": id, "object": "chat.completion.chunk", "model": "imparo",
                         "choices": [{"index": 0, "delta": {"content": &v[sent_visible..]},
                                      "finish_reason": null}]}),
-                    )?;
-                    sent_visible = v.len();
+                            )?;
+                            sent_visible = v.len();
+                        }
+                        http::sse_send(stream, &mut frames)?;
+                    }
                 }
-            }
-        }
-        if let Some(t) = t_e {
-            t_send += t.elapsed().as_secs_f64() * 1e3;
-        }
-        // The last token needs no forward: its logits would never be read. Computing them
-        // anyway spent a full decode step per request.
-        if turn_ended || generated.len() >= max_tokens {
-            break;
-        }
-        let pos = prompt_tokens + step;
-        if pipelined {
-            // The step at `pos` is already queued. Its pick is token step+1; the step
-            // after it produces token step+2, wanted only if that token can be emitted.
-            let want_more = step + 2 < max_tokens;
-            if want_more && engine.model.queue_step(None, pos + 1).is_err() {
-                break;
-            }
-            match engine.model.wait_step() {
-                Ok(id) => next = id,
-                Err(_) => {
-                    queued = want_more;
+                if let Some(t) = t_e {
+                    t_send += t.elapsed().as_secs_f64() * 1e3;
+                }
+                // The last token needs no forward: its logits would never be read. Computing them
+                // anyway spent a full decode step per request.
+                if turn_ended || generated.len() >= max_tokens {
                     break;
                 }
+                if cursor.is_some() {
+                    continue;
+                }
+                let pos = prompt_tokens + step;
+                if pipelined {
+                    // The step at `pos` is already queued. Its pick is token step+1; the step
+                    // after it produces token step+2, wanted only if that token can be emitted.
+                    let want_more = step + 2 < max_tokens;
+                    if want_more && model.queue_step(None, pos + 1).is_err() {
+                        break;
+                    }
+                    if let Ok(id) = model.wait_step() {
+                        next = id;
+                    } else {
+                        queued = want_more;
+                        outstanding_pipeline = queued;
+                        break;
+                    }
+                    queued = want_more;
+                    outstanding_pipeline = queued;
+                } else {
+                    match model.forward_next(next, pos) {
+                        Ok(id) => next = id,
+                        Err(_) => break,
+                    }
+                }
+                decode_steps += 1;
             }
-            queued = want_more;
-        } else {
-            match engine.model.forward_next(next, pos) {
-                Ok(id) => next = id,
-                Err(_) => break,
+            let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
+            if let Some(c) = &cursor {
+                if c.consumed != decode_steps
+                    || model.kv_runtime().filled != prompt_tokens + decode_steps
+                {
+                    return Err(std::io::Error::other(
+                        "service cursor committed position mismatch",
+                    ));
+                }
+                eprintln!(
+                    "[imparo] draft blocks={} calls={} sequential={} delivered={} consumed={} filled={}",
+                    c.verified_blocks,
+                    c.draft_calls,
+                    c.sequential_steps,
+                    generated.len(),
+                    c.consumed,
+                    model.kv_runtime().filled
+                );
+                if let Some(histogram) = &c.verified_consumed_histogram {
+                    eprintln!("[imparo] draft-consumed-histogram {histogram:?}");
+                }
+            }
+            Ok(Generation {
+                prefill_ms,
+                service_witness,
+                generated,
+                decode_steps,
+                decode_ms,
+                t_sample,
+                t_detok,
+                t_send,
+                probe,
+                emitted,
+                sent_reasoning,
+                sent_visible,
+                frames,
+                pipelined,
+                queued,
+            })
+        };
+        #[cfg(feature = "cuda-speculative")]
+        {
+            if let Some(spec) = draft_spec.as_deref() {
+                let mut output = None;
+                let mut finished = None;
+                let scoped = if cache_draft
+                    && matches!(spec, imparo_model::speculative::DraftSpec::Dspark(_))
+                {
+                    let ran = target.with_cached_draft(
+                        spec,
+                        &ids,
+                        prefill_from,
+                        &mut |model, provider| {
+                            let result = generate(model, Some(provider));
+                            let status = result
+                                .as_ref()
+                                .map(|_| ())
+                                .map_err(ToString::to_string);
+                            output = Some(result);
+                            finished = Some(Instant::now());
+                            status
+                        },
+                    );
+                    match ran {
+                        Ok(false) => {
+                            output = Some(generate(&mut **target, None));
+                            finished = Some(Instant::now());
+                            Ok(())
+                        }
+                        Ok(true) => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    target.with_draft(spec, &mut |model, provider| {
+                        output = Some(generate(model, Some(provider)));
+                        finished = Some(Instant::now());
+                        Ok(())
+                    })
+                };
+                match scoped {
+                    Err(e) => Err(std::io::Error::other(e)),
+                    Ok(()) => {
+                        let mut result =
+                            output.expect("draft scope did not invoke generation");
+                        if let (Ok(value), Some(at)) = (&mut result, finished) {
+                            value.decode_ms += at.elapsed().as_secs_f64() * 1e3;
+                        }
+                        result
+                    }
+                }
+            } else {
+                generate(&mut **target, None)
             }
         }
-        decode_steps += 1;
-    }
-    let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
+        #[cfg(not(feature = "cuda-speculative"))]
+        {
+            generate(&mut **target, None)
+        }
+    };
+    let Generation {
+        prefill_ms,
+        service_witness,
+        generated,
+        decode_steps,
+        decode_ms,
+        t_sample,
+        t_detok,
+        t_send,
+        probe,
+        emitted,
+        sent_reasoning,
+        sent_visible,
+        mut frames,
+        pipelined,
+        queued,
+    } = match generation_result {
+        Ok(result) => result,
+        Err(e) => {
+            // A verified block may be ahead of delivery. Abandon the transient
+            // claim; never pretend changing filled rolls recurrent state back.
+            if outstanding_pipeline {
+                engine.model.discard_step().map_err(std::io::Error::other)?;
+            }
+            let filled = engine.model.kv_runtime().filled;
+            engine.resident.clear();
+            engine.resident_conv.clear();
+            engine.model.kv_set_filled(0);
+            if let (Some(pool), Some(label)) =
+                (engine.pool.as_mut(), effective_label.as_deref())
+            {
+                pool.forget(&[label.to_owned()])
+                    .map_err(std::io::Error::other)?;
+            }
+            eprintln!(
+                "[imparo] generation abandoned committed={filled} resident=0 filled=0: {e}"
+            );
+            // SSE headers are already sent. Do not write a second HTTP response.
+            if streaming {
+                return Err(e);
+            }
+            return http::json(stream, 500, &json!({"error":e.to_string()}));
+        }
+    };
     // The cache now holds the prompt plus every token that went through a forward:
     // decode_steps of the generated tokens (the last generated token is never
     // forwarded — its logits would be unread — so it is not resident).
+    // A textual stop can leave accepted, un-emitted draft inputs ahead of delivery.
+    // Never publish that partial transcript as a resumable target/draft state.
+    let discard_partial_draft = decode_steps > generated.len();
     engine.resident = ids;
     engine
         .resident
@@ -1626,8 +2103,16 @@ fn chat_completions(
         message["tool_calls"] = Value::Array(tool_calls.clone());
     }
 
+    if let Some(folder) = &service_witness {
+        std::fs::write(
+            folder.join("generated.json"),
+            serde_json::to_vec(&generated)?,
+        )?;
+    }
     let completion_tokens = generated.len();
-    let finish = if tool_calls.is_empty() {
+    let finish = if !seed && completion_tokens >= max_tokens {
+        "length"
+    } else if tool_calls.is_empty() {
         "stop"
     } else {
         "tool_calls"
@@ -1675,9 +2160,10 @@ fn chat_completions(
     );
     let sent = (|| -> std::io::Result<()> {
         if streaming {
+            // The tail's frames and the terminator go out as one write (task #202).
             if reasoning.len() > sent_reasoning {
-                http::sse(
-                    stream,
+                http::sse_frame(
+                    &mut frames,
                     &json!({
                     "id": id, "object": "chat.completion.chunk", "model": "imparo",
                     "choices": [{"index": 0,
@@ -1689,8 +2175,8 @@ fn chat_completions(
             // `body` (split but unparsed) here would put every tool call back into the
             // stream at the end, which is most of what this defect was.
             if visible.len() > sent_visible {
-                http::sse(
-                    stream,
+                http::sse_frame(
+                    &mut frames,
                     &json!({
                     "id": id, "object": "chat.completion.chunk", "model": "imparo",
                     "choices": [{"index": 0, "delta": {"content": &visible[sent_visible..]},
@@ -1698,23 +2184,23 @@ fn chat_completions(
                 )?;
             }
             if !tool_calls.is_empty() {
-                http::sse(
-                    stream,
+                http::sse_frame(
+                    &mut frames,
                     &json!({
                     "id": id, "object": "chat.completion.chunk", "model": "imparo",
                     "choices": [{"index": 0, "delta": {"tool_calls": tool_calls},
                                  "finish_reason": null}]}),
                 )?;
             }
-            http::sse(
-                stream,
+            http::sse_frame(
+                &mut frames,
                 &json!({
                 "id": id, "object": "chat.completion.chunk", "model": "imparo",
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
                 "usage": usage, "timings": timings}),
             )?;
-            stream.write_all(b"data: [DONE]\n\n")?;
-            stream.flush()
+            frames.extend_from_slice(b"data: [DONE]\n\n");
+            http::sse_send(stream, &mut frames)
         } else {
             http::json(
                 stream,
@@ -1735,6 +2221,23 @@ fn chat_completions(
         }
     }
     let tail_discard_ms = t_tail.elapsed().as_secs_f64() * 1e3;
+    if discard_partial_draft {
+        #[cfg(feature = "cuda-speculative")]
+        engine
+            .model
+            .clear_draft_cache()
+            .map_err(std::io::Error::other)?;
+        engine.resident.clear();
+        engine.resident_conv.clear();
+        engine.model.kv_set_filled(0);
+        if let (Some(pool), Some(label)) =
+            (engine.pool.as_mut(), effective_label.as_deref())
+        {
+            pool.forget(&[label.to_owned()])
+                .map_err(std::io::Error::other)?;
+        }
+        return sent;
+    }
     // THE RECORDED STREAM STAYS SHORT. Two tokens of this turn never get a KV row here:
     // the last generated one (its logits would be unread) and the stop token the loop
     // dropped. A turn close used to forward them -- a full weight pass for 4-5 tokens,

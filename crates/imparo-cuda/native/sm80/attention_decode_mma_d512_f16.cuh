@@ -282,18 +282,27 @@ __global__ void combine_reverse(
     float numerator[2] = {0.0f, 0.0f};
     const uint32_t output0 = 2 * threadIdx.x;
 
-    for (uint32_t block_rev = physical_blocks; block_rev > 0; --block_rev) {
+    // Divisible nonempty schedules assign a contiguous block range to each
+    // logical tile, with only slot zero live. Enumerate that range directly;
+    // all other schedules keep the general reverse intersection walk below.
+    const uint32_t blocks_per_tile = physical_blocks / n_kv;
+    const bool direct = physical_blocks % n_kv == 0
+        && schedule_groups >= blocks_per_tile;
+    const uint32_t first_block = direct ? logical_tile * blocks_per_tile : 0;
+    const uint32_t end_block = direct
+        ? (logical_tile + 1) * blocks_per_tile : physical_blocks;
+    for (uint32_t block_rev = end_block; block_rev > first_block; --block_rev) {
         const uint32_t physical_block = block_rev - 1;
-        for (uint32_t slot_rev = kSegmentsPerPhysicalBlock;
+        for (uint32_t slot_rev = direct ? 1 : kSegmentsPerPhysicalBlock;
              slot_rev > 0; --slot_rev) {
             const uint32_t slot = slot_rev - 1;
             uint32_t owner = 0;
             uint32_t group_begin = 0;
             uint32_t group_end = 0;
-            if (!physical_segment_bounds(physical_block, physical_blocks,
+            if (!direct && (!physical_segment_bounds(physical_block, physical_blocks,
                     n_kv, schedule_groups, slot, &owner,
                     &group_begin, &group_end)
-                    || owner != logical_tile) {
+                    || owner != logical_tile)) {
                 continue;
             }
             const float * partial = workspace

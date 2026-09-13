@@ -201,6 +201,7 @@ fn init_with_streamed(
             streamed,
         )
     }?;
+    crate::knobs::reset_workflow_defaults();
     capture_cuda_safe_defaults();
     if std::env::var("IMPARO_NO_HOSTCONFIG").is_err() {
         if let Some(batch) = apply_host_config(weights.len() as u64) {
@@ -409,6 +410,26 @@ fn split_prefill_graph_requested(count: u32) -> bool {
 
 #[allow(unused_variables)]
 impl Backend for CudaBackend {
+    #[cfg(feature = "cuda-speculative")]
+    fn set_forward_demand_lab(
+        &self,
+        ffn_layers: u32,
+        logits_wanted: bool,
+    ) -> Result<bool, i32> {
+        // The workflow owns serialized device access and calls before preparation.
+        unsafe { crate::execution::set_forward_demand(ffn_layers, logits_wanted) }
+            .map(|()| true)
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    fn set_projection_reference_lab(
+        &self,
+        start: u32,
+        tokens: u32,
+    ) -> Result<bool, i32> {
+        unsafe { crate::execution::set_projection_reference(start, tokens) }
+            .map(|()| true)
+    }
     fn last_gpu_us(&self) -> f64 {
         unsafe { imparo_cuda_last_gpu_us() }
     }
@@ -563,12 +584,39 @@ impl Backend for CudaBackend {
             rc => Err(rc),
         }
     }
+    fn verification_body_begin(
+        &self,
+        rows: u32,
+        start: u32,
+    ) -> Result<imparo_backend::VerificationSubmission, i32> {
+        use imparo_backend::VerificationSubmission::{Capture, Eager, Replay};
+        match unsafe { imparo_cuda_verification_body_begin(rows, start) } {
+            0 => Ok(Eager),
+            1 => Ok(Capture),
+            2 => Ok(Replay),
+            rc if rc < 0 => Err(-rc),
+            rc => Err(rc),
+        }
+    }
+    fn recurrent_plane_count(&self, _requested: u32) -> u32 {
+        // CUDA executes steps synchronously and captures recurrent addresses in its
+        // decode graphs. It has neither queued decode nor a recoverable mega route;
+        // keep the state in place until graph replay supports rotating addresses.
+        1
+    }
+    // Q8_0_TM is consumed by the existing native Q8 GEMV/GEMM paths (wire kind 3).
+    // Preserve the common loader's refusal for formats without a CUDA reader.
+    fn serves_weight_type(&self, ggml_type: u32) -> bool {
+        matches!(ggml_type, 0 | 2 | 8 | 1000)
+    }
     fn set_batch_geometry(&self, geometry: BatchGeometry) -> Result<(), i32> {
         match unsafe {
             imparo_cuda_set_batch_geometry(
                 geometry.absolute_start,
                 geometry.active_tokens,
                 geometry.phase as u32,
+                geometry.canonical_start,
+                geometry.canonical_tokens,
             )
         } {
             0 => Ok(()),
@@ -628,6 +676,11 @@ impl Backend for CudaBackend {
     fn set_tuner_dispatch_expectation(&self, names: &[&str]) -> Result<(), String> {
         let mut mask = 0_u64;
         for name in names {
+            if crate::knobs::is_workflow_knob(name) {
+                return Err(format!(
+                    "CUDA workflow knob {name} requires whole-model route/state evidence, not native micro dispatch proof"
+                ));
+            }
             let slot = crate::knobs::slot_for_name(name).ok_or_else(|| {
                 format!("CUDA dispatch expectation names unknown knob {name}")
             })?;
@@ -682,8 +735,79 @@ impl Backend for CudaBackend {
         let _ = decode;
         7
     }
-    fn row_local_prefill_tail_rows(&self) -> u32 {
-        crate::knobs::row_local_prefill_tail_rows()
+    fn set_materialized_prefill_tail(
+        &self,
+        start: u32,
+        tokens: u32,
+    ) -> Result<(), i32> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            std::env::var("IMPARO_NO_HOSTCONFIG").as_deref() == Ok("1")
+                && (std::env::var("IMPARO_CUDA_MATERIALIZED_TAIL_LAB").as_deref()
+                    == Ok("1")
+                    || (cfg!(feature = "cuda-speculative")
+                        && std::env::var("IMPARO_OUTPUT_REFERENCE_LAB").as_deref()
+                            == Ok("1")))
+        });
+        if !enabled {
+            return Ok(());
+        }
+        match unsafe {
+            imparo_cuda_set_materialized_prefill_tail(u64::from(start), tokens)
+        } {
+            0 => Ok(()),
+            rc => Err(rc),
+        }
+    }
+    fn prefill_ple_prefix_elision(&self, n_tok: u32) -> bool {
+        if n_tok != 512 {
+            return false;
+        }
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("IMPARO_NO_HOSTCONFIG").as_deref() == Ok("1")
+                && std::env::var("IMPARO_CUDA_PLE_PREFIX_LAB").as_deref() == Ok("1")
+        })
+    }
+    fn prefill_unused_query_elision(&self) -> bool {
+        // Same-binary research switch. No selector, receipt or default admission
+        // is implied; the model still proves that no live consumer needs Q.
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("IMPARO_NO_HOSTCONFIG").as_deref() == Ok("1")
+                && std::env::var("IMPARO_CUDA_UNUSED_QUERY_LAB").as_deref() == Ok("1")
+        })
+    }
+    fn shared_kv_prefill_tail_rows(&self) -> Option<u32> {
+        // Bounded same-binary research grid; no default or receipt admission.
+        static ROWS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        *ROWS.get_or_init(|| {
+            if std::env::var("IMPARO_NO_HOSTCONFIG").as_deref() != Ok("1") {
+                return None;
+            }
+            std::env::var("IMPARO_CUDA_SHARED_KV_TAIL_LAB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| matches!(v, 16 | 32 | 64))
+        })
+    }
+
+    fn finite_history_prefill_tail_rows(&self) -> Option<u32> {
+        static ROWS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let laboratory = *ROWS.get_or_init(|| {
+            if std::env::var("IMPARO_NO_HOSTCONFIG").as_deref() != Ok("1") {
+                return None;
+            }
+            std::env::var("IMPARO_CUDA_FINITE_HISTORY_TAIL_LAB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| matches!(v, 16 | 32 | 64 | 128))
+        });
+        laboratory.or_else(crate::knobs::finite_history_prefill_tail_rows)
+    }
+
+    fn row_local_prefill_tail_rows(&self, n_tok: u32) -> u32 {
+        crate::knobs::row_local_prefill_tail_rows(n_tok)
     }
     fn alloc(&self, id: BufId, bytes: u64) -> Result<(), i32> {
         match unsafe { imparo_cuda_alloc(b(id), bytes) } {
@@ -982,6 +1106,15 @@ impl Backend for CudaBackend {
             && up_kind == 1
             && (n_tok == 1 || q4_gelu_prefill)
             && activation == Epilogue::Gelu as u32;
+        let q8_canonical_silu = gate_kind == 2
+            && up_kind == 2
+            && n_tok > 8
+            && n_in % 256 == 0
+            && n_out % 128 == 0
+            && activation == Epilogue::Silu as u32
+            && (crate::knobs::q8_canonical_gate_up_pair_enabled()
+                || std::env::var("IMPARO_CUDA_Q8_CANONICAL_PAIR_LAB").as_deref()
+                    == Ok("1"));
         let q8_tm_silu = gate_kind == 3
             && up_kind == 3
             && n_tok > 8
@@ -994,7 +1127,7 @@ impl Backend for CudaBackend {
             && std::env::var_os("IMPARO_GPU_PROBE").is_none()
             && crate::knobs::q8_tm_decode_silu_pair_enabled();
         if std::env::var_os("IMPARO_CUDA_NO_MATMAT_GATED").is_some()
-            || (!q4_gelu && !q8_tm_silu && !q8_tm_decode_silu)
+            || (!q4_gelu && !q8_tm_silu && !q8_tm_decode_silu && !q8_canonical_silu)
         {
             return false;
         }
@@ -1010,7 +1143,7 @@ impl Backend for CudaBackend {
                 b(dst),
                 b(tmp),
                 n_tok,
-                if q8_tm_silu || q8_tm_decode_silu {
+                if q8_tm_silu || q8_tm_decode_silu || q8_canonical_silu {
                     Epilogue::Silu as u32
                 } else {
                     0
@@ -1018,6 +1151,15 @@ impl Backend for CudaBackend {
             )
         }
         true
+    }
+    #[cfg(feature = "cuda-owner-lab")]
+    fn decode_ffn_boundary(
+        &self,
+        phase: imparo_backend::DecodeFfnPhase,
+        entering: bool,
+    ) -> Result<(), i32> {
+        // Backend calls are serialized by the model's existing execution contract.
+        unsafe { crate::owner_lab::record_ffn(phase, entering) }
     }
     fn ffn_gated_down(
         &self,
@@ -1052,7 +1194,20 @@ impl Backend for CudaBackend {
             && n_tok > 8
             && activation == Epilogue::Silu as u32
             && crate::knobs::q8_tm_silu_pair_enabled();
-        if !q4_gelu && !q8_tm_silu {
+        let q8_canonical_silu = crate::knobs::q8_canonical_sidecar_enabled()
+            && ((gate_kind == 2 && up_kind == 2)
+                || (gate_kind == 3
+                    && up_kind == 3
+                    && std::env::var_os("IMPARO_LAB_Q8_TM_GATE_UP_CANONICAL_DOWN")
+                        .is_some()))
+            && (down_kind == 2
+                || (down_kind == 3
+                    && gate_kind == 3
+                    && up_kind == 3
+                    && std::env::var_os("IMPARO_LAB_Q8_DOWN_TM_ASYNC").is_some()))
+            && n_tok > 8
+            && activation == Epilogue::Silu as u32;
+        if !q4_gelu && !q8_tm_silu && !q8_canonical_silu {
             return false;
         }
         unsafe {
@@ -1343,6 +1498,46 @@ impl Backend for CudaBackend {
             );
         }
     }
+    fn kv_head_postprocess_store(
+        &self,
+        k: BufId,
+        v: BufId,
+        k_norm_off: u64,
+        v_rms_norm: bool,
+        head_dim: u32,
+        eps: f32,
+        n_kv: u32,
+        start_pos: u32,
+        n_tok: u32,
+        rope_dim: u32,
+        rope_base: f32,
+        freqs: Option<&[f32]>,
+        k_hadamard_nrot: u32,
+        v_hadamard_nrot: u32,
+        layer: u32,
+        ring: u32,
+    ) -> bool {
+        unsafe {
+            imparo_cuda_kv_head_postprocess_store(
+                b(k),
+                b(v),
+                k_norm_off,
+                u32::from(v_rms_norm),
+                head_dim,
+                eps,
+                n_kv,
+                start_pos,
+                n_tok,
+                rope_dim,
+                rope_base,
+                freqs.map_or(std::ptr::null(), <[f32]>::as_ptr),
+                k_hadamard_nrot,
+                v_hadamard_nrot,
+                layer,
+                ring,
+            ) != 0
+        }
+    }
     fn rms_norm_add(
         &self,
         dst: BufId,
@@ -1423,7 +1618,7 @@ impl Backend for CudaBackend {
         base_off: u32,
     ) -> bool {
         if !crate::knobs::rms_norm_add_enabled()
-            || crate::knobs::prefill_projection_q8_d4_mode() != 2
+            || !matches!(crate::knobs::prefill_projection_q8_d4_mode(), 2 | 3)
             || std::env::var_os("IMPARO_GPU_PROBE").is_some()
             || dst == resid
             || dst == other
@@ -1576,7 +1771,10 @@ impl Backend for CudaBackend {
         // reads a half-precision layer scratch instead, so populate that scratch here.
         // v2 deliberately removed `kv_dequant` from the shared Backend trait: cache
         // representation is a backend-owned detail of attention, not model workflow.
-        if n_tok > 1 {
+        // Native dispatch can defer this producer until a half-cache consumer is chosen.
+        let defer_kv =
+            std::env::var("IMPARO_LAB_DEFER_KV_MATERIALIZATION").as_deref() == Ok("1");
+        if n_tok > 1 && !defer_kv {
             let slots = prefill_dequant_slots(start_pos, n_tok, ring);
             unsafe {
                 imparo_cuda_kv_dequant(
@@ -1653,6 +1851,20 @@ impl Backend for CudaBackend {
     fn copy_range(&self, dst: BufId, dst_off: u32, src: BufId, src_off: u32, n: u32) {
         unsafe { imparo_cuda_copy_range(b(dst), dst_off, b(src), src_off, n) }
     }
+    fn copy_range_after_forward(
+        &self,
+        dst: BufId,
+        dst_off: u32,
+        src: BufId,
+        src_off: u32,
+        n: u32,
+    ) -> Result<(), i32> {
+        // The previous end closed capture. An eager copy uses the same stream;
+        // begin() would incorrectly switch Decode to Prefill and retire its cache.
+        self.copy_range(dst, dst_off, src, src_off, n);
+        self.end()
+    }
+
     fn mul_strided(
         &self,
         a: BufId,
@@ -1672,6 +1884,85 @@ impl Backend for CudaBackend {
     }
     fn argmax(&self, src: BufId, dst: BufId, n: u32) {
         unsafe { imparo_cuda_argmax(b(src), b(dst), n) }
+    }
+    fn supports_greedy_verification(&self) -> bool {
+        cfg!(feature = "cuda-speculative") && imparo_cuda_has_greedy_verification()
+    }
+    fn verify_greedy_and_restore(
+        &self,
+        src: BufId,
+        tokens: BufId,
+        dst: BufId,
+        recur: BufId,
+        snap: BufId,
+        vocab: u32,
+        rows: u32,
+        elems: u32,
+    ) -> Result<(), i32> {
+        if !self.supports_greedy_verification() {
+            return Err(-1);
+        }
+        let rc = unsafe {
+            imparo_cuda_verify_greedy_and_restore(
+                b(src),
+                b(tokens),
+                b(dst),
+                b(recur),
+                b(snap),
+                vocab,
+                rows,
+                elems,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(rc) }
+    }
+    fn matmat_output_prefix(
+        &self,
+        kind: u32,
+        offset: u64,
+        n_in: u32,
+        canonical_out: u32,
+        output_out: u32,
+        src: BufId,
+        dst: BufId,
+        n_tok: u32,
+    ) {
+        unsafe {
+            imparo_cuda_matmat_output_prefix(
+                kind,
+                offset,
+                n_in,
+                canonical_out,
+                output_out,
+                b(src),
+                b(dst),
+                n_tok,
+            )
+        }
+    }
+    fn ple_gather_combine_prefix(
+        &self,
+        proj: BufId,
+        tokens_buf: BufId,
+        w_offset: u64,
+        source_width: u32,
+        output_width: u32,
+        emb_scale: f32,
+        comb_scale: f32,
+        n_tok: u32,
+    ) {
+        unsafe {
+            imparo_cuda_ple_gather_combine_prefix(
+                b(proj),
+                b(tokens_buf),
+                w_offset,
+                source_width,
+                output_width,
+                emb_scale,
+                comb_scale,
+                n_tok,
+            )
+        }
     }
     fn ple_gather_combine(
         &self,
@@ -1699,6 +1990,43 @@ impl Backend for CudaBackend {
     /// `supports_gated_delta` is false so no workflow reaches it with another form.
     /// The assertion is there because a silent no-op here is a plausible wrong answer.
     #[allow(clippy::too_many_arguments)]
+    fn matmat_shortconv(
+        &self,
+        wkind: WeightKindWire,
+        proj_off: u64,
+        conv_off: u64,
+        src: BufId,
+        bcx: BufId,
+        state: BufId,
+        state_off: u32,
+        out: BufId,
+        width: u32,
+        kernel: u32,
+        n_tok: u32,
+    ) -> bool {
+        if !crate::knobs::prefill_bcx_shortconv_ready_enabled()
+            || crate::knobs::prefill_projection_q8_d4_mode() != 3
+            || std::env::var_os("IMPARO_GPU_PROBE").is_some()
+        {
+            return false;
+        }
+        unsafe {
+            imparo_cuda_matmat_shortconv(
+                wkind,
+                proj_off,
+                conv_off,
+                b(src),
+                b(bcx),
+                b(state),
+                state_off,
+                b(out),
+                width,
+                kernel,
+                n_tok,
+            ) != 0
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
     fn causal_conv(
         &self,
         form: ConvForm,
@@ -1706,6 +2034,7 @@ impl Backend for CudaBackend {
         w_off: u64,
         state: BufId,
         state_off: u32,
+        state_out_off: u32,
         out: BufId,
         width: u32,
         kernel: u32,
@@ -1716,12 +2045,20 @@ impl Backend for CudaBackend {
             ConvForm::GatedBcx,
             "cuda implements only the gated causal-conv form"
         );
+        // CUDA executes one recurrent plane at a time. Preserve a distinct
+        // input plane by copying its history before the existing in-place op.
+        if state_out_off != state_off {
+            let elems = width
+                .checked_mul(kernel.saturating_sub(1))
+                .expect("causal-conv history size overflow");
+            self.copy_range(state, state_out_off, state, state_off, elems);
+        }
         unsafe {
             imparo_cuda_shortconv(
                 b(src),
                 w_off,
                 b(state),
-                state_off,
+                state_out_off,
                 b(out),
                 width,
                 kernel,
@@ -1930,7 +2267,7 @@ mod tests {
             .expect("set_kv_pages body")
             .0;
         let capture_guard = setter
-            .find("if (g.graph_capturing) return CUDA_RC_INVALID;")
+            .find("if (execution().graph_capturing) return CUDA_RC_INVALID;")
             .expect("capture guard");
         let prepare = setter
             .find("prepare_page_update")
@@ -1950,7 +2287,7 @@ mod tests {
             .expect("replace_kv_arena definition")
             .1;
         let guard = replace
-            .find("if (g.graph_capturing) return CUDA_RC_INVALID;")
+            .find("if (execution().graph_capturing) return CUDA_RC_INVALID;")
             .expect("capture guard");
         let build = replace.find("build_page_tables").expect("page-table build");
         assert!(
@@ -1969,10 +2306,9 @@ mod tests {
         assert!(native.contains(
             "return token_count == 128 && value && std::strcmp(value, \"1\") == 0;"
         ));
-        assert!(
-            native
-                .contains("g.ffn_sidecar_model_ready && g.prefill_warm_forwards >= 2")
-        );
+        assert!(native.contains(
+            "g.ffn_sidecar_model_ready && execution().prefill_warm_forwards >= 2"
+        ));
         assert!(rust.contains("fn prefill_body_prepare("));
         let workflow = include_str!("../../imparo-model/src/gemma4/workflow_gpu.rs");
         assert!(workflow.contains(".prefill_body_prepare(tokens, sp, argmax)"));
@@ -1982,7 +2318,7 @@ mod tests {
         assert!(native.contains("static int prefill_body_capture_or_replay("));
         assert!(native.contains("boundary=post-embedding"));
         assert!(native.contains("prefill body prefix sync"));
-        assert!(native.contains("if (g.forward_start)"));
-        assert!(native.contains("g.prefill_graph_blocked = true;"));
+        assert!(native.contains("if (execution().forward_start)"));
+        assert!(native.contains("execution().prefill_graph_blocked = true;"));
     }
 }

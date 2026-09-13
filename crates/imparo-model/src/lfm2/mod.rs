@@ -20,4 +20,7 @@ crate::architecture!(Lfm2Arch => Lfm2 {
     device_batch:        workflow_gpu::batch,
     device_prepare:      workflow_gpu::prepare_device,
     buffer_requirements: workflow_gpu::buffer_requirements,
+    device_all_logits: cfg!(any(feature = "cuda", feature = "cuda-dynamic")),
+    device_prefix_verification: cfg!(any(feature = "cuda", feature = "cuda-dynamic")),
+    device_greedy_verification: cfg!(feature = "cuda-speculative"),
 });

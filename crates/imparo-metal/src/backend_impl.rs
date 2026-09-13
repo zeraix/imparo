@@ -20,6 +20,16 @@ fn b(id: BufId) -> u32 {
 }
 
 impl Backend for MetalBackend {
+    fn mega_admission(&self, architecture: &str, slot: u32) -> u32 {
+        mega_family(architecture).map_or(0, |f| crate::mega_admission(f, slot))
+    }
+    fn mega_seat_form(&self, architecture: &str) -> imparo_backend::MegaSeat {
+        match mega_family(architecture).map(crate::mega_seat_form) {
+            Some(1) => imparo_backend::MegaSeat::Grid,
+            Some(2) => imparo_backend::MegaSeat::OnePerCore,
+            _ => imparo_backend::MegaSeat::None,
+        }
+    }
     fn begin(&self) {
         crate::begin();
     }
@@ -650,6 +660,9 @@ impl Backend for MetalBackend {
             op.eps,
             op.epilogue.map_or(crate::NO_EPILOGUE, |e| e.norm_w_off),
             op.epilogue.map_or(0, |e| b(e.gate)),
+            op.snap.map_or(crate::NO_SNAP, |s| b(s.buf)),
+            op.snap.map_or(0, |s| s.off),
+            op.snap.map_or(0, |s| s.row),
         )
     }
     fn supports_gated_delta(&self) -> bool {
@@ -672,7 +685,15 @@ impl Backend for MetalBackend {
         a_stride: u32,
         n_row: u32,
     ) {
-        crate::mul_strided_sigmoid(b(a), b(bb), width, b_off, b_stride, a_stride, n_row);
+        crate::mul_strided_sigmoid(
+            b(a),
+            b(bb),
+            width,
+            b_off,
+            b_stride,
+            a_stride,
+            n_row,
+        );
     }
     fn copy_strided(
         &self,
@@ -698,49 +719,13 @@ impl Backend for MetalBackend {
         crate::mega_qkv_wanted()
     }
     fn mega_program_end(&self) {
-        crate::mega_program_end()
+        crate::mega_program_end();
     }
     fn mega_front_wanted(&self) -> bool {
         crate::mega_front_wanted()
     }
     fn mega_attn_wanted(&self) -> bool {
         crate::mega_attn_wanted()
-    }
-    /// The whole gated FFN as one persistent dispatch: the mega FFN block (IMPARO_MEGA_FFN=1, #141).
-    /// Decode only, Q4_0 only. `BufId::U` is the second scratch row -- the row the
-    /// dispatch path this replaces writes its up projection into.
-    #[allow(clippy::too_many_arguments)]
-    fn ffn_gated_down(
-        &self,
-        gate_kind: WeightKindWire,
-        gate_off: u64,
-        up_kind: WeightKindWire,
-        up_off: u64,
-        down_kind: WeightKindWire,
-        down_off: u64,
-        n_in: u32,
-        n_mid: u32,
-        n_out: u32,
-        src: BufId,
-        gated_tmp: BufId,
-        dst: BufId,
-        n_tok: u32,
-    ) -> bool {
-        if n_tok != 1 || gate_kind != 1 || up_kind != 1 || down_kind != 1 {
-            return false;
-        }
-        crate::ffn_persistent(
-            gate_off,
-            up_off,
-            down_off,
-            n_in,
-            n_mid,
-            n_out,
-            b(src),
-            b(gated_tmp),
-            b(BufId::U),
-            b(dst),
-        )
     }
     fn act(&self, a: BufId, n: u32) {
         crate::act(b(a), n);
@@ -834,22 +819,52 @@ impl Backend for MetalBackend {
     }
     fn serves_weight_type(&self, ggml_type: u32) -> bool {
         // F32, Q4_0, Q8_0, the tile-major Q8_0 (fc 15) and the tile-major family the
-        // WFMT decode bricks read (fc 21). Q4_0_TM and the tile-major Q2_K / Q4_1 / Q5_x
-        // have rules but no brick arm yet, so they are refused BY NAME at load.
+        // WFMT decode bricks read (fc 21). Q4_0_TM has a rule but no brick arm (row-major
+        // Q4_0 has kernels of its own), so it is refused BY NAME at load.
         //
-        // Row-major 11/12/13/14/20/23 are here because a ROW-GATHERED tensor (token_embd)
-        // keeps the row-major layout by rule and is read by imparo_blk_gather_rows, which
-        // runs the same decode brick over a row-major block. The MULTI-SPAN formats --
-        // Q2_K (10), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22) -- are absent
-        // from that list while their tile-major twins are present: their scales are two or
-        // three spans of the source block, so a row-major row has no single scale pointer
-        // and the gather cannot read one. Tile-major concatenates the spans, so the GEMM
-        // can. A file that carries one of them as its token_embd is refused BY NAME.
+        // Row-major 3/6/7/11/12/13/14/16/19/20/23/29 are here because a ROW-GATHERED tensor
+        // (token_embd) keeps the row-major layout by rule and is read by
+        // imparo_blk_gather_rows, which runs the same decode brick over a row-major block.
+        // The MULTI-SPAN formats -- Q2_K (10), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21),
+        // IQ2_S (22) -- are absent from that list while their tile-major twins are present:
+        // their scales are two or three spans of the source block, so a row-major row has
+        // no single scale pointer and the gather cannot read one. Tile-major concatenates
+        // the spans, so the GEMM can. A file that carries one of them as its token_embd is
+        // refused BY NAME.
         matches!(
             ggml_type,
-            0 | 2 | 8 | 11 | 12 | 13 | 14 | 20 | 23
-                | 1000 | 1010 | 1011 | 1012 | 1013 | 1014 | 1017 | 1018
-                | 1020 | 1021 | 1022 | 1023
+            0 | 2
+                | 3
+                | 6
+                | 7
+                | 8
+                | 11
+                | 12
+                | 13
+                | 14
+                | 16
+                | 19
+                | 20
+                | 23
+                | 29
+                | 1000
+                | 1003
+                | 1006
+                | 1007
+                | 1010
+                | 1011
+                | 1012
+                | 1013
+                | 1014
+                | 1016
+                | 1017
+                | 1018
+                | 1019
+                | 1020
+                | 1021
+                | 1022
+                | 1023
+                | 1029
         )
     }
     fn read_weight_bytes(&self, file_off: u64, dst: &mut [u8]) -> bool {
@@ -991,10 +1006,14 @@ use imparo_backend::{SweepKind as Sw, Workload as Wl};
 // THE MATMUL FAMILY -- one logical op, four kernels, chosen by batch size:
 //
 //   n_tok == 1            the DECODE GEMV. One token against the whole weight matrix, so
-//     ..gemv_max_tok      it is pure weight traffic and its shape is about how lanes
+//                         it is pure weight traffic and its shape is about how lanes
 //                         divide a row and how many rows a lane group carries.
-//                         guarded by: lanes x nr0 (one pipeline table indexed by both),
-//                         and gemv_max_tok, which is where this path ends.
+//                         guarded by: lanes x nr0 (one pipeline table indexed by both).
+//                         It ends at one row, and that is not a knob: two rows or more
+//                         take the GEMM family in every weight family, because the
+//                         GEMV's k-order is not the GEMM's and two chunkings of one
+//                         prompt must write the same K/V bytes (g_gemv_max_tok in the
+//                         bridge; docs/kv-identity-grid.md).
 //
 //   2..nb8_max            the NARROW tile. A handful of tokens is too many for the GEMV
 //                         and too few to fill the wide tile's 64-token width.
@@ -1042,8 +1061,8 @@ use imparo_backend::{SweepKind as Sw, Workload as Wl};
 //                         the host is still encoding.
 //                         guarded by: flush_layers, flush_layers_prefill.
 //
-// The three boundaries -- gemv_max_tok, nb8_max, attn_stream_min_pos -- are what
-// partition a request into regimes. Everything else is a shape within one regime.
+// The two boundaries -- nb8_max, attn_stream_min_pos -- are what partition a request
+// into regimes. Everything else is a shape within one regime.
 
 /// The same arithmetic the backend runs at init, so the registry and the kernel cannot
 /// disagree about what fits. Inverts the threadgroup layout: subtract the fixed regions,
@@ -1170,6 +1189,70 @@ const fn derive_flush(
 /// a no-op. That is a convention, and conventions drift -- worth making a mechanism the
 /// next time a derived knob is added, keyed on where its inputs come from rather than on
 /// the author remembering.
+/// THE MEGA PIPELINE FAMILIES, as the native side numbers them (one composed kernel per
+/// architecture, task #158). The entry bridges below stamp these into the FFI entry; the
+/// applicability and admission hooks map an architecture name onto them.
+const MEGA_FAMILY_GEMMA4: u32 = 0;
+const MEGA_FAMILY_LFM2: u32 = 1;
+const MEGA_FAMILY_QWEN35: u32 = 2;
+
+/// The pipeline family that serves `architecture`'s mega entries, or `None` when this
+/// backend has no composed kernel for it. The names are the GGUF architecture strings the
+/// model crate's `load` maps to workflows; an architecture missing here has no mega route
+/// on Metal, which is the truthful answer, not a default arm.
+fn mega_family(architecture: &str) -> Option<u32> {
+    match architecture {
+        "gemma4" => Some(MEGA_FAMILY_GEMMA4),
+        "lfm2" => Some(MEGA_FAMILY_LFM2),
+        "qwen35" => Some(MEGA_FAMILY_QWEN35),
+        _ => None,
+    }
+}
+
+/// The LIMIT a grid knob is ranked under (task #203): what the admission probe MEASURED for
+/// this model's pipeline at head-dim `slot` during the tuner's discovery, or one threadgroup
+/// per core when nothing has been measured in this process -- the floor that admits
+/// everywhere. A constant cannot serve here: 2*(cores-2) hung an M4 Pro, one-per-core cost an
+/// M3 Pro 2.6% of E4B decode at depth. The engine never consults this; it applies the stored
+/// VALUE.
+fn mega_tgs_ceiling(slot: u32) -> u32 {
+    let probed = crate::mega_admission_current(slot);
+    if probed != 0 {
+        probed
+    } else {
+        crate::gpu_cores()
+    }
+}
+
+/// A grid knob's legality: inside its pipeline's measured limit and the family's thread
+/// budget at the seated width.
+fn mega_tgs_legal(slot: u32, v: u32) -> bool {
+    let lim = crate::mega_threads_limit();
+    let ceil = mega_tgs_ceiling(slot);
+    v > 0
+        && (ceil == 0 || v <= ceil)
+        && (lim == 0
+            || u64::from(v) * u64::from(crate::mega_nsg_current()) * 32
+                <= u64::from(lim))
+}
+
+/// A grid knob's ladder: WHOLE CORES ONLY, up to its pipeline's measured limit. A grid that
+/// is not a whole number of cores leaves some cores hosting one threadgroup and some two, and
+/// every barrier waits for the doubled ones -- the same rule the host's grid search applies.
+fn mega_tgs_candidates(slot: u32) -> Vec<u32> {
+    let c = crate::gpu_cores();
+    let ceil = mega_tgs_ceiling(slot);
+    if c == 0 || ceil == 0 {
+        return vec![1];
+    }
+    // Below one per core the probe halved down to what admits (a wide threadgroup on a
+    // small GPU): that grid is the only rung, and one per core is not on the ladder.
+    if ceil < c {
+        return vec![ceil];
+    }
+    (1..=ceil / c).map(|k| k * c).collect()
+}
+
 static METAL_KNOBS: &[KnobDecl] = &[
     KnobDecl {
         // COMPUTED, never swept. The widest position tile that fits this device's queried
@@ -1286,9 +1369,11 @@ static METAL_KNOBS: &[KnobDecl] = &[
         candidates: None,
         after: &[],
         cross_check: None,
-        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
-        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
-        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
+        // The narrow tile belongs to the register-tiled route, so it applies to every
+        // family that route serves (Q4_0 and the block-quant formats); on a Q8 model the
+        // route never dispatches it, and the sweep used to spend DecodeMix reps on it and
+        // record a pick (review #116, D11).
+        applies: Some(|m| m.weight_kinds & crate::rt_route_kinds() != 0),
         tuple: Some("narrow"),
         // nb8_shape picks WHICH narrow tile; nb8_max picks the batch size at which
         // it engages. The right boundary depends on which tile sits behind it, so the
@@ -1303,9 +1388,10 @@ static METAL_KNOBS: &[KnobDecl] = &[
     },
     // Boundary crossings, in dependency order: each runs against the nb8 pick above.
     KnobDecl {
-        // WHERE THE NARROW TILE GIVES WAY to the wide one. Same boundary shape as
-        // gemv_max_tok, one level up: a handful of tokens is too many for the GEMV and
-        // too few to fill a 64-token tile, and this is where "too few" ends.
+        // WHERE THE NARROW TILE GIVES WAY to the wide one: a handful of tokens is too
+        // few to fill a 64-token tile, and this is where "too few" ends. Both tiles
+        // run the same MMA k-loop, so unlike the retired GEMV crossing this boundary
+        // moves no bits (docs/kv-identity-grid.md, "What it is NOT").
         name: "nb8_max",
         legal: None,
         bit_affecting: false,
@@ -1313,9 +1399,8 @@ static METAL_KNOBS: &[KnobDecl] = &[
         candidates: None,
         after: &[],
         cross_check: None,
-        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
-        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
-        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
+        // Same families as nb8_shape: the register-tiled route's.
+        applies: Some(|m| m.weight_kinds & crate::rt_route_kinds() != 0),
         tuple: Some("narrow"),
         category: KnobCategory::Benched,
         values: &[],
@@ -1326,44 +1411,6 @@ static METAL_KNOBS: &[KnobDecl] = &[
             ladder: &[4, 8, 12, 16, 24, 32, 48],
             hi: 64,
             lo: 0,
-        },
-        workload: Wl::NarrowMix(8),
-    },
-    KnobDecl {
-        // WHERE THE DECODE GEMV ENDS. Batches up to this take the one-token kernel,
-        // above it the GEMM family. A boundary, so it defines a regime rather than
-        // choosing a shape within one: it is searched over a ladder of batch sizes,
-        // looking for the size at which the wider kernel starts winning and keeps
-        // winning.
-        name: "gemv_max_tok",
-        legal: None,
-        bit_affecting: false,
-        derive: None,
-        candidates: None,
-        after: &[],
-        cross_check: None,
-        // Q4-only kernel: on a Q8 model the route never dispatches it, and the sweep
-        // used to spend DecodeMix reps on it and record a pick (review #116, D11).
-        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
-        // JOINS the gemv tuple, as its BOUNDARY. Where the GEMV gives way to the GEMM
-        // depends on how good the GEMV is, and that is what the tuple's other three
-        // knobs decide -- so the crossover has to be searched AFTER them, against the
-        // shape that won. Tuple members that are boundary searches always run last,
-        // which is the same relationship attn_stream_min_pos has to the decode_stream
-        // shape knobs.
-        //
-        // This is what "dependency order" turns out to be in practice: not a separate
-        // ordering mechanism, but a boundary inside the tuple whose regimes it defines.
-        tuple: Some("gemv"),
-        category: KnobCategory::Benched,
-        values: &[],
-        apply: crate::set_gemv_max_tok,
-        current: crate::gemv_max_tok_current,
-        screened: false,
-        sweep: Sw::Crossing {
-            ladder: &[2, 3, 4, 6, 8, 12, 16],
-            hi: 64,
-            lo: 1,
         },
         workload: Wl::NarrowMix(8),
     },
@@ -1444,44 +1491,6 @@ static METAL_KNOBS: &[KnobDecl] = &[
         screened: false,
         sweep: Sw::Values,
         workload: Wl::DecodeMix,
-    },
-    KnobDecl {
-        name: "q8_batch_sgs",
-        legal: None,
-        bit_affecting: false,
-        derive: None,
-        candidates: Some(|_m, d| simdgroups_upto(1, d.max_threads)),
-        after: &[],
-        cross_check: None,
-        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
-        tuple: Some("q8_narrow"),
-        category: KnobCategory::Benched,
-        values: &[],
-        apply: crate::set_q8_batch_sgs,
-        current: crate::q8_batch_sgs,
-        screened: false,
-        sweep: Sw::Values,
-        workload: Wl::NarrowMix(4),
-    },
-    KnobDecl {
-        name: "q8_token_tile",
-        legal: None,
-        bit_affecting: false,
-        derive: None,
-        candidates: None,
-        after: &["q8_batch_sgs"],
-        cross_check: None,
-        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
-        tuple: Some("q8_narrow"),
-        category: KnobCategory::Benched,
-        // How many tokens reuse one dequantised weight byte. A function constant, so each
-        // value is its own pipeline and the list is exactly what was compiled.
-        values: &[1, 2, 4, 8],
-        apply: crate::set_q8_token_tile,
-        current: crate::q8_token_tile,
-        screened: false,
-        sweep: Sw::Values,
-        workload: Wl::NarrowMix(4),
     },
     KnobDecl {
         name: "st_gemm_shape",
@@ -1623,33 +1632,16 @@ static METAL_KNOBS: &[KnobDecl] = &[
         sweep: Sw::Values,
         workload: Wl::PrefillGemmWidths,
     },
-    KnobDecl {
-        name: "q8_gemv_max_tok",
-        legal: None,
-        bit_affecting: false,
-        derive: None,
-        candidates: None,
-        after: &["q8_token_tile", "q8_batch_sgs", "st_gemm_shape"],
-        cross_check: None,
-        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
-        // The boundary between the narrow token-tile kernel and the wide GEMM, searched
-        // AFTER both sides are settled -- the same relationship gemv_max_tok has to the
-        // gemv tuple. hi = 64 keeps every rung on the token tile; lo = 1 sends every rung
-        // above one token to the GEMM.
-        tuple: Some("q8_narrow"),
-        category: KnobCategory::Benched,
-        values: &[],
-        apply: crate::set_q8_gemv_max_tok,
-        current: crate::q8_gemv_max_tok,
-        screened: false,
-        sweep: Sw::Crossing {
-            ladder: &[2, 4, 8, 16, 32],
-            hi: 64,
-            lo: 1,
-        },
-        workload: Wl::NarrowMix(8),
-    },
     // NOT DECLARED, and each for a stated reason rather than by omission:
+    //
+    //   q8_gemv_max_tok / q8_batch_sgs / q8_token_tile  (and the Q4 family's gemv_max_tok)
+    //       RETIRED 2026-09-11. The route boundary is ONE ROW for every weight family --
+    //       `g_gemv_max_tok` in the bridge, fixed by the KV identity contract: two chunkings
+    //       of one prompt must write the same K/V bytes, and the token tile's k-order is
+    //       not the GEMM's (docs/kv-identity-grid.md). So the token tile is reached only
+    //       under IMPARO_GEMV_MAX, and its two shape knobs would rank a kernel the engine
+    //       never dispatches. The kernel stays compiled (imparo-metalbench's IMPARO_Q8_CHECK
+    //       still verifies it) for the day a decode batch dispatches it.
     //
     //   st_gemm_large_shape
     //       The SECOND tile of the prefill pair. There is no boundary knob any more: the
@@ -1696,11 +1688,12 @@ static METAL_KNOBS: &[KnobDecl] = &[
         after: &[],
         cross_check: None,
         applies: None,
-        // Sets the thread count for BOTH decode attention kernels -- the score-tile
-        // path and the streaming path -- so the crossover between them depends on it.
-        // Measured apart from the tuple it gave attn_stream_min_pos=2048; measured with
-        // it, 6144. A knob that changes another knob's answer belongs in its tuple.
-        tuple: Some("decode_stream"),
+        // The score-tile kernel's thread count. It used to set the streaming kernel's
+        // too and so sat in the decode_stream tuple; the streaming kernel runs a fixed
+        // 128 threads now (measured, see the dispatch), and a tuple is timed on its
+        // FIRST member's workload -- with this knob first, the streaming knobs were
+        // ranked on the score-tile path this workload forces and read inert.
+        tuple: None,
         category: KnobCategory::Benched,
         values: &[],
         apply: crate::set_attn_threads,
@@ -2015,12 +2008,17 @@ static METAL_KNOBS: &[KnobDecl] = &[
         workload: Wl::DecodeAttentionStep,
     },
     KnobDecl {
-        // The vector decode kernel reads K/V once per QUERY head, so it wins while a span's
-        // K/V is cache-resident and loses to the K-once-per-KV-head routes past that. The
-        // crossover is measured per model on the deep decode step (1024 on both reference
-        // models: at 16k keys the unsliced kernel loses 11% of the step on 512-dim heads,
-        // the isolated probe notwithstanding); the ladder runs past the deep span for a
-        // sliced form of the kernel. bit_affecting: the route changes the summation order.
+        // The vector decode kernel reads K/V once per QUERY head. It loses to the
+        // K-once-per-KV-head routes when its grid cannot stream the span: one threadgroup
+        // per query head, so E4B's 512-dim layers (8 heads) lose 11% of the step at 16k
+        // keys and seat 1024, while Qwen3.8-27B's 256-dim layers (24 heads) are linear at
+        // 0.65 us per key to 16k and seat 16384 -- 2.0x the ungrouped split kernel at
+        // 5646 keys and 2.3x at 16k (docs/evidence/bracket/2026-09-11-27b-decode-attention-
+        // at-depth.md). The seat is the deep step's own span, because the workload runs
+        // at one span: candidates below it are inert, candidates at or above it route the
+        // step to this kernel, and the tuner keeps the default when the two groups tie.
+        // A crossing over spans is the tuner follow-up. bit_affecting: the route changes
+        // the summation order.
         name: "attn_vec_max_keys",
         legal: None,
         bit_affecting: true,
@@ -2036,54 +2034,48 @@ static METAL_KNOBS: &[KnobDecl] = &[
         current: crate::attn_vec_max_keys,
         screened: false,
         sweep: Sw::Values,
-        // NOTE: this workload runs one decode-attention step at depth, where every
-        // candidate below the span is inert and the tuner keeps the default; a short-span
-        // workload that crosses the ladder is the tuner follow-up (task #122).
+        // One decode-attention step at the deep span; see the note above on what a
+        // single span can and cannot seat.
         workload: Wl::DecodeAttentionStep,
     },
     KnobDecl {
-        // The persistent grid needs a whole-engine decode measurement: DecodeMix only
-        // dispatches independent matmuls and never exercises its barriers. It previously
-        // called this knob INERT and stored the untested two-per-core default on M4.
-        // The native setter now caps stored seats at one group per detected core; wider
-        // grids are explicit env experiments, not micro-tuner candidates. Changing the
-        // grid can change attention's split/reduction order, so correctness is required.
+        // THE PERSISTENT GRID of the smaller attention geometry's mega pipeline (task #203):
+        // threadgroups per dispatch. Its LIMIT -- how many the pipeline holds resident,
+        // which is its register footprint on this GPU -- is measured by the tuner's
+        // discovery (Backend::mega_admission); the VALUE is ranked under it and applied by
+        // the engine as written, one per core until a tune says otherwise. Neither constant
+        // that stood here was right everywhere: 2*(cores-2) hung an M4 Pro, one per core
+        // cost an M3 Pro 2.6% of E4B decode at depth.
+        //
+        // RANKED on the persistent kernel itself: one decode step, every layer as a mega
+        // entry over the tuner's synthetic weights, at a short span (every layer at the
+        // seat) and cross-checked at depth (the engine's mix). DecodeMix runs independent
+        // matmuls and never reaches a grid barrier, which is why it once called this knob
+        // INERT. Changing the grid can change attention's split/reduction order, so
+        // correctness is required.
         name: "mega_tgs",
-        legal: Some(|v, _m, _d| {
-            let lim = crate::mega_threads_limit();
-            v > 0
-                && (crate::gpu_cores() == 0 || v <= crate::gpu_cores())
-                && (lim == 0
-                    || u64::from(v) * u64::from(crate::mega_nsg_current()) * 32
-                        <= u64::from(lim))
-        }),
+        legal: Some(|v, _m, _d| mega_tgs_legal(0, v)),
         bit_affecting: true,
         derive: None,
-        candidates: Some(|_m, _d| {
-            let c = crate::gpu_cores();
-            if c == 0 {
-                return vec![1];
-            }
-            vec![c]
-        }),
+        candidates: Some(|_m, _d| mega_tgs_candidates(0)),
         after: &[],
-        cross_check: None,
-        // Facts describe the post-load projections: Gemma's block reads Q4_0 (1),
-        // LFM2's reads Q8_0_TM (3), including Q8_0 repacked at load. Row-major Q8_0
-        // alone cannot enter the LFM2 block. This is only eligibility for an external
-        // trial; the whole-model run must still prove that the route engaged.
+        cross_check: Some(Wl::MegaDecodeStepDeep),
+        // APPLICABILITY, not eligibility: the seat governs a dispatch only where the model's
+        // decode runs per-layer entries at the seat (gemma4 at level >= 2). LFM2's default is
+        // the per-token program at one per core (#153) and qwen35's workflow offers no entry,
+        // so on those the knob would rank identical candidates and record a decision that
+        // decided nothing.
         applies: Some(|m| {
-            m.weight_kinds & ((1 << 1) | (1 << 3)) != 0 && crate::mega_level() >= 1
+            m.mega_seat == imparo_backend::MegaSeat::Grid && crate::mega_level() >= 2
         }),
         tuple: Some("mega"),
-        category: KnobCategory::EndToEnd,
+        category: KnobCategory::Benched,
         values: &[],
         apply: crate::set_mega_tgs,
         current: crate::mega_tgs_current,
         screened: false,
-        sweep: Sw::External,
-        // Unused for External knobs; never rank the grid on this operator proxy.
-        workload: Wl::DecodeMix,
+        sweep: Sw::Values,
+        workload: Wl::MegaDecodeStep,
     },
     KnobDecl {
         // Simdgroups per mega threadgroup, and with mega_tgs the product is the grid. This
@@ -2098,11 +2090,10 @@ static METAL_KNOBS: &[KnobDecl] = &[
         name: "mega_nsg",
         legal: Some(|v, _m, d| {
             let lim = crate::mega_threads_limit();
+            let tgs = crate::mega_tgs_current().max(crate::mega_tgs_large_current());
             v > 0
                 && u64::from(v) * 32 <= u64::from(d.max_threads)
-                && (lim == 0
-                    || u64::from(crate::mega_tgs_current()) * u64::from(v) * 32
-                        <= u64::from(lim))
+                && (lim == 0 || u64::from(tgs) * u64::from(v) * 32 <= u64::from(lim))
         }),
         bit_affecting: true,
         derive: None,
@@ -2116,20 +2107,54 @@ static METAL_KNOBS: &[KnobDecl] = &[
                 .collect()
         }),
         after: &[],
-        cross_check: None,
-        // Keep the same post-load format eligibility as mega_tgs above.
+        cross_check: Some(Wl::MegaDecodeStepDeep),
+        // The width is a floor for BOTH forms (the program raises it from the phases), so it
+        // applies wherever the model's decode dispatches mega entries at all.
         applies: Some(|m| {
-            m.weight_kinds & ((1 << 1) | (1 << 3)) != 0 && crate::mega_level() >= 1
+            m.mega_seat != imparo_backend::MegaSeat::None && crate::mega_level() >= 2
         }),
         tuple: Some("mega"),
-        category: KnobCategory::EndToEnd,
+        category: KnobCategory::Benched,
         values: &[],
         apply: crate::set_mega_nsg,
         current: crate::mega_nsg_current,
         screened: false,
-        sweep: Sw::External,
-        // As above, no micro workload currently executes the persistent kernel.
-        workload: Wl::DecodeMix,
+        sweep: Sw::Values,
+        workload: Wl::MegaDecodeStep,
+    },
+    KnobDecl {
+        // The grid of the pipeline compiled for the model's LARGER attention head dim --
+        // E4B's 7 full-attention layers at head dim 512, their own pipeline slot with a
+        // bigger footprint than the hd-256 one (the head dim sizes register arrays, so each
+        // dim is its own instantiation). A seat per pipeline, because admission is per
+        // pipeline: one seat for both would hold the 35 windowed layers at whatever the 7
+        // hd-512 ones admit. Named like st_gemm_large_shape (the second, larger tile),
+        // never by the dim: the registry is one static list for every model. Same limit
+        // rule and workload as mega_tgs; ranked after the pair above has settled (the width
+        // is shared). Its layers run at this seat while their span is within
+        // attn_vec_max_keys; past it they take the deep-body variant at one per core, so
+        // the cross-check at depth reads a tie for it by construction.
+        name: "mega_tgs_large",
+        legal: Some(|v, _m, _d| mega_tgs_legal(1, v)),
+        bit_affecting: true,
+        derive: None,
+        candidates: Some(|_m, _d| mega_tgs_candidates(1)),
+        after: &["mega_tgs", "mega_nsg"],
+        cross_check: Some(Wl::MegaDecodeStepDeep),
+        // Only a model with a second attention geometry compiles the second slot.
+        applies: Some(|m| {
+            m.mega_seat == imparo_backend::MegaSeat::Grid
+                && crate::mega_level() >= 2
+                && crate::mega_slot_present(1)
+        }),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_mega_tgs_large,
+        current: crate::mega_tgs_large_current,
+        screened: false,
+        sweep: Sw::Values,
+        workload: Wl::MegaDecodeStep,
     },
     KnobDecl {
         name: "attn_qcomb_pt",
@@ -2242,26 +2267,27 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // and until now a compiled literal that no tuner could see -- the single most
         // valuable missing knob in the audit.
         //
-        // MODEL-SPECIFIC. The kernel gates it on head_dim == 512, so on a model with no
-        // such layers it selects nothing and must not be offered: measuring it would
-        // spend samples on a value that changes nothing and then RECORD a pick, which
-        // reads as a decision when none was made.
+        // MODEL-SPECIFIC. The variants built are hd 512 x 2 and hd 256 x 2 and x 3 (the
+        // threadgroup budget, see the kernel), so on a model whose deep head dim is
+        // neither it selects nothing and must not be offered: measuring it would spend
+        // samples on a value that changes nothing and then RECORD a pick, which reads as
+        // a decision when none was made. 3 is legal at hd 256 only.
         name: "attn_stream_hq",
         category: KnobCategory::Benched,
-        values: &[1, 2],
+        values: &[1, 2, 3],
         apply: crate::set_attn_stream_hq,
         current: crate::attn_stream_hq_current,
         screened: false,
-        legal: None,
+        legal: Some(|v, m, _d| v <= 2 || m.deep_head_dim == 256),
         bit_affecting: false,
         derive: None,
         candidates: None,
         after: &[],
         cross_check: None,
-        applies: Some(|m| m.deep_head_dim == 512),
+        applies: Some(|m| m.deep_head_dim == 512 || m.deep_head_dim == 256),
         tuple: Some("decode_stream"),
         sweep: Sw::Values,
-        workload: Wl::AttentionDecodeDeep,
+        workload: Wl::AttentionDecodeStream,
     },
     KnobDecl {
         // Slices per decode attention dispatch. Coupled to hq: the GQA-grouped path has a
@@ -2303,7 +2329,7 @@ static METAL_KNOBS: &[KnobDecl] = &[
         applies: Some(|m| m.deep_head_dim == 512),
         tuple: Some("decode_stream"),
         sweep: Sw::Values,
-        workload: Wl::AttentionDecodeDeep,
+        workload: Wl::AttentionDecodeStream,
     },
     KnobDecl {
         name: "attn_stream_min_pos",
@@ -2515,6 +2541,13 @@ impl BackendKnobs for MetalBackend {
     /// `attn_qcomb_mask` gained the `2^slots` candidate hook its comment had always
     /// described -- without it the mask resolved to an empty ladder and was never swept.
     fn space_version(&self) -> u32 {
+        // 21: gemv_max_tok, q8_gemv_max_tok, q8_batch_sgs, q8_token_tile LEAVE the space --
+        //     the GEMV/GEMM boundary is one row in every family by the KV identity rule,
+        //     so the crossings are not knobs and the token tile is unreachable by default
+        //     (see the NOT DECLARED list). A stored v19/v20 file's lines for them are
+        //     reported and ignored by apply_host_config.
+        // 20: mega_tgs_large joins the space (the grid seat is per pipeline slot; mega_tgs now
+        //     governs the smaller attention geometry's pipeline only), task #203.
         // 19: mega_tgs / mega_nsg join the space (the persistent mega block's grid shape).
         // 18: q8_tm_decode_sgs joins the space (the tile-major decode GEMV's simdgroups).
         // 18: attn_fd_chunk joins the space (keys per flash-decoding slice).
@@ -2523,7 +2556,7 @@ impl BackendKnobs for MetalBackend {
         // 15: attn_qcomb_nsg joins the space. The knob set changed, so a v14 tune file
         // must not be read as if it described this space -- it has no value for the new
         // knob, and the derivation it silently fell back to is the thing being replaced.
-        19
+        21
     }
 }
 
@@ -2545,43 +2578,22 @@ fn norm_row_mask(bit: u32) -> bool {
     m & (1 << bit) != 0
 }
 
-#[cfg(test)]
-mod ladder_tests {
-    use super::{simdgroups_upto, threads_upto};
-
-    /// The ladders that used to be written out must come back unchanged on the machine
-    /// they were written on -- otherwise this change is a retune wearing a refactor's
-    /// clothes, and the pinned numbers would move for a reason nobody recorded.
-    #[test]
-    fn the_written_ladders_are_reproduced_at_1024_threads() {
-        assert_eq!(threads_upto(128, 1024), vec![128, 256, 512, 1024]);
-        assert_eq!(simdgroups_upto(1, 1024), vec![1, 2, 4, 8, 16, 32]);
-    }
-
-    /// The point of deriving them: a device with half the budget must not be offered a
-    /// dispatch it cannot run. 1024 threads was in the registry as a literal.
-    #[test]
-    fn a_narrower_device_is_never_offered_an_illegal_dispatch() {
-        assert_eq!(threads_upto(128, 512), vec![128, 256, 512]);
-        assert_eq!(simdgroups_upto(1, 512), vec![1, 2, 4, 8, 16]);
-        for max in [256u32, 512, 1024, 2048] {
-            assert!(threads_upto(128, max).iter().all(|t| *t <= max));
-            assert!(simdgroups_upto(1, max).iter().all(|s| s * 32 <= max));
-        }
-    }
-
-    /// A ladder is never empty: the lowest rung is the compiled default, and a device
-    /// that cannot run it is one this backend cannot run at all.
-    #[test]
-    fn the_lowest_rung_survives_an_absurd_limit() {
-        assert_eq!(threads_upto(128, 0), vec![128]);
-        assert_eq!(simdgroups_upto(1, 0), vec![1]);
-    }
-}
-
 /// One gemma4 layer (from the FFN input, or from the residual with the fronts) as one entry of
 /// the mega kernel (task #158 step 2): the program's slots and words, the architecture's own
 /// rules here, the Metal rules in the bridge.
+/// WHY THE BRIDGE REFUSED AN ENTRY, on request (IMPARO_MEGA_REFUSE_LOG=1): the line of the
+/// rule. Silent by design otherwise -- the layer takes the dispatch path -- and the tuner's
+/// mega workload needs the reason when every layer is refused (task #203).
+fn mega_refused(line: u32) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("IMPARO_MEGA_REFUSE_LOG").is_some()) {
+        eprintln!(
+            "imparo metal: mega entry refused by the bridge (backend_impl.rs:{line})"
+        );
+    }
+    false
+}
+
 fn mega_gemma4_entry(l: &Gemma4MegaLayer<'_>, n_tok: u32) -> bool {
     let &Gemma4MegaLayer {
         gate_kind,
@@ -2614,6 +2626,7 @@ fn mega_gemma4_entry(l: &Gemma4MegaLayer<'_>, n_tok: u32) -> bool {
         next_out,
         front,
     } = l;
+    #[allow(clippy::wildcard_imports)] // the slot names are generated by build.rs
     use crate::mega_slots::*;
     use crate::{MEGA_SLOT_BUF_R as R, MEGA_SLOT_BUF_RW as RW, MEGA_SLOT_BUF_W as W};
     use crate::{mega_slot_buf as sbuf, mega_slot_kv as skv, mega_slot_weight as sw};
@@ -2633,36 +2646,36 @@ fn mega_gemma4_entry(l: &Gemma4MegaLayer<'_>, n_tok: u32) -> bool {
                 || q.wk.is_some() != q.wv.is_some()
         })
     {
-        return false;
+        return mega_refused(line!());
     }
     // gemma4's own rules: Q4 row widths, the norm rows staged in the n_mid scratch, the
     // attention phase needs the front in the same dispatch, the q/k/v front needs the
     // attention phase (Q never leaves the block otherwise), the head geometry.
     if n_embd % 32 != 0 || n_ff % 32 != 0 || ple % 32 != 0 || n_ff < n_embd {
-        return false;
+        return mega_refused(line!());
     }
     if (attention.is_some() && front.is_none())
         || (qkv.is_some() && attention.is_none())
     {
-        return false;
+        return mega_refused(line!());
     }
     if front.is_some_and(|f| f.attn_in % 32 != 0) {
-        return false;
+        return mega_refused(line!());
     }
     if let (Some(q), Some(f), Some(a)) = (qkv, front, attention) {
         if q.rope_dim == 0 || q.rope_dim % 2 != 0 || q.rope_dim > f.head_dim {
-            return false;
+            return mega_refused(line!());
         }
         if q.wk.is_some() && a.kv_layer != q.layer {
-            return false;
+            return mega_refused(line!());
         }
         if a.n_heads * f.head_dim != f.attn_in {
-            return false;
+            return mega_refused(line!());
         }
     }
     let has_next = next_norm_off != NO_WEIGHT && next_norm_off != 0;
     let has_kv = qkv.is_some_and(|q| q.wk.is_some());
-    let mut e = crate::MegaEntryFfi::new(0);
+    let mut e = crate::MegaEntryFfi::new(MEGA_FAMILY_GEMMA4);
     e.min_level = if qkv.is_some() {
         5
     } else if attention.is_some() {
@@ -2763,6 +2776,7 @@ fn mega_gemma4_entry(l: &Gemma4MegaLayer<'_>, n_tok: u32) -> bool {
 /// One LFM2 layer as one persistent dispatch (task #147). Decode only, tile-major Q8_0
 /// only (the kind the load-time repack produces).
 fn mega_lfm2_entry(l: &Lfm2MegaLayer, n_tok: u32) -> bool {
+    #[allow(clippy::wildcard_imports)] // the slot names are generated by build.rs
     use crate::mega_slots::*;
     use crate::{MEGA_SLOT_BUF_RW as RW, MEGA_SLOT_BUF_W as W};
     use crate::{mega_slot_buf as sbuf, mega_slot_kv as skv, mega_slot_weight as sw};
@@ -2774,7 +2788,7 @@ fn mega_lfm2_entry(l: &Lfm2MegaLayer, n_tok: u32) -> bool {
     if l.n_embd % 32 != 0 || l.n_ff % 32 != 0 || l.n_embd % 8 != 0 || l.n_ff % 8 != 0 {
         return false;
     }
-    let mut e = crate::MegaEntryFfi::new(1);
+    let mut e = crate::MegaEntryFfi::new(MEGA_FAMILY_LFM2);
     e.min_level = 2;
     e.slots[L2_W_GATE] = sw(l.gate_off, L2_O_GATE_OFF);
     e.slots[L2_W_UP] = sw(l.up_off, L2_O_UP_OFF);
@@ -2914,6 +2928,7 @@ fn mega_lfm2_entry(l: &Lfm2MegaLayer, n_tok: u32) -> bool {
 /// also the brick's row-major arm, which decodes nothing, so passing it on would produce
 /// plausible zeros rather than an error.
 fn mega_qwen35_entry(l: &Qwen35MegaLayer, n_tok: u32) -> bool {
+    #[allow(clippy::wildcard_imports)] // the slot names are generated by build.rs
     use crate::mega_slots::*;
     use crate::{MEGA_SLOT_BUF_RW as RW, MEGA_SLOT_BUF_W as W};
     use crate::{mega_slot_buf as sbuf, mega_slot_weight as sw};
@@ -2932,7 +2947,7 @@ fn mega_qwen35_entry(l: &Qwen35MegaLayer, n_tok: u32) -> bool {
     if f_gate == 0 || f_up == 0 || f_down == 0 {
         return false;
     }
-    let mut e = crate::MegaEntryFfi::new(2);
+    let mut e = crate::MegaEntryFfi::new(MEGA_FAMILY_QWEN35);
     e.min_level = crate::MEGA_LEVEL_QWEN35;
     e.slots[Q35_W_GATE] = sw(l.gate_off, Q35_O_GATE_OFF);
     e.slots[Q35_W_UP] = sw(l.up_off, Q35_O_UP_OFF);
@@ -2959,4 +2974,38 @@ fn mega_qwen35_entry(l: &Qwen35MegaLayer, n_tok: u32) -> bool {
         Qwen35MegaMixer::None => e.u[Q35_U_KIND] = 0,
     }
     crate::mega_layer(&e)
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::{simdgroups_upto, threads_upto};
+
+    /// The ladders that used to be written out must come back unchanged on the machine
+    /// they were written on -- otherwise this change is a retune wearing a refactor's
+    /// clothes, and the pinned numbers would move for a reason nobody recorded.
+    #[test]
+    fn the_written_ladders_are_reproduced_at_1024_threads() {
+        assert_eq!(threads_upto(128, 1024), vec![128, 256, 512, 1024]);
+        assert_eq!(simdgroups_upto(1, 1024), vec![1, 2, 4, 8, 16, 32]);
+    }
+
+    /// The point of deriving them: a device with half the budget must not be offered a
+    /// dispatch it cannot run. 1024 threads was in the registry as a literal.
+    #[test]
+    fn a_narrower_device_is_never_offered_an_illegal_dispatch() {
+        assert_eq!(threads_upto(128, 512), vec![128, 256, 512]);
+        assert_eq!(simdgroups_upto(1, 512), vec![1, 2, 4, 8, 16]);
+        for max in [256u32, 512, 1024, 2048] {
+            assert!(threads_upto(128, max).iter().all(|t| *t <= max));
+            assert!(simdgroups_upto(1, max).iter().all(|s| s * 32 <= max));
+        }
+    }
+
+    /// A ladder is never empty: the lowest rung is the compiled default, and a device
+    /// that cannot run it is one this backend cannot run at all.
+    #[test]
+    fn the_lowest_rung_survives_an_absurd_limit() {
+        assert_eq!(threads_upto(128, 0), vec![128]);
+        assert_eq!(simdgroups_upto(1, 0), vec![1]);
+    }
 }

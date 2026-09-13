@@ -60,6 +60,12 @@ pub struct ShortconvTransactionShape {
 pub struct Shapes {
     /// The model's one process-wide gated activation, resolved from every layer.
     pub activation: Epilogue,
+    /// What the mega grid seat governs on this model (task #203); `applies` reads it.
+    pub mega_seat: imparo_backend::MegaSeat,
+    /// The model's layers as mega entries over the synthetic weights, positions at 0 --
+    /// what `MegaDecodeStep` dispatches. Empty when this architecture's bench cannot
+    /// build them yet; the grid knobs then keep their incumbent.
+    pub mega_layers: Vec<imparo_backend::MegaLayer<'static>>,
     /// The decode-step matmuls as `(weight offset, n_in, n_out, weight kind)`, at the
     /// offsets AND THE QUANT TYPES the model actually stores them with.
     ///
@@ -138,6 +144,33 @@ pub struct Shapes {
     /// deep dispatch is measuring 7/42 of the attention a step does, with none of the
     /// interleaving.
     pub attn_layers: Vec<(u32, u32)>,
+}
+
+/// Model-backed operations supported by minimum-token threshold sweeps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TokenMinWorkload {
+    Ffn,
+    FullAttention { layer: u32, head_dim: u32 },
+}
+
+fn token_min_workload(
+    workload: Workload,
+    has_ffn: bool,
+    deep_head_dim: u32,
+    attention_layers: &[(u32, u32)],
+) -> Option<TokenMinWorkload> {
+    match workload {
+        Workload::PrefillFfnTransaction if has_ffn => Some(TokenMinWorkload::Ffn),
+        Workload::AttentionPrefillDeep if deep_head_dim != 0 => attention_layers
+            .iter()
+            .position(|&(head_dim, window)| head_dim == deep_head_dim && window == 0)
+            .and_then(|layer| u32::try_from(layer).ok())
+            .map(|layer| TokenMinWorkload::FullAttention {
+                layer,
+                head_dim: deep_head_dim,
+            }),
+        _ => None,
+    }
 }
 
 /// What stage 1 decides: one value per Micro-stage Benched knob, in registry order,
@@ -251,6 +284,9 @@ fn kv_scratch_bytes(kv_tag: &str, slots: u32, n_kv: u32, head_dim: u32) -> u64 {
 /// floor of 6.5%, and the kernels are demonstrably reached -- the same workload takes 9.8
 /// ms on f16 and 79 ms on q4_0.
 const UNRESOLVABLE_FLOOR: f64 = 0.05;
+/// Consecutive warm-up samples that must each land within 2% of their predecessor before
+/// the control is read (task #78): one agreeing pair is chance on a ramping GPU.
+const WARM_STABLE_RUN: u32 = 3;
 
 /// The position every DEEP workload is measured at. 16k is a long agentic context and the
 /// depth this repo's end-to-end brackets use, so a knob ranked here is a knob verified
@@ -446,6 +482,16 @@ fn stable_token_min_threshold(rows: &[(u32, bool, bool)]) -> Option<u32> {
     })
 }
 
+fn stable_token_max_threshold(rows: &[(u32, bool, bool)]) -> Option<u32> {
+    let prefix = rows.iter().take_while(|row| row.1 && row.2).count();
+    // Unknown/non-winning rungs cannot bridge two winning islands.
+    if prefix == 0 || rows[prefix..].iter().any(|row| row.1 && row.2) {
+        None
+    } else {
+        Some(rows[prefix - 1].0)
+    }
+}
+
 fn settle_token_min_scans(scans: &[Option<u32>], ladder: &[u32], default: u32) -> u32 {
     let mut positions: Vec<usize> = scans
         .iter()
@@ -531,7 +577,7 @@ fn time_us_checked(
     evidence: Option<(Workload, u32)>,
     f: &dyn Fn(),
 ) -> f64 {
-    time_us_reset_checked(b, samples, reps, false, &|| {}, evidence, f)
+    time_us_reset_checked(b, samples, reps, false, &|| {}, evidence, false, f)
 }
 
 fn time_us_reset(
@@ -542,7 +588,23 @@ fn time_us_reset(
     reset: &dyn Fn(),
     f: &dyn Fn(),
 ) -> f64 {
-    time_us_reset_checked(b, samples, reps, restore_each_rep, reset, None, f)
+    time_us_reset_checked(b, samples, reps, restore_each_rep, reset, None, false, f)
+}
+
+/// `time_us_reset` for a workload whose GPU submission may legitimately FAIL for one
+/// candidate: a persistent-kernel grid whose barrier timed out under the failsafe. A failed
+/// submission is that candidate's verdict (infinity, never timed), not a harness defect --
+/// the caller recovers the route and moves on. Every other workload keeps the panic: for
+/// them a failed submission IS a harness defect.
+fn time_us_reset_soft(
+    b: &dyn Backend,
+    samples: usize,
+    reps: usize,
+    restore_each_rep: bool,
+    reset: &dyn Fn(),
+    f: &dyn Fn(),
+) -> f64 {
+    time_us_reset_checked(b, samples, reps, restore_each_rep, reset, None, true, f)
 }
 
 fn time_us_reset_checked(
@@ -552,6 +614,7 @@ fn time_us_reset_checked(
     restore_each_rep: bool,
     reset: &dyn Fn(),
     evidence: Option<(Workload, u32)>,
+    soft: bool,
     f: &dyn Fn(),
 ) -> f64 {
     // One untimed rep: it pays for the pipeline switch, and its duration says how many
@@ -562,9 +625,15 @@ fn time_us_reset_checked(
     b.reset_tuner_dispatch_proof();
     b.begin();
     f();
-    b.end().unwrap_or_else(|rc| {
-        panic!("tuner warm-up GPU submission failed with backend code {rc}")
-    });
+    if let Err(rc) = b.end() {
+        if soft {
+            println!(
+                "  GPU submission failed in the warm-up (backend code {rc}): candidate rejected"
+            );
+            return f64::INFINITY;
+        }
+        panic!("tuner warm-up GPU submission failed with backend code {rc}");
+    }
     b.validate_tuner_dispatch_proof()
         .unwrap_or_else(|error| panic!("tuner warm-up dispatch proof failed: {error}"));
     if let Some((workload, expected)) = evidence {
@@ -623,9 +692,15 @@ fn time_us_reset_checked(
             for _ in 0..n {
                 f();
             }
-            b.end().unwrap_or_else(|rc| {
-                panic!("tuner timed GPU submission failed with backend code {rc}")
-            });
+            if let Err(rc) = b.end() {
+                if soft {
+                    println!(
+                        "  GPU submission failed in a timed rep (backend code {rc}): candidate rejected"
+                    );
+                    return f64::INFINITY;
+                }
+                panic!("tuner timed GPU submission failed with backend code {rc}");
+            }
             b.validate_tuner_dispatch_proof()
                 .unwrap_or_else(|error| panic!("tuner dispatch proof failed: {error}"));
             if let Some((workload, expected)) = evidence {
@@ -859,8 +934,29 @@ pub fn measure(
         n_layers: s.n_layers,
         layer_dispatches: s.layer_dispatches,
         weight_kinds: s.weight_kinds,
+        mega_seat: s.mega_seat,
     };
     let shortconv_available = s.shortconv_transaction.is_some();
+    // THE MEGA KERNEL'S SCRATCH, reserved once like the engine does at load (task #155):
+    // the sync buffer that carries the sticky error, the FFN staging row and the deep
+    // attention body's partials. Without it every entry is refused and the grid knobs would
+    // read INERT for a reason that has nothing to do with the grid.
+    let mega_available = !s.mega_layers.is_empty()
+        && match b.mega_reserve(s.n_ff, s.n_head, s.head_dim.max(s.deep_head_dim)) {
+            Ok(()) => true,
+            Err(rc) => {
+                println!(
+                    "  mega scratch reserve rc={rc}: the mega decode-step workload is unavailable"
+                );
+                false
+            }
+        };
+    if !mega_available && s.mega_seat != imparo_backend::MegaSeat::None {
+        println!(
+            "  mega decode-step workload unavailable for this architecture: the grid knobs \
+             (mega_tgs / mega_nsg / mega_tgs_large) keep their incumbent"
+        );
+    }
 
     // DEPENDENCY ORDER, checked rather than assumed. The tuner drives the registry in
     // declaration order; a knob that must be settled first has to sit earlier in the file,
@@ -896,6 +992,10 @@ pub fn measure(
             ) || s.ffn_transaction.is_some())
             && (d.workload != Workload::DecodeShortconvTransaction
                 || shortconv_available)
+            && (!matches!(
+                d.workload,
+                Workload::MegaDecodeStep | Workload::MegaDecodeStepDeep
+            ) || mega_available)
     };
     let selected_tuple = if let Some(name) = only {
         let target = reg
@@ -923,10 +1023,19 @@ pub fn measure(
                 "requested knob {name} needs a validated short-convolution tensor and state shape"
             ));
         }
+        if matches!(
+            target.workload,
+            Workload::MegaDecodeStep | Workload::MegaDecodeStepDeep
+        ) && !mega_available
+        {
+            return Err(format!(
+                "requested knob {name} needs this architecture's mega entries and the mega scratch"
+            ));
+        }
         if target.bit_affecting && !allow_bits {
             return Err(format!(
-                "requested knob {name} can change output bits; rerun with \
-                 --allow-bit-changes and re-run numerical gates"
+                "requested knob {name} can change output bits and --hold-bit-changes is \
+                 set; rerun without it and re-run numerical gates"
             ));
         }
         if let Some(group) = target.tuple {
@@ -943,8 +1052,8 @@ pub fn measure(
             if !held.is_empty() {
                 return Err(format!(
                     "requested knob {name} belongs to coupled tuple {group}, whose \
-                     bit-affecting members are held: {}; rerun with --allow-bit-changes \
-                     and re-run numerical gates",
+                     bit-affecting members are held by --hold-bit-changes: {}; rerun \
+                     without it and re-run numerical gates",
                     held.join(" ")
                 ));
             }
@@ -975,14 +1084,14 @@ pub fn measure(
         if !held.is_empty() {
             if allow_bits {
                 println!(
-                    "  bits: sweeping {} which CAN change output bits -- regenerate the \
-                     pins and re-check agreement before trusting the result",
+                    "  bits: sweeping {} which CAN change output bits -- re-lay the pins \
+                     (det_gate --update-pins) and re-check agreement before trusting the \
+                     result; --hold-bit-changes keeps them at their incumbent",
                     held.join(" ")
                 );
             } else {
                 println!(
-                    "  bits: holding {} at their incumbent (they change output bits); \
-                     --allow-bit-changes to sweep them",
+                    "  bits: holding {} at their incumbent (--hold-bit-changes)",
                     held.join(" ")
                 );
             }
@@ -1004,9 +1113,11 @@ pub fn measure(
             .collect()
     };
     if verbose {
+        // A knob held because it changes bits is listed on the bits line above, not
+        // here: this line names the knobs that do not apply to the MODEL.
         let skipped: Vec<&str> = reg
             .iter()
-            .filter(|d| !applicable(d))
+            .filter(|d| !applicable(d) && (allow_bits || !d.bit_affecting))
             .map(|d| d.name)
             .collect();
         if !skipped.is_empty() {
@@ -1030,6 +1141,8 @@ pub fn measure(
         (BufId::K, s.head_dim * s.n_kv * tile),
         (BufId::V, s.head_dim * s.n_kv * tile),
         (BufId::Attn, s.head_dim * s.n_head * tile),
+        // The mega entry's `add` row (o_proj's output on gemma4).
+        (BufId::O, hidden * tile),
         // The sliced decode kernels write one partial per (head, slice) HERE.
         // Without it they bound a nil buffer and their "timings" measured
         // writes that went nowhere -- which is why the span sweep read ~1.0x
@@ -1286,21 +1399,46 @@ pub fn measure(
     // Let the GPU reach steady clocks BEFORE anything is compared. GPUs ramp under
     // sustained load (the same reference read 28% faster across one warm-up here);
     // candidates measured early are charged for a cold device.
+    //
+    // SETTLED MEANS A RUN OF STABLE SAMPLES, NOT ONE STABLE PAIR. This loop used to stop
+    // the first time two adjacent samples agreed within 2%, and on a ramping GPU two
+    // neighbours agree by chance long before the trend ends: it exited after two runs,
+    // `ref_before` was a cold reading, and the end-of-stage guard then charged the
+    // harness's own ramp to the machine -- "control 495.9 -> 548.8 us drift=11%" on a
+    // settled machine, 30% on a busy one (task #78). Three consecutive samples within
+    // 2% of their predecessor is the bar, under a cap of 24; the clocks that reach it
+    // have stopped moving.
     let mut prev = reference();
     let mut warm = 1;
-    for _ in 0..12 {
+    let mut stable = 0;
+    for _ in 0..24 {
         let cur = reference();
         let moved = (cur - prev).abs() / prev.max(1e-9);
         prev = cur;
         warm += 1;
-        if moved < 0.02 {
+        stable = if moved < 0.02 { stable + 1 } else { 0 };
+        if stable >= WARM_STABLE_RUN {
             break;
         }
     }
     if verbose {
-        println!("  warm-up {warm} runs, settled at {prev:.0} us");
+        println!(
+            "  warm-up {warm} runs, settled at {prev:.0} us ({})",
+            if stable >= WARM_STABLE_RUN {
+                "three consecutive within 2%"
+            } else {
+                "cap reached, still moving"
+            }
+        );
     }
-    let ref_before = reference();
+    // The control's two endpoints are medians of three readings, so a single noisy
+    // sample at either end cannot trip the drift guard by itself.
+    let control = || {
+        let mut v = [reference(), reference(), reference()];
+        v.sort_by(f64::total_cmp);
+        v[1]
+    };
+    let ref_before = control();
 
     // --- workload builders, from the registry's declared vocabulary.
     // The decode mix: the decode-step matmuls at the model's real offsets, summed --
@@ -1356,7 +1494,11 @@ pub fn measure(
             BufId::X,
             n_tok,
         );
-        if candidate_must_run {
+        let canonical_sidecar_selected = reg.iter().any(|decl| {
+            decl.name == "mmq_q8_canonical_gate_up_pair"
+                && matches!((decl.current)(), 2..=4)
+        });
+        if candidate_must_run || canonical_sidecar_selected {
             assert!(
                 fused,
                 "FFN sidecar candidate became unreachable after its preflight probe"
@@ -1511,7 +1653,7 @@ pub fn measure(
         let geometry = BatchGeometry::try_new(0, n_tok, BatchPhase::Prefill).unwrap();
         b.set_batch_geometry(geometry)
             .expect("set FFN candidate probe geometry");
-        b.set_activation(Epilogue::Gelu);
+        b.set_activation(s.activation);
         b.begin();
         b.scale(BufId::Cur, 1.0, n_tok * shape.gate.1);
         let reached = b.ffn_gated_down(
@@ -1531,7 +1673,7 @@ pub fn measure(
         );
         b.end()
             .unwrap_or_else(|rc| panic!("FFN candidate preflight failed rc={rc}"));
-        reached
+        reached && b.validate_tuner_dispatch_proof().is_ok()
     };
     let probe_exact128_candidate = || -> bool {
         if !exact128_facts_complete
@@ -1649,9 +1791,92 @@ pub fn measure(
         Workload,
         ScratchImage,
     >::new());
+    // THE MEGA DECODE STEP'S SPAN, the same rule DecodeAttentionStep applies per layer: the
+    // full-attention layers at the regime's depth, a windowed layer never past its window,
+    // never below kv_len (the cache was sized that way), and a ring only where the engine
+    // passes one. Returns (start position, ring mask).
+    let mega_span = |deep: bool, window: u32| -> (u32, u32) {
+        let far = if deep { DEEP_DECODE_POS } else { kv_len };
+        let span = (if window == 0 { far } else { window.min(far) }).max(kv_len);
+        let ring = if window == 0 { 0 } else { slots(span) - 1 };
+        (span - 1, ring)
+    };
+    // The entries at that span: the templates from the bench, positions set here.
+    let mega_entries = |deep: bool| -> Vec<imparo_backend::MegaEntry<'static>> {
+        s.mega_layers
+            .iter()
+            .map(|template| {
+                let mut layer = *template;
+                if let imparo_backend::MegaLayer::Gemma4(g) = &mut layer {
+                    if let Some(a) = g.front.as_mut().and_then(|f| f.attention.as_mut())
+                    {
+                        let (pos, ring) = mega_span(deep, a.window);
+                        a.start_pos = pos;
+                        a.ring = ring;
+                    }
+                }
+                imparo_backend::MegaEntry { layer, n_tok: 1 }
+            })
+            .collect()
+    };
+    // What the step writes, sized from the entries: one token's row of every activation
+    // scratch the entries name, and this token's K/V row in every layer that owns a cache
+    // (the slot the ring maps the position to). Restored before every rep, and left as
+    // found for the workloads after it -- the attention knobs read Q and the cache.
+    let mega_state_regions = |deep: bool| -> Vec<TunerScratchRegion> {
+        let row = |id: BufId, elements: u32| TunerScratchRegion::BufferF32 {
+            id,
+            off: 0,
+            elements: elements as usize,
+        };
+        let deep_hd = s.head_dim.max(s.deep_head_dim);
+        let mut regions = vec![
+            row(BufId::X, s.n_embd),
+            row(BufId::Cur, s.n_embd),
+            row(BufId::O, s.n_embd),
+            row(BufId::G, s.n_ff),
+            row(BufId::U, s.n_ff),
+            row(BufId::Q, s.n_head * deep_hd),
+            row(BufId::K, s.n_kv * deep_hd),
+            row(BufId::V, s.n_kv * deep_hd),
+            row(BufId::Attn, s.n_head * deep_hd),
+        ];
+        if let Some(ple) = s.ple_transaction {
+            regions.push(row(BufId::Model0, ple.gate.2));
+            regions.push(row(BufId::Model1, s.n_embd));
+        }
+        for template in &s.mega_layers {
+            let imparo_backend::MegaLayer::Gemma4(g) = template else {
+                continue;
+            };
+            let Some(front) = g.front else { continue };
+            let (Some(a), Some(q)) = (front.attention, front.qkv) else {
+                continue;
+            };
+            if q.wk.is_none() {
+                continue; // a shared-KV layer writes no row
+            }
+            let (pos, ring) = mega_span(deep, a.window);
+            let slot = if ring == 0 { pos } else { pos % (ring + 1) };
+            let bytes = row_bytes(a.kv_width);
+            for is_v in [false, true] {
+                regions.push(TunerScratchRegion::KvBytes {
+                    layer: q.layer,
+                    is_v,
+                    off: u64::from(slot) * bytes,
+                    bytes: bytes as usize,
+                });
+            }
+        }
+        regions
+    };
     let run_workload = |w: Workload| -> f64 {
         if !scratch_by_workload.borrow().contains_key(&w) {
             let image = match w.effects() {
+                WorkloadEffects::MegaDecodeState => ScratchImage::capture_regions(
+                    b,
+                    &mega_state_regions(w == Workload::MegaDecodeStepDeep),
+                ),
                 WorkloadEffects::ModelRecurrentState => {
                     let shape = s.shortconv_transaction.expect(
                         "short-convolution workload requires a validated state shape",
@@ -1673,6 +1898,9 @@ pub fn measure(
         let image = images.get(&w).expect("workload scratch was captured");
         let timed = |samples: usize, reps: usize, f: &dyn Fn()| {
             time_us_reset(b, samples, reps, image.mutable, &|| image.restore(b), f)
+        };
+        let timed_soft = |samples: usize, reps: usize, f: &dyn Fn()| {
+            time_us_reset_soft(b, samples, reps, image.mutable, &|| image.restore(b), f)
         };
         match w {
             Workload::DecodeMix => {
@@ -1786,6 +2014,34 @@ pub fn measure(
                 drop(restore);
                 t
             }
+            Workload::AttentionDecodeStream => {
+                // FORCE THE STREAMING PATH, the other side of AttentionDecodeDeep's coin:
+                // attn_stream_hq and attn_stream_slices select the streaming kernel, which
+                // the deep step reaches only past attn_stream_min_pos and only when the
+                // vector route does not take the span first (Qwen3.8-27B seats
+                // attn_vec_max_keys at the deep span itself). Boundary 0 streams at every
+                // span; vector limit 0 lets no span through to the vector kernel.
+                let boundary = reg.iter().find(|d| d.name == "attn_stream_min_pos");
+                let vec_limit = reg.iter().find(|d| d.name == "attn_vec_max_keys");
+                let restore_b = boundary.map(|d| KnobRestore {
+                    knob: d,
+                    value: (d.current)(),
+                });
+                let restore_v = vec_limit.map(|d| KnobRestore {
+                    knob: d,
+                    value: (d.current)(),
+                });
+                if let Some(d) = boundary {
+                    (d.apply)(0);
+                }
+                if let Some(d) = vec_limit {
+                    (d.apply)(0);
+                }
+                let t = timed(3, 64, &attn_deep(1, deep_pos, deep_len.max(kv_len)));
+                drop(restore_v);
+                drop(restore_b);
+                t
+            }
             Workload::AttentionPrefill => timed(3, 2, &attn(tile, 512)),
             // LIGHT FIRST: the ranking is per KEY (the loop over the context is what a
             // prefill attention knob changes), so 64 queries rank it as 512 do, at an
@@ -1837,6 +2093,45 @@ pub fn measure(
                     );
                 }
             }),
+            // ONE DECODE STEP THROUGH THE MEGA KERNEL (task #203): every layer as one entry
+            // at the grid the knob under test set, the program's run flushed after the last
+            // layer (LFM2's form). A refused entry is not a slower candidate, it is a
+            // candidate that never ran: rejected, and the route reopened for the next one.
+            Workload::MegaDecodeStep | Workload::MegaDecodeStepDeep => {
+                let entries = mega_entries(w == Workload::MegaDecodeStepDeep);
+                let refused = std::cell::Cell::new(0u32);
+                // TWO REPS, not four: one rep is a whole decode step (~19 ms on E4B, 42
+                // persistent dispatches), so two already make a ~40 ms timed region -- well
+                // past the millisecond rule -- and four spent ~4 s of a tune on the mega
+                // tuple for nothing the extra samples could resolve.
+                let t = timed_soft(3, 2, &|| {
+                    for e in &entries {
+                        if !b.mega_layer(e) {
+                            refused.set(refused.get() + 1);
+                        }
+                    }
+                    b.mega_program_end();
+                });
+                // A barrier that timed out (the failsafe) closes the route until the engine
+                // recovers; the tuner has no state to roll back, so it reopens it and moves
+                // on -- the candidate is rejected, never timed.
+                if !t.is_finite() {
+                    println!("  {w:?}: a mega barrier timed out; candidate rejected");
+                    let _ = b.mega_recover();
+                    return f64::INFINITY;
+                }
+                if refused.get() > 0 {
+                    println!(
+                        "  {w:?}: the backend REFUSED {} entry dispatches over {} layers; \
+                         candidate rejected (not timed)",
+                        refused.get(),
+                        entries.len()
+                    );
+                    let _ = b.mega_recover();
+                    return f64::INFINITY;
+                }
+                t
+            }
             Workload::AttentionPrefillReuse => {
                 timed(3, 8, &attn_deep(REUSE_TAIL, deep_pos, deep_len.max(kv_len)))
             }
@@ -2181,6 +2476,7 @@ pub fn measure(
                 // knob has no end to pin and a Values knob is swept, not crossed.
                 SweepKind::Crossing { lo, .. }
                 | SweepKind::TokenMinCrossing { lo, .. }
+                | SweepKind::TokenMaxCrossing { lo, .. }
                 | SweepKind::SpanCrossing { lo, .. } => {
                     let cur = (r.current)();
                     (r.apply)(lo);
@@ -2605,25 +2901,50 @@ pub fn measure(
         pick
     };
 
-    // --- Minimum-token crossing for a complete semantic operation. Unlike Crossing,
-    // the candidate owns the LARGE side. Every rung first proves that the candidate
+    // --- Token crossing for a complete semantic operation. The enum determines
+    // which side the candidate owns. Every rung first proves that the candidate
     // actually dispatches, then races candidate/control in h/l/l/h/h/l order. A single
     // threshold is accepted only when three scans agree and each scan contains at most
     // one loss->win transition; a non-monotonic route map is not representable by this
     // knob and therefore fails closed.
-    let token_min_crossing = |d: &KnobDecl, ladder: &[u32], hi: u32, lo: u32| -> u32 {
+    let token_min_crossing = |d: &KnobDecl,
+                              ladder: &[u32],
+                              hi: u32,
+                              lo: u32,
+                              small_side: bool|
+     -> u32 {
         let default = (d.current)();
-        if d.workload != Workload::PrefillFfnTransaction || s.ffn_transaction.is_none()
-        {
+        let Some(workload) = token_min_workload(
+            d.workload,
+            s.ffn_transaction.is_some(),
+            s.deep_head_dim,
+            &s.attn_layers,
+        ) else {
             if verbose {
                 println!(
-                    "  {}: no validated full FFN tensor triple; keeping safe {}",
-                    d.name, default
+                    "  {}: no model geometry for {:?}; keeping safe {}",
+                    d.name, d.workload, default
                 );
             }
             (d.apply)(default);
             return default;
-        }
+        };
+        let run = |n: u32, candidate: bool| match workload {
+            TokenMinWorkload::Ffn => run_ffn_transaction(n, candidate),
+            TokenMinWorkload::FullAttention { layer, head_dim } => b.attention(
+                layer,
+                head_dim,
+                s.n_head,
+                s.n_kv,
+                s.n_kv * head_dim,
+                0,
+                1.0,
+                0,
+                n,
+                scores_needed(n, 0),
+                0,
+            ),
+        };
         let med3 = |mut values: [f64; 3]| {
             values.sort_by(f64::total_cmp);
             values[1]
@@ -2639,7 +2960,23 @@ pub fn measure(
             for &n in ladder {
                 (d.apply)(hi);
                 expect_one(d);
-                let reachable = probe_ffn_candidate(n);
+                let reachable = match workload {
+                    TokenMinWorkload::Ffn => probe_ffn_candidate(n),
+                    TokenMinWorkload::FullAttention { .. } => {
+                        b.set_batch_geometry(
+                            BatchGeometry::try_new(0, n, BatchPhase::Prefill).unwrap(),
+                        )
+                        .expect("set Attention crossing probe geometry");
+                        b.reset_tuner_dispatch_proof();
+                        b.begin();
+                        run(n, true);
+                        b.end().unwrap_or_else(|rc| {
+                            panic!("Attention candidate preflight failed rc={rc}")
+                        });
+                        // An unsupported route must not be mistaken for a measured tie.
+                        b.validate_tuner_dispatch_proof().is_ok()
+                    }
+                };
                 if !reachable {
                     rows.push((n, false, 0.0, 0.0, 0.0, false));
                     continue;
@@ -2654,9 +2991,9 @@ pub fn measure(
                     b.set_batch_geometry(
                         BatchGeometry::try_new(0, n, BatchPhase::Prefill).unwrap(),
                     )
-                    .expect("set FFN crossing geometry");
+                    .expect("set token crossing geometry");
                     time_us(b, 1, 2, &|| {
-                        run_ffn_transaction(n, value == hi);
+                        run(n, value == hi);
                     })
                 };
                 // Contemporary, order-reversed legs cancel slow thermal drift.
@@ -2677,7 +3014,11 @@ pub fn measure(
             }
             let decisions: Vec<(u32, bool, bool)> =
                 rows.iter().map(|row| (row.0, row.1, row.5)).collect();
-            let threshold = stable_token_min_threshold(&decisions);
+            let threshold = if small_side {
+                stable_token_max_threshold(&decisions)
+            } else {
+                stable_token_min_threshold(&decisions)
+            };
             (threshold, rows)
         };
 
@@ -2693,13 +3034,13 @@ pub fn measure(
             for (n, reachable, h, l, noise, wins) in &last {
                 if *reachable {
                     println!(
-                        "    n_tok={n:<3} sidecar={h:>8.1} us native={l:>8.1} us +                             gain={:+.2}% noise={:.2}% {}",
+                        "    n_tok={n:<3} candidate={h:>8.1} us control={l:>8.1} us gain={:+.2}% noise={:.2}% {}",
                         (l / h.max(1e-9) - 1.0) * 100.0,
                         noise * 100.0,
                         if *wins { "win" } else { "hold" }
                     );
                 } else {
-                    println!("    n_tok={n:<3} sidecar unreachable; native only");
+                    println!("    n_tok={n:<3} candidate unreachable; control only");
                 }
             }
             println!("  {}: scans {scans:?} -> {pick}", d.name);
@@ -3082,13 +3423,26 @@ pub fn measure(
                         })
                         .collect();
                 }
-                combos.retain(|c| *c != cur);
-                combos.insert(0, cur.clone());
                 let apply = |c: &[u32]| {
                     for (d, v) in vals.iter().zip(c) {
                         (d.apply)(*v);
                     }
                 };
+                combos.retain(|c| *c != cur);
+                // A COMBINATION IS LEGAL AS A WHOLE. A member's `legal` may read the others'
+                // live values -- the mega grid's thread budget and its measured admission
+                // both depend on the width -- so it is asked with the combination applied,
+                // not with the other members at their seats. Asked the old way, (36, 32)
+                // passed on the mega tuple, the native clamp ran it as 18 x 32, and that
+                // grid timed out at a barrier (task #203).
+                combos.retain(|c| {
+                    apply(c);
+                    vals.iter()
+                        .zip(c)
+                        .all(|(d, v)| d.legal.is_none_or(|f| f(*v, &facts, profile)))
+                });
+                apply(&cur);
+                combos.insert(0, cur.clone());
                 let wl = vals[0].workload;
                 let time_one = || run_workload(wl);
                 apply(&cur);
@@ -3269,7 +3623,10 @@ pub fn measure(
             let v = match d.sweep {
                 SweepKind::Crossing { ladder, hi, lo } => crossing(d, ladder, hi, lo),
                 SweepKind::TokenMinCrossing { ladder, hi, lo } => {
-                    token_min_crossing(d, ladder, hi, lo)
+                    token_min_crossing(d, ladder, hi, lo, false)
+                }
+                SweepKind::TokenMaxCrossing { ladder, hi, lo } => {
+                    token_min_crossing(d, ladder, hi, lo, true)
                 }
                 SweepKind::SpanCrossing { ladder, hi, lo } => {
                     span_crossing(d, ladder, hi, lo)
@@ -3372,7 +3729,10 @@ pub fn measure(
             SweepKind::Values => sweep(d),
             SweepKind::Crossing { ladder, hi, lo } => crossing(d, ladder, hi, lo),
             SweepKind::TokenMinCrossing { ladder, hi, lo } => {
-                token_min_crossing(d, ladder, hi, lo)
+                token_min_crossing(d, ladder, hi, lo, false)
+            }
+            SweepKind::TokenMaxCrossing { ladder, hi, lo } => {
+                token_min_crossing(d, ladder, hi, lo, true)
             }
             SweepKind::SpanCrossing { ladder, hi, lo } => {
                 span_crossing(d, ladder, hi, lo)
@@ -3384,7 +3744,7 @@ pub fn measure(
     // Restore the reference settings and re-time. Same work, same knobs, so any change
     // is the machine, not the measurement.
     b.set_tuner_dispatch_expectation(&[])?;
-    let ref_after = reference();
+    let ref_after = control();
     let drift = (ref_after - ref_before).abs() / ref_before.max(1e-9);
     if verbose {
         println!(
@@ -3455,6 +3815,65 @@ mod tests {
         );
         assert_eq!(exact128_route_evidence(0, 42, 0), None);
         assert_eq!(exact128_route_evidence(64, 64, 0), None);
+    }
+
+    #[test]
+    fn attention_token_crossing_does_not_require_ffn_tensors() {
+        use super::{TokenMinWorkload, token_min_workload};
+        use imparo_backend::Workload;
+        assert_eq!(
+            token_min_workload(
+                Workload::AttentionPrefillDeep,
+                false,
+                64,
+                &[(256, 1024), (64, 0)]
+            ),
+            Some(TokenMinWorkload::FullAttention {
+                layer: 1,
+                head_dim: 64
+            }),
+        );
+        // The model chooses the head geometry; this helper is not SM86/D64-specific.
+        assert_eq!(
+            token_min_workload(
+                Workload::AttentionPrefillDeep,
+                false,
+                512,
+                &[(256, 1024), (512, 0)]
+            ),
+            Some(TokenMinWorkload::FullAttention {
+                layer: 1,
+                head_dim: 512
+            }),
+        );
+    }
+
+    #[test]
+    fn token_crossing_requires_its_own_workload_geometry() {
+        use super::{TokenMinWorkload, token_min_workload};
+        use imparo_backend::Workload;
+        for layers in [vec![], vec![(64, 1024)], vec![(256, 0)]] {
+            assert_eq!(
+                token_min_workload(Workload::AttentionPrefillDeep, true, 64, &layers),
+                None
+            );
+        }
+        assert_eq!(
+            token_min_workload(Workload::AttentionPrefillDeep, true, 0, &[(0, 0)]),
+            None
+        );
+        assert_eq!(
+            token_min_workload(Workload::PrefillFfnTransaction, false, 64, &[(64, 0)]),
+            None
+        );
+        assert_eq!(
+            token_min_workload(Workload::PrefillFfnTransaction, true, 0, &[]),
+            Some(TokenMinWorkload::Ffn)
+        );
+        assert_eq!(
+            token_min_workload(Workload::PrefillGemm, true, 64, &[(64, 0)]),
+            None
+        );
     }
 
     #[test]
@@ -3570,6 +3989,44 @@ mod tests {
         );
         assert_eq!(
             settle_token_min_scans(&[Some(128), Some(449), Some(512)], &ladder, 0,),
+            0
+        );
+    }
+
+    #[test]
+    fn token_max_crossing_accepts_only_a_complete_winning_prefix() {
+        use super::stable_token_max_threshold as threshold;
+        assert_eq!(
+            threshold(&[(9, true, true), (64, true, true), (128, true, false)]),
+            Some(64)
+        );
+        assert_eq!(threshold(&[(9, true, true), (64, true, true)]), Some(64));
+        assert_eq!(threshold(&[(9, true, false), (64, true, false)]), None);
+        assert_eq!(threshold(&[]), None);
+        assert_eq!(threshold(&[(9, false, false), (64, true, true)]), None);
+        assert_eq!(
+            threshold(&[(9, true, true), (32, false, false), (64, true, true)]),
+            None
+        );
+        assert_eq!(
+            threshold(&[(9, true, true), (32, true, false), (64, true, true)]),
+            None
+        );
+    }
+
+    #[test]
+    fn token_max_scan_consensus_preserves_default_when_evidence_disagrees() {
+        let ladder = [9, 32, 64, 128, 256, 512];
+        assert_eq!(
+            settle_token_min_scans(&[Some(64), Some(128), Some(64)], &ladder, 0),
+            64
+        );
+        assert_eq!(
+            settle_token_min_scans(&[Some(64), None, Some(64)], &ladder, 0),
+            0
+        );
+        assert_eq!(
+            settle_token_min_scans(&[Some(32), Some(128), Some(512)], &ladder, 0),
             0
         );
     }

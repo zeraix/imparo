@@ -11,6 +11,9 @@ license.workspace = true
 # native backend. Official thin releases use `cuda-dynamic`: the common runtime is
 # toolkit-free and resolves exactly one per-SM backend at runtime.
 cuda = ["cuda-static"]
+# Static development bridge only; no dynamic plugin ABI or release export.
+cuda-speculative = ["cuda-static"]
+cuda-owner-lab = ["cuda-speculative"]
 cuda-static = ["dep:imparo-program-pack", "dep:sha2"]
 cuda-dynamic = ["dep:ed25519-dalek", "dep:imparo-program-pack", "dep:serde_json", "dep:sha2"]
 signing-tool = ["dep:ed25519-dalek", "dep:serde_json", "dep:sha2"]

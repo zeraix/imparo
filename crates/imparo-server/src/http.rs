@@ -108,10 +108,48 @@ pub fn sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.flush()
 }
 
+/// One SSE frame, `data: <json>\n\n`, appended to `buf`; nothing reaches the socket until
+/// `sse_send`. A token's frames (a reasoning delta and a visible delta, or the tail's four)
+/// therefore go out as ONE write, and the frame itself is serialised into memory first
+/// (task #202). It used to be `write!(stream, "data: {value}\n\n")` on the bare `TcpStream`:
+/// a `write!` hands every piece the formatter produces to `write_all`, and `Value`'s
+/// `Display` is the serializer writing piece by piece -- each brace, quote, key and colon
+/// became its own write(2). Measured ~40 us per token for a 200-byte frame, flat in the
+/// response length; a socket write is a few microseconds.
+///
+/// # Errors
+///
+/// Returns an I/O error when the value cannot be serialised (it always can for the JSON
+/// this server builds; the type is what `serde_json::to_writer` returns).
+pub fn sse_frame(buf: &mut Vec<u8>, value: &serde_json::Value) -> std::io::Result<()> {
+    buf.extend_from_slice(b"data: ");
+    serde_json::to_writer(&mut *buf, value).map_err(std::io::Error::other)?;
+    buf.extend_from_slice(b"\n\n");
+    Ok(())
+}
+
+/// Write everything accumulated by `sse_frame` in one call and empty the buffer.
+///
+/// # Errors
+///
+/// Returns an I/O error when the socket cannot be written.
+pub fn sse_send(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let sent = stream.write_all(buf);
+    buf.clear();
+    sent?;
+    stream.flush()
+}
+
+/// One frame sent on its own (the role preamble, error frames).
+///
 /// # Errors
 ///
 /// Returns an I/O error when the socket cannot be written.
 pub fn sse(stream: &mut TcpStream, value: &serde_json::Value) -> std::io::Result<()> {
-    write!(stream, "data: {value}\n\n")?;
-    stream.flush()
+    let mut buf = Vec::with_capacity(256);
+    sse_frame(&mut buf, value)?;
+    sse_send(stream, &mut buf)
 }

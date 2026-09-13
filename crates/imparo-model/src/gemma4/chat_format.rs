@@ -153,12 +153,38 @@ pub fn render(
         out.push('\n');
     }
 
-    for m in messages {
+    for (message_index, m) in messages.iter().enumerate() {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
         let content = m.get("content").and_then(Value::as_str).unwrap_or("");
 
         if role == "tool" {
-            let name = m.get("name").and_then(Value::as_str).unwrap_or("");
+            let name = m
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    let id = m.get("tool_call_id")?.as_str()?;
+                    messages[..message_index]
+                        .iter()
+                        .rev()
+                        .filter(|prior| {
+                            prior.get("role").and_then(Value::as_str)
+                                == Some("assistant")
+                        })
+                        .find_map(|prior| {
+                            prior
+                                .get("tool_calls")?
+                                .as_array()?
+                                .iter()
+                                .rev()
+                                .find(|call| {
+                                    call.get("id").and_then(Value::as_str) == Some(id)
+                                })?
+                                .get("function")?
+                                .get("name")?
+                                .as_str()
+                        })
+                })
+                .unwrap_or("");
             out.push_str(&format!(
                 "{RESP_OPEN}response:{name}{{value:{}}}{RESP_CLOSE}",
                 quoted(content)
@@ -285,11 +311,18 @@ pub fn split_channels(text: &str, starts_inside: bool) -> (String, String) {
 /// back any tail that is a proper prefix of a marker until the next token settles it.
 #[must_use]
 pub fn partial_marker_len(s: &str, marker: &str) -> usize {
-    let max = (marker.len() - 1).min(s.len());
-    (1..=max)
-        .rev()
-        .find(|&k| s.ends_with(&marker[..k]))
-        .unwrap_or(0)
+    let bytes = s.as_bytes();
+    let marker = marker.as_bytes();
+    if marker.is_empty() {
+        return 0;
+    }
+    let start = bytes.len().saturating_sub(marker.len() - 1);
+    for at in start..bytes.len() {
+        if bytes[at] == marker[0] && marker.starts_with(&bytes[at..]) {
+            return bytes.len() - at;
+        }
+    }
+    0
 }
 
 /// Extracts `<|tool_call>call:name{args}<tool_call|>` blocks, returning
@@ -298,6 +331,9 @@ pub fn partial_marker_len(s: &str, marker: &str) -> usize {
 /// A streaming caller cuts with `unsettled_in_visible` first; see [`crate::chat::ChatCodec`].
 #[must_use]
 pub fn parse_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
+    parse_tool_calls_impl(text, true)
+}
+fn parse_tool_calls_impl(text: &str, collect: bool) -> (String, Vec<(String, String)>) {
     let mut visible = String::new();
     let mut calls = Vec::new();
     let mut rest = text;
@@ -307,22 +343,98 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
         // then breaking left `rest` still pointing at the opener, so the tail push below
         // emitted the text before the call a SECOND time: `abc<|tool_call>x` came back as
         // `abcabc<|tool_call>x`.
-        let Some(end) = after.find(CALL_CLOSE) else {
+        let Some(end) = call_end(after) else {
             break;
         };
         visible.push_str(&rest[..at]);
         let body = &after[..end];
-        if let Some(stripped) = body.strip_prefix("call:") {
-            if let Some(brace) = stripped.find('{') {
-                let name = stripped[..brace].trim().to_string();
-                let args = stripped[brace + 1..].trim_end_matches('}');
-                calls.push((name, args_to_json(args)));
+        let parsed = body.strip_prefix("call:").and_then(|stripped| {
+            let brace = stripped.find('{')?;
+            let name = stripped[..brace].trim();
+            if name.is_empty() {
+                return None;
             }
+            let args = stripped[brace + 1..].trim_end().strip_suffix('}')?;
+            Some((name, args))
+        });
+        if let Some((name, args)) = parsed {
+            if collect {
+                calls.push((name.to_string(), args_to_json(args)));
+            }
+        } else {
+            visible.push_str(&rest[at..at + CALL_OPEN.len() + end + CALL_CLOSE.len()]);
         }
         rest = &after[end + CALL_CLOSE.len()..];
     }
     visible.push_str(rest);
     (visible, calls)
+}
+
+/// Byte offsets advance once; ASCII delimiters are always UTF-8 boundaries.
+#[derive(Default)]
+struct Quotes {
+    marker: bool,
+    json: bool,
+    escape: bool,
+}
+impl Quotes {
+    fn consume(&mut self, bytes: &[u8], i: &mut usize) -> bool {
+        if !self.json && bytes[*i..].starts_with(Q.as_bytes()) {
+            self.marker = !self.marker;
+            *i += Q.len();
+            return true;
+        }
+        let byte = bytes[*i];
+        if self.marker {
+            *i += 1;
+            return true;
+        }
+        if self.json {
+            if self.escape {
+                self.escape = false;
+            } else if byte == b'\\' {
+                self.escape = true;
+            } else if byte == b'"' {
+                self.json = false;
+            }
+            *i += 1;
+            return true;
+        }
+        if byte == b'"' {
+            self.json = true;
+            *i += 1;
+            return true;
+        }
+        false
+    }
+}
+fn call_end(text: &str) -> Option<usize> {
+    // Most streamed prefixes have no close marker: do not scan their arguments.
+    text.find(CALL_CLOSE)?;
+    let bytes = text.as_bytes();
+    let mut quotes = Quotes::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        if quotes.consume(bytes, &mut i) {
+            continue;
+        }
+        if bytes[i..].starts_with(CALL_CLOSE.as_bytes()) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+fn unfinished_call_len(text: &str) -> usize {
+    let mut rest = text;
+    while let Some(at) = rest.find(CALL_OPEN) {
+        let after = &rest[at + CALL_OPEN.len()..];
+        let Some(end) = call_end(after) else {
+            return rest.len() - at;
+        };
+        rest = &after[end + CALL_CLOSE.len()..];
+    }
+    partial_marker_len(rest, CALL_OPEN)
 }
 
 /// Turns `path:<|"|>a.rs<|"|>,n:3` back into JSON.
@@ -347,45 +459,32 @@ fn args_to_json(args: &str) -> String {
 }
 
 /// Splits on commas that are not inside a quoted marker or nested braces.
-fn split_top_level(s: &str) -> Vec<String> {
+fn split_top_level(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0_i32;
-    let mut in_q = false;
-    let mut cur = String::new();
-    let bytes: Vec<char> = s.chars().collect();
+    let mut quotes = Quotes::default();
+    let bytes = s.as_bytes();
     let mut i = 0;
+    let mut start = 0;
     while i < bytes.len() {
-        if s[byte_index(&bytes, i)..].starts_with(Q) {
-            in_q = !in_q;
-            cur.push_str(Q);
-            i += Q.chars().count();
+        if quotes.consume(bytes, &mut i) {
             continue;
         }
-        let c = bytes[i];
-        match c {
-            '{' | '[' if !in_q => {
-                depth += 1;
-                cur.push(c);
+        match bytes[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
             }
-            '}' | ']' if !in_q => {
-                depth -= 1;
-                cur.push(c);
-            }
-            ',' if !in_q && depth == 0 => {
-                parts.push(std::mem::take(&mut cur));
-            }
-            _ => cur.push(c),
+            _ => {}
         }
         i += 1;
     }
-    if !cur.trim().is_empty() {
-        parts.push(cur);
+    if !s[start..].trim().is_empty() {
+        parts.push(&s[start..]);
     }
     parts
-}
-
-fn byte_index(chars: &[char], i: usize) -> usize {
-    chars.iter().take(i).map(|c| c.len_utf8()).sum()
 }
 
 /// gemma4's half of the chat seam.
@@ -415,7 +514,12 @@ impl crate::chat::ChatCodec for Codec {
     /// `<|channel>` itself when it reasons. So the answer is read off the prompt like every
     /// other format, and for this one it is false in practice rather than by assumption.
     fn prompt_ends_in_reasoning(&self, prompt: &str) -> bool {
-        crate::chat::think::ends_inside(prompt, ASSISTANT_TURN_OPEN, CHANNEL_OPEN, CHANNEL_CLOSE)
+        crate::chat::think::ends_inside(
+            prompt,
+            ASSISTANT_TURN_OPEN,
+            CHANNEL_OPEN,
+            CHANNEL_CLOSE,
+        )
     }
     /// gemma4 hands the turn to the caller with RESP_OPEN after a tool call. See the trait.
     fn turn_ends_at(&self, text: &str) -> Option<usize> {
@@ -446,7 +550,8 @@ impl crate::chat::ChatCodec for Codec {
                 // point of a thinking channel. Any other name's body is dropped by the split,
                 // so holding it to the close costs nothing and keeps the carried state a bool.
                 Some(nl) => {
-                    !after[nl..].contains(CHANNEL_CLOSE) && after[..nl].trim() != "thought"
+                    !after[nl..].contains(CHANNEL_CLOSE)
+                        && after[..nl].trim() != "thought"
                 }
             };
             if unsettled {
@@ -456,7 +561,7 @@ impl crate::chat::ChatCodec for Codec {
         hold
     }
     fn unsettled_in_visible(&self, text: &str) -> usize {
-        crate::chat::think::unsettled_pair(text, CALL_OPEN, CALL_CLOSE)
+        unfinished_call_len(text)
     }
     /// True when `text` leaves us inside the THOUGHT channel specifically -- the one the
     /// split keeps. Walked the same way the split walks it, on a settled piece.
@@ -487,6 +592,12 @@ impl crate::chat::ChatCodec for Codec {
     }
     fn parse_tool_calls(&self, text: &str) -> (String, Vec<(String, String)>) {
         parse_tool_calls(text)
+    }
+    fn tool_visible<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        if !text.contains(CALL_OPEN) {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        std::borrow::Cow::Owned(parse_tool_calls_impl(text, false).0)
     }
     fn user_turn_open(&self) -> &'static str {
         // `render` writes `{TURN_OPEN}{role}\n` for every turn, and gemma4 maps
@@ -658,7 +769,8 @@ mod tests {
     #[test]
     fn a_call_marker_inside_reasoning_does_not_stall_the_stream() {
         use crate::chat::ChatCodec;
-        let text = "<|channel>thought\nmaybe <|tool_call> would help<channel|>the answer";
+        let text =
+            "<|channel>thought\nmaybe <|tool_call> would help<channel|>the answer";
         assert_eq!(Codec.unsettled_in_raw(text), 0, "raw text is fully settled");
         // What the ONE-cut form answered on this text, which is why it stalled: everything
         // from the opener on, so the `<channel|>` and the answer after it never went out.
@@ -668,7 +780,10 @@ mod tests {
         );
         let (r, v) = Codec.split_channels(text, false);
         assert_eq!(v, "the answer");
-        assert!(r.contains("<|tool_call>"), "it stays in the reasoning, as prose");
+        assert!(
+            r.contains("<|tool_call>"),
+            "it stays in the reasoning, as prose"
+        );
         // And the visible half, which is what the parse sees, has nothing pending.
         assert_eq!(Codec.unsettled_in_visible(&v), 0);
     }
@@ -699,9 +814,13 @@ mod tests {
                 continue;
             }
             let settled = &text[..end];
-            let settled = &settled[..settled.len() - Codec.unsettled_in_visible(settled)];
+            let settled =
+                &settled[..settled.len() - Codec.unsettled_in_visible(settled)];
             let (visible, calls) = parse_tool_calls(settled);
-            assert!(visible.starts_with(&prior_visible), "visible retracted at {end}");
+            assert!(
+                visible.starts_with(&prior_visible),
+                "visible retracted at {end}"
+            );
             assert!(!visible.contains(CALL_OPEN), "leaked an opener at {end}");
             assert!(!visible.contains(CALL_CLOSE), "leaked a close at {end}");
             assert!(calls.len() >= prior_calls, "a call was retracted at {end}");
@@ -721,12 +840,18 @@ mod tests {
     #[test]
     fn an_unclosed_call_is_shown_by_the_parse_and_held_by_the_cut() {
         use crate::chat::ChatCodec;
-        let text = r#"visible<|tool_call>call:get_weather{ci"#;
+        let text = r"visible<|tool_call>call:get_weather{ci";
         assert_eq!(Codec.parse_tool_calls(text), (text.to_string(), Vec::new()));
-        assert_eq!(Codec.unsettled_in_visible(text), text.len() - "visible".len());
+        assert_eq!(
+            Codec.unsettled_in_visible(text),
+            text.len() - "visible".len()
+        );
         // Cut first, and what is left parses to exactly the settled text.
         let settled = &text[..text.len() - Codec.unsettled_in_visible(text)];
-        assert_eq!(Codec.parse_tool_calls(settled), ("visible".to_string(), Vec::new()));
+        assert_eq!(
+            Codec.parse_tool_calls(settled),
+            ("visible".to_string(), Vec::new())
+        );
     }
 
     /// The text before an unclosed call was emitted TWICE: `rest[..at]` was pushed before
@@ -766,7 +891,8 @@ mod tests {
                     continue;
                 }
                 let raw_tail = &text[..end][fed_raw..];
-                let settled = &raw_tail[..raw_tail.len() - Codec.unsettled_in_raw(raw_tail)];
+                let settled =
+                    &raw_tail[..raw_tail.len() - Codec.unsettled_in_raw(raw_tail)];
                 if !settled.is_empty() {
                     let (r, v) = Codec.split_channels(settled, inside);
                     r_out.push_str(&r);
@@ -775,7 +901,8 @@ mod tests {
                     fed_raw += settled.len();
                 }
                 let vis_tail = &vis_split[fed_vis..];
-                let ready = &vis_tail[..vis_tail.len() - Codec.unsettled_in_visible(vis_tail)];
+                let ready =
+                    &vis_tail[..vis_tail.len() - Codec.unsettled_in_visible(vis_tail)];
                 if !ready.is_empty() {
                     let v = Codec.parse_tool_calls(ready).0;
                     assert!(!v.contains(CALL_OPEN), "streamed an opener: {v:?}");
@@ -786,8 +913,14 @@ mod tests {
             // The tail flush: whatever was still held when generation ended.
             let (r_final, body) = Codec.split_channels(text, false);
             let (v_final, _) = Codec.parse_tool_calls(&body);
-            assert!(v_final.starts_with(&v_out), "visible was not a growing prefix: {v_out:?}");
-            assert!(r_final.starts_with(&r_out), "reasoning was not a growing prefix: {r_out:?}");
+            assert!(
+                v_final.starts_with(&v_out),
+                "visible was not a growing prefix: {v_out:?}"
+            );
+            assert!(
+                r_final.starts_with(&r_out),
+                "reasoning was not a growing prefix: {r_out:?}"
+            );
         }
     }
 
@@ -799,5 +932,35 @@ mod tests {
         // a FULL marker in the text is not a partial one
         assert_eq!(partial_marker_len("x<channel|>", CHANNEL_CLOSE), 0);
         assert_eq!(partial_marker_len("", CHANNEL_OPEN), 0);
+    }
+}
+
+#[cfg(test)]
+mod tool_protocol_regressions {
+    use super::*;
+    #[test]
+    fn partial_nested_and_quoted_marker_arguments() {
+        let partial = "前🙂<|tool_call>call:f{a:1";
+        assert_eq!(parse_tool_calls(partial), (partial.into(), vec![]));
+        let text = r#"前<|tool_call>call:f{a:{"x":1,"s":"},["},b:<|"|>杭州,<tool_call|><|"|>}<tool_call|>后"#;
+        let (visible, calls) = parse_tool_calls(text);
+        assert_eq!(visible, "前后");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].1).unwrap(),
+            serde_json::json!({"a":{"x":1,"s":"},["},"b":"杭州,<tool_call|>"})
+        );
+    }
+    #[test]
+    fn tool_result_name_comes_from_previous_call_id() {
+        let messages = [
+            serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_1","function":{"name":"lookup","arguments":"{}"}}]}),
+            serde_json::json!({"role":"tool","tool_call_id":"call_1","content":"晴"}),
+        ];
+        assert!(render(&messages, &[], true).contains("response:lookup{"));
+        assert!(
+            !render(&[messages[1].clone(), messages[0].clone()], &[], true)
+                .contains("response:lookup{")
+        );
     }
 }

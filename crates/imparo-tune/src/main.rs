@@ -255,6 +255,54 @@ fn external_candidate_membership(
     }
 }
 
+/// The mega grid's LIMIT (task #203), measured on this model's pipeline family AT EVERY
+/// WIDTH the sweep may set, in the same quiet moment as the device facts. Admission is per
+/// (pipeline, threads per threadgroup): a limit taken at 16 simdgroups says nothing about
+/// 32, and a grid under the wrong width's limit timed out at a barrier and stalled the
+/// display for the failsafe's spin cap. The backend keeps every measurement for the
+/// registry's `candidates` / `legal`; none is a device fact (each is this kernel's register
+/// footprint on this GPU), so none is stored -- every tune measures, the engine never needs it.
+fn probe_mega_admission(
+    sp: &Space,
+    architecture: &str,
+    facts: &imparo_backend::ModelFacts,
+    profile: &imparo_backend::DeviceProfile,
+) {
+    if facts.mega_seat == imparo_backend::MegaSeat::None {
+        return;
+    }
+    let Some(width) = sp.reg.iter().find(|d| d.name == "mega_nsg") else {
+        return;
+    };
+    let seat = (width.current)();
+    let mut widths = width
+        .candidates
+        .map_or_else(|| width.values.to_vec(), |f| f(facts, profile));
+    if !widths.contains(&seat) {
+        widths.push(seat);
+    }
+    for nsg in widths {
+        (width.apply)(nsg);
+        // One pipeline per attention geometry (slot 0 the smaller head dim, slot 1 the
+        // larger): each has its own footprint, its own limit and its own knob.
+        for slot in 0..2u32 {
+            let n = sp.ops.mega_admission(architecture, slot);
+            if n == 0 {
+                if slot == 0 {
+                    println!(
+                        "  mega admission at {nsg} simdgroups: not measured; the one-per-core floor is the only candidate"
+                    );
+                }
+            } else {
+                println!(
+                    "  mega admission at {nsg} simdgroups: slot {slot} of the {architecture} layer pipeline holds {n} threadgroups resident"
+                );
+            }
+        }
+    }
+    (width.apply)(seat);
+}
+
 /// A stored request can become illegal when init discovers the device's limits.
 /// Accept a backend adjustment only when the existing legality hook explains BOTH
 /// sides: the request cannot run here, and the readback can. A legal value lost by
@@ -334,7 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let first = args.next().ok_or(
         "usage: imparo-tune MODEL.gguf [--kv f16|q8_0|q4_0] [--out FILE] [--knob NAME] \
          [--emit-candidate] [--external-candidate NAME=VALUE] \
-         [--allow-bit-changes] [--explain] [--discover-only] | --print-fingerprint",
+         [--hold-bit-changes] [--explain] [--discover-only] | --print-fingerprint",
     )?;
     // --kv: which cache type to tune FOR. It must be set before the backend initialises,
     // because the quantized attention pipelines are built at init from it -- a process
@@ -374,9 +422,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // materializes one registry-validated candidate selected by an external whole-model
     // experiment; it still has no runtime authority until receipt sealing succeeds.
     let mut external_candidates: Vec<ExternalCandidate> = Vec::new();
-    // Knobs that can change output BITS are held at their incumbent unless asked for.
-    // The tuner ranks on time; it cannot see accuracy, so trading it must be a choice.
-    let mut allow_bits = false;
+    // Knobs that can change output BITS are swept like the others. The tuner ranks on
+    // time and cannot see accuracy, so a sweep of these obliges the caller to re-lay the
+    // pins and re-run the agreement gates -- the verbose run says so. They used to be held
+    // at their incumbent unless asked for, and a new quant of an already-tuned model then
+    // started its decode-attention seats at the compiled defaults (attn_vec_max_keys 1024
+    // where the same geometry had measured 16384: 8.2 against 8.6 tok/s at 5646 keys on
+    // Qwen3.8-27B, 2026-09-11); sweeping by default was the user's call. --hold-bit-changes
+    // restores the hold for a run that must not move bits.
+    let mut allow_bits = true;
     // --explain: print the knowledge the declarations carry, and stop. If the registry
     // really holds what decides what, against which evidence, it should be readable
     // without reading the source.
@@ -412,7 +466,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--kv" => {
                 let _ = args.next();
             }
-            "--allow-bit-changes" => allow_bits = true,
+            "--allow-bit-changes" => allow_bits = true, // the old opt-in, now the default
+            "--hold-bit-changes" => allow_bits = false,
             "--explain" => explain = true,
             "--discover-only" => discover_only = true,
             _ => {}
@@ -438,7 +493,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         external_candidate_membership(declaration, external.value, None)?;
         if declaration.bit_affecting && !allow_bits {
             return Err(format!(
-                "--external-candidate {} changes output bits; add --allow-bit-changes",
+                "--external-candidate {} changes output bits and --hold-bit-changes is set",
                 external.name
             )
             .into());
@@ -476,8 +531,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if target.bit_affecting && !allow_bits {
             return Err(format!(
-                "--knob {k} can change output bits; rerun with --allow-bit-changes and \
-                 re-run numerical gates"
+                "--knob {k} can change output bits and --hold-bit-changes is set; rerun \
+                 without it and re-run numerical gates"
             )
             .into());
         }
@@ -538,6 +593,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .unwrap_or(0);
     let shapes = micro::Shapes {
         activation: imparo_model::backend::model_activation(&plan)?.epilogue(),
+        // Resolved below, once the bench extension says whether the workflow offers entries.
+        mega_seat: imparo_backend::MegaSeat::None,
+        mega_layers: Vec::new(),
         n_experts,
         n_embd: c.n_embd,
         n_ff: c.n_ff,
@@ -673,7 +731,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The layer tensors spread over `blk_bytes`; the lm-head, the largest GEMV of a
     // token, gets its own region after them at its real size (it does not fit in a
     // layer's slot: 278 MB on LFM2, 377 MB on E4B).
-    let blk_bytes = widest.max(256 << 20);
+    // Never at offset 0: the mega entry bridge reads offset 0 as the absent-weight sentinel
+    // (`w_absent`) and refuses the entry, so the spread starts one alignment unit in and
+    // the region carries that unit extra.
+    const SYNTHETIC_TENSOR_ALIGNMENT: usize = 256;
+    let blk_bytes = widest.max(256 << 20) + SYNTHETIC_TENSOR_ALIGNMENT;
     let lm_head_info: Option<(u64, u32, u32, u32, usize)> =
         ["output.weight", "token_embd.weight"]
             .iter()
@@ -692,6 +754,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some((blk_bytes as u64, ne0 as u32, ne1 as u32, kind as u32, bytes))
             });
     let wbytes = blk_bytes + lm_head_info.map_or(0, |h| (h.4 + 16383) & !16383);
+    // ONE ZERO ROW for every norm weight the mega entries name (task #203): a norm's cost
+    // does not depend on its values, and the rows are kilobytes. Past the lm-head region,
+    // 16 KB aligned like the rest of the blob; never offset 0 (the absent-weight sentinel).
+    let norm_off = wbytes as u64;
+    let wbytes =
+        wbytes + ((4 * shapes.n_embd.max(shapes.n_ff) as usize + 16383) & !16383);
     let layout = std::alloc::Layout::from_size_align(wbytes, 16384)
         .map_err(|e| format!("synthetic weight layout: {e}"))?;
     // SAFETY: freshly allocated, 16 KB aligned, and it outlives every use below.
@@ -803,13 +871,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     unsupported.push(format!("{n}(ggml={})", t.ggml_type));
                     return None;
                 };
-                let span = (blk_bytes as u64) / (names.len().max(1) as u64);
+                let align = SYNTHETIC_TENSOR_ALIGNMENT as u64;
+                let span = (blk_bytes as u64 - align) / (names.len().max(1) as u64);
                 // cudaMalloc supplies at least 256-byte alignment and the packed MMQ
                 // kernels preserve that tensor-base contract. Spreading synthetic
                 // tensors at arbitrary byte offsets violated the contract for nonzero
                 // prefill projections (decode MMVQ happened to tolerate it).
-                const SYNTHETIC_TENSOR_ALIGNMENT: u64 = 256;
-                let off = ((i as u64) * span) & !(SYNTHETIC_TENSOR_ALIGNMENT - 1);
+                let off = align + (((i as u64) * span) & !(align - 1));
                 // THE SIZE COMES FROM THE LAYOUT TABLE, not from a match on the kind.
                 // It was a literal 18 (Q4_0), which under-counts a Q8_0 tensor by 89% --
                 // 34 bytes per 32 values -- so the bounds check below admitted an offset
@@ -852,7 +920,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lookup_tensor("ffn_down"),
     ) {
         (Some(gate), Some(up), Some(down))
-            if matches!(gate.3, 1 | 2 | 3)
+            if matches!(gate.3, 1..=3)
                 && gate.3 == up.3
                 && up.3 == down.3
                 && gate.1 == shapes.n_embd
@@ -892,9 +960,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layers
         .iter()
         .filter_map(|layer| match layer.attention {
-            imparo_model::Attention::Recurrent { r_elems, s_elems, .. } => {
-                Some((r_elems, s_elems))
-            }
+            imparo_model::Attention::Recurrent {
+                r_elems, s_elems, ..
+            } => Some((r_elems, s_elems)),
             _ => None,
         })
     {
@@ -928,6 +996,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // THE MEGA ENTRIES for the decode-step workload (task #203): one per layer over the
+    // synthetic offsets above; empty when this architecture's bench has no builder, and
+    // the grid knobs then keep their incumbent (the sweep says so).
+    let mega_layers: Vec<imparo_backend::MegaLayer<'static>> =
+        mbench.mega_layers.map_or_else(Vec::new, |build| {
+            build(&knobs::MegaBenchInputs {
+                plan: &plan,
+                lookup: &lookup_tensor,
+                norm_off,
+            })
+        });
     if !unsupported.is_empty() {
         println!(
             "  decode_mix: {} tensor(s) dropped, no kernel for their quant type: {}",
@@ -974,6 +1053,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  weight kinds present: mask {weight_kinds:#05b}, wide projections {wide_kind}"
     );
+    // WHAT THE MEGA GRID SEAT GOVERNS HERE (task #203): the workflow must offer entries at
+    // all (the bench extension mirrors that), and the backend says which form they run in.
+    let mega_seat = if mbench.mega_entries {
+        sp.ops.mega_seat_form(&arch_name)
+    } else {
+        imparo_backend::MegaSeat::None
+    };
+    println!(
+        "mega seat: {mega_seat:?} (workflow entries={}, backend form)",
+        mbench.mega_entries
+    );
+    // WHICH LAYERS EACH GRID KNOB GOVERNS on this model. The knobs are named by head-dim
+    // order (the registry is one static list for every model), so the resolution is
+    // printed here: slot 0 is the smallest attention head dim, slot 1 the next.
+    if mega_seat != imparo_backend::MegaSeat::None {
+        let mut dims: Vec<(u32, usize)> = Vec::new();
+        for &(hd, _) in &shapes.attn_layers {
+            match dims.iter_mut().find(|(d, _)| *d == hd) {
+                Some((_, n)) => *n += 1,
+                None => dims.push((hd, 1)),
+            }
+        }
+        dims.sort_unstable();
+        let slots: Vec<String> = ["mega_tgs", "mega_tgs_large"]
+            .iter()
+            .zip(&dims)
+            .map(|(name, (hd, n))| format!("{name} = hd {hd} ({n} layers)"))
+            .collect();
+        println!("mega grid slots: {}", slots.join(", "));
+    }
     let shapes = micro::Shapes {
         decode_mix,
         lm_head,
@@ -984,6 +1093,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         layer_dispatches: mbench.layer_dispatches,
         weight_kinds,
         wide_kind,
+        mega_seat,
+        mega_layers,
         ..shapes
     };
 
@@ -998,6 +1109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_layers: shapes.n_layers,
         layer_dispatches: shapes.layer_dispatches,
         weight_kinds: shapes.weight_kinds,
+        mega_seat: shapes.mega_seat,
     };
     let limits = sp.ops.device_profile();
     if let Some(stored) = stored_config.as_ref() {
@@ -1037,6 +1149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if explain {
         let profile = discover::profile(sp.ops, false);
+        probe_mega_admission(&sp, &arch_name, &facts, &profile);
         explain_registry(sp.reg, &facts, &profile);
         tuner_mode.close()?;
         return Ok(());
@@ -1052,6 +1165,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let measured = discover::profile(sp.ops, true);
     sp.ops.validate_tuner_profile(&measured)?;
     store_device_profile(sp.tag, &measured)?;
+    probe_mega_admission(&sp, &arch_name, &facts, &measured);
+    // A STORED SEAT THE LIMIT NOW EXCLUDES. The incumbent was captured from the applied
+    // file before discovery; a limit measured just now (the mega grid's admission is this
+    // kernel's footprint on this GPU, so a kernel change can lower it under a stored
+    // value) makes that seat illegal, and a sweep must never dispatch an illegal
+    // incumbent. Re-seat it at the ladder's first legal rung and say so.
+    let mut incumbent = incumbent;
+    for (i, d) in sp.reg.iter().enumerate() {
+        let Some(legal) = d.legal else { continue };
+        let seated = incumbent.vals[i];
+        if legal(seated, &facts, &measured) {
+            continue;
+        }
+        let ladder = match d.candidates {
+            Some(f) => f(&facts, &measured),
+            None => d.values.to_vec(),
+        };
+        let Some(rung) = ladder.into_iter().find(|v| legal(*v, &facts, &measured))
+        else {
+            return Err(format!(
+                "stored seat {}={seated} is illegal after discovery and the ladder has no \
+                 legal rung",
+                d.name
+            )
+            .into());
+        };
+        (d.apply)(rung);
+        incumbent.vals[i] = (d.current)();
+        println!(
+            "stored seat {}={seated} is illegal after discovery; seated {} (running {})",
+            d.name, rung, incumbent.vals[i]
+        );
+    }
     if discover_only || !had_profile {
         if had_profile {
             println!("ALL device profile written; no knob swept (--discover-only)");
@@ -1134,7 +1280,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         only_knob.as_deref().map_or(
             "micro-benches only (no end-to-end search)".to_string(),
             |name| {
-                format!("single {name} micro-bench; all other knobs compiled defaults")
+                let seats = if stored_config.is_some() {
+                    "inherited stored seats (unspecified knobs use compiled defaults)"
+                } else {
+                    "compiled defaults"
+                };
+                format!("single {name} micro-bench; all other knobs {seats}")
             },
         )
     } else {
@@ -1287,6 +1438,7 @@ mod stored_seat_tests {
                 workload: Workload::DecodeMix,
             },
             ModelFacts {
+                mega_seat: imparo_backend::MegaSeat::None,
                 n_embd: 2048,
                 n_ff: 10752,
                 n_head: 32,
@@ -1429,14 +1581,15 @@ fn explain_registry(
 ) {
     use imparo_backend::SweepKind as Sw;
     println!(
-        "\nMODEL   n_embd={} n_ff={} heads={} kv={} head_dim={} deep={} experts={}",
+        "\nMODEL   n_embd={} n_ff={} heads={} kv={} head_dim={} deep={} experts={} mega_seat={:?}",
         facts.n_embd,
         facts.n_ff,
         facts.n_head,
         facts.n_kv,
         facts.head_dim,
         facts.deep_head_dim,
-        facts.n_experts
+        facts.n_experts,
+        facts.mega_seat
     );
     println!(
         "DEVICE  threadgroup={} B  threads={}  accumulators={}  cache_knee={} MB  dram={} MB/s",
@@ -1467,6 +1620,7 @@ fn explain_registry(
             Sw::Values => "swept",
             Sw::Crossing { .. }
             | Sw::TokenMinCrossing { .. }
+            | Sw::TokenMaxCrossing { .. }
             | Sw::SpanCrossing { .. } => "boundary",
         };
         let regime = match d.sweep {
@@ -1476,6 +1630,7 @@ fn explain_registry(
             // would state something the code does not do.
             Sw::Crossing { .. }
             | Sw::TokenMinCrossing { .. }
+            | Sw::TokenMaxCrossing { .. }
             | Sw::SpanCrossing { .. } => "own ladder".to_string(),
             Sw::Values => format!("{:?}", d.workload),
         };
@@ -1507,13 +1662,17 @@ fn explain_registry(
         }
         if matches!(
             d.sweep,
-            Sw::Crossing { .. } | Sw::TokenMinCrossing { .. } | Sw::SpanCrossing { .. }
+            Sw::Crossing { .. }
+                | Sw::TokenMinCrossing { .. }
+                | Sw::TokenMaxCrossing { .. }
+                | Sw::SpanCrossing { .. }
         ) {
             notes.push("defines a regime".into());
         }
         let rungs = match d.sweep {
             Sw::Crossing { .. }
             | Sw::TokenMinCrossing { .. }
+            | Sw::TokenMaxCrossing { .. }
             | Sw::SpanCrossing { .. } => "own ladder".to_string(),
             Sw::Derived => "-".to_string(),
             Sw::External | Sw::Values => {

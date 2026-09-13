@@ -121,7 +121,12 @@ impl Canonical {
                 self.u32(rope_dim);
                 self.u32(window);
             }
-            Attention::Recurrent { r_elems, s_elems, key_dim, value_dim } => {
+            Attention::Recurrent {
+                r_elems,
+                s_elems,
+                key_dim,
+                value_dim,
+            } => {
                 self.u8(2);
                 self.u32(r_elems);
                 self.u32(s_elems);
@@ -271,6 +276,8 @@ mod tests {
             weight_residency: WeightResidencyPlan {
                 row_gathered: TABLES,
             },
+            decode_interleave: true,
+            mega_decode: true,
             layers: vec![
                 LayerPlan {
                     index: 0,

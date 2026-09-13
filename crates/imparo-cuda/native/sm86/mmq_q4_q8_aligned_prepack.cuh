@@ -59,6 +59,41 @@ inline bool launch_pack_q4_equal_size(
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
+// Byte-preserving vector packing: Q4 records are two-byte aligned, while
+// their split nibble plane is sixteen-byte aligned. Avoid eighteen independent
+// byte memory operations per record without changing either weight layout.
+__global__ void pack_q4_equal_size_vector(
+        const uint8_t * __restrict__ raw, uint8_t * __restrict__ packed,
+        uint32_t n_in, uint32_t n_out) {
+    const uint32_t blocks = n_in / 32;
+    const uint64_t records = uint64_t(n_out) * blocks;
+    const uint64_t logical = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (logical >= records) return;
+    const uint32_t row = uint32_t(logical / blocks);
+    const uint32_t kb = uint32_t(logical - uint64_t(row) * blocks);
+    const uint64_t physical = packed_record_index(row, kb, n_in);
+    const auto * source = reinterpret_cast<const uint16_t *>(raw + logical * 18);
+    reinterpret_cast<uint16_t *>(packed)[physical] = source[0];
+    reinterpret_cast<uint4 *>(packed + records * 2)[physical] = make_uint4(
+        uint32_t(source[1]) | (uint32_t(source[2]) << 16),
+        uint32_t(source[3]) | (uint32_t(source[4]) << 16),
+        uint32_t(source[5]) | (uint32_t(source[6]) << 16),
+        uint32_t(source[7]) | (uint32_t(source[8]) << 16));
+}
+
+inline bool launch_pack_q4_equal_size_vector(
+        const uint8_t * raw, uint8_t * packed,
+        uint32_t n_in, uint32_t n_out, cudaStream_t stream) {
+    if (!raw || !packed || (reinterpret_cast<uintptr_t>(raw) & 1u)
+            || (reinterpret_cast<uintptr_t>(packed) & 15u)
+            || !((n_in == 2560 && n_out == 10240)
+                || (n_in == 10240 && n_out == 2560))) return false;
+    const uint64_t records = uint64_t(n_out) * (n_in / 32);
+    pack_q4_equal_size_vector<<<uint32_t((records + 255) / 256), 256, 0, stream>>>(
+        raw, packed, n_in, n_out);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 template <bool FullK>
 __device__ __forceinline__ void compute_segment(
         const uint16_t * __restrict__ scales16,

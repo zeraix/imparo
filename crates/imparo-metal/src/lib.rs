@@ -58,13 +58,15 @@ pub fn decode_probe_for_tests(
     scales: &[u8],
     payload: &[u8],
     n_elems: usize,
+    half: bool,
 ) -> Result<Vec<f32>, i32> {
     // The probe needs the device and the compiled library, which `imparo_metal_init`
     // builds; the process runs one model, so this init is the test's model.
     static ONCE: std::sync::Once = std::sync::Once::new();
     static DUMMY: [u8; 64] = [0; 64];
     ONCE.call_once(|| {
-        let rc = unsafe { imparo_metal_init(DUMMY.as_ptr().cast(), DUMMY.len() as u64) };
+        let rc =
+            unsafe { imparo_metal_init(DUMMY.as_ptr().cast(), DUMMY.len() as u64) };
         assert!(rc == 0 || rc == 4, "metal init for the brick gate: rc={rc}");
     });
     let mut out = vec![0.0_f32; n_elems];
@@ -76,6 +78,7 @@ pub fn decode_probe_for_tests(
             payload.as_ptr().cast(),
             payload.len() as u64,
             u32::try_from(n_elems).map_err(|_| -1_i32)?,
+            u32::from(half),
             out.as_mut_ptr(),
         )
     };
@@ -100,6 +103,7 @@ unsafe extern "C" {
         payload: *const core::ffi::c_void,
         n_pay_bytes: u64,
         n_elems: u32,
+        as_half: u32,
         out: *mut f32,
     ) -> i32;
     fn imparo_metal_working_set_budget() -> u64;
@@ -220,8 +224,6 @@ unsafe extern "C" {
     fn imparo_metal_st_gemm_large_shape() -> u32;
     fn imparo_metal_set_q8_full_tiles(on: u32);
     fn imparo_metal_q8_full_tiles() -> u32;
-    fn imparo_metal_set_q8_gemv_max_tok(n: u32);
-    fn imparo_metal_q8_gemv_max_tok() -> u32;
     fn imparo_metal_set_q8_all(on: u32);
     fn imparo_metal_st_gemm_shapes() -> u32;
     fn imparo_metal_set_q8_design(v: u32);
@@ -278,6 +280,12 @@ unsafe extern "C" {
     fn imparo_metal_mega_nsg_current() -> u32;
     fn imparo_metal_mega_threads_limit() -> u32;
     fn imparo_metal_gpu_cores() -> u32;
+    fn imparo_metal_set_mega_tgs_large(v: u32);
+    fn imparo_metal_mega_tgs_large_current() -> u32;
+    fn imparo_metal_mega_admission(family: u32, slot: u32) -> u32;
+    fn imparo_metal_mega_admission_current(slot: u32) -> u32;
+    fn imparo_metal_mega_slot_present(slot: u32) -> u32;
+    fn imparo_metal_mega_seat_form(family: u32) -> u32;
     fn imparo_metal_mega_level() -> u32;
     fn imparo_metal_attn_fd_chunk_mask(hd: u32, share: u32) -> u32;
     fn imparo_metal_sgs_current() -> u32;
@@ -347,18 +355,6 @@ unsafe extern "C" {
     );
     fn imparo_metal_mega_layer(e: *const MegaEntryFfi) -> bool;
     fn imparo_metal_mega_wfmt(wkind: u32) -> u32;
-    fn imparo_metal_ffn_persistent(
-        gate_off: u64,
-        up_off: u64,
-        down_off: u64,
-        n_in: u32,
-        n_mid: u32,
-        n_out: u32,
-        src: u32,
-        gtmp: u32,
-        utmp: u32,
-        dst: u32,
-    ) -> bool;
     fn imparo_metal_matmat_gated(
         gate_kind: u32,
         gate_off: u64,
@@ -534,6 +530,11 @@ unsafe extern "C" {
         // The fused epilogue: IMPARO_NO_EPILOGUE in norm_w_off means "not fused".
         norm_w_off: u64,
         gate: u32,
+        // The boundary snapshot: NO_SNAP in `snap` means none, then the other two are
+        // ignored and the kernel writes nothing aside.
+        snap: u32,
+        snap_off: u32,
+        snap_row: u32,
     ) -> bool;
     fn imparo_metal_set_recurrent_dims(key_dim: u32, value_dim: u32);
     fn imparo_metal_supports_gated_delta() -> u32;
@@ -894,12 +895,6 @@ pub fn q8_design_legal(v: u32) -> bool {
 pub fn q8_designs() -> u32 {
     unsafe { imparo_metal_q8_designs() }
 }
-q8_knob!(
-    set_q8_gemv_max_tok,
-    q8_gemv_max_tok,
-    imparo_metal_set_q8_gemv_max_tok,
-    imparo_metal_q8_gemv_max_tok
-);
 /// Which of THIS MODEL's head dims take qcomb: one bit per dim it uses, bit i for the
 /// i-th. A clear bit falls through to qtile, whose head dim is dynamic.
 ///
@@ -978,11 +973,16 @@ pub fn attn_vec_max_keys() -> u32 {
     unsafe { imparo_metal_attn_vec_max_keys() }
 }
 
-/// Mega (persistent) block grid: threadgroups (knob `mega_tgs`) and simdgroups per
-/// threadgroup (knob `mega_nsg`). The host clamps both so that tgs * nsg * 32 stays within
-/// `mega_threads_limit` -- every threadgroup of the grid must be resident at once.
+/// Mega (persistent) block grid: threadgroups per PIPELINE SLOT (knob `mega_tgs` for the
+/// smaller attention geometry's pipeline, `mega_tgs_large` for the larger's; task #203) and
+/// simdgroups per threadgroup (knob `mega_nsg`, per family). The host clamps each so that
+/// tgs * nsg * 32 stays within `mega_threads_limit` -- every threadgroup of the grid must be
+/// resident at once.
 pub fn set_mega_tgs(v: u32) {
     unsafe { imparo_metal_set_mega_tgs(v) }
+}
+pub fn set_mega_tgs_large(v: u32) {
+    unsafe { imparo_metal_set_mega_tgs_large(v) }
 }
 pub fn set_mega_nsg(v: u32) {
     unsafe { imparo_metal_set_mega_nsg(v) }
@@ -990,6 +990,16 @@ pub fn set_mega_nsg(v: u32) {
 #[must_use]
 pub fn mega_tgs_current() -> u32 {
     unsafe { imparo_metal_mega_tgs_current() }
+}
+#[must_use]
+pub fn mega_tgs_large_current() -> u32 {
+    unsafe { imparo_metal_mega_tgs_large_current() }
+}
+/// Whether the library this process compiled has a mega pipeline at head-dim `slot` (1 = the
+/// model has a second attention geometry): the applicability of `mega_tgs_large`.
+#[must_use]
+pub fn mega_slot_present(slot: u32) -> bool {
+    unsafe { imparo_metal_mega_slot_present(slot) != 0 }
 }
 #[must_use]
 pub fn mega_nsg_current() -> u32 {
@@ -1006,7 +1016,34 @@ pub fn mega_threads_limit() -> u32 {
 pub fn gpu_cores() -> u32 {
     unsafe { imparo_metal_gpu_cores() }
 }
-/// IMPARO_MEGA_FFN level: 0 off, 1 the FFN block, 2 the FFN + PLE block.
+
+/// MEASURE how many threadgroups of `family`'s plain mega layer pipeline this GPU holds
+/// resident at the seated width, and remember it (task #203). The tuner's discovery step
+/// calls this between regions; 0 = no pipeline for the family, a region is open, or the
+/// probe could not run. The value is a measurement, not a constant: the two constants that
+/// stood in its place were each wrong on some machine (2*(cores-2) hung an M4 Pro,
+/// one-per-core cost an M3 Pro 2.6% of E4B decode at depth).
+pub fn mega_admission(family: u32, slot: u32) -> u32 {
+    unsafe { imparo_metal_mega_admission(family, slot) }
+}
+
+/// What the last `mega_admission` measured for the family it asked about, per pipeline
+/// slot, at the width it was measured at; 0 = nothing measured in this process (the registry
+/// then offers the one-per-core floor alone).
+#[must_use]
+pub fn mega_admission_current(slot: u32) -> u32 {
+    unsafe { imparo_metal_mega_admission_current(slot) }
+}
+
+/// Which form `family`'s mega entries run in: 0 = no pipeline, 1 = per-layer dispatches
+/// at the grid seat, 2 = the per-token program at one threadgroup per core (task #153's
+/// per-architecture default, or IMPARO_MEGA_PROGRAM).
+#[must_use]
+pub fn mega_seat_form(family: u32) -> u32 {
+    unsafe { imparo_metal_mega_seat_form(family) }
+}
+/// IMPARO_MEGA_FFN level: 0 off; 1 builds the pipelines but dispatches nothing (the stage-1
+/// FFN block that level once selected is gone, task #203); 2 the FFN + PLE block; up to 5.
 #[must_use]
 pub fn mega_level() -> u32 {
     unsafe { imparo_metal_mega_level() }
@@ -1154,6 +1191,9 @@ pub fn nr0_current() -> u32 {
 pub fn set_nb8_max(n: u32) {
     unsafe { imparo_metal_set_nb8_max(n) }
 }
+/// Where the GEMV ends, in every weight family: one row by the KV identity rule (the
+/// bridge clamps below 1). Not a registry knob; a diagnostic hook for IMPARO_GEMV_MAX
+/// and imparo-metalbench's kernel check.
 pub fn set_gemv_max_tok(n: u32) {
     unsafe { imparo_metal_set_gemv_max_tok(n) }
 }
@@ -1354,6 +1394,12 @@ pub fn working_set_budget() -> u64 {
     unsafe { imparo_metal_working_set_budget() }
 }
 
+/// Applies the device profile and the stored host configuration, then initialises the
+/// device with the weight mapping.
+///
+/// # Safety
+/// Same contract as [`init`]: `base` must point to `len` readable bytes that outlive
+/// every kernel, because Metal wraps the mapping without copying.
 pub unsafe fn init_tuned(base: *const u8, len: u64) -> Result<(), i32> {
     // The buffer table must be able to hold every BufId. Checked rather than assumed:
     // the two numbers live in different languages and an undersized table indexes out of
@@ -1676,8 +1722,9 @@ pub unsafe fn init_tuned(base: *const u8, len: u64) -> Result<(), i32> {
             unsafe { imparo_metal_set_nb8_shape(n) }
         }
     }
-    // GEMV boundary: batches of 2..N tokens take the GEMV. A/B override; the tuned
-    // value comes from hostconfig (v11).
+    // DIAGNOSTIC: batches of 2..N rows take the GEMV in every weight family. The shipped
+    // boundary is one row and is not tuned (g_gemv_max_tok in the bridge); this is the
+    // A/B that re-shows why -- chunk widths stop being byte-equal.
     if let Ok(v) = std::env::var("IMPARO_GEMV_MAX") {
         if let Ok(n) = v.parse::<u32>() {
             unsafe { imparo_metal_set_gemv_max_tok(n) }
@@ -2233,27 +2280,6 @@ pub fn mega_attn_wanted() -> bool {
 pub fn mega_front_wanted() -> bool {
     mega_level() >= 3
 }
-/// The mega FFN block (gate|up -> act*mul -> down as one persistent dispatch); false when the
-/// route is off (IMPARO_MEGA_FFN unset), unavailable, or disabled after a barrier timeout.
-#[allow(clippy::too_many_arguments)]
-pub fn ffn_persistent(
-    gate_off: u64,
-    up_off: u64,
-    down_off: u64,
-    n_in: u32,
-    n_mid: u32,
-    n_out: u32,
-    src: u32,
-    gtmp: u32,
-    utmp: u32,
-    dst: u32,
-) -> bool {
-    unsafe {
-        imparo_metal_ffn_persistent(
-            gate_off, up_off, down_off, n_in, n_mid, n_out, src, gtmp, utmp, dst,
-        )
-    }
-}
 pub fn matmat_gated(
     gate_kind: u32,
     gate_off: u64,
@@ -2577,8 +2603,10 @@ pub fn attention(
     max_scores: u32,
     ring: u32,
 ) {
-    attention_scaled(kv_layer, head_dim, n_heads, n_kv, kv_width, start_pos,
-        window, n_tok, max_scores, ring, 1.0);
+    attention_scaled(
+        kv_layer, head_dim, n_heads, n_kv, kv_width, start_pos, window, n_tok,
+        max_scores, ring, 1.0,
+    );
 }
 
 /// FA scales the scores after its half-Q dot product. Other routes retain prescaled Q.
@@ -2627,7 +2655,16 @@ pub fn causal_conv(
 ) {
     unsafe {
         imparo_metal_causal_conv(
-            form, src, w_off, state, state_off, state_out_off, out, width, kern, n_tok,
+            form,
+            src,
+            w_off,
+            state,
+            state_off,
+            state_out_off,
+            out,
+            width,
+            kern,
+            n_tok,
         );
     }
 }
@@ -2655,7 +2692,6 @@ pub fn causal_conv_snapshot(
 /// The gated delta rule; see `Backend::delta_net`. False when the pipeline was not built
 /// or was built for other head widths, and then nothing is written.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn delta_net(
     qkv: u32,
     alpha: u32,
@@ -2676,14 +2712,40 @@ pub fn delta_net(
     // (then `gate` is ignored and the rule writes `out` as before).
     norm_w_off: u64,
     gate: u32,
+    // The boundary snapshot: the buffer that receives the matrix after `snap_row` tokens
+    // (at element offset `snap_off`), or `NO_SNAP` when no boundary falls in the batch.
+    snap: u32,
+    snap_off: u32,
+    snap_row: u32,
 ) -> bool {
     unsafe {
         imparo_metal_delta_net(
-            qkv, alpha, beta, a_off, dt_off, state, state_off, state_out_off, out,
-            k_heads, v_heads, key_dim, value_dim, n_tok, eps, norm_w_off, gate,
+            qkv,
+            alpha,
+            beta,
+            a_off,
+            dt_off,
+            state,
+            state_off,
+            state_out_off,
+            out,
+            k_heads,
+            v_heads,
+            key_dim,
+            value_dim,
+            n_tok,
+            eps,
+            norm_w_off,
+            gate,
+            snap,
+            snap_off,
+            snap_row,
         )
     }
 }
+
+/// `snap` for a `delta_net` call with no boundary inside the batch. Not a buffer id.
+pub const NO_SNAP: u32 = u32::MAX;
 
 /// `norm_w_off` for a `delta_net` call with no fused epilogue. Not a valid weight offset:
 /// the same all-ones sentinel the norm kernels use for "this row has no weight".
@@ -2736,7 +2798,14 @@ pub fn mul_strided_sigmoid(
 }
 
 /// One sub-block out of every row; see `Backend::copy_strided`.
-pub fn copy_strided(dst: u32, src: u32, width: u32, src_off: u32, src_stride: u32, n_row: u32) {
+pub fn copy_strided(
+    dst: u32,
+    src: u32,
+    width: u32,
+    src_off: u32,
+    src_stride: u32,
+    n_row: u32,
+) {
     unsafe { imparo_metal_copy_strided(dst, src, width, src_off, src_stride, n_row) }
 }
 pub fn add(a: u32, b: u32, n: u32) {
@@ -2904,7 +2973,7 @@ pub fn ple_gather_combine_staged(
     unsafe {
         imparo_metal_ple_gather_combine_staged(
             proj, rows, width, emb_scale, comb_scale, n_tok,
-        )
+        );
     }
 }
 

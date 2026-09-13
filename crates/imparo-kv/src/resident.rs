@@ -63,6 +63,7 @@ pub fn set_scrambled_tables(
     geom: &[LayerStateGeom],
     slots: usize,
     capacity: usize,
+    identity: bool,
 ) {
     // Clamped to CAPACITY: buffers are sized min(kv_round(pos), capacity), so a
     // swap must never map into blocks the allocation clamped away (the first
@@ -73,8 +74,7 @@ pub fn set_scrambled_tables(
         if !matches!(geom.kind, StateKind::Full) {
             continue;
         }
-        let ident = std::env::var("IMPARO_SCRAMBLE_IDENTITY").is_ok();
-        let table = scrambled_page_table(backed, ident);
+        let table = scrambled_page_table(backed, identity);
         be.set_kv_page_table(geom.layer, &table);
     }
 }

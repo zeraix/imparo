@@ -16,7 +16,9 @@ EXPORTS
     imparo_cuda_begin
     imparo_cuda_begin_forward
     imparo_cuda_set_batch_geometry
+    imparo_cuda_set_materialized_prefill_tail
     imparo_cuda_decode_prepare
+    imparo_cuda_verification_body_begin
     imparo_cuda_prefill_prepare
     imparo_cuda_flush
     imparo_cuda_end
@@ -56,6 +58,7 @@ EXPORTS
     imparo_cuda_knob
     imparo_cuda_buf_count
     imparo_cuda_matmat
+    imparo_cuda_matmat_output_prefix
     imparo_cuda_matmat_gated
     imparo_cuda_ffn_gated_down
     imparo_cuda_matmat_pair
@@ -74,6 +77,7 @@ EXPORTS
     imparo_cuda_kv_store
     imparo_cuda_kv_dequant
     imparo_cuda_attention
+    imparo_cuda_matmat_shortconv
     imparo_cuda_shortconv
     imparo_cuda_shortconv_snapshot
     imparo_cuda_silu
@@ -92,6 +96,7 @@ EXPORTS
     imparo_cuda_row
     imparo_cuda_rows
     imparo_cuda_ple_gather_combine
+    imparo_cuda_ple_gather_combine_prefix
     imparo_cuda_ple_norm_gather_combine
     imparo_cuda_program_pack_install
     imparo_cuda_program_catalog_identity
@@ -99,3 +104,4 @@ EXPORTS
     imparo_cuda_program_freeze
     imparo_cuda_program_launch
     imparo_cuda_program_reset
+    imparo_cuda_verify_greedy_and_restore

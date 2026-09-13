@@ -30,6 +30,12 @@ use std::process::Command;
 /// the file somewhere nobody looks. That is exactly what happened -- the tuner wrote
 /// `...space-v3.txt` while the server went on loading `...space-v2.txt`.
 ///
+/// v21 (Metal): REMOVED gemv_max_tok, q8_gemv_max_tok, q8_batch_sgs, q8_token_tile. The
+/// GEMV/GEMM boundary is one row in every weight family: the GEMV's k-order is not the
+/// GEMM's, so a boundary above one row made a prompt's K/V bytes depend on its chunk
+/// width (Qwen3.8-27B, batch 64 against 512 at n=2000), which the KV pool's identity
+/// contract forbids. The token tile the Q8 shape knobs ranked is unreachable by default.
+///
 /// v11: ADDED gemv_max_tok -- batches of 2..N tokens take the GEMV again. The v9
 /// forfeit is repaid: the multi-token GEMV's non-determinism was root-caused as the
 /// engine's own arena aliasing (overlapping ranges in distinct MTLBuffers, invisible

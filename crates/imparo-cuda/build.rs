@@ -62,7 +62,7 @@ fn track_native_sources(directory: &std::path::Path) {
             continue;
         }
         if path.extension().is_some_and(|extension| {
-            matches!(extension.to_str(), Some("cu" | "cuh" | "h" | "def"))
+            matches!(extension.to_str(), Some("cu" | "cuh" | "h" | "inc" | "def"))
         }) {
             println!("cargo:rerun-if-changed={}", path.display());
         }
@@ -166,8 +166,18 @@ fn main() {
         // Contributor/source builds retain the opt-in cuBLAS kernel laboratory.
         // Official per-SM release plugins omit this macro and therefore remain
         // driver-only instead of importing the CUDA Toolkit's cublas DLL.
-        "-DIMPARO_CUDA_ENABLE_CUBLAS_LAB=1".to_string(),
     ];
+    let owner_lab = std::env::var_os("CARGO_FEATURE_CUDA_OWNER_LAB").is_some();
+    let speculative =
+        owner_lab || std::env::var_os("CARGO_FEATURE_CUDA_SPECULATIVE").is_some();
+    if speculative {
+        args.push("-DIMPARO_CUDA_SPECULATIVE=1".to_string());
+    } else {
+        args.push("-DIMPARO_CUDA_ENABLE_CUBLAS_LAB=1".to_string());
+    }
+    if owner_lab {
+        args.push("-DIMPARO_CUDA_EXECUTION_OWNER_LAB=1".to_string());
+    }
     if program_smoke {
         // Hardware-smoke helpers are compile-time gated, absent from the release
         // export list, and never become part of the stable backend ABI.
@@ -257,6 +267,27 @@ fn main() {
                           (set NVCC to the compiler path)"
         ),
     }
+    // Keep the optional attention provider out of the main CUDA translation unit.
+    let mut objects = vec![obj.clone()];
+    if speculative {
+        let fa2_obj = format!("{out}/imparo_d64_fa2.{}", if win { "obj" } else { "o" });
+        let mut fa2_args = args[..args.len() - 4].to_vec();
+        fa2_args.extend([
+            "-c".to_string(),
+            "native/sm80/d64_fa2/dispatch.cu".to_string(),
+            "-o".to_string(),
+            fa2_obj.clone(),
+        ]);
+        let status = std::process::Command::new(&nvcc)
+            .args(&fa2_args)
+            .status()
+            .expect("nvcc attention provider");
+        assert!(
+            status.success(),
+            "nvcc attention provider failed with {status}"
+        );
+        objects.push(fa2_obj);
+    }
     // Archive with nvcc itself (-lib): works on MSVC where `ar` does not exist.
     let lib = if win {
         format!("{out}/imparo_cuda.lib")
@@ -264,7 +295,9 @@ fn main() {
         format!("{out}/libimparo_cuda.a")
     };
     let arc = std::process::Command::new(&nvcc)
-        .args(["-lib", &obj, "-o", &lib])
+        .arg("-lib")
+        .args(&objects)
+        .args(["-o", &lib])
         .status()
         .expect("nvcc -lib");
     assert!(arc.success(), "nvcc -lib failed");

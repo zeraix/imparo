@@ -1,4 +1,5 @@
 [package]
+autobins = false
 name = "imparo-model"
 version.workspace = true
 edition.workspace = true
@@ -27,6 +28,8 @@ cuda-dynamic = ["dep:imparo-cuda", "imparo-cuda/cuda-dynamic"]
 # every capture inserts synchronization/readback boundaries and is inadmissible timing
 # evidence by construction.
 cuda-gate0-capture = ["cuda"]
+cuda-speculative = ["cuda", "imparo-cuda/cuda-speculative"]
+cuda-owner-lab = ["cuda-speculative", "imparo-cuda/cuda-owner-lab"]
 [[bin]]
 name = "imparo-plan"
 path = "src/bin/imparo-plan.rs"

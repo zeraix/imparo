@@ -56,7 +56,8 @@ pub fn active() -> Option<&'static dyn Backend> {
     // `active()` still handed back the device backend, so a CPU run reached the GPU
     // arena path and died on an uninitialised device ("metal arena rc=3") instead of
     // running anywhere. Both spellings select the host backend here.
-    if std::env::var("IMPARO_BACKEND").is_ok_and(|v| v == "cpu") || !gpu_requested_from_env()
+    if std::env::var("IMPARO_BACKEND").is_ok_and(|v| v == "cpu")
+        || !gpu_requested_from_env()
     {
         static BE: imparo_cpu::CpuBackend = imparo_cpu::CpuBackend;
         return Some(with_page(&BE));
@@ -229,9 +230,8 @@ pub fn enable_gpu(
         let dims: Vec<u64> = t.ne[..t.n_dims as usize].to_vec();
         let runtime = crate::backend::runtime_weight_type(name, t.ggml_type, &dims);
         if !be.serves_weight_type(runtime) {
-            let named = |k: u32| {
-                imparo_gguf::tensor_layout(k).map(|l| l.name).unwrap_or("unknown")
-            };
+            let named =
+                |k: u32| imparo_gguf::tensor_layout(k).map_or("unknown", |l| l.name);
             let becomes = if runtime == t.ggml_type {
                 String::new()
             } else {
@@ -315,7 +315,9 @@ pub fn enable_gpu(
 /// When a rule needs more spans than the seam carries. A format the seam cannot describe
 /// must not be repacked at some other layout by accident.
 #[must_use]
-pub fn block_layout(rule: &imparo_gguf::weights::TmRule) -> imparo_backend::WeightBlockLayout {
+pub fn block_layout(
+    rule: &imparo_gguf::weights::TmRule,
+) -> imparo_backend::WeightBlockLayout {
     let pay = rule.payload_spans();
     let n = rule.scale_spans.len() + pay.len();
     assert!(
@@ -418,7 +420,8 @@ fn load_time_repack(
     let verify = std::env::var("IMPARO_LOAD_REPACK_VERIFY").is_ok_and(|v| v == "1");
     let mut n_applied = 0_usize;
     let mut bytes_applied = 0_u64;
-    let mut kinds: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut kinds: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
     for (i, job) in jobs.iter().enumerate() {
         if !applied[i] {
             continue;
@@ -595,4 +598,11 @@ mod tests {
                 .is_empty()
         );
     }
+}
+
+/// Static CUDA knob registry used when loading an explicit draft profile.
+#[cfg(feature = "cuda-speculative")]
+pub fn cuda_knob_registry() -> &'static [imparo_backend::KnobDecl] {
+    use imparo_backend::BackendKnobs as _;
+    imparo_cuda::CudaBackend.knob_registry()
 }

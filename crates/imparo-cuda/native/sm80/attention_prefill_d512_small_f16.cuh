@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 
 // Ampere D=64/D=256/D=512 Flash Attention for a tail of up to four query tokens.
 // chunking. The 16 query/head columns map to two cooperating warps. Key groups
@@ -11,6 +12,7 @@ namespace imparo_sm80_d512_small {
 
 constexpr uint32_t kQueryTokens = 4;
 constexpr uint32_t kGqaHeads = 4;
+// Keep the 16-column fragment/workspace ABI for both GQA2 and default GQA4.
 constexpr uint32_t kColumns = kQueryTokens * kGqaHeads;
 constexpr uint32_t kKeyBatch = 32;
 constexpr uint32_t kWarps = 2;
@@ -100,7 +102,7 @@ __device__ __forceinline__ __half2 cache_half2_q4_scaled(
         __float2half(fmaf(d, float(value1), -8.0f * d)));
 }
 
-__device__ __forceinline__ uint64_t block_stride(
+__host__ __device__ __forceinline__ uint64_t block_stride(
         uint32_t kv_span, uint32_t parts) {
     const uint32_t groups = (kv_span + kKeyBatch - 1) / kKeyBatch;
     return uint64_t(kColumns) * kv_span
@@ -128,17 +130,29 @@ __device__ __forceinline__ uint64_t meta_index(
 // Two warps cover the two 16-key halves for all 16 query/head columns. The
 // small reference configuration stages the complete D=512 K dimension at once,
 // so the MMA accumulator walks dimensions 0..511 in increasing order.
-template <uint32_t HeadDim, uint32_t CacheType>
+template <uint32_t HeadDim, uint32_t CacheType, uint32_t GqaHeads = kGqaHeads,
+          bool QueryGrid = false>
 __global__ void scores(
         const float * q, const void * kc, float * workspace,
         uint32_t block_base, uint32_t n_heads, uint32_t n_kv,
         uint32_t kv_width, uint32_t start_pos, float qk_scale, uint32_t window,
         uint32_t n_tok, uint32_t ring, uint32_t valid_span,
         uint32_t kv_span, uint32_t parts, const uint32_t * decode_control) {
+static_assert(GqaHeads == 2 || GqaHeads == 4, "small FA GQA factor");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (decode_control) {
         start_pos = decode_control[0];
         valid_span = ring ? min(start_pos + 1, ring + 1) : start_pos + 1;
+    }
+    if constexpr (QueryGrid) {
+        // Each z is an independent M1, including its own physical workspace row pitch.
+        const uint32_t plane_span = ring
+            ? min(valid_span + gridDim.z - 1, ring + 1) : kv_span;
+        workspace += uint64_t(blockIdx.z) * gridDim.x * block_stride(plane_span, parts);
+        q += uint64_t(blockIdx.z) * n_heads * HeadDim;
+        start_pos += blockIdx.z;
+        valid_span = ring ? min(start_pos + 1, ring + 1) : start_pos + 1;
+        if (ring) kv_span = valid_span;
     }
     const uint32_t local_block = blockIdx.x;
     const uint32_t kvh = block_base + local_block;
@@ -159,8 +173,8 @@ __global__ void scores(
         for (uint32_t e = lane; e < 16 * 8; e += 32) {
             const uint32_t qrow = e >> 3;
             const uint32_t pair = e & 7;
-            const uint32_t token = qrow / kGqaHeads;
-            const uint32_t head = kvh * kGqaHeads + qrow % kGqaHeads;
+            const uint32_t token = qrow / GqaHeads;
+            const uint32_t head = kvh * GqaHeads + qrow % GqaHeads;
             __half2 qv = __float2half2_rn(0.0f);
             if (token < n_tok && head < n_heads) {
                 const float * qr = q + ((uint64_t)token * n_heads + head) * HeadDim
@@ -192,7 +206,7 @@ __global__ void scores(
     for (uint32_t l = 0; l < 8; ++l) {
         const uint32_t column = imparo_sm80_prefill::fragment_q_column(lane, l);
         const uint32_t key = key0 + imparo_sm80_prefill::fragment_key_row(lane, l);
-        const uint32_t token = column / kGqaHeads;
+        const uint32_t token = column / GqaHeads;
         const uint32_t pos = start_pos + token;
         const uint32_t lo = window > 0 && pos + 1 > window ? pos + 1 - window : 0;
         const uint32_t key_pos = key < valid_span
@@ -214,7 +228,7 @@ __global__ void scores(
 #endif
 }
 
-template <uint32_t HeadDim, uint32_t CacheType>
+template <uint32_t HeadDim, uint32_t CacheType, uint32_t GqaHeads = kGqaHeads>
 __global__ void scores_paged(
         const float * q, const void * kc, float * workspace,
         uint32_t block_base, uint32_t n_heads, uint32_t n_kv,
@@ -222,6 +236,7 @@ __global__ void scores_paged(
         uint32_t n_tok, uint32_t ring, uint32_t valid_span,
         uint32_t kv_span, uint32_t parts, const uint32_t * decode_control,
         const uint32_t * page_table) {
+static_assert(GqaHeads == 2 || GqaHeads == 4, "small FA GQA factor");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (decode_control) {
         start_pos = decode_control[0];
@@ -246,8 +261,8 @@ __global__ void scores_paged(
         for (uint32_t e = lane; e < 16 * 8; e += 32) {
             const uint32_t qrow = e >> 3;
             const uint32_t pair = e & 7;
-            const uint32_t token = qrow / kGqaHeads;
-            const uint32_t head = kvh * kGqaHeads + qrow % kGqaHeads;
+            const uint32_t token = qrow / GqaHeads;
+            const uint32_t head = kvh * GqaHeads + qrow % GqaHeads;
             __half2 qv = __float2half2_rn(0.0f);
             if (token < n_tok && head < n_heads) {
                 const float * qr = q + ((uint64_t)token * n_heads + head) * HeadDim
@@ -281,7 +296,7 @@ __global__ void scores_paged(
     for (uint32_t l = 0; l < 8; ++l) {
         const uint32_t column = imparo_sm80_prefill::fragment_q_column(lane, l);
         const uint32_t key = key0 + imparo_sm80_prefill::fragment_key_row(lane, l);
-        const uint32_t token = column / kGqaHeads;
+        const uint32_t token = column / GqaHeads;
         const uint32_t pos = start_pos + token;
         const uint32_t lo = window > 0 && pos + 1 > window ? pos + 1 - window : 0;
         const uint32_t key_pos = key < valid_span
@@ -307,7 +322,7 @@ __global__ void scores_paged(
 // Each block owns one (partial, query column, 16-key warp partition). It scans
 // that partial's key groups online, recording the half-accumulator rescale used
 // before every subsequent PV MMA.
-__global__ void softmax_parts(
+__device__ __forceinline__ void softmax_parts_body(
         float * workspace, uint32_t kv_span, uint32_t parts) {
     const uint32_t local_block = blockIdx.x;
     const uint32_t warp = threadIdx.x >> 5;
@@ -390,20 +405,47 @@ __global__ void softmax_parts(
     }
 }
 
+// Original entry point and arithmetic remain available to normal/Graph launches.
+__global__ void softmax_parts(float * workspace, uint32_t kv_span, uint32_t parts) {
+    softmax_parts_body(workspace, kv_span, parts);
+}
+
+__global__ void softmax_parts_queries(float * workspace, uint32_t kv_span,
+        uint32_t parts, uint32_t valid_span, uint32_t ring) {
+    const uint32_t plane_span = ring
+        ? min(valid_span + gridDim.z - 1, ring + 1) : kv_span;
+    workspace += uint64_t(blockIdx.z) * gridDim.x * block_stride(plane_span, parts);
+    if (ring) kv_span = min(valid_span + blockIdx.z, ring + 1);
+    softmax_parts_body(workspace, kv_span, parts);
+}
+
 // Compute one half-MMA numerator per stream-K partial, combine its two warp
 // partitions, then reproduce the reference uniform fixup from the last partial
 // to the first. Each thread in warp 0 owns eight (query, output-row) cells.
-template <uint32_t HeadDim, uint32_t CacheType, uint32_t OutputTiles>
+template <uint32_t HeadDim, uint32_t CacheType, uint32_t OutputTiles,
+          uint32_t GqaHeads = kGqaHeads, bool QueryGrid = false, bool F32Numerator = false>
 __global__ void values_combine(
         const void * vc, const float * workspace, float * out,
         uint32_t block_base, uint32_t n_heads, uint32_t n_kv,
         uint32_t kv_width, uint32_t n_tok, uint32_t ring,
         uint32_t valid_span, uint32_t kv_span, uint32_t parts,
         const uint32_t * decode_control) {
+static_assert(GqaHeads == 2 || GqaHeads == 4, "small FA GQA factor");
+static_assert(!F32Numerator || (HeadDim == 512 && CacheType == 2 && GqaHeads == 2 && !QueryGrid),
+    "FP32 PV is qualified only for the Q4 D512 assistant");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (decode_control) {
         const uint32_t start_pos = decode_control[0];
         valid_span = ring ? min(start_pos + 1, ring + 1) : start_pos + 1;
+    }
+    if constexpr (QueryGrid) {
+        const uint32_t plane_span = ring
+            ? min(valid_span + gridDim.z - 1, ring + 1) : kv_span;
+        workspace += uint64_t(blockIdx.z) * gridDim.x * block_stride(plane_span, parts);
+        out += uint64_t(blockIdx.z) * n_heads * HeadDim;
+        valid_span = ring ? min(valid_span + blockIdx.z, ring + 1)
+                          : valid_span + blockIdx.z;
+        if (ring) kv_span = valid_span;
     }
     static_assert(HeadDim == 64 || HeadDim == 256 || HeadDim == 512,
         "small FA head dimension");
@@ -420,7 +462,8 @@ __global__ void values_combine(
     const uint64_t base = uint64_t(local_block) * block_stride(kv_span, parts);
     __shared__ __align__(16) __half2 p_tile[kWarps][16 * 8];
     __shared__ __align__(16) __half2 v_tile[kWarps][16 * 8];
-    __shared__ __align__(16) __half c_tile[kWarps][OutputTiles * 16 * 16];
+    using PartialValue = typename std::conditional<F32Numerator, float, __half>::type;
+    __shared__ __align__(16) PartialValue c_tile[kWarps][OutputTiles * 16 * 16];
     // Rescale and partial-softmax metadata are column properties, but every
     // output row consumes them. Stage each value once instead of issuing the
     // same global workspace load for every MMA accumulator cell.
@@ -432,12 +475,15 @@ __global__ void values_combine(
     float accum_max[OutputTiles][8]{};
 
     for (int32_t part = int32_t(parts) - 1; part >= 0; --part) {
-        imparo_sm80_prefill::Half16x8 c[OutputTiles];
+        using Numerator = typename std::conditional<F32Numerator,
+            imparo_sm80_prefill::Float16x16, imparo_sm80_prefill::Half16x8>::type;
+        Numerator c[OutputTiles];
 #pragma unroll
         for (uint32_t tile = 0; tile < OutputTiles; ++tile) {
 #pragma unroll
-            for (uint32_t l = 0; l < 4; ++l) {
-                c[tile].x[l] = __float2half2_rn(0.0f);
+            for (uint32_t l = 0; l < (F32Numerator ? 8u : 4u); ++l) {
+                if constexpr (F32Numerator) c[tile].x[l] = 0.0f;
+                else c[tile].x[l] = __float2half2_rn(0.0f);
             }
         }
         const uint32_t group_start = uint64_t(uint32_t(part)) * groups / parts;
@@ -470,12 +516,17 @@ __global__ void values_combine(
 #pragma unroll
                 for (uint32_t tile = 0; tile < OutputTiles; ++tile) {
 #pragma unroll
-                    for (uint32_t l = 0; l < 4; ++l) {
-                        const uint32_t column =
-                            imparo_sm80_prefill::half_acc_query_column(lane, l);
-                        const float scale = rescale_tile[partition][column];
-                        c[tile].x[l] = __hmul2(
-                            c[tile].x[l], __float2half2_rn(scale));
+                    for (uint32_t l = 0; l < (F32Numerator ? 8u : 4u); ++l) {
+                        if constexpr (F32Numerator) {
+                            const uint32_t column = imparo_sm80_mma::fragment_q_column(lane, l);
+                            c[tile].x[l] *= rescale_tile[partition][column];
+                        } else {
+                            const uint32_t column =
+                                imparo_sm80_prefill::half_acc_query_column(lane, l);
+                            const float scale = rescale_tile[partition][column];
+                            c[tile].x[l] = __hmul2(
+                                c[tile].x[l], __float2half2_rn(scale));
+                        }
                     }
                 }
             }
@@ -517,7 +568,8 @@ __global__ void values_combine(
                     probability, p_tile[warp], 8, lane);
                 imparo_sm80_prefill::load_half16x8_trans(
                     value, v_tile[warp], 8, lane);
-                imparo_sm80_prefill::mma_pv(c[tile], probability, value);
+                if constexpr (F32Numerator) imparo_sm80_mma::mma_qk(c[tile], probability, value);
+                else imparo_sm80_prefill::mma_pv(c[tile], probability, value);
                 if constexpr (OutputTiles > 1) {
                     if (tile + 1 < OutputTiles) __syncwarp();
                 }
@@ -544,15 +596,21 @@ __global__ void values_combine(
 #pragma unroll
         for (uint32_t tile = 0; tile < OutputTiles; ++tile) {
 #pragma unroll
-            for (uint32_t l = 0; l < 4; ++l) {
-                const uint32_t query =
-                    imparo_sm80_prefill::half_acc_query_column(lane, l);
-                const uint32_t out_pair =
-                    imparo_sm80_prefill::half_acc_output_pair(lane, l);
-                const uint32_t offset = tile * 16 * 16
-                    + query * 16 + 2 * out_pair;
-                c_tile[warp][offset] = __low2half(c[tile].x[l]);
-                c_tile[warp][offset + 1] = __high2half(c[tile].x[l]);
+            for (uint32_t l = 0; l < (F32Numerator ? 8u : 4u); ++l) {
+                if constexpr (F32Numerator) {
+                    const uint32_t query = imparo_sm80_mma::fragment_q_column(lane, l);
+                    const uint32_t output = imparo_sm80_mma::fragment_key_row(lane, l);
+                    c_tile[warp][tile * 16 * 16 + query * 16 + output] = c[tile].x[l];
+                } else {
+                    const uint32_t query =
+                        imparo_sm80_prefill::half_acc_query_column(lane, l);
+                    const uint32_t out_pair =
+                        imparo_sm80_prefill::half_acc_output_pair(lane, l);
+                    const uint32_t offset = tile * 16 * 16
+                        + query * 16 + 2 * out_pair;
+                    c_tile[warp][offset] = __low2half(c[tile].x[l]);
+                    c_tile[warp][offset + 1] = __high2half(c[tile].x[l]);
+                }
             }
         }
         if (lane < kColumns) {
@@ -579,10 +637,14 @@ __global__ void values_combine(
                     const float scale0 = expf(max0 - part_max);
                     const float scale1 = expf(max1 - part_max);
                     const uint32_t offset = tile * 16 * 16 + e;
-                    float part_num = fmaf(
-                        scale0, __half2float(c_tile[0][offset]), 0.0f);
-                    part_num = fmaf(
-                        scale1, __half2float(c_tile[1][offset]), part_num);
+                    float part_num;
+                    if constexpr (F32Numerator) {
+                        part_num = fmaf(scale0, c_tile[0][offset], 0.0f);
+                        part_num = fmaf(scale1, c_tile[1][offset], part_num);
+                    } else {
+                        part_num = fmaf(scale0, __half2float(c_tile[0][offset]), 0.0f);
+                        part_num = fmaf(scale1, __half2float(c_tile[1][offset]), part_num);
+                    }
                     float part_sum = scale0 * sum0;
                     part_sum = fmaf(scale1, sum1, part_sum);
 
@@ -610,8 +672,8 @@ __global__ void values_combine(
                         accum_max[tile][slot] = max_new;
                     }
                     if (part == 0) {
-                        const uint32_t token = column / kGqaHeads;
-                        const uint32_t head = kvh * kGqaHeads + column % kGqaHeads;
+                        const uint32_t token = column / GqaHeads;
+                        const uint32_t head = kvh * GqaHeads + column % GqaHeads;
                         if (token < n_tok && head < n_heads) {
                             out[((uint64_t)token * n_heads + head) * HeadDim
                                 + out0 + tile * 16 + output_row]
@@ -632,13 +694,15 @@ __global__ void values_combine(
 #endif
 }
 
-template <uint32_t HeadDim, uint32_t CacheType, uint32_t OutputTiles>
+template <uint32_t HeadDim, uint32_t CacheType, uint32_t OutputTiles,
+          uint32_t GqaHeads = kGqaHeads>
 __global__ void values_combine_paged(
         const void * vc, const float * workspace, float * out,
         uint32_t block_base, uint32_t n_heads, uint32_t n_kv,
         uint32_t kv_width, uint32_t n_tok, uint32_t ring,
         uint32_t valid_span, uint32_t kv_span, uint32_t parts,
         const uint32_t * decode_control, const uint32_t * page_table) {
+static_assert(GqaHeads == 2 || GqaHeads == 4, "small FA GQA factor");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (decode_control) {
         const uint32_t start_pos = decode_control[0];
@@ -855,8 +919,8 @@ __global__ void values_combine_paged(
                         accum_max[tile][slot] = max_new;
                     }
                     if (part == 0) {
-                        const uint32_t token = column / kGqaHeads;
-                        const uint32_t head = kvh * kGqaHeads + column % kGqaHeads;
+                        const uint32_t token = column / GqaHeads;
+                        const uint32_t head = kvh * GqaHeads + column % GqaHeads;
                         if (token < n_tok && head < n_heads) {
                             out[((uint64_t)token * n_heads + head) * HeadDim
                                 + out0 + tile * 16 + output_row]

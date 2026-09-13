@@ -409,7 +409,9 @@ pub fn config_root(
             // state whose shape is nothing like a KV row, so two models that differ only
             // in where their recurrent blocks sit, or in how much state those blocks
             // carry, must not hash the same.
-            Attention::Recurrent { r_elems, s_elems, .. } => {
+            Attention::Recurrent {
+                r_elems, s_elems, ..
+            } => {
                 geom.push(2);
                 geom.extend_from_slice(&r_elems.to_le_bytes());
                 geom.extend_from_slice(&s_elems.to_le_bytes());
@@ -636,7 +638,11 @@ use imparo_kv::{KvState, LayerStateGeom, StateKind};
 /// `plane` selects which of `Recur`'s planes holds the live state (task #165); `RecurSnap`
 /// is one plane and always takes 0.
 #[must_use]
-pub fn read_recurrent(elems: usize, from: imparo_backend::BufId, plane: u32) -> Vec<u8> {
+pub fn read_recurrent(
+    elems: usize,
+    from: imparo_backend::BufId,
+    plane: u32,
+) -> Vec<u8> {
     let off = u64::from(plane) * elems as u64;
     imparo_kv::state::capture_recurrent(backend(), elems, from, off)
 }
@@ -858,6 +864,10 @@ pub trait KvPoolMember {
     fn kv_capacity_blocks(&self) -> u32 {
         (self.kv_runtime().capacity / imparo_kv::page_cells()) as u32
     }
+    /// None is the unchanged legacy path; Some records physical window reach.
+    fn kv_window_reuse_allowed(&self, boundary: usize) -> Option<bool> {
+        self.state().window_history.allows(boundary)
+    }
     /// Declare the resume point without touching any state (bookkeeping after an external
     /// truncation decision).
     fn kv_set_filled(&mut self, filled: usize) {
@@ -921,6 +931,9 @@ pub trait KvPoolMember {
             self.plan().recurrent_elems() as usize,
         )?;
         self.recur_restored_to_plane0();
+        self.state()
+            .window_history
+            .restored(state, &self.kv_state_geometry());
         self.kv_note_restored_recurrent(state);
         self.kv_runtime_mut().filled = state.boundary;
         Ok(())
@@ -946,6 +959,7 @@ pub trait KvPoolMember {
     /// layers by region. `region` indexes the rings a windowed layer holds; region 0 is
     /// the single-ring layout, so a build with one region is byte-identical to none.
     fn kv_apply_region(&self, region: usize) {
+        self.state().window_history.select_region(region);
         let be = backend();
         for g in self.kv_state_geometry() {
             let StateKind::Window { ring, .. } = g.kind else {
@@ -968,6 +982,15 @@ pub trait KvPoolMember {
     /// conversation's state answering for another.
     fn kv_recurrent_note(&self) -> Option<(usize, Vec<u8>)> {
         let st = self.state();
+        if st.recur_ckpt_on_device {
+            // Still in `BufId::RecurSnap`; a switch is the moment to read it, before the
+            // next conversation's batch writes the buffer.
+            let n = self.plan().recurrent_elems() as usize;
+            return Some((
+                st.recur_ckpt_at,
+                read_recurrent(n, imparo_backend::BufId::RecurSnap, 0),
+            ));
+        }
         (!st.recur_ckpt.is_empty()).then(|| (st.recur_ckpt_at, st.recur_ckpt.clone()))
     }
 
@@ -996,6 +1019,7 @@ pub trait KvPoolMember {
             let st = self.state_mut();
             st.recur_ckpt_at = 0;
             st.recur_ckpt.clear();
+            st.recur_ckpt_on_device = false;
             return Ok(());
         };
         imparo_kv::state::restore_recurrent(backend(), n, &blob)?;
@@ -1003,6 +1027,7 @@ pub trait KvPoolMember {
         let st = self.state_mut();
         st.recur_ckpt_at = at;
         st.recur_ckpt = blob;
+        st.recur_ckpt_on_device = false;
         Ok(())
     }
 
@@ -1036,6 +1061,7 @@ pub trait KvPoolMember {
         let st = self.state_mut();
         st.recur_ckpt = blob;
         st.recur_ckpt_at = b;
+        st.recur_ckpt_on_device = false;
     }
 
     /// The recurrent snapshot a checkpoint at `boundary` must carry, or None when this
@@ -1060,6 +1086,9 @@ pub trait KvPoolMember {
                 imparo_backend::BufId::Recur,
                 self.state().recur_plane,
             ));
+        }
+        if boundary == self.state().recur_ckpt_at && self.state().recur_ckpt_on_device {
+            return Some(read_recurrent(n, imparo_backend::BufId::RecurSnap, 0));
         }
         if boundary == self.state().recur_ckpt_at && !self.state().recur_ckpt.is_empty()
         {
@@ -1132,6 +1161,9 @@ pub trait KvPoolMember {
             self.kv_install_recurrent(
                 (!state.recurrent.is_empty()).then(|| (0, state.recurrent.clone())),
             )?;
+            self.state()
+                .window_history
+                .restored(state, &self.kv_state_geometry());
             self.kv_set_filled(0);
             return Ok(());
         }
@@ -1148,17 +1180,22 @@ pub trait KvPoolMember {
             self.plan().recurrent_elems() as usize,
         )?;
         self.recur_restored_to_plane0();
+        self.state()
+            .window_history
+            .restored(state, &self.kv_state_geometry());
         self.kv_note_restored_recurrent(state);
         self.kv_runtime_mut().filled = state.boundary;
         Ok(())
     }
-    /// TEST INSTRUMENT: scatter placement so physical location must be invisible.
-    fn kv_set_scrambled_tables(&self) {
+    /// TEST INSTRUMENT: scatter placement so physical location must be invisible;
+    /// `identity` puts the tables back.
+    fn kv_set_scrambled_tables(&self, identity: bool) {
         set_scrambled_tables(
             backend(),
             &self.kv_state_geometry(),
             self.kv_runtime().slots,
             self.kv_runtime().capacity,
+            identity,
         );
     }
     /// Diagnostic: per-layer K/V value structure (IMPARO_KV_SCAN gates the caller).
@@ -1191,6 +1228,9 @@ macro_rules! pool_tenant_for {
             }
             fn backend(&self) -> Option<&'static dyn imparo_backend::Backend> {
                 crate::backend::active()
+            }
+            fn kv_window_reuse_allowed(&self, boundary: usize) -> Option<bool> {
+                KvPoolMember::kv_window_reuse_allowed(self, boundary)
             }
             fn kv_runtime(&self) -> &imparo_kv::state::KvRuntime {
                 KvPoolMember::kv_runtime(self)
@@ -1234,6 +1274,7 @@ macro_rules! pool_tenant_for {
 }
 
 pool_tenant_for!(dyn KvPoolMember + '_);
+pool_tenant_for!(dyn crate::Model + '_);
 pool_tenant_for!(dyn crate::Model + Send + '_);
 
 /// The active backend. The defaults above reach it here rather than taking it as an

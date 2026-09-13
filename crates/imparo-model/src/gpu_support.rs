@@ -78,6 +78,15 @@ pub(crate) fn gpu_probe_layer() -> usize {
     })
 }
 
+/// IMPARO_GPU_PROBE_ROW=last: the probes read the CHUNK'S LAST ROW instead of its first.
+/// Row 0 of a chunk is a different position for every chunk width, so two runs at different
+/// batch widths can only be compared at the last row of their final chunk, which is the
+/// same position in both. Read once, like the layer above.
+pub(crate) fn gpu_probe_last_row() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("IMPARO_GPU_PROBE_ROW").is_ok_and(|v| v == "last"))
+}
+
 /// Like `gprobe`, but the buffer holds HALVES: reads raw bits and decodes. `n` halves,
 /// `off_halves` must be even. `m::read` copies float-sized words, so a plain gprobe on a
 /// half buffer prints reinterpreted garbage -- which cost this session a wrong theory.
@@ -121,6 +130,7 @@ pub(crate) fn gprobe_half(name: &str, buf: BufId, off_halves: u64, n: usize) {
 /// not something to leave on.
 pub(crate) fn gprobe(name: &str, buf: BufId, off: u64, n: usize) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static VALUES: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("IMPARO_GPU_PROBE").is_ok()) {
         return;
     }
@@ -142,6 +152,20 @@ pub(crate) fn gprobe(name: &str, buf: BufId, off: u64, n: usize) {
             .wrapping_add(u64::from(x.to_bits()))
     });
     eprintln!("[gpu] {name}: ck={ck:016x}");
+    // IMPARO_GPU_PROBE_VALUES=<name> prints every value of that probe as its f32 bits in
+    // hex, in buffer order, so another engine's activations at the same point can be
+    // compared value by value (dev_harness/layer_agree.py). The line below shows five.
+    // It goes to stderr like every probe line: a probe writes no file.
+    let values = VALUES.get_or_init(|| std::env::var("IMPARO_GPU_PROBE_VALUES").ok());
+    if values.as_deref() == Some(name) {
+        let bits: Vec<String> =
+            v.iter().map(|x| format!("{:08x}", x.to_bits())).collect();
+        eprintln!(
+            "[gpu] values {name} L{} n={n}: {}",
+            gpu_probe_layer(),
+            bits.join(" ")
+        );
+    }
     let rms = (v
         .iter()
         .filter(|x| x.is_finite())
@@ -367,44 +391,83 @@ pub fn batch_floor(b_req: usize) -> usize {
     }
 }
 
-/// Size the arena, place the grouped buffers, allocate the dedicated ones, and hand back
-/// where everything landed.
-///
-/// Groups share bytes: the arena is sized to the LARGEST group, and every group starts at
-/// offset zero. IMPARO_NO_ARENA_OVERLAP lays them end to end instead, which is the A/B for
-/// whether an aliasing bug is an aliasing bug.
-/// The bytes `place_buffers` would allocate for `reqs`, without allocating: the arena (the
-/// largest group when groups overlap, their sum when they do not) plus every dedicated
-/// buffer, page-rounded the way the backend rounds. The activation term of the fast-tier
-/// reserve (docs/memory-tiers-and-fit.md section 2) is this number at the largest batch.
-#[must_use]
-pub fn layout_bytes(reqs: &[BufferRequirement]) -> u64 {
-    let overlap = std::env::var("IMPARO_NO_ARENA_OVERLAP").is_err();
-    let mut group_bytes: BTreeMap<u8, u64> = BTreeMap::new();
-    let mut dedicated = 0_u64;
-    for r in reqs {
-        match r.placement {
-            Placement::Group(g) => {
-                *group_bytes.entry(g).or_insert(0) += be().page_round(r.bytes);
-            }
-            Placement::Dedicated => dedicated += be().page_round(r.bytes),
-            Placement::Within { .. } => {}
-        }
-    }
-    let arena = if overlap {
-        group_bytes.values().copied().max().unwrap_or(0)
-    } else {
-        group_bytes.values().sum()
-    };
-    arena + dedicated
+/// One decision of `plan_layout` for one buffer, in the order `apply_layout` carries them out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Its own allocation.
+    Alloc,
+    /// A region of the arena: a group member laid out after its predecessors.
+    Place { offset: u64 },
+    /// An alias placed inside its host's region, at `host_off + skip`.
+    AliasPlace {
+        host: BufId,
+        slot: u8,
+        host_off: u64,
+        skip: u64,
+    },
+    /// An alias promoted to its own allocation: another group's bytes reach into the host.
+    AliasDedicated {
+        host: BufId,
+        slot: u8,
+        host_off: u64,
+        skip: u64,
+        others_reach: u64,
+    },
+    /// An alias that does not fit inside its host: nothing allocated, the backend's slower
+    /// path is still correct.
+    AliasSkipped {
+        host: BufId,
+        slot: u8,
+        skip: u64,
+        host_bytes: u64,
+    },
+    /// An alias whose host is not in the arena: nothing to alias into, nothing allocated.
+    AliasNoHost,
 }
 
-pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
-    let overlap = std::env::var("IMPARO_NO_ARENA_OVERLAP").is_err();
+/// One buffer of a `LayoutPlan`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub id: BufId,
+    pub bytes: u64,
+    pub action: Action,
+}
+
+/// The layout as decided, before anything is allocated.
+///
+/// ONE DERIVATION (task #194). The fit's activation reserve and the allocator used to compute
+/// the same number separately: `layout_bytes` summed the groups and the dedicated buffers and
+/// skipped every `Placement::Within`, while `place_buffers` promoted an alias that another
+/// group reaches into to a Dedicated allocation. On Qwen3.8-27B that left the reservation
+/// 34.2 MiB short of what the run then allocated -- and the fit promotes weights into the room
+/// it thinks it has, so the tier was oversubscribed by exactly that. Both now read this plan.
+#[derive(Clone, Debug)]
+pub struct LayoutPlan {
+    /// Bytes of the arena: the largest group when groups overlap, their sum when they do not.
+    pub arena: u64,
+    /// The arena plus every allocation, page-rounded the way the backend rounds.
+    pub bytes: u64,
+    /// Arena regions by buffer id: offset and length.
+    pub regions: BTreeMap<u32, (u64, u64)>,
+    pub steps: Vec<Step>,
+}
+
+/// Decide the layout of `reqs` without touching the backend.
+///
+/// Groups share bytes: the arena is sized to the LARGEST group and every group starts at
+/// offset zero; with `overlap` off they are laid end to end instead (IMPARO_NO_ARENA_OVERLAP),
+/// which is the A/B for whether an aliasing bug is an aliasing bug. `page` is the backend's
+/// page rounding, passed in so the plan can be checked without a device.
+#[must_use]
+pub fn plan_layout_with(
+    reqs: &[BufferRequirement],
+    overlap: bool,
+    page: &dyn Fn(u64) -> u64,
+) -> LayoutPlan {
     let mut group_bytes: BTreeMap<u8, u64> = BTreeMap::new();
     for r in reqs {
         if let Placement::Group(g) = r.placement {
-            *group_bytes.entry(g).or_insert(0) += be().page_round(r.bytes);
+            *group_bytes.entry(g).or_insert(0) += page(r.bytes);
         }
     }
     let arena = if overlap {
@@ -412,8 +475,6 @@ pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
     } else {
         group_bytes.values().sum()
     };
-    be().arena(arena)
-        .map_err(|rc| format!("metal arena rc={rc} (asked for {arena} bytes)"))?;
 
     // Where each group starts: zero when they share, cumulative when they do not.
     let mut group_start: BTreeMap<u8, u64> = BTreeMap::new();
@@ -425,22 +486,29 @@ pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
 
     let mut at: BTreeMap<u8, u64> = group_start;
     let mut regions = BTreeMap::new();
+    let mut steps = Vec::with_capacity(reqs.len());
     let mut bytes = arena;
     for r in reqs {
         match r.placement {
             Placement::Dedicated => {
-                bytes += be().page_round(r.bytes);
-                be().alloc(r.id, r.bytes)
-                    .map_err(|rc| format!("metal alloc {:?} failed rc={rc}", r.id))?;
+                bytes += page(r.bytes);
+                steps.push(Step {
+                    id: r.id,
+                    bytes: r.bytes,
+                    action: Action::Alloc,
+                });
             }
             Placement::Group(g) => {
                 let off = *at.get(&g).unwrap_or(&0);
-                be().place(r.id, off, r.bytes)
-                    .map_err(|rc| format!("metal place {:?} rc={rc}", r.id))?;
                 regions.insert(r.id as u32, (off, r.bytes));
-                at.insert(g, off + be().page_round(r.bytes));
+                at.insert(g, off + page(r.bytes));
+                steps.push(Step {
+                    id: r.id,
+                    bytes: r.bytes,
+                    action: Action::Place { offset: off },
+                });
             }
-            // Handled below: an alias needs the region it lands in to exist already.
+            // Decided below: an alias needs the region it lands in to exist already.
             Placement::Within { .. } => {}
         }
     }
@@ -457,9 +525,15 @@ pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
             continue;
         };
         let Some((host_off, host_bytes)) = regions.get(&(host as u32)).copied() else {
-            continue; // host was dedicated or forced out; nothing to alias into
+            // Host was dedicated or forced out; nothing to alias into.
+            steps.push(Step {
+                id: r.id,
+                bytes: r.bytes,
+                action: Action::AliasNoHost,
+            });
+            continue;
         };
-        let skip = be().page_round(r.bytes) * u64::from(slot);
+        let skip = page(r.bytes) * u64::from(slot);
         // AN ALIAS IS ONLY SAFE BEYOND EVERY OTHER GROUP'S END. Overlapping groups all
         // start at offset zero, so bytes inside one group's region are ALSO written by
         // any other group whose own region reaches that far -- being inside a host that
@@ -484,42 +558,152 @@ pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
             0
         };
         if host_off + skip < others_reach {
-            bytes += be().page_round(r.bytes);
-            be().alloc(r.id, r.bytes)
-                .map_err(|rc| format!("metal alloc {:?} failed rc={rc}", r.id))?;
-            if crate::log_on() {
-                eprintln!(
-                    "[imparo] alias {:?} slot {slot} DEDICATED: another group reaches \
-                     {others_reach} bytes, past {host_off}+{skip} inside {host:?}",
-                    r.id
-                );
-            }
+            bytes += page(r.bytes);
+            steps.push(Step {
+                id: r.id,
+                bytes: r.bytes,
+                action: Action::AliasDedicated {
+                    host,
+                    slot,
+                    host_off,
+                    skip,
+                    others_reach,
+                },
+            });
             continue;
         }
-        // A SKIPPED alias is invisible in the output -- the backend's slower path is
-        // still correct -- so it has to be visible in the log, or a performance cliff
-        // has no explanation. Absence of evidence is not evidence.
         if skip + r.bytes > host_bytes {
-            if crate::log_on() {
-                eprintln!(
-                    "[imparo] alias {:?} slot {slot} SKIPPED: {} + {} > {host_bytes} \
-                     inside {host:?}",
-                    r.id, skip, r.bytes
-                );
-            }
+            steps.push(Step {
+                id: r.id,
+                bytes: r.bytes,
+                action: Action::AliasSkipped {
+                    host,
+                    slot,
+                    skip,
+                    host_bytes,
+                },
+            });
             continue;
-        }
-        be().place(r.id, host_off + skip, r.bytes)
-            .map_err(|rc| format!("metal place {:?} rc={rc}", r.id))?;
-        if crate::log_on() {
-            eprintln!(
-                "[imparo] alias {:?} slot {slot} at {}+{skip} ({} bytes) inside {host:?}",
-                r.id, host_off, r.bytes
-            );
         }
         regions.insert(r.id as u32, (host_off + skip, r.bytes));
+        steps.push(Step {
+            id: r.id,
+            bytes: r.bytes,
+            action: Action::AliasPlace {
+                host,
+                slot,
+                host_off,
+                skip,
+            },
+        });
     }
-    Ok(Layout { regions, bytes })
+    LayoutPlan {
+        arena,
+        bytes,
+        regions,
+        steps,
+    }
+}
+
+/// `plan_layout_with` under the engine's own rules: the backend's page rounding and the
+/// IMPARO_NO_ARENA_OVERLAP switch.
+#[must_use]
+pub fn plan_layout(reqs: &[BufferRequirement]) -> LayoutPlan {
+    let overlap = std::env::var("IMPARO_NO_ARENA_OVERLAP").is_err();
+    plan_layout_with(reqs, overlap, &|b| be().page_round(b))
+}
+
+/// The bytes `place_buffers` would allocate for `reqs`, without allocating -- the plan's own
+/// count, so it includes an alias promoted to Dedicated. The activation term of the fast-tier
+/// reserve (docs/memory-tiers-and-fit.md section 2) is this number at the largest batch.
+#[must_use]
+pub fn layout_bytes(reqs: &[BufferRequirement]) -> u64 {
+    plan_layout(reqs).bytes
+}
+
+/// Carry a plan out: size the arena, place the grouped buffers and the aliases, allocate the
+/// dedicated ones, and hand back where everything landed. Every alias decision is logged
+/// here under IMPARO_LOG, because a skipped alias is invisible in the output -- the backend's
+/// slower path is still correct -- and a performance cliff with no explanation is worse than
+/// a log line. Absence of evidence is not evidence.
+///
+/// # Errors
+/// When the backend cannot allocate.
+pub fn apply_layout(plan: LayoutPlan) -> Result<Layout, String> {
+    be().arena(plan.arena).map_err(|rc| {
+        format!("metal arena rc={rc} (asked for {} bytes)", plan.arena)
+    })?;
+    for s in &plan.steps {
+        match s.action {
+            Action::Alloc => {
+                be().alloc(s.id, s.bytes)
+                    .map_err(|rc| format!("metal alloc {:?} failed rc={rc}", s.id))?;
+            }
+            Action::Place { offset } => {
+                be().place(s.id, offset, s.bytes)
+                    .map_err(|rc| format!("metal place {:?} rc={rc}", s.id))?;
+            }
+            Action::AliasDedicated {
+                host,
+                slot,
+                host_off,
+                skip,
+                others_reach,
+            } => {
+                be().alloc(s.id, s.bytes)
+                    .map_err(|rc| format!("metal alloc {:?} failed rc={rc}", s.id))?;
+                if crate::log_on() {
+                    eprintln!(
+                        "[imparo] alias {:?} slot {slot} DEDICATED: another group reaches \
+                         {others_reach} bytes, past {host_off}+{skip} inside {host:?}",
+                        s.id
+                    );
+                }
+            }
+            Action::AliasSkipped {
+                host,
+                slot,
+                skip,
+                host_bytes,
+            } => {
+                if crate::log_on() {
+                    eprintln!(
+                        "[imparo] alias {:?} slot {slot} SKIPPED: {} + {} > {host_bytes} \
+                         inside {host:?}",
+                        s.id, skip, s.bytes
+                    );
+                }
+            }
+            Action::AliasPlace {
+                host,
+                slot,
+                host_off,
+                skip,
+            } => {
+                be().place(s.id, host_off + skip, s.bytes)
+                    .map_err(|rc| format!("metal place {:?} rc={rc}", s.id))?;
+                if crate::log_on() {
+                    eprintln!(
+                        "[imparo] alias {:?} slot {slot} at {}+{skip} ({} bytes) inside {host:?}",
+                        s.id, host_off, s.bytes
+                    );
+                }
+            }
+            Action::AliasNoHost => {}
+        }
+    }
+    Ok(Layout {
+        regions: plan.regions,
+        bytes: plan.bytes,
+    })
+}
+
+/// Plan and carry out in one call: what every workflow's activation allocation uses.
+///
+/// # Errors
+/// When the backend cannot allocate.
+pub fn place_buffers(reqs: &[BufferRequirement]) -> Result<Layout, String> {
+    apply_layout(plan_layout(reqs))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -558,8 +742,8 @@ pub fn probe_first(label: &str) {
     }
 }
 
-/// Layers per command buffer for this forward: the tuner's seat, LOWERED when the
-/// last one held the GPU too long.
+/// Layers per command buffer for this forward: the tuner's seat, LOWERED so that no one
+/// buffer holds the device longer than the stall budget.
 ///
 /// A COMMAND BUFFER'S DURATION IS OTHERWISE UNBOUNDED IN MODEL SIZE. Every
 /// architecture encodes a whole prefill chunk into one buffer when the seat is 0, and
@@ -569,10 +753,34 @@ pub fn probe_first(label: &str) {
 /// exists for -- a 2026-09-09 run held one for over fifteen minutes and took the
 /// machine with it.
 ///
-/// THE SEAT STILL DECIDES SPEED; this only ever lowers it, and only after a
-/// measurement. `flush_layers` is swept by imparo-tune and stays the answer to "how
-/// many layers per buffer is fastest"; the bound is a separate question -- "how long
-/// may one buffer hold the device" -- and the two are kept apart on purpose.
+/// THE BOUND IS A TIME PER LAYER AT A WIDTH, NOT A LAYER COUNT. A buffer costs
+/// (layers in it) x (this model's GPU seconds per layer at this chunk width), and the
+/// second factor is what is unknown. It is measured when a prefill region ends
+/// (`prefill_region_ended`, from the region's longest buffer) and kept as the LARGEST
+/// per-layer time seen at the WIDEST width seen; a query at a narrower width takes that
+/// time as it is (a narrower chunk never costs a layer more than a wider one) and a
+/// wider query scales it by the width ratio (the compute-bound upper bound). So the
+/// bound only ever tightens for a given width, and a 2-token tail -- whose layer costs
+/// its weight read, not its two tokens -- cannot masquerade as a rate and shrink every
+/// later 512-token buffer to one layer.
+///
+/// Until 2026-09-11 the bound read the LAST region's longest buffer at the start of the
+/// next forward and lowered a layer count. That left the first region of every process
+/// unbounded (4.2-5.0 s in one buffer on the 27B), and the first chunk of every later
+/// request too, because the region before a prefill is a decode step whose buffers are
+/// milliseconds wide -- a single-chunk request was never bounded at all. Before its
+/// first measurement a process now splits the region into eight buffers: the first
+/// region's cost is unknown, the largest model this tree has run holds the device 5 s
+/// in one buffer, and eight boundaries cost about 2 ms on the smallest models'
+/// half-second regions, once per process. From the second region on the measurement
+/// decides. Regions a workflow ends without reporting (an early return) are folded in
+/// at the next call, one forward late.
+///
+/// THE SEAT STILL DECIDES SPEED; this only ever lowers it. `flush_layers` is swept by
+/// imparo-tune and stays the answer to "how many layers per buffer is fastest"; the bound
+/// is a separate question -- "how long may one buffer hold the device" -- and the two are
+/// kept apart on purpose. On the small models the measured time puts the cap above their
+/// layer count, so their seat (one buffer) is what runs after the first region.
 ///
 /// The budget is a POLICY, not a derivation, and is stated as one: 1000 ms by default,
 /// `IMPARO_CB_STALL_MS` to change it. Two things pin it rather than taste. It sits
@@ -583,23 +791,13 @@ pub fn probe_first(label: &str) {
 /// probe was run to find the point where a compositor actually starves: deliberately
 /// holding the GPU to find it is how this machine was hurt before.
 ///
-/// Decode is returned untouched. A decode buffer is one token, milliseconds wide, and
-/// was never the thing holding the device.
-pub fn flush_layers_bounded(decode: bool, layers: usize) -> usize {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    /// The cap this process has ratcheted to, or `usize::MAX` while none is needed.
-    ///
-    /// THE STATE IS THE DECISION, NOT THE SEAT. Deriving "layers per buffer" from the
-    /// seat on every call and then comparing the last measurement against the budget is
-    /// a control loop with no memory of its own output, and it oscillates: the clamp
-    /// brings the buffer under budget, the next call sees a healthy measurement, reverts
-    /// to one buffer, and the buffer is over budget again. Measured on Qwen3.8-27B before
-    /// this was a ratchet -- cbs 1 (4983 ms), 6 (830 ms), 1 (4969 ms) over three reps.
-    ///
-    /// It only ever tightens. Re-testing a safety bound by going back to a five-second
-    /// command buffer is the thing the bound exists to prevent.
-    static CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
-
+/// Decode (`b == 1`) is returned untouched. A decode buffer is one token, milliseconds
+/// wide, and was never the thing holding the device.
+pub fn flush_layers_bounded(b: u32, layers: usize) -> usize {
+    use std::sync::atomic::Ordering;
+    // A region the workflow ended without reporting is folded in here, one forward late.
+    prefill_region_ended();
+    let decode = b <= 1;
     let seat = be().flush_layers(decode) as usize;
     if decode || layers == 0 {
         return seat;
@@ -610,41 +808,104 @@ pub fn flush_layers_bounded(decode: bool, layers: usize) -> usize {
     } else {
         seat
     };
-    let mut cap = CAP.load(Ordering::Relaxed);
-    let effective = want_by_seat.min(cap);
-
-    let longest = be().longest_cb_gpu_seconds();
-    let budget = stall_budget_s();
-    if longest > budget && effective > 1 {
-        // The last region ran `effective` layers in `longest` seconds. Scale so the
-        // projection lands under the budget; never below one layer per buffer.
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation
-        )]
-        let tightened =
-            (((effective as f64) * budget / longest).floor() as usize).max(1);
-        if tightened < effective {
-            CAP.store(tightened, Ordering::Relaxed);
-            cap = tightened;
-            // Log every actual change, not only the first one: a later, tighter cap
-            // changes execution geometry and must remain visible in raw run logs.
-            // This branch runs only on a decrease; stable forwards do not log.
-            eprintln!(
-                "[imparo] one command buffer held the GPU for {:.0} ms over a \
-                 {:.0} ms budget; prefill flushes every {tightened} of {layers} \
-                 layers from here (previous effective {effective}; \
-                 IMPARO_CB_STALL_MS to change the budget)",
-                longest * 1e3,
-                budget * 1e3
-            );
-        }
-    }
+    let per_layer_s = prefill_layer_seconds_at(b);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    let cap = if per_layer_s > 0.0 {
+        ((stall_budget_s() / per_layer_s).floor() as usize).max(1)
+    } else {
+        layers.div_ceil(FIRST_REGION_BUFFERS).max(1)
+    };
     let out = want_by_seat.min(cap);
+    LAST_PREFILL_LPB.store(out.min(layers), Ordering::Relaxed);
+    LAST_PREFILL_B.store(b, Ordering::Relaxed);
     // The call sites read 0 as "one buffer for the whole forward"; say that when the
     // answer is the whole model, so an unbounded model keeps the seat it was tuned with.
     if out >= layers { seat } else { out }
+}
+
+/// Buffers the first prefill region of a process is split into, before any time has
+/// been measured. See `flush_layers_bounded`.
+const FIRST_REGION_BUFFERS: usize = 8;
+
+/// The reference measurement: the widest prefill chunk this process has run (tokens)
+/// and the largest GPU seconds one layer took in any region (f64 bits). 0 until the
+/// first region ends.
+static PREFILL_REF_B: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+static PREFILL_REF_LAYER_S: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// The geometry the last prefill forward was given -- layers per buffer and chunk width
+/// -- so its region can be read back when it ends. 0 layers = nothing pending.
+static LAST_PREFILL_LPB: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static LAST_PREFILL_B: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// The GPU seconds one layer is expected to take in a prefill chunk of `b` tokens: the
+/// reference time as it is up to the reference width, scaled by the width ratio above
+/// it. 0 while nothing has been measured.
+fn prefill_layer_seconds_at(b: u32) -> f64 {
+    use std::sync::atomic::Ordering;
+    let ref_b = PREFILL_REF_B.load(Ordering::Relaxed);
+    if ref_b == 0 {
+        return 0.0;
+    }
+    let t = f64::from_bits(PREFILL_REF_LAYER_S.load(Ordering::Relaxed));
+    if b <= ref_b {
+        t
+    } else {
+        t * f64::from(b) / f64::from(ref_b)
+    }
+}
+
+/// A prefill region has ended (after `be().end()`): its longest command buffer over the
+/// layers that buffer held is one layer's time at the region's width, and it joins the
+/// reference (widest width, largest time). A decode region, or one no prefill forward
+/// announced, leaves the reference alone. Every change of the reference is logged, so a
+/// later, tighter cap stays visible in raw run logs.
+pub fn prefill_region_ended() {
+    use std::sync::atomic::Ordering;
+    let lpb = LAST_PREFILL_LPB.swap(0, Ordering::Relaxed);
+    let b = LAST_PREFILL_B.load(Ordering::Relaxed);
+    if lpb == 0 || b == 0 {
+        return;
+    }
+    let longest = be().longest_cb_gpu_seconds();
+    if longest <= 0.0 {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let layer_s = longest / lpb as f64;
+    let old_b = PREFILL_REF_B.load(Ordering::Relaxed);
+    let old_t = f64::from_bits(PREFILL_REF_LAYER_S.load(Ordering::Relaxed));
+    let new_b = old_b.max(b);
+    let new_t = old_t.max(layer_s);
+    if new_b == old_b && new_t <= old_t {
+        return;
+    }
+    PREFILL_REF_B.store(new_b, Ordering::Relaxed);
+    PREFILL_REF_LAYER_S.store(new_t.to_bits(), Ordering::Relaxed);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    let cap_at_ref =
+        ((stall_budget_s() / prefill_layer_seconds_at(new_b)).floor() as usize).max(1);
+    eprintln!(
+        "[imparo] prefill buffer bound: {lpb} layers x {b} tokens held the GPU {:.0} ms in \
+         one buffer ({:.1} ms per layer); reference now {:.1} ms per layer at {new_b} \
+         tokens, so a buffer there may hold {cap_at_ref} layers under the {:.0} ms budget \
+         (IMPARO_CB_STALL_MS)",
+        longest * 1e3,
+        layer_s * 1e3,
+        new_t * 1e3,
+        stall_budget_s() * 1e3
+    );
 }
 
 /// How long one command buffer may hold the device. See `flush_layers_bounded`.
@@ -734,11 +995,45 @@ impl<A: Architecture> Workflow<A> {
     /// When the backend cannot allocate.
     /// Returns the bytes it allocated, so a caller that wants to report the footprint
     /// does not run the placement a second time to find out.
+    // Capacity belongs to allocation, not mathematical batch width or output demand.
+    // The opt-in observer lease retains exactly the already required M3 layout:
+    // batch_floor(3) is unchanged, and prefill/capture-off retain normal shrinking.
+    fn activation_layout_request(&self, rows: usize) -> (usize, crate::OutputDemand) {
+        if (1..=3).contains(&rows)
+            && self
+                .state
+                .layer_outputs
+                .as_ref()
+                .is_some_and(crate::layer_outputs::LayerOutputCapture::active)
+            && std::env::var("IMPARO_LAB_SPEC_ACTIVATION_CAP").as_deref() == Ok("3")
+        {
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[imparo] speculative activation capacity=3 tile_rows={} logits_rows=3",
+                    batch_floor(3)
+                );
+            }
+            (3, crate::OutputDemand::AllTokens)
+        } else {
+            (rows, self.state.output_demand)
+        }
+    }
+
     pub fn gpu_alloc_activations(&mut self, b_req: usize) -> Result<u64, String> {
-        let b = batch_floor(b_req);
-        let reqs = A::buffer_requirements(&self.plan, b, self.state.kv_rt.capacity);
+        let (layout_rows, layout_demand) = self.activation_layout_request(b_req);
+        let b = batch_floor(layout_rows);
+        let reqs = A::buffer_requirements_for_output(
+            &self.plan,
+            b,
+            self.state.kv_rt.capacity,
+            layout_demand,
+            layout_rows,
+        )?;
         let layout = place_buffers(&reqs)?;
-        self.state.gpu_batch = b_req;
+        self.state.gpu_batch = layout_rows;
+        self.state.gpu_all_logits = layout_demand.requires_all_positions();
         Ok(layout.total_bytes())
     }
 
@@ -747,7 +1042,10 @@ impl<A: Architecture> Workflow<A> {
     /// # Errors
     /// When the backend cannot allocate.
     pub fn gpu_fit_batch(&mut self, b: usize) -> Result<(), String> {
-        if b == self.state.gpu_batch {
+        let (layout_rows, layout_demand) = self.activation_layout_request(b);
+        if layout_rows == self.state.gpu_batch
+            && self.state.gpu_all_logits == layout_demand.requires_all_positions()
+        {
             return Ok(());
         }
         let was = self.state.gpu_batch;
@@ -773,7 +1071,9 @@ impl<A: Architecture> Workflow<A> {
             return Ok(());
         }
         crate::host::log_footprint("before gpu prepare");
-        self.gpu_prepare(crate::prefill_batch())?;
+        let ring_batch = crate::prefill_batch();
+        let initial_batch = self.state.initial_gpu_batch.take().unwrap_or(ring_batch);
+        self.gpu_prepare_initial(ring_batch, initial_batch)?;
         self.state.kv_rt.slots = crate::kv::KV_FIRST_SLOTS;
         self.state.gpu_ready = true;
         Ok(())
@@ -784,13 +1084,24 @@ impl<A: Architecture> Workflow<A> {
     /// # Errors
     /// When the architecture has no device forward, or the backend cannot allocate.
     pub fn gpu_prepare(&mut self, max_batch: usize) -> Result<(), String> {
+        self.gpu_prepare_initial(max_batch, max_batch)
+    }
+
+    fn gpu_prepare_initial(
+        &mut self,
+        max_batch: usize,
+        initial_batch: usize,
+    ) -> Result<(), String> {
+        if initial_batch == 0 || initial_batch > max_batch {
+            return Err("initial activation width exceeds the prefill bound".into());
+        }
         if !A::DEVICE {
             return Err(crate::no_device_workflow(&self.plan));
         }
         // Set BEFORE any kv_bytes_for call: it sizes the windowed rings, and a ring cannot
         // be resized later without invalidating every position already mapped into it.
         self.state.kv_ring_batch = max_batch;
-        let act_bytes = self.gpu_alloc_activations(max_batch)?;
+        let act_bytes = self.gpu_alloc_activations(initial_batch)?;
 
         // Per-conversation recurrent state: allocated ONCE, from the plan, and never
         // resized -- it is constant in context. Outside `buffer_requirements` on purpose:
@@ -817,17 +1128,19 @@ impl<A: Architecture> Workflow<A> {
             .map_err(|rc| format!("metal mega scratch reserve rc={rc}"))?;
         let recur = self.plan.recurrent_elems();
         if recur > 0 {
-            // PLANES, not one buffer plus a rollback copy: a decode step reads one plane and
-            // writes the next, so the plane it read IS its pre-step state and a failure is
-            // undone by not advancing an index. Same bytes as the old Recur plus its
-            // two-slot rollback copy, and no per-step copy at all (task #165).
-            be().alloc(BufId::Recur, u64::from(recur) * 4 * u64::from(imparo_backend::RECUR_PLANES))
-                .map_err(|rc| format!("metal alloc recurrent state rc={rc}"))?;
+            // Use the same negotiated plane count as the decode cursors. Backends
+            // with rolling state keep the pre-step plane for rollback; a fixed-state
+            // graph backend executes in place in its single admitted plane.
+            be().alloc(
+                BufId::Recur,
+                u64::from(recur) * 4 * u64::from(self.state.recur_planes),
+            )
+            .map_err(|rc| format!("metal alloc recurrent state rc={rc}"))?;
             // The snapshot twin, same size: where the state at a boundary INSIDE a batch
             // is written. See `arm_recurrent_snapshot`.
             be().alloc(BufId::RecurSnap, u64::from(recur) * 4)
                 .map_err(|rc| format!("metal alloc recurrent snapshot rc={rc}"))?;
-
+            self.state.gpu_recur_snap_slots = 1;
             self.zero_recurrent();
             if crate::log_on() {
                 eprintln!(
@@ -854,21 +1167,22 @@ impl<A: Architecture> Workflow<A> {
         // Footprint once read 452 MiB against a hand estimate of ~138, and guessing at
         // the difference is how you optimise the wrong thing.
         // The recurrent state was missing from this line, and on Qwen3.8-27B that is not a
-        // rounding error: 149.62 MiB of state becomes 598.5 MiB of allocation (RECUR_PLANES
-        // planes so a failed step is undone by not advancing an index, plus one boundary
+        // rounding error: 149.62 MiB of state became 598.5 MiB of allocation (three planes
+        // so a failed step is undone by not advancing an index, plus one boundary
         // snapshot), which read as 600 MiB of unexplained growth between two footprint
         // stages. A line that omits an allocation invites exactly the guessing the comment
         // above forbids, so it names every one.
         let kv_total: u64 = kv_bytes.iter().sum::<u64>() * 2; // K and V
         let recur = u64::from(self.plan.recurrent_elems()) * 4;
-        let recur_total = recur * u64::from(imparo_backend::RECUR_PLANES) + recur;
+        let planes = self.state.recur_planes;
+        let recur_total = recur * u64::from(planes) + recur;
         let mib = |b: u64| b as f64 / (1 << 20) as f64;
         eprintln!(
-            "[imparo] gpu alloc: kv={:.1} MiB activations={:.1} MiB recurrent={:.1} MiB              ({} planes + snapshot of {:.1}) (max_batch={max_batch})",
+            "[imparo] gpu alloc: kv={:.1} MiB activations={:.1} MiB recurrent={:.1} MiB              ({} planes + snapshot of {:.1}) (max_batch={max_batch}, initial_batch={initial_batch})",
             mib(kv_total),
             act_bytes as f64 / (1 << 20) as f64,
             mib(recur_total),
-            imparo_backend::RECUR_PLANES,
+            planes,
             mib(recur)
         );
         // LAST, because it is the last thing load owes the device: every allocation above
@@ -907,20 +1221,25 @@ impl<A: Architecture> Workflow<A> {
     /// numbers.
     ///
     /// THE BACKEND FILLS; THE HOST DOES NOT BUILD THE ZEROS. This used to allocate a host
-    /// `Vec<f32>` of `recurrent_elems * RECUR_PLANES`, fault every page of it in, and
+    /// `Vec<f32>` of `recurrent_elems * planes`, fault every page of it in, and
     /// memcpy it across. On Qwen3.8-27B that is a gigabyte of state, and it cost 3374 ms
     /// on the first conversation and 65 ms on every one after -- all of it to produce a
     /// source operand whose value is known. `Backend::zero` fills the buffer in place.
-    pub fn zero_recurrent(&self) {
+    pub fn zero_recurrent(&mut self) {
         let n = self.plan.recurrent_elems() as u64;
         if n > 0 {
-            be().zero(BufId::Recur, 0, n * u64::from(imparo_backend::RECUR_PLANES));
+            be().zero(BufId::Recur, 0, n * u64::from(self.state.recur_planes));
             // The snapshot twin too. A layer kind writes only the part of the state it
             // owns -- a short convolution writes its history and nothing else -- so any
             // region no snapshot dispatch covers would be read back as whatever the
             // allocation happened to contain. LFM2 has no such region (s_elems = 0); a
             // gated-delta-rule model would.
             be().zero(BufId::RecurSnap, 0, n);
+            // A note that lived only in that buffer is gone with it.
+            if self.state.recur_ckpt_on_device {
+                self.state.recur_ckpt_on_device = false;
+                self.state.recur_ckpt.clear();
+            }
         }
     }
 
@@ -930,8 +1249,13 @@ impl<A: Architecture> Workflow<A> {
     /// A checkpoint for a boundary cannot be read off the device afterwards -- the live
     /// buffer holds only "now". The batch therefore writes it aside as it passes, and
     /// `state.recur_snap` is how the model's graph is told to: `Some(k)` means "the
-    /// boundary is k tokens into this batch", and the graph dispatches one extra
-    /// state-shaped kernel into `BufId::RecurSnap`.
+    /// boundary is k tokens into this batch". Every state-holding kernel then writes
+    /// its part of the state as of row k into `BufId::RecurSnap`: the short convolution
+    /// through an extra state-shaped dispatch, the delta rule in passing (its matrix
+    /// lives in registers for the batch). A snapshot is the WHOLE recurrent state or it
+    /// is not one: a checkpoint carrying the conv history alone restored Qwen3.8-27B
+    /// with an all-zero matrix, and the adopting conversation answered differently from
+    /// its first token.
     ///
     /// ```text
     /// chunk grid 512, unit grid 256, an 800-token prefill:
@@ -955,18 +1279,39 @@ impl<A: Architecture> Workflow<A> {
             .then(|| u32::try_from(last - at).expect("chunk fits u32"));
     }
 
-    /// Reads back what the armed batch wrote aside, and disarms.
+    /// Notes what the armed batch wrote aside, and disarms.
     ///
     /// Called after the batch whatever happened, so an armed flag never survives into a
     /// batch that was not told about it -- a stale `Some(k)` would have the next graph
     /// snapshot a boundary that is not there.
+    ///
+    /// A synchronous decode leaves the bytes on the device (`recur_ckpt_on_device`) for
+    /// the checkpoint or switch that asks; an interleaved one reads them back here,
+    /// because a queued step it later discards may overwrite the buffer.
     pub fn take_recurrent_snapshot(&mut self, at: usize) {
         let Some(k) = self.state.recur_snap.take() else {
             return;
         };
         let n = self.plan.recurrent_elems() as usize;
-        self.state.recur_ckpt = crate::kv::read_recurrent(n, BufId::RecurSnap, 0);
         self.state.recur_ckpt_at = at + k as usize;
+        if !self.plan.decode_interleave {
+            self.state.recur_ckpt.clear();
+            self.state.recur_ckpt_on_device = true;
+            return;
+        }
+        let t = std::time::Instant::now();
+        self.state.recur_ckpt = crate::kv::read_recurrent(n, BufId::RecurSnap, 0);
+        self.state.recur_ckpt_on_device = false;
+        // Under IMPARO_PROF, so the readback is attributed: it runs at every grid boundary
+        // a decode crosses (every 64 tokens) and blocks the host until the bytes are in.
+        if std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1") {
+            eprintln!(
+                "[prof] recurrent snapshot readback {:.1} MiB in {:.1} ms at boundary {}",
+                n as f64 * 4.0 / (1u64 << 20) as f64,
+                t.elapsed().as_secs_f64() * 1e3,
+                self.state.recur_ckpt_at
+            );
+        }
     }
 
     /// Reads back a summary of the device KV, for the drift instruments.
@@ -1009,4 +1354,168 @@ pub(crate) fn tail_align() -> u32 {
 /// A probe, not a knob: it changes nothing but stderr.
 pub(crate) fn layer_skip_log() -> bool {
     std::env::var("IMPARO_LAYER_SKIP_LOG").is_ok_and(|v| v == "1")
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    const PAGE: u64 = 16384;
+    fn page(b: u64) -> u64 {
+        b.div_ceil(PAGE) * PAGE
+    }
+    fn req(id: BufId, bytes: u64, placement: Placement) -> BufferRequirement {
+        BufferRequirement {
+            id,
+            bytes,
+            placement,
+        }
+    }
+
+    /// The #194 defect: an alias another group reaches into is promoted to its own
+    /// allocation by the allocator, and the reserve has to count it. The mixer group (1) is
+    /// larger than the host's group (0), so the alias at offset 0 of the host sits inside
+    /// bytes group 1 also writes.
+    #[test]
+    fn a_promoted_alias_is_counted_in_the_plan_bytes() {
+        let reqs = [
+            req(BufId::X, 1 << 20, Placement::Group(0)),
+            req(BufId::Cur, 3 << 20, Placement::Group(1)),
+            req(
+                BufId::Q,
+                512 << 10,
+                Placement::Within {
+                    host: BufId::X,
+                    slot: 0,
+                },
+            ),
+        ];
+        let plan = plan_layout_with(&reqs, true, &page);
+        assert_eq!(plan.arena, 3 << 20, "the arena is the largest group");
+        assert_eq!(
+            plan.bytes,
+            (3 << 20) + page(512 << 10),
+            "the promoted alias is allocated"
+        );
+        assert!(matches!(
+            plan.steps.iter().find(|s| s.id == BufId::Q).unwrap().action,
+            Action::AliasDedicated { host: BufId::X, slot: 0, host_off: 0, skip: 0, others_reach } if others_reach == 3 << 20
+        ));
+        assert!(
+            !plan.regions.contains_key(&(BufId::Q as u32)),
+            "a dedicated alias has no arena region"
+        );
+    }
+
+    /// Hosted in the largest group AND past every other group's end (group 0 reaches 1 MiB,
+    /// slot 2 of a 512 KiB alias starts at 1 MiB), the alias costs nothing and lands inside
+    /// its host. Slot 1 would start at 512 KiB, inside group 0's reach, and be promoted.
+    #[test]
+    fn an_alias_past_every_other_groups_reach_is_free() {
+        let reqs = [
+            req(BufId::X, 1 << 20, Placement::Group(0)),
+            req(BufId::Cur, 3 << 20, Placement::Group(1)),
+            req(
+                BufId::Q,
+                512 << 10,
+                Placement::Within {
+                    host: BufId::Cur,
+                    slot: 2,
+                },
+            ),
+        ];
+        let plan = plan_layout_with(&reqs, true, &page);
+        assert_eq!(plan.bytes, 3 << 20);
+        assert_eq!(
+            plan.regions.get(&(BufId::Q as u32)).copied(),
+            Some((1 << 20, 512 << 10))
+        );
+        assert!(matches!(
+            plan.steps.iter().find(|s| s.id == BufId::Q).unwrap().action,
+            Action::AliasPlace { host: BufId::Cur, slot: 2, host_off: 0, skip } if skip == 1 << 20
+        ));
+        let inside = [
+            req(BufId::X, 1 << 20, Placement::Group(0)),
+            req(BufId::Cur, 3 << 20, Placement::Group(1)),
+            req(
+                BufId::Q,
+                512 << 10,
+                Placement::Within {
+                    host: BufId::Cur,
+                    slot: 1,
+                },
+            ),
+        ];
+        let plan = plan_layout_with(&inside, true, &page);
+        assert_eq!(plan.bytes, (3 << 20) + (512 << 10));
+        assert!(matches!(
+            plan.steps.iter().find(|s| s.id == BufId::Q).unwrap().action,
+            Action::AliasDedicated { others_reach, .. } if others_reach == 1 << 20
+        ));
+    }
+
+    /// An alias that does not fit its host is skipped, allocates nothing, and one whose host
+    /// is dedicated has nothing to alias into; a dedicated buffer is page-rounded into the sum.
+    #[test]
+    fn skipped_and_hostless_aliases_cost_nothing_and_dedicated_buffers_are_page_rounded()
+     {
+        let reqs = [
+            req(BufId::X, 1 << 20, Placement::Group(0)),
+            req(BufId::Cur, 100, Placement::Dedicated),
+            req(
+                BufId::Q,
+                2 << 20,
+                Placement::Within {
+                    host: BufId::X,
+                    slot: 0,
+                },
+            ),
+            req(
+                BufId::K,
+                4096,
+                Placement::Within {
+                    host: BufId::Cur,
+                    slot: 0,
+                },
+            ),
+        ];
+        let plan = plan_layout_with(&reqs, true, &page);
+        assert_eq!(plan.bytes, (1 << 20) + PAGE);
+        assert!(matches!(
+            plan.steps.iter().find(|s| s.id == BufId::Q).unwrap().action,
+            Action::AliasSkipped { host: BufId::X, .. }
+        ));
+        assert_eq!(
+            plan.steps.iter().find(|s| s.id == BufId::K).unwrap().action,
+            Action::AliasNoHost
+        );
+    }
+
+    /// With overlap off the groups are laid end to end and nothing reaches into anything.
+    #[test]
+    fn without_overlap_groups_are_end_to_end_and_no_alias_is_promoted() {
+        let reqs = [
+            req(BufId::X, 1 << 20, Placement::Group(0)),
+            req(BufId::Cur, 3 << 20, Placement::Group(1)),
+            req(
+                BufId::Q,
+                512 << 10,
+                Placement::Within {
+                    host: BufId::X,
+                    slot: 0,
+                },
+            ),
+        ];
+        let plan = plan_layout_with(&reqs, false, &page);
+        assert_eq!(plan.arena, 4 << 20);
+        assert_eq!(plan.bytes, 4 << 20);
+        assert_eq!(
+            plan.regions.get(&(BufId::Cur as u32)).copied(),
+            Some((1 << 20, 3 << 20))
+        );
+        assert!(matches!(
+            plan.steps.iter().find(|s| s.id == BufId::Q).unwrap().action,
+            Action::AliasPlace { .. }
+        ));
+    }
 }

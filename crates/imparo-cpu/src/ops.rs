@@ -238,8 +238,16 @@ pub fn delta_net(
     assert_eq!(qkv.len(), n_tok * qkv_width, "qkv is n_tok x qkv_width");
     assert_eq!(log_decay.len(), n_tok * vh, "log_decay is n_tok x v_heads");
     assert_eq!(beta.len(), n_tok * vh, "beta is n_tok x v_heads");
-    assert_eq!(state.len(), shape.state_elems(), "state is v_heads x value_dim x key_dim");
-    assert_eq!(out.len(), n_tok * v_width, "out is n_tok x v_heads x value_dim");
+    assert_eq!(
+        state.len(),
+        shape.state_elems(),
+        "state is v_heads x value_dim x key_dim"
+    );
+    assert_eq!(
+        out.len(),
+        n_tok * v_width,
+        "out is n_tok x v_heads x value_dim"
+    );
 
     let qscale = 1.0 / (kd as f32).sqrt();
     let mut qn = vec![0.0_f32; kh * kd];
@@ -284,7 +292,10 @@ pub fn delta_net(
                     state[r + i] += kn[kb + i] * dj;
                 }
             }
-            for (j, o) in out[t * v_width + vb..t * v_width + vb + vd].iter_mut().enumerate() {
+            for (j, o) in out[t * v_width + vb..t * v_width + vb + vd]
+                .iter_mut()
+                .enumerate()
+            {
                 let r = sb + j * kd;
                 let mut projected = 0.0_f32;
                 for i in 0..kd {
@@ -365,8 +376,16 @@ pub fn delta_net_chunked(
     assert_eq!(qkv.len(), n_tok * qkv_width, "qkv is n_tok x qkv_width");
     assert_eq!(log_decay.len(), n_tok * vh, "log_decay is n_tok x v_heads");
     assert_eq!(beta.len(), n_tok * vh, "beta is n_tok x v_heads");
-    assert_eq!(state.len(), shape.state_elems(), "state is v_heads x value_dim x key_dim");
-    assert_eq!(out.len(), n_tok * v_width, "out is n_tok x v_heads x value_dim");
+    assert_eq!(
+        state.len(),
+        shape.state_elems(),
+        "state is v_heads x value_dim x key_dim"
+    );
+    assert_eq!(
+        out.len(),
+        n_tok * v_width,
+        "out is n_tok x v_heads x value_dim"
+    );
     if n_tok == 0 {
         return;
     }
@@ -432,7 +451,11 @@ pub fn delta_net_chunked(
                     let decay = (gc[t] - gc[u]).exp();
                     kq[t * c + u] = decay * dot_f32(qt, ku);
                     // A is STRICTLY lower: token t's own delta is what the row solves for.
-                    let a = if u == t { 0.0 } else { bt * decay * dot_f32(kt, ku) };
+                    let a = if u == t {
+                        0.0
+                    } else {
+                        bt * decay * dot_f32(kt, ku)
+                    };
                     lower[t * c + u] = a;
                 }
             }
@@ -1163,7 +1186,16 @@ mod tests {
         for t in 0..n_tok {
             let row = &bcx[t * 3 * width..(t + 1) * 3 * width];
             let mut o = vec![0.0f32; width];
-            causal_conv(ConvForm::GatedBcx, row, &conv_w, &mut s_one, &mut o, width, kernel, 1);
+            causal_conv(
+                ConvForm::GatedBcx,
+                row,
+                &conv_w,
+                &mut s_one,
+                &mut o,
+                width,
+                kernel,
+                1,
+            );
             out_one[t * width..(t + 1) * width].copy_from_slice(&o);
         }
         assert_eq!(out_batch, out_one, "batched and stepwise outputs differ");
@@ -1182,7 +1214,16 @@ mod tests {
 
         // Only tap 0 is non-zero: out[t] = c * seq[t + 0].
         let conv_w = vec![1.0, 0.0, 0.0];
-        causal_conv(ConvForm::GatedBcx, &bcx, &conv_w, &mut state, &mut out, width, kernel, 2);
+        causal_conv(
+            ConvForm::GatedBcx,
+            &bcx,
+            &conv_w,
+            &mut state,
+            &mut out,
+            width,
+            kernel,
+            2,
+        );
         assert_eq!(
             out,
             vec![5.0, 7.0],
@@ -1195,7 +1236,16 @@ mod tests {
         let mut state2 = vec![5.0, 7.0];
         let mut out2 = vec![0.0f32; 2];
         let conv_w2 = vec![0.0, 0.0, 1.0];
-        causal_conv(ConvForm::GatedBcx, &bcx, &conv_w2, &mut state2, &mut out2, width, kernel, 2);
+        causal_conv(
+            ConvForm::GatedBcx,
+            &bcx,
+            &conv_w2,
+            &mut state2,
+            &mut out2,
+            width,
+            kernel,
+            2,
+        );
         assert_eq!(
             out2,
             vec![1.0, 1.0],
@@ -1219,7 +1269,16 @@ mod tests {
         let conv_w = vec![1.0f32; width * kernel];
         let mut state = vec![0.0f32; (kernel - 1) * width];
         let mut out = vec![9.0f32; n_tok * width];
-        causal_conv(ConvForm::GatedBcx, &bcx, &conv_w, &mut state, &mut out, width, kernel, n_tok);
+        causal_conv(
+            ConvForm::GatedBcx,
+            &bcx,
+            &conv_w,
+            &mut state,
+            &mut out,
+            width,
+            kernel,
+            n_tok,
+        );
         assert!(out.iter().all(|&v| v == 0.0), "c = 0 must zero the output");
         // b*x = 6 flowed into the state regardless.
         assert!(state.iter().all(|&v| v == 6.0), "state must still advance");

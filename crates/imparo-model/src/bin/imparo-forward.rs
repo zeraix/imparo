@@ -63,6 +63,33 @@ fn dump_logits_if_requested(logits: &[f32]) -> std::io::Result<()> {
     dump_logits_for_env(logits, "IMPARO_LOGITS_DUMP")
 }
 
+/// The scramble probe's store-side witness: the first bytes of four K rows of one
+/// full-attention layer, read at their identity slots (`swapped` false) or at the slots
+/// the pair-swap map sends them to. The harness requires the rows to move intact.
+fn print_k_rows(geom: &imparo_kv::LayerStateGeom, swapped: bool) {
+    let layer = geom.layer;
+    for pos in [0usize, 63, 64, 127] {
+        let phys = if swapped {
+            ((pos / 64) ^ 1) * 64 + pos % 64 // pair-swap map
+        } else {
+            pos
+        };
+        let mut row = vec![0u8; geom.k_stride];
+        imparo_model::backend::active().unwrap().read_kv_bytes(
+            layer,
+            false,
+            (phys * geom.k_stride) as u64,
+            &mut row,
+        );
+        let head: Vec<String> = row[..8].iter().map(|b| format!("{b:02x}")).collect();
+        if swapped {
+            println!("k{layer} pos={pos} phys={phys} head={}", head.join(""));
+        } else {
+            println!("k{layer}-identity pos={pos} head={}", head.join(""));
+        }
+    }
+}
+
 fn phase_a1_prefill_wall_line(
     enabled: bool,
     rep: usize,
@@ -183,7 +210,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --split K: forward tokens[..K] at 0, then tokens[K..] at K -- the KV-pool
     // continuation instrument. The harness compares the opt-in raw final-logit dump;
     // top10 remains diagnostic output only.
+    //
+    // --split K1,K2,...: one rep per cut in THIS process (0 = the cold forward), so a
+    // gate that compares several cuts of one prompt loads the model once instead of once
+    // per cut -- on Qwen3.8-27B a load is 5 s and the resume gate ran 16 of them. Each
+    // rep's logits go to IMPARO_LOGITS_DUMP_DIR as rep-NNN.raw; a rep starting at
+    // position 0 resets the recurrent state and refills the cache exactly as a fresh
+    // process does (the reset lives in the forward, not here).
     let mut split: Option<usize> = None;
+    let mut split_series: Vec<usize> = Vec::new();
     // --decode N: after the prefill, run N greedy single-token steps and print the
     // token trail plus an FNV hash of every step's logits. With --repeat this is
     // the engine-level decode-determinism gate (task #26's reproducer).
@@ -221,8 +256,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         first = args.next().ok_or("--dbatch B MODEL.gguf TOKEN...")?;
     }
     if first == "--split" {
-        split = Some(args.next().ok_or("--split needs a position")?.parse()?);
-        first = args.next().ok_or("--split K MODEL.gguf TOKEN...")?;
+        let spec = args.next().ok_or("--split needs a position")?;
+        let cuts = spec
+            .split(',')
+            .map(str::parse::<usize>)
+            .collect::<Result<Vec<_>, _>>()?;
+        if cuts.len() > 1 {
+            if repeat != 1 {
+                return Err(
+                    "--split K1,K2,... sets the rep count itself; drop --repeat".into(),
+                );
+            }
+            repeat = cuts.len();
+            split_series = cuts;
+        } else {
+            split = cuts.first().copied();
+        }
+        first = args
+            .next()
+            .ok_or("--split K[,K2,...] MODEL.gguf TOKEN...")?;
     }
     // --spill DIR / --restore DIR: the disk-tier instrument. --spill runs the full
     // forward, captures the KV state at the unit boundary and commits it to the
@@ -263,6 +315,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(masks) = &exact128_mask_sweep {
         if masks.is_empty() {
             return Err("IMPARO_EXACT128_MASK_SWEEP contains no masks".into());
+        }
+        if !split_series.is_empty() {
+            return Err("IMPARO_EXACT128_MASK_SWEEP and --split K1,K2,... both set the rep count".into());
         }
         repeat = masks.len();
     }
@@ -324,7 +379,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if graph_decode_paged {
         model.kv_prepare_pool()?;
-        model.kv_set_scrambled_tables();
+        model.kv_set_scrambled_tables(false);
     }
 
     let logits_dump_dir = std::env::var_os("IMPARO_LOGITS_DUMP_DIR").map(PathBuf::from);
@@ -339,6 +394,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .checked_add(u32::try_from(rep)?)
                 .ok_or("--vary-last token overflow")?;
             *toks_rep.last_mut().expect("non-empty tokens checked above") = replacement;
+        }
+        let split = if split_series.is_empty() {
+            split
+        } else {
+            Some(split_series[rep])
+        };
+        // A scramble rep after the first starts on the tables the previous rep left
+        // pair-swapped; its identity leg needs identity placement back.
+        if scramble && rep > 0 {
+            model.kv_set_scrambled_tables(true);
         }
         let t1 = std::time::Instant::now();
         let mut wall_token_count = toks_rep.len();
@@ -476,33 +541,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )? {
             println!("{line}");
         }
-        if scramble && rep == 0 {
+        if scramble {
             // Both legs run in this process, so each needs its own machine-readable
             // full-distribution witness for the fail-closed KV placement gate.
             dump_logits_for_env(&logits, "IMPARO_SCRAMBLE_IDENTITY_DUMP")?;
 
             let mut a = String::new();
             top10_string(&logits, &mut a);
-            if std::env::var("IMPARO_SCRAMBLE_DUMP").is_ok() {
-                let geom = model
-                    .kv_state_geometry()
-                    .into_iter()
-                    .find(|g| g.layer == 5)
-                    .expect("layer 5 geometry");
-                for pos in [0usize, 63, 64, 127] {
-                    let mut row = vec![0u8; geom.k_stride];
-                    imparo_model::backend::active().unwrap().read_kv_bytes(
-                        5,
-                        false,
-                        (pos * geom.k_stride) as u64,
-                        &mut row,
-                    );
-                    let head: Vec<String> =
-                        row[..8].iter().map(|b| format!("{b:02x}")).collect();
-                    println!("k5-identity pos={pos} head={}", head.join(""));
-                }
+            // Store-side witness on the FIRST full-attention layer -- the one kind whose
+            // placement the scramble moves. Which layer that is belongs to the
+            // architecture (gemma4: 5, qwen35: 3); asking for a fixed number panicked on
+            // the second architecture that ran this probe.
+            let witness = std::env::var("IMPARO_SCRAMBLE_DUMP")
+                .ok()
+                .map(|_| {
+                    model
+                        .kv_state_geometry()
+                        .into_iter()
+                        .find(|g| matches!(g.kind, imparo_kv::StateKind::Full))
+                        .ok_or(
+                            "scramble witness: the model has no full-attention layer",
+                        )
+                })
+                .transpose()?;
+            if let Some(geom) = &witness {
+                print_k_rows(geom, false);
             }
-            model.kv_set_scrambled_tables();
+            model.kv_set_scrambled_tables(false);
             // With --split K, the scrambled run RESUMES at K instead of running cold:
             // paged placement AND a resume, which is the cell neither half covered.
             // Identity+cold vs identity+resume is the split gate; identity+cold vs
@@ -517,6 +582,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut b = String::new();
             top10_string(&l2, &mut b);
             dump_logits_for_env(&l2, "IMPARO_SCRAMBLE_PAGED_DUMP")?;
+            if let Some(dir) = &logits_dump_dir {
+                dump_logits_to_path(&l2, dir.join(format!("rep-{rep:03}.paged.raw")))?;
+            }
             println!("identity {a}");
             println!("scrambled{b}");
             println!(
@@ -524,26 +592,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if a == b { "BYTE-EQUAL" } else { "MISMATCH" }
             );
             // Store-side verification: position p's K row must sit at the
-            // pair-swapped physical slot. Layer 5 is the first full-attention layer.
-            if std::env::var("IMPARO_SCRAMBLE_DUMP").is_ok() {
-                let geom = model
-                    .kv_state_geometry()
-                    .into_iter()
-                    .find(|g| g.layer == 5)
-                    .expect("layer 5 geometry");
-                for pos in [0usize, 63, 64, 127] {
-                    let phys = ((pos / 64) ^ 1) * 64 + pos % 64; // pair-swap map
-                    let mut row = vec![0u8; geom.k_stride];
-                    imparo_model::backend::active().unwrap().read_kv_bytes(
-                        5,
-                        false,
-                        (phys * geom.k_stride) as u64,
-                        &mut row,
-                    );
-                    let head: Vec<String> =
-                        row[..8].iter().map(|b| format!("{b:02x}")).collect();
-                    println!("k5 pos={pos} phys={phys} head={}", head.join(""));
-                }
+            // pair-swapped physical slot.
+            if let Some(geom) = &witness {
+                print_k_rows(geom, true);
             }
         }
         if graph_decode_n > 0 {

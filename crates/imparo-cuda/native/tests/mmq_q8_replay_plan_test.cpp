@@ -209,5 +209,23 @@ int main() {
     overflow.status = PlanStatus::Overflow;
     assert(choose_execution(overflow, true) == ExecutionRoute::Reject);
 
+    // An explicitly requested short replay inherits MMQ's tile/reduction family;
+    // the ordinary small-batch selector stays outside MMQ. Physical work remains
+    // bounded by the real live tokens, not by a padded fictional input tensor.
+    for (uint32_t tokens = 2; tokens <= 8; ++tokens) {
+        assert(make_plan(2048, 2048, tokens, 30, sm86).status
+            == PlanStatus::NotApplicable);
+        const ReplayPlan short_plan = canonical_whole_k_plan(
+            make_plan(2048, 2048, tokens, 30, sm86, true));
+        const ReplayPlan cold_plan = canonical_whole_k_plan(
+            make_plan(2048, 2048, 64 + tokens, 30, sm86));
+        assert(short_plan.status == PlanStatus::Ok);
+        assert(short_plan.tile_tokens == cold_plan.tile_tokens);
+        assert(short_plan.token_tiles == (tokens + short_plan.tile_tokens - 1)
+            / short_plan.tile_tokens);
+        assert(!short_plan.needs_workspace && !short_plan.replay);
+        assert(choose_execution(short_plan, true) == ExecutionRoute::Mmq);
+    }
+
     return 0;
 }

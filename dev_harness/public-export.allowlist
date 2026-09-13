@@ -28,6 +28,7 @@ crates/imparo-cpu/Cargo.toml
 crates/imparo-cpu/src/backend_impl.rs
 crates/imparo-cpu/src/lib.rs
 crates/imparo-cpu/src/ops.rs
+crates/imparo-cpu/src/quants.rs
 crates/imparo-cuda/Cargo.toml
 crates/imparo-cuda/build.rs
 crates/imparo-cuda/build_support.rs
@@ -78,6 +79,8 @@ crates/imparo-cuda/native/sm86/mmq_q4_q8_gate_up_pipe.cuh
 crates/imparo-cuda/native/sm86/mmq_q4_q8_interleaved.cuh
 crates/imparo-cuda/native/sm86/mmq_q4_q8_pair.cuh
 crates/imparo-cuda/native/sm86/mmq_q4_q8_ple_gate.cuh
+crates/imparo-cuda/native/sm86/mmq_q8_tm_gate_up_row_pair.cuh
+crates/imparo-cuda/native/sm86/mmvq_q8_tm_gate_up_silu.cuh
 crates/imparo-cuda/native/sm86/q8_mma_ready_a0.cuh
 crates/imparo-cuda/native/sm86/q8_mma_ready_a1.cuh
 crates/imparo-cuda/native/sm86/q8_mma_ready_a2.cuh
@@ -120,6 +123,7 @@ crates/imparo-cuda/tests/lfm2_contract.rs
 crates/imparo-cuda/tests/program_pack_contract.rs
 crates/imparo-cuda/tests/step1_contract.rs
 crates/imparo-gguf/Cargo.toml
+crates/imparo-gguf/src/bin/imparo-repack.rs
 crates/imparo-gguf/src/lib.rs
 crates/imparo-gguf/src/scan.rs
 crates/imparo-gguf/src/weights.rs
@@ -140,6 +144,8 @@ crates/imparo-kv/src/store.rs
 crates/imparo-kv/src/tenant.rs
 crates/imparo-metal/Cargo.toml
 crates/imparo-metal/build.rs
+crates/imparo-metal/mega_program.rs
+crates/imparo-metal/mega_slots.rs
 crates/imparo-metal/native/imparo.metal
 crates/imparo-metal/native/imparo_metal.mm
 crates/imparo-metal/src/backend_impl.rs
@@ -162,12 +168,22 @@ crates/imparo-model/src/gpu_support.rs
 crates/imparo-model/src/host.rs
 crates/imparo-model/src/identity.rs
 crates/imparo-model/src/kv.rs
+crates/imparo-model/src/layer_outputs.rs
 crates/imparo-model/src/lfm2/chat_format.rs
 crates/imparo-model/src/lfm2/mod.rs
 crates/imparo-model/src/lfm2/plan.rs
 crates/imparo-model/src/lfm2/workflow_cpu.rs
 crates/imparo-model/src/lfm2/workflow_gpu.rs
 crates/imparo-model/src/lib.rs
+crates/imparo-model/src/placement.rs
+crates/imparo-model/src/qwen35/chat_format.rs
+crates/imparo-model/src/qwen35/mod.rs
+crates/imparo-model/src/qwen35/plan.rs
+crates/imparo-model/src/qwen35/workflow_cpu.rs
+crates/imparo-model/src/qwen35/workflow_gpu.rs
+crates/imparo-model/src/speculative.rs
+crates/imparo-model/src/verification.rs
+crates/imparo-model/src/window_history.rs
 crates/imparo-program-pack/Cargo.toml
 crates/imparo-program-pack/fuzz/Cargo.lock
 crates/imparo-program-pack/fuzz/Cargo.toml

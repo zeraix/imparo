@@ -50,6 +50,167 @@ pub struct ModelBench {
     /// the graph, and the engine's own dispatch counter reads 0 unless `IMPARO_PROF=1` is
     /// set. It is the work term in the command-buffer trade -- see `flush_layers`.
     pub layer_dispatches: u32,
+    /// Whether this architecture's decode WORKFLOW offers mega entries
+    /// (`Backend::mega_layer`) at all. The tuner combines it with the backend's form
+    /// policy into `ModelFacts::mega_seat` (task #203). Mirrors the workflow the way
+    /// `decode_tensors` mirrors its tensor use: gemma4 and LFM2 dispatch entries; qwen35's
+    /// workflow does not yet (#165), so the grid knobs must not be offered for it.
+    pub mega_entries: bool,
+    /// Builds this architecture's mega entries for the tuner's `MegaDecodeStep` workload
+    /// (task #203): one `MegaLayer` per layer over the synthetic tensor offsets, positions
+    /// left at 0 (the workload sets the span). Mirrors the workflow's own entry literal the
+    /// way `decode_tensors` mirrors its tensor use. `None` = the workload is unavailable for
+    /// this architecture; the grid knobs then keep their incumbent, and the sweep says so.
+    pub mega_layers:
+        Option<fn(&MegaBenchInputs<'_>) -> Vec<imparo_backend::MegaLayer<'static>>>,
+}
+
+/// What a mega entry builder reads: the plan (geometry and KV source per layer, rope), the
+/// synthetic offset of each decode tensor by name, and one zero row every norm weight points
+/// at -- a norm's cost does not depend on its values, and the rows are kilobytes.
+pub struct MegaBenchInputs<'a> {
+    pub plan: &'a imparo_model::ModelPlan,
+    pub lookup: &'a dyn Fn(&str) -> Option<(u64, u32, u32, u32)>,
+    pub norm_off: u64,
+}
+
+/// gemma4's level-5 entry -- the whole layer from the residual: q/k/v front, attention over
+/// the cache, o_proj + sandwich, FFN, PLE, tails -- as `gemma4/workflow_gpu.rs` builds it,
+/// over the synthetic tensors. Differences from the engine's entry, each timing-neutral:
+/// every norm weight is the zero row, `out_scale` is 1.0 (a scalar), rope has no factor
+/// table, and there is no next-norm tail (level 5 forms the next layer's input itself).
+/// A shared-KV layer carries no K/V projection and reads its source layer's cache, as in
+/// the engine. Empty when the model has no per-layer embedding (then the workflow offers no
+/// entry either) or a tensor the entry needs is missing.
+fn gemma4_mega_layers(
+    i: &MegaBenchInputs<'_>,
+) -> Vec<imparo_backend::MegaLayer<'static>> {
+    use imparo_backend::{
+        BufId, Gemma4MegaLayer, MegaAttn, MegaFront, MegaLayer, MegaQkv, NO_WEIGHT,
+    };
+    use imparo_model::{Attention, KvSource};
+    let c = &i.plan.config;
+    let Some(ple) = i.plan.embed.per_layer_dim.filter(|&p| p > 0) else {
+        return Vec::new();
+    };
+    let (
+        Some(gate),
+        Some(up),
+        Some(down),
+        Some(pg),
+        Some(pp),
+        Some(wq),
+        Some(wk),
+        Some(wv),
+        Some(wo),
+    ) = (
+        (i.lookup)("ffn_gate"),
+        (i.lookup)("ffn_up"),
+        (i.lookup)("ffn_down"),
+        (i.lookup)("inp_gate"),
+        (i.lookup)("proj"),
+        (i.lookup)("attn_q"),
+        (i.lookup)("attn_k"),
+        (i.lookup)("attn_v"),
+        (i.lookup)("attn_output"),
+    )
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(i.plan.layers.len());
+    for (li, layer) in i.plan.layers.iter().enumerate() {
+        let (hd, rope_base, rope_dim, window) = match layer.attention {
+            Attention::Full {
+                head_dim,
+                rope_base,
+                rope_dim,
+            } => (head_dim, rope_base, rope_dim, 0),
+            Attention::Window {
+                head_dim,
+                rope_base,
+                rope_dim,
+                window,
+            } => (head_dim, rope_base, rope_dim, window),
+            Attention::Recurrent { .. } => return Vec::new(),
+        };
+        let (kv_layer, shared) = match layer.kv_source {
+            KvSource::Own => (li as u32, false),
+            KvSource::SharedWith(src) => (src, true),
+        };
+        let kv_hd = i
+            .plan
+            .layers
+            .get(kv_layer as usize)
+            .map_or(hd, |l| l.attention.head_dim());
+        out.push(MegaLayer::Gemma4(Gemma4MegaLayer {
+            gate_kind: gate.3,
+            gate_off: gate.0,
+            up_kind: up.3,
+            up_off: up.0,
+            down_kind: down.3,
+            down_off: down.0,
+            post_ffw_norm_off: i.norm_off,
+            pg_kind: pg.3,
+            pg_off: pg.0,
+            pp_kind: pp.3,
+            pp_off: pp.0,
+            post_norm_off: i.norm_off,
+            next_norm_off: NO_WEIGHT,
+            out_scale: 1.0,
+            n_embd: c.n_embd,
+            n_ff: c.n_ff,
+            ple,
+            per_layer_off: (li as u32) * ple,
+            eps: c.norm_eps,
+            src: BufId::Cur,
+            x: BufId::X,
+            add: BufId::O,
+            g: BufId::G,
+            u: BufId::U,
+            // The workflow's GATE / BACK / PER_LAYER scratch ids.
+            gate: BufId::Model0,
+            per_layer: BufId::Model2,
+            back: BufId::Model1,
+            next_out: BufId::X,
+            front: Some(MegaFront {
+                wo_kind: wo.3,
+                wo_off: wo.0,
+                attn: BufId::Attn,
+                attn_in: c.n_heads * hd,
+                post_attn_norm_off: i.norm_off,
+                ffn_norm_off: i.norm_off,
+                head_dim: hd,
+                attention: Some(MegaAttn {
+                    kv_layer,
+                    n_heads: c.n_heads,
+                    n_kv: c.n_kv_heads,
+                    kv_width: c.n_kv_heads * kv_hd,
+                    start_pos: 0,
+                    window,
+                    ring: 0,
+                    q: BufId::Q,
+                    had_k: 0,
+                    had_v: 0,
+                }),
+                qkv: Some(MegaQkv {
+                    wq_kind: wq.3,
+                    wq_off: wq.0,
+                    wk: (!shared).then_some((wk.3, wk.0)),
+                    wv: (!shared).then_some((wv.3, wv.0)),
+                    q_norm_off: i.norm_off,
+                    k_norm_off: i.norm_off,
+                    in_norm_off: i.norm_off,
+                    rope_dim,
+                    rope_base,
+                    freqs: None,
+                    k: BufId::K,
+                    v: BufId::V,
+                    layer: li as u32,
+                }),
+            }),
+        }));
+    }
+    out
 }
 
 pub const MODEL_BENCHES: &[ModelBench] = &[
@@ -73,6 +234,8 @@ pub const MODEL_BENCHES: &[ModelBench] = &[
         // ropes, 2 kv_stores, 1 attention, 1 strided multiply. Shared-KV layers skip the K/V
         // projections and their stores, so this is the full-attention layer's count.
         layer_dispatches: 21,
+        mega_entries: true,
+        mega_layers: Some(gemma4_mega_layers),
     },
     ModelBench {
         arch: "lfm2",
@@ -93,6 +256,10 @@ pub const MODEL_BENCHES: &[ModelBench] = &[
         // norm, in projection, shortconv, out projection, residual add, FFN norm,
         // gate/up projections, standalone SiLU-mul, down projection, residual add.
         layer_dispatches: 11,
+        mega_entries: true,
+        // The LFM2 entry (short-conv / attention mixers, recurrent state) is not built for
+        // the tuner yet: mega_nsg applies to LFM2 but keeps its incumbent until it is.
+        mega_layers: None,
     },
     ModelBench {
         arch: "qwen35",
@@ -134,6 +301,8 @@ pub const MODEL_BENCHES: &[ModelBench] = &[
         // on Qwen3.8-27B-UD-Q4_K_S): 9496 dispatches / 8 = 1187 per token, and
         // 48 delta x 18 + 16 attention x 20 + 3 outside the layers = 1187 exactly.
         layer_dispatches: 18,
+        mega_entries: false,
+        mega_layers: None,
     },
 ];
 

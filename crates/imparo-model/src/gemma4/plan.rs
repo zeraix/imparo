@@ -139,6 +139,8 @@ pub fn build(
             row_gathered: &["per_layer_token_embd.weight"],
         },
         layers,
+        decode_interleave: true,
+        mega_decode: true,
         output: OutputPlan {
             final_norm: true,
             logit_softcap: f32_opt(document, "gemma4.final_logit_softcapping"),

@@ -29,6 +29,23 @@ fn body_after<'a>(source: &'a str, marker: &str) -> &'a str {
         .1
 }
 
+/// The dense projection's body. The exported `imparo_cuda_matmat` and
+/// `imparo_cuda_matmat_output_prefix` are thin entries over `matmat_impl`, whose body
+/// ends where the first of them begins.
+fn matmat_body() -> &'static str {
+    let entry = body_after(NATIVE, "extern \"C\" void imparo_cuda_matmat(")
+        .split_once("extern \"C\" void imparo_cuda_matmat_gated")
+        .unwrap()
+        .0;
+    assert!(entry.contains(
+        "matmat_impl(wkind, w_off, n_in, n_out, src, dst, n_tok, src_row, 0);"
+    ));
+    body_after(NATIVE, "static void matmat_impl(")
+        .split_once("extern \"C\" void imparo_cuda_matmat(")
+        .unwrap()
+        .0
+}
+
 #[test]
 fn d64_lfm2_does_not_sweep_the_d256_d512_value_tile_knob() {
     let declaration = body_after(CUDA_KNOBS, "\"attn_value_tiles\",")
@@ -81,8 +98,31 @@ fn shortconv_validates_shape_buffers_aliases_and_weights_before_launch() {
     let advance = body.find("shortconv_state_kernel<<<").unwrap();
     assert!(shape < buffers && buffers < aliases && aliases < weights);
     assert!(weights < output && output < advance);
-    assert!(NATIVE.contains("id >= B_COUNT || !g.bufs[id]"));
-    assert!(NATIVE.contains("bytes > g.sizes[id] - byte_offset"));
+    assert!(NATIVE.contains("id >= B_COUNT || !execution().bufs[id]"));
+    assert!(NATIVE.contains("bytes > execution().sizes[id] - byte_offset"));
+}
+
+#[test]
+fn direct_q8_kv_prepare_is_optional_and_preserves_the_portable_fallback() {
+    let native = body_after(
+        NATIVE,
+        "extern \"C\" uint32_t imparo_cuda_kv_head_postprocess_store(",
+    );
+    assert!(native.contains("const uint32_t min_tokens = tuner_knob(9);"));
+    assert!(native.contains("g.kv_type_k == 8 && g.kv_type_v == 8"));
+    assert!(native.contains("k_lfm2_k_head_q8_store<<<"));
+    assert!(native.contains("k_lfm2_v_hadamard_q8_store<<<"));
+
+    let direct = LFM2_WORKFLOW
+        .find("be().kv_head_postprocess_store(")
+        .expect("LFM2 direct Q8 KV transaction");
+    let fallback = LFM2_WORKFLOW[direct..]
+        .find("if !direct_kv")
+        .expect("portable fallback after optional direct transaction");
+    let store = LFM2_WORKFLOW[direct..]
+        .find("be().kv_store(BufId::K")
+        .expect("portable K store remains");
+    assert!(fallback < store);
 }
 
 #[test]
@@ -116,7 +156,8 @@ fn unsupported_fused_silu_fails_before_epilogue_state_changes() {
         .unwrap()
         .0;
     assert!(
-        setter.find("if (on > 1)").unwrap() < setter.find("g.epilogue = on").unwrap()
+        setter.find("if (on > 1)").unwrap()
+            < setter.find("execution().epilogue = on").unwrap()
     );
     assert!(setter.contains("set_pending(CUDA_RC_INVALID"));
 }
@@ -144,11 +185,7 @@ fn abi24_rows_dispatches_each_weight_layout_and_binds_table_extent() {
 
 #[test]
 fn q8_matmat_uses_its_34_byte_layout_and_bounded_weight_slices() {
-    let matmat = body_after(NATIVE, "extern \"C\" void imparo_cuda_matmat(");
-    let matmat = matmat
-        .split_once("extern \"C\" void imparo_cuda_matmat_gated")
-        .unwrap()
-        .0;
+    let matmat = matmat_body();
     let full_range = matmat
         .find("resident_weight_range(w_off, tensor_bytes)")
         .unwrap();
@@ -157,17 +194,13 @@ fn q8_matmat_uses_its_34_byte_layout_and_bounded_weight_slices() {
     let q8_launch = matmat.find("k_gemm_q8_0_f32<<<").unwrap();
     assert!(full_range < cache_bound && cache_bound < slice && slice < q8_launch);
     assert!(matmat.contains("(wkind == 1 ? 18 : 34)"));
-    assert!(matmat.contains("(wkind == 2 || wkind == 3) && g.epilogue != 0"));
+    assert!(matmat.contains("(wkind == 2 || wkind == 3) && execution().epilogue != 0"));
     assert!(NATIVE.contains("float(int8_t(blk[2 + i]))"));
 }
 
 #[test]
 fn q8_short_batches_use_q8_1_mmvq_and_keep_an_explicit_f32_fallback() {
-    let matmat = body_after(NATIVE, "extern \"C\" void imparo_cuda_matmat(");
-    let matmat = matmat
-        .split_once("extern \"C\" void imparo_cuda_matmat_gated")
-        .unwrap()
-        .0;
+    let matmat = matmat_body();
     assert!(matmat.contains("const bool q8_weight = wkind == 2 || wkind == 3"));
     assert!(matmat.contains("const bool q8_mmvq = q8_weight && g.sm_version >= 80"));
     assert!(matmat.contains("std::getenv(\"IMPARO_CUDA_Q8_F32\") != nullptr"));
@@ -189,11 +222,7 @@ fn q8_short_batches_use_q8_1_mmvq_and_keep_an_explicit_f32_fallback() {
 
 #[test]
 fn q8_tile_major_has_complete_decode_prefill_and_paged_fallback_routes() {
-    let matmat = body_after(NATIVE, "extern \"C\" void imparo_cuda_matmat(");
-    let matmat = matmat
-        .split_once("extern \"C\" void imparo_cuda_matmat_gated")
-        .unwrap()
-        .0;
+    let matmat = matmat_body();
 
     assert!(matmat.contains("wkind != 2 && wkind != 3"));
     assert!(matmat.contains("Q8_0_TM output rows must be tile-aligned"));
@@ -230,10 +259,14 @@ fn q8_tile_major_has_complete_decode_prefill_and_paged_fallback_routes() {
     assert!(Q8_MMVQ.contains("launch_layout<true>"));
     assert!(Q8_MMQ.contains(concat!(
         "template <uint32_t Tokens, bool AlignedWholeK = false, ",
-        "bool TileMajor = false,\n          uint32_t Epilogue = 0>"
+        "bool TileMajor = false,\n          uint32_t Epilogue = 0, bool AsyncTileMajor = false,\n",
+        "          uint32_t Warps = kWarps, uint32_t CanonicalLoadLanes = 1,\n",
+        "          uint32_t Rows = kRows, bool HalfwordLoads = false>"
     )));
     assert!(Q8_MMQ.contains("q8_0_q8_1_mma<Tokens, false, TileMajor>"));
-    assert!(Q8_MMQ.contains("q8_0_q8_1_mma<Tokens, true, TileMajor, Epilogue>"));
+    assert!(Q8_MMQ.contains(
+        "q8_0_q8_1_mma<Tokens, true, TileMajor, Epilogue, AsyncTileMajor, Warps, CanonicalLoadLanes, Rows, HalfwordLoads>"
+    ));
     assert!(Q8_MMQ.contains("if constexpr (Epilogue >= 2 && Epilogue <= 4)"));
     assert!(Q8_MMQ.contains("if constexpr (Epilogue == 3 || Epilogue == 4)"));
     assert!(Q8_MMQ.contains("BlockQ8_1Mmq * __restrict__ output_q8"));
@@ -247,10 +280,10 @@ fn q8_tile_major_has_complete_decode_prefill_and_paged_fallback_routes() {
 #[test]
 fn d64_wide_prefill_is_bounded_and_retains_the_small_chain_fallback() {
     assert!(SMALL_FA.contains("HeadDim == 64 || HeadDim == 256 || HeadDim == 512"));
-    assert!(NATIVE.contains("scores_paged<64, CacheType>"));
-    assert!(NATIVE.contains("scores<64, CacheType>"));
-    assert!(NATIVE.contains("values_combine_paged<64, CacheType, 1>"));
-    assert!(NATIVE.contains("values_combine<64, CacheType, 1>"));
+    assert!(NATIVE.contains("scores_paged<64, CacheType, GqaHeads>"));
+    assert!(NATIVE.contains("scores<64, CacheType, GqaHeads, QueryGrid>"));
+    assert!(NATIVE.contains("values_combine_paged<64, CacheType, 1, GqaHeads>"));
+    assert!(NATIVE.contains("values_combine<64, CacheType, 1, GqaHeads, QueryGrid>"));
     assert!(NATIVE.contains("head_dim == 64 || head_dim == 256 || head_dim == 512"));
     assert!(NATIVE.contains("head_dim != 64 || n_tok >= 3"));
     assert!(NATIVE.contains("IMPARO_CUDA_ATTN_D64_STREAM_PART_CAP"));
@@ -350,7 +383,7 @@ fn q8_replay_is_preflighted_once_and_oom_falls_back_before_mmq_enqueue() {
     assert!(!Q8_MMQ.contains("inline uint32_t select_tile_tokens"));
     assert!(Q8_MMQ.contains("const imparo_sm80_q8_replay::ReplayPlan & plan"));
 
-    let matmat = body_after(NATIVE, "extern \"C\" void imparo_cuda_matmat(");
+    let matmat = matmat_body();
     let plan = matmat.find("imparo_sm80_q8_replay::make_plan(").unwrap();
     let canonical = matmat
         .find("q8_mmq_plan = imparo_sm80_q8_replay::canonical_whole_k_plan(")
@@ -367,7 +400,7 @@ fn q8_replay_is_preflighted_once_and_oom_falls_back_before_mmq_enqueue() {
     let grow = body_after(NATIVE, "int ensure_q8_scratch(uint64_t bytes)");
     let grow = grow.split_once("bool ensure_q8_scratch_next").unwrap().0;
     let allocate = grow.find("alloc_raw(&next").unwrap();
-    let publish = grow.find("g.q8_scratch = next").unwrap();
+    let publish = grow.find("execution().q8_scratch = next").unwrap();
     let release = grow.find("cudaFree(previous)").unwrap();
     assert!(allocate < publish && publish < release);
 }
@@ -379,7 +412,7 @@ fn lfm2_resizes_only_activation_state_for_each_live_batch() {
         .unwrap();
     let prepare = LFM2_WORKFLOW.find("be().decode_prepare(").unwrap();
     let begin = LFM2_WORKFLOW.find("be().begin_forward(decode);").unwrap();
-    let shortconv = LFM2_WORKFLOW.find("be().shortconv(").unwrap();
+    let shortconv = LFM2_WORKFLOW.find("be().causal_conv(").unwrap();
     assert!(fit < prepare && prepare < begin && begin < shortconv);
 }
 
@@ -444,7 +477,13 @@ fn lfm2_quantized_kv_rotation_matches_the_upstream_attention_order() {
             && attention < inverse
             && inverse < output
     );
-    assert!(LFM2_WORKFLOW.contains("if KvType::k() != KvType::F16"));
+    assert!(
+        LFM2_WORKFLOW.contains("let qk_hadamard_nrot = if KvType::k() == KvType::F16")
+    );
+    assert!(LFM2_WORKFLOW.contains("if qk_hadamard_nrot != 0"));
+    assert!(
+        LFM2_WORKFLOW.contains("had_nrot(\"IMPARO_HAD_K\", kv_quant_route.key, hd)?")
+    );
     assert!(LFM2_WORKFLOW.contains("if KvType::v() != KvType::F16"));
 }
 #[test]
@@ -454,28 +493,34 @@ fn lfm2_graph_stages_token_without_weakening_the_ple_contract() {
         .split_once("int upload_staged_decode_inputs()")
         .unwrap()
         .0;
-    assert!(stage.contains("if (!g.decode_ple_desc_valid) return 0;"));
+    assert!(stage.contains("if (!execution().decode_ple_desc_valid) return 0;"));
     assert!(
         stage.contains(
-            "if (!g.ple_stage_host || staged_bytes > g.ple_stage_host_bytes)"
+            "if (!execution().ple_stage_host || staged_bytes > execution().ple_stage_host_bytes)"
         )
     );
     assert!(
         stage
-            .find("*static_cast<uint32_t *>(g.decode_token_stage_host) = token;")
+            .find(
+                "*static_cast<uint32_t *>(execution().decode_token_stage_host) = token;"
+            )
             .unwrap()
             < stage
-                .find("if (!g.decode_ple_desc_valid) return 0;")
+                .find("if (!execution().decode_ple_desc_valid) return 0;")
                 .unwrap()
     );
 
     let upload = body_after(NATIVE, "int upload_staged_decode_inputs()");
     let upload = upload.split_once("} // namespace").unwrap().0;
-    assert!(upload.contains("const uint64_t ple_bytes = g.decode_ple_desc_valid"));
-    assert!(upload.contains("if (ple_bytes && (!g.ple_stage_host || !g.weight_cache"));
+    assert!(
+        upload.contains("const uint64_t ple_bytes = execution().decode_ple_desc_valid")
+    );
+    assert!(upload.contains(
+        "if (ple_bytes && (!execution().ple_stage_host || !execution().weight_cache"
+    ));
     assert!(upload.contains("if (ple_bytes && cudaMemcpyAsync("));
     assert!(!NATIVE.contains(
-        "g.decode_row_desc_valid && g.decode_row_bytes == 0\n        && g.decode_ple_desc_valid"
+        "execution().decode_row_desc_valid && execution().decode_row_bytes == 0\n        && execution().decode_ple_desc_valid"
     ));
 }
 
@@ -492,8 +537,8 @@ fn d64_graph_route_is_controlled_classified_and_fail_closed() {
         )
     );
     assert!(NATIVE.contains("const bool d64_graph_q4 = n_kv != 0 && direct_q4_decode"));
-    assert!(NATIVE.contains("if (g.graph_capturing && d64_graph_q4)"));
-    assert!(NATIVE.contains("++g.graph_expected_dynamic_nodes;"));
+    assert!(NATIVE.contains("if (execution().graph_capturing && d64_graph_q4)"));
+    assert!(NATIVE.contains("++execution().graph_expected_dynamic_nodes;"));
     assert!(NATIVE.contains(
         "decode_graph_candidate()\n        && !d64_graph_q4 && !d64_graph_q8"
     ));
@@ -509,10 +554,11 @@ fn d64_graph_route_is_controlled_classified_and_fail_closed() {
 
 #[test]
 fn d64_attention_keeps_the_oracle_f32_value_reduction_by_default() {
-    let controlled = body_after(NATIVE, "if (g.graph_capturing && d64_graph_q4) {")
-        .split_once("const bool d256_tiled4 =")
-        .unwrap()
-        .0;
+    let controlled =
+        body_after(NATIVE, "if (execution().graph_capturing && d64_graph_q4) {")
+            .split_once("const bool d256_tiled4 =")
+            .unwrap()
+            .0;
     assert!(controlled.contains("IMPARO_CUDA_ATTN_D64_HALF"));
 
     let fallback = body_after(NATIVE, "const bool d64_f32 = head_dim == 64");
@@ -564,7 +610,7 @@ fn d64_q4_decode_owns_a_separate_quant_vector_contract_and_fallback() {
     ));
     let vector = NATIVE.find("const bool d64_vec_q4 =").unwrap();
     let controlled = NATIVE
-        .find("if (g.graph_capturing && d64_graph_q4) {")
+        .find("if (execution().graph_capturing && d64_graph_q4) {")
         .unwrap();
     assert!(
         vector < controlled,
@@ -585,12 +631,14 @@ fn d64_q8_decode_is_a_receipted_vector_route_with_graph_replay() {
     assert!(NATIVE.contains("imparo_sm80_d64_q8_vec::partial_q8"));
     assert!(NATIVE.contains("imparo_sm80_d64_q4_vec::combine_q4"));
     assert!(NATIVE.contains("const bool d64_graph_q8 = n_kv != 0"));
-    assert!(NATIVE.contains("(!g.graph_capturing || d64_graph_q8)"));
+    assert!(NATIVE.contains("(!execution().graph_capturing || d64_graph_q8)"));
     let q8_launch = body_after(NATIVE, "const bool d64_vec_q8 =")
-        .split_once("if (g.graph_capturing && d64_graph_q4)")
+        .split_once("if (execution().graph_capturing && d64_graph_q4)")
         .expect("D64 Q8 launch boundary")
         .0;
-    let graph_accounting = q8_launch.find("if (g.graph_capturing) {").unwrap();
+    let graph_accounting = q8_launch
+        .find("if (execution().graph_capturing) {")
+        .unwrap();
     let optional_trace = q8_launch
         .find("if (std::getenv(\"IMPARO_CUDA_ATTN_D64_VEC_TRACE\"))")
         .unwrap();
@@ -686,14 +734,19 @@ fn d512_fused_prefill_reuses_stable_cell_bounds_and_fails_closed() {
 
 #[test]
 fn q8_large_batches_use_an_independent_full_precision_d4_contract() {
-    let matmat = body_after(NATIVE, "extern \"C\" void imparo_cuda_matmat(");
-    let matmat = matmat
-        .split_once("extern \"C\" void imparo_cuda_matmat_gated")
+    let matmat = matmat_body();
+    assert!(matmat.contains(
+        "bool q8_mmq = q8_weight && g.sm_version >= 80 && (n_tok > 8 || short_q8_replay)"
+    ));
+    // A batch of 8 or fewer tokens reaches this path only through the short replay
+    // laboratory, which is off unless both of its environment variables are set.
+    let lab = body_after(NATIVE, "static bool short_prefill_replay_lab(")
+        .split_once("static void matmat_impl(")
         .unwrap()
         .0;
-    assert!(
-        matmat.contains("bool q8_mmq = q8_weight && g.sm_version >= 80 && n_tok > 8")
-    );
+    assert!(lab.contains(
+        "if (!raw || !nohost || std::strcmp(nohost, \"1\") != 0) return 0u;"
+    ));
     assert!(NATIVE.contains("Q8_LAYOUT_MMQ_D4 = 3"));
     assert!(matmat.contains("q8_mmq ? Q8_LAYOUT_MMQ_D4"));
     assert!(matmat.contains("n_in, n_tok, src_row, q8_mmq"));
@@ -705,7 +758,7 @@ fn q8_large_batches_use_an_independent_full_precision_d4_contract() {
         .0;
     assert!(quantizer.contains("bool full_precision_scale"));
     assert!(quantizer.contains(
-        "full_precision_scale\n            ? d : __half2float(__float2half(d))"
+        "(match_m1_quant || full_precision_scale)\n            ? d : __half2float(__float2half(d))"
     ));
 
     assert!(matmat.contains("imparo_sm80_q8_mmq::launch("));
@@ -714,7 +767,9 @@ fn q8_large_batches_use_an_independent_full_precision_d4_contract() {
     assert!(Q8_MMQ.contains("mma_m16n8k32"));
     assert!(Q8_MMQ.contains("bool AlignedWholeK = false, bool TileMajor = false"));
     assert!(Q8_MMQ.contains("if constexpr (!AlignedWholeK)"));
-    assert!(Q8_MMQ.contains("q8_0_q8_1_mma<Tokens, true, TileMajor, Epilogue>"));
+    assert!(Q8_MMQ.contains(
+        "q8_0_q8_1_mma<Tokens, true, TileMajor, Epilogue, AsyncTileMajor, Warps, CanonicalLoadLanes, Rows, HalfwordLoads>"
+    ));
     assert!(Q8_MMQ.contains("inline LaunchResult launch_aligned_whole_k("));
     assert!(NATIVE.contains("g.knobs[42] = 0;"));
     assert!(NATIVE.contains("const bool aligned_whole_k_requested = tensor_resident"));
@@ -723,4 +778,39 @@ fn q8_large_batches_use_an_independent_full_precision_d4_contract() {
     assert!(NATIVE.contains(
         "launch_result\n                    == imparo_sm80_q8_mmq::LaunchResult::NotSupported"
     ));
+}
+
+#[test]
+fn canonical_halfword_down_remains_an_opt_in_transaction_candidate() {
+    assert!(Q8_MMQ.contains("uint32_t Rows = kRows, bool HalfwordLoads = false>"));
+    assert!(
+        Q8_MMQ.contains(
+            "static_assert(!HalfwordLoads || (AlignedWholeK && Epilogue == 0)"
+        )
+    );
+    let load = body_after(Q8_MMQ, "__device__ __forceinline__ int load_q8_halfwords(");
+    let load = load.split_once("\n}").unwrap().0;
+    assert!(load.contains("reinterpret_cast<const uint16_t *>"));
+    assert!(!load.contains("reinterpret_cast<const uint32_t *>"));
+    let down = body_after(
+        NATIVE,
+        "static uint32_t try_q8_canonical_silu_private_down(",
+    );
+    let down = down
+        .split_once("static uint32_t try_q8_tm_silu_private_down(")
+        .unwrap()
+        .0;
+    assert!(down.contains("tuner_knob(61)"));
+    assert!(down.contains("tuner_knob(62)"));
+    // The W16 down (canonical modes 3 and 4) is a third way into the aligned launch,
+    // beside the two measured bounds.
+    assert!(
+        down.contains(
+            "const bool down_w16 = canonical_mode == 3 || canonical_mode == 4;"
+        )
+    );
+    assert!(down.contains("if (down_w16 || small_down || large_down)"));
+    assert!(down.contains("launch_aligned_whole_k<false,0,false,8,4,64,64,true>"));
+    assert!(down.contains("launch_aligned_whole_k<false,0,false,8,4,128,128,true>"));
+    assert!(down.contains("imparo_cuda_matmat(down_kind"));
 }

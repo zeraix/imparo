@@ -14,6 +14,14 @@
 
 pub mod numerical;
 
+/// Submission at the boundary after request-dependent inputs are materialized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerificationSubmission {
+    Eager,
+    Capture,
+    Replay,
+}
+
 /// Named activation/scratch slots. Each backend maps a slot to its own allocation;
 /// the ids are the cross-backend vocabulary the workflows speak.
 ///
@@ -121,19 +129,6 @@ pub type WeightKindWire = u32;
 /// and the CUDA backend tested `w_off != u64::MAX`, so a no-weight norm on CUDA read a
 /// weight vector at offset 4294967295. All-ones in 64 bits cannot be a real tensor offset,
 /// which is what the Metal kernel's IMPARO_NO_WEIGHT now is too.
-/// PLANES OF THE RECURRENT STATE, and why three.
-///
-/// A decode step reads one plane and writes the next, so the plane it read IS the pre-step
-/// state and a failed step is undone by NOT ADVANCING an index -- no copy. The count is
-/// `max steps in flight + 1`: with two pipelined steps encoded before either retires,
-///
-///   step t    reads p0  writes p1
-///   step t+1  reads p1  writes p2      <- p0 is still t's rollback point, so it must live
-///
-/// Two planes would have t+1 write over p0 and destroy it. This is exactly the allocation
-/// the old `Recur` + a two-slot rollback copy already cost, so the footprint does not move.
-pub const RECUR_PLANES: u32 = 3;
-
 pub const NO_WEIGHT: u64 = u64::MAX;
 
 /// The mixer of an LFM2 decode layer, for [`Backend::mega_lfm2_layer`].
@@ -410,6 +405,26 @@ impl ConvForm {
 /// It is a SEPARATE type, not two more fields, because it is optional as a UNIT -- a
 /// backend either does both steps inside the rule or neither, and half of it is not a
 /// state anyone should be able to construct.
+/// A checkpoint boundary inside a delta-rule batch: after `row` tokens of the batch the
+/// rule writes the matrix as it stands to `buf` at `off` and carries on.
+///
+/// The convolution history is written aside the same way (`causal_conv_snapshot`), and a
+/// recurrent state is BOTH: a checkpoint that carries the history without the matrix
+/// restores a model that saw the prefix's last three tokens and none of the rest.
+/// Measured on Qwen3.8-27B: a conversation adopting another's 768-token prefix answered
+/// differently from its first reasoning token, because the matrix region of the
+/// snapshot plane was never written (docs/kv-identity-grid.md).
+#[derive(Clone, Copy, Debug)]
+pub struct DeltaSnapshot {
+    pub buf: BufId,
+    /// Element offset of this layer's matrix region in `buf` -- the snapshot plane's
+    /// copy of `DeltaNet::state_off`.
+    pub off: u32,
+    /// Tokens of the batch before the boundary; the matrix after the update of token
+    /// `row - 1` is what is written.
+    pub row: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct DeltaEpilogue {
     /// `ssm_norm` in the weight buffer: ONE head's worth of weights (`value_dim`),
@@ -454,6 +469,8 @@ pub struct DeltaNet {
     /// `delta_net_fuses_epilogue`. `None`, or a backend that does not advertise it,
     /// leaves the caller to dispatch `rms_norm` and `act_mul` itself.
     pub epilogue: Option<DeltaEpilogue>,
+    /// The boundary snapshot, when a checkpoint boundary falls inside this batch.
+    pub snap: Option<DeltaSnapshot>,
     pub k_heads: u32,
     pub v_heads: u32,
     /// The Q/K head width, which is also the state's key coordinate.
@@ -464,6 +481,26 @@ pub struct DeltaNet {
     /// The floor of the L2 normalisation: `max(norm, eps)`, not `norm + eps`. The second
     /// shrinks every vector slightly, which is a different function.
     pub eps: f32,
+}
+
+/// Model-owned FFN boundary for optional decode-graph experiments.
+/// This describes semantic work; backends may ignore it without changing outputs.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeFfnPhase {
+    pub layer: u32,
+    pub gate_kind: WeightKindWire,
+    pub up_kind: WeightKindWire,
+    pub down_kind: WeightKindWire,
+    pub gate_off: u64,
+    pub up_off: u64,
+    pub down_off: u64,
+    pub n_in: u32,
+    pub n_mid: u32,
+    pub n_out: u32,
+    pub src: BufId,
+    pub dst: BufId,
+    pub tokens: u32,
+    pub activation: Epilogue,
 }
 
 /// Stable, typed policy for resolving the block width of the orthonormal
@@ -619,6 +656,9 @@ pub struct BatchGeometry {
     pub absolute_start: u64,
     pub active_tokens: u32,
     pub phase: BatchPhase,
+    /// The cold batch interval whose numerical family this physical suffix inherits.
+    pub canonical_start: u64,
+    pub canonical_tokens: u32,
 }
 
 impl BatchGeometry {
@@ -638,7 +678,33 @@ impl BatchGeometry {
             absolute_start,
             active_tokens,
             phase,
+            canonical_start: absolute_start,
+            canonical_tokens: active_tokens,
         })
+    }
+
+    /// Describe a physical suffix in an absolute prefill cell. The cell width
+    /// belongs to the model scheduler; backends must not guess a fixed512 grid.
+    pub fn try_prefill(
+        absolute_start: u64,
+        active_tokens: u32,
+        cell_tokens: u32,
+    ) -> Result<Self, &'static str> {
+        if cell_tokens == 0 {
+            return Err("prefill cell must contain at least one token");
+        }
+        let mut geometry =
+            Self::try_new(absolute_start, active_tokens, BatchPhase::Prefill)?;
+        let prefix = (absolute_start % u64::from(cell_tokens)) as u32;
+        let canonical_tokens = prefix
+            .checked_add(active_tokens)
+            .ok_or("canonical token count overflows u32")?;
+        if canonical_tokens > cell_tokens {
+            return Err("physical batch crosses a canonical cell");
+        }
+        geometry.canonical_start = absolute_start - u64::from(prefix);
+        geometry.canonical_tokens = canonical_tokens;
+        Ok(geometry)
     }
 
     #[must_use]
@@ -663,6 +729,25 @@ mod batch_geometry_tests {
         assert_eq!(split.canonical_offset(512, 0), Some(192));
         assert_eq!(cold.canonical_offset(512, 231), Some(231));
         assert_eq!(split.canonical_offset(512, 39), Some(231));
+    }
+
+    #[test]
+    fn canonical_family_survives_suffix_pruning_with_different_cell_widths() {
+        for cell in [128, 256, 384, 512, 1024] {
+            let start = u64::from(cell) * 2;
+            let cold = BatchGeometry::try_prefill(start, 66, cell).unwrap();
+            let tail = BatchGeometry::try_prefill(start + 64, 2, cell).unwrap();
+            assert_eq!(
+                (cold.canonical_start, cold.canonical_tokens),
+                (tail.canonical_start, tail.canonical_tokens)
+            );
+            assert_ne!(cold.active_tokens, tail.active_tokens);
+            let truly_small = BatchGeometry::try_prefill(start, 2, cell).unwrap();
+            assert_eq!(truly_small.canonical_tokens, 2);
+        }
+        assert!(BatchGeometry::try_prefill(0, 1, 0).is_err());
+        assert!(BatchGeometry::try_prefill(127, 2, 128).is_err());
+        assert!(BatchGeometry::try_prefill(u64::MAX, 1, 512).is_err());
     }
 
     #[test]
@@ -845,6 +930,26 @@ pub trait Backend: Sync {
     fn begin_forward(&self, _decode: bool) {
         self.begin();
     }
+    /// Static laboratory declaration of the complete work in the next device batch.
+    /// Called between closed forwards before graph preparation. A supporting backend
+    /// binds capture identity and atomic FFN completion to this demand; `false`
+    /// means this experiment is unsupported. This is not a dynamic plugin ABI.
+    fn set_forward_demand_lab(
+        &self,
+        _ffn_layers: u32,
+        _logits_wanted: bool,
+    ) -> Result<bool, i32> {
+        Ok(false)
+    }
+    /// Eager static experiment: projection numerical reference, independent of
+    /// truthful active batch/attention/KV geometry; reset at each begin/end.
+    fn set_projection_reference_lab(
+        &self,
+        _start: u32,
+        _tokens: u32,
+    ) -> Result<bool, i32> {
+        Ok(false)
+    }
     /// Prepares one single-token decode. `Ok(true)` means the backend has already
     /// submitted a reusable execution graph, so the semantic operations for this
     /// forward must not be encoded again. Backends without replay support retain
@@ -881,6 +986,16 @@ pub trait Backend: Sync {
         _argmax: bool,
     ) -> Result<bool, i32> {
         Ok(false)
+    }
+    /// Optionally capture the already-materialized verification body until end().
+    /// Capture encodes current operations, while Replay has already submitted the
+    /// body. Both defer external feature publication until after end().
+    fn verification_body_begin(
+        &self,
+        _rows: u32,
+        _start: u32,
+    ) -> Result<VerificationSubmission, i32> {
+        Ok(VerificationSubmission::Eager)
     }
     /// Sets the immutable absolute geometry for the next device batch. Backends that
     /// do not use position-dependent numerical routes deliberately inherit this no-op.
@@ -936,6 +1051,13 @@ pub trait Backend: Sync {
     }
     fn mega_recover(&self) -> Result<(), i32> {
         Ok(())
+    }
+    /// Negotiate the recurrent state planes requested by the model plan. This is a
+    /// static execution capability: allocation, placement and step cursors must use
+    /// the same count, independently of runtime tuning choices. Backends that rotate
+    /// planes must bind each step's state addresses when replaying cached work.
+    fn recurrent_plane_count(&self, requested: u32) -> u32 {
+        requested.max(1)
     }
     /// Whether `end_async` / `wait_outstanding` overlap regions on this backend, and
     /// `argmax_feed` writes the pick where the next step's gather reads it.
@@ -997,6 +1119,26 @@ pub trait Backend: Sync {
     /// derivation silently compute against a made-up number.
     fn device_profile(&self) -> DeviceProfile {
         DeviceProfile::default()
+    }
+    /// MEASURE how many threadgroups of `architecture`'s mega layer pipeline at head-dim
+    /// `slot` (0 = the smaller attention geometry, 1 = the larger) this GPU holds resident
+    /// at the seated width -- the LIMIT the grid knob for that pipeline is ranked under
+    /// (task #203). The value is remembered by the backend for `candidates` / `legal`
+    /// to read; 0 = no such pipeline, or the probe could not run.
+    ///
+    /// A DISCOVERY probe, called by the tuner between regions like `spill_rate`: it
+    /// dispatches the real pipeline in probe mode and clears the grid-barrier counters,
+    /// so it must never run with a region open. The engine never calls it -- an untuned
+    /// host runs one threadgroup per core, a tuned one applies the stored value as
+    /// written, and the tuner only ever writes a value it measured under this limit.
+    fn mega_admission(&self, _architecture: &str, _slot: u32) -> u32 {
+        0
+    }
+    /// Which form `architecture`'s mega entries run in on this backend, or `None` when it
+    /// has no pipeline family for them. The model side (whether the workflow offers
+    /// entries at all) is the tuner's to combine with this; see [`MegaSeat`].
+    fn mega_seat_form(&self, _architecture: &str) -> MegaSeat {
+        MegaSeat::None
     }
     /// TFLOPS holding the `idx`-th candidate accumulator count live. Sweeping it finds
     /// the spill cliff. 0.0 where a backend has no such probe.
@@ -1073,9 +1215,46 @@ pub trait Backend: Sync {
     }
 
     /// Rows retained after the last state-writing operator when all remaining
-    /// work is row-local and only the final logit row is observable.
-    fn row_local_prefill_tail_rows(&self) -> u32 {
+    /// work is row-local and only the final logit row is observable. Backends
+    /// may make this a measured per-request decision from the original batch.
+    fn row_local_prefill_tail_rows(&self, _n_tok: u32) -> u32 {
         64
+    }
+
+    /// Whether a workflow may omit Q when its only consumer, attention, is dead
+    /// after the final required state write. K/V preparation remains mandatory.
+    /// Backends retain their existing schedule until they admit this capability.
+    /// Admit compact PLE layer-prefix production only with a matching strided
+    /// gather implementation. The workflow proves which layer slices are dead.
+    /// Update the currently materialized Prefill suffix without rewriting the
+    /// reference batch used for numerical route selection or graph identity.
+    fn set_materialized_prefill_tail(
+        &self,
+        _start: u32,
+        _tokens: u32,
+    ) -> Result<(), i32> {
+        Ok(())
+    }
+
+    fn prefill_ple_prefix_elision(&self, _n_tok: u32) -> bool {
+        false
+    }
+
+    fn prefill_unused_query_elision(&self) -> bool {
+        false
+    }
+
+    /// Optional row count for the final shared-KV tail. The model must prove that
+    /// all KV writes are complete and that discarded query rows have no consumer.
+    /// This is a separate numerical route from the established aligned schedule.
+    fn shared_kv_prefill_tail_rows(&self) -> Option<u32> {
+        None
+    }
+
+    /// Minimum retained rows for a proven finite-history suffix. The model owns
+    /// history/checkpoint demand; the backend owns numerical shape admission.
+    fn finite_history_prefill_tail_rows(&self) -> Option<u32> {
+        None
     }
 
     // --- buffers and arena ---
@@ -1126,7 +1305,7 @@ pub trait Backend: Sync {
     ///
     /// SEPARATE FROM `write` BECAUSE THE SOURCE DOES NOT EXIST. Writing zeros through
     /// `write` means the caller builds them: a recurrent state cleared that way allocated
-    /// a host `Vec` the size of the whole state times `RECUR_PLANES`, faulted it in, and
+    /// a host `Vec` the size of the whole state times its plane count, faulted it in, and
     /// memcpy'd it across -- 3374 ms on Qwen3.8-27B's first conversation and 65 ms on
     /// every one after, for a buffer a backend can fill in place.
     ///
@@ -1271,6 +1450,15 @@ pub trait Backend: Sync {
     ) -> bool {
         false
     }
+    /// Observe an FFN boundary without submitting work or changing its semantics.
+    /// Default backends do nothing; an experiment may record capture dependencies.
+    fn decode_ffn_boundary(
+        &self,
+        _phase: DecodeFfnPhase,
+        _entering: bool,
+    ) -> Result<(), i32> {
+        Ok(())
+    }
     /// Try the complete gated FFN projection
     /// `dst = down * (activation(gate * src) * (up * src))` as one backend
     /// operation.
@@ -1391,6 +1579,29 @@ pub trait Backend: Sync {
     /// `None` is mandatory; activation-specific fusion is opt-in.
     fn supports_epilogue(&self, epi: Epilogue) -> bool {
         epi == Epilogue::None
+    }
+
+    /// Try an input projection followed by gated short convolution and state advance.
+    /// A successful call writes `bcx`, `out`, and the advanced recurrent `state`.
+    /// Returning `false` promises no public writes; the caller retains its ordinary
+    /// projection, optional snapshot, and short-convolution sequence. Callers needing
+    /// a snapshot of the pre-advance history must use that established sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn matmat_shortconv(
+        &self,
+        _wkind: WeightKindWire,
+        _proj_off: u64,
+        _conv_off: u64,
+        _src: BufId,
+        _bcx: BufId,
+        _state: BufId,
+        _state_off: u32,
+        _out: BufId,
+        _width: u32,
+        _kernel: u32,
+        _n_tok: u32,
+    ) -> bool {
+        false
     }
 
     /// A causal depthwise convolution over `n_tok` tokens of `width` channels.
@@ -1659,6 +1870,32 @@ pub trait Backend: Sync {
             self.hadamard(v, n_tok * n_kv * head_dim, v_hadamard_nrot);
         }
     }
+    /// Try to postprocess K/V and write their quantized cache representation as
+    /// one backend transaction. Returning `false` guarantees that neither the
+    /// source buffers nor the cache were modified, so the workflow can execute
+    /// the portable postprocess + store sequence unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_head_postprocess_store(
+        &self,
+        _k: BufId,
+        _v: BufId,
+        _k_norm_off: u64,
+        _v_rms_norm: bool,
+        _head_dim: u32,
+        _eps: f32,
+        _n_kv: u32,
+        _start_pos: u32,
+        _n_tok: u32,
+        _rope_dim: u32,
+        _rope_base: f32,
+        _freqs: Option<&[f32]>,
+        _k_hadamard_nrot: u32,
+        _v_hadamard_nrot: u32,
+        _layer: u32,
+        _ring: u32,
+    ) -> bool {
+        false
+    }
     /// Try to evaluate `dst = rms_norm(src, weight) + add` in one backend operation.
     ///
     /// This is an optional, model-agnostic fusion. Returning `false` promises that no
@@ -1848,6 +2085,20 @@ pub trait Backend: Sync {
     /// `n` floats from `src[src_off..]` to `dst[dst_off..]` (element offsets). `dst` may
     /// be `src` when the two ranges do not overlap; the caller guarantees that.
     fn copy_range(&self, dst: BufId, dst_off: u32, src: BufId, src_off: u32, n: u32);
+    /// Copy after a completed synchronous forward, outside its reusable graph.
+    /// A backend with retained decode state must preserve that lifecycle here.
+    fn copy_range_after_forward(
+        &self,
+        dst: BufId,
+        dst_off: u32,
+        src: BufId,
+        src_off: u32,
+        n: u32,
+    ) -> Result<(), i32> {
+        self.begin();
+        self.copy_range(dst, dst_off, src, src_off, n);
+        self.end()
+    }
     fn mul_strided(
         &self,
         a: BufId,
@@ -1874,6 +2125,28 @@ pub trait Backend: Sync {
         n: u32,
     ) {
         self.argmax(src, pick, n);
+    }
+    /// Optional whole-logit greedy selection with accepted-prefix recurrent restore.
+    fn supports_greedy_verification(&self) -> bool {
+        false
+    }
+    /// dst[0..3] stores status/consumed/next as u32 bits; dst[3..3+2*rows]
+    /// is row workspace. Status zero is success. All logits must be finite;
+    /// equal maxima select the first index, matching the host verifier.
+    /// Restore snap[(consumed+1)*elems..] only for a partial accepted prefix.
+    /// Validate every range/alias before launch; unsupported backends return Err.
+    fn verify_greedy_and_restore(
+        &self,
+        _src: BufId,
+        _tokens: BufId,
+        _dst: BufId,
+        _recur: BufId,
+        _snap: BufId,
+        _vocab: u32,
+        _rows: u32,
+        _elems: u32,
+    ) -> Result<(), i32> {
+        Err(-1)
     }
     fn ple_gather_combine(
         &self,
@@ -1911,6 +2184,48 @@ pub trait Backend: Sync {
         unreachable!(
             "ple_gather_combine_staged on a backend whose stage_rows returned false"
         )
+    }
+
+    /// Combine a compact output prefix with rows from the original wider table.
+    /// Callers may use unequal widths only when prefill_ple_prefix_elision is true.
+    /// Output prefix with the reference projection's original output width.
+    /// The admitted backend preserves its numerical family while omitting dead rows.
+    fn matmat_output_prefix(
+        &self,
+        kind: u32,
+        offset: u64,
+        n_in: u32,
+        canonical_out: u32,
+        output_out: u32,
+        src: BufId,
+        dst: BufId,
+        n_tok: u32,
+    ) {
+        assert_eq!(canonical_out, output_out, "projection prefix not admitted");
+        self.matmat(kind, offset, n_in, output_out, src, dst, n_tok);
+    }
+
+    fn ple_gather_combine_prefix(
+        &self,
+        proj: BufId,
+        tokens_buf: BufId,
+        w_offset: u64,
+        source_width: u32,
+        output_width: u32,
+        emb_scale: f32,
+        comb_scale: f32,
+        n_tok: u32,
+    ) {
+        assert_eq!(source_width, output_width, "PLE prefix gather not admitted");
+        self.ple_gather_combine(
+            proj,
+            tokens_buf,
+            w_offset,
+            output_width,
+            emb_scale,
+            comb_scale,
+            n_tok,
+        );
     }
 
     // --- weights + config + identity ---
@@ -2346,7 +2661,18 @@ pub enum Workload {
     /// being ranked on a workload that never reached it, and their candidates duly
     /// landed within noise of each other. Same defect as a prefill tile knob declared on
     /// DecodeMix: the workload has to exercise the thing the knob selects.
+    ///
+    /// This one FORCES THE SCORE-TILE KERNEL (it ranks attn_min_tgs and attn_threads,
+    /// which govern that kernel), so the streaming knobs need the workload below.
     AttentionDecodeDeep,
+    /// Single-query attention against the same deep context with the STREAMING kernel
+    /// forced: the vector route off and the score-tile boundary at zero. What
+    /// attn_stream_hq and attn_stream_slices select. Ranked on AttentionDecodeDeep
+    /// (score-tile forced) every head-sharing value read the same 842.5 us on
+    /// Qwen3.8-27B while the engine measured 601 / 334 / 238 ms per 24 steps for 1 / 2
+    /// / 3 heads per threadgroup at 16k keys -- the knob ranked on a kernel it could
+    /// not move, the defect this enum's doc describes, one level down.
+    AttentionDecodeStream,
     /// Batched prefill attention against a SHALLOW context -- a cold first chunk.
     AttentionPrefill,
     /// A full prefill chunk against a DEEP context: the shape a 16k prefill spends
@@ -2424,6 +2750,18 @@ pub enum Workload {
     /// Down together, so the tuner must time and prove every controlled stage rather
     /// than persist an untested mixture or rank the bundle on FFN alone.
     PrefillFfnExact128,
+    /// ONE DECODE STEP THROUGH THE MEGA KERNEL: every layer of the model as one
+    /// `Backend::mega_layer` entry, over the tuner's synthetic weights and its own cache,
+    /// at a SHORT span -- every layer's dispatch runs at the grid seat. The regime of the
+    /// persistent grid knobs (`mega_tgs`, `mega_tgs_large`, `mega_nsg`; task #203):
+    /// `DecodeMix` dispatches independent matmuls and never reaches a grid barrier, so it
+    /// once called them INERT. A layer the backend refuses is a candidate rejected, never
+    /// a timing.
+    MegaDecodeStep,
+    /// The same step at a DEEP span: the engine's real mix at depth, where a layer whose
+    /// span exceeds the vector-attention cap takes the deep variant at one threadgroup per
+    /// core and the rest stay at the seat. The cross-check regime of the grid knobs.
+    MegaDecodeStepDeep,
 }
 
 /// Stable identity of the frozen dynamic-program search surface. The three catalog
@@ -2517,6 +2855,10 @@ pub enum WorkloadEffects {
     /// Mutable recurrent state whose exact size comes from the model plan rather than
     /// a backend-global constant.
     ModelRecurrentState,
+    /// The mega decode step's writes, sized from the model: the residual and the
+    /// activation scratch rows of one token, and this token's K/V row in every layer
+    /// that owns a cache. Captured by the tuner from the entries it built.
+    MegaDecodeState,
 }
 
 impl Workload {
@@ -2530,6 +2872,7 @@ impl Workload {
             | Self::NarrowMix(_)
             | Self::AttentionDecode
             | Self::AttentionDecodeDeep
+            | Self::AttentionDecodeStream
             | Self::AttentionPrefill
             | Self::AttentionPrefillDeep
             | Self::DecodeAttentionStep
@@ -2542,6 +2885,9 @@ impl Workload {
             | Self::PrefillFfnTransaction
             | Self::PrefillFfnExact128 => WorkloadEffects::ReadOnly,
             Self::DecodeShortconvTransaction => WorkloadEffects::ModelRecurrentState,
+            Self::MegaDecodeStep | Self::MegaDecodeStepDeep => {
+                WorkloadEffects::MegaDecodeState
+            }
         }
     }
 }
@@ -2573,6 +2919,14 @@ pub enum SweepKind {
     /// minimum. This is deliberately separate from `Crossing`, whose `hi` route owns
     /// the small side of the boundary.
     TokenMinCrossing {
+        ladder: &'static [u32],
+        hi: u32,
+        lo: u32,
+    },
+    /// Transaction-aware counterpart of TokenMinCrossing whose candidate owns
+    /// the small side. The last stable winning rung is an inclusive maximum.
+    /// Unlike Crossing, this measures the declared complete semantic workload.
+    TokenMaxCrossing {
         ladder: &'static [u32],
         hi: u32,
         lo: u32,
@@ -2693,6 +3047,26 @@ pub struct DeviceProfile {
     pub fill_threadgroups: u32,
 }
 
+/// What the tuned mega grid seat governs for a model's decode -- the APPLICABILITY fact
+/// behind `mega_tgs` / `mega_nsg` (task #203).
+///
+/// Two owners feed it, and neither alone can answer: the model's workflow decides whether
+/// it offers mega entries at all (qwen35's does not yet), the backend decides which FORM
+/// those entries run in (LFM2's default is the per-token program at one threadgroup per
+/// core, measured in #153; gemma4's is the per-layer dispatch at the seat). A knob offered
+/// where it governs nothing is worse than useless: the tuner spends measurements on it and
+/// then RECORDS a pick that reads as a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MegaSeat {
+    /// This model's decode dispatches no mega entry; neither knob applies.
+    None,
+    /// Per-layer entries at the seat: `mega_tgs` sets the grid, `mega_nsg` the width.
+    Grid,
+    /// Entries run one threadgroup per core (the program form): the grid is derived and
+    /// `mega_tgs` governs nothing; `mega_nsg` is still the width floor.
+    OnePerCore,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelFacts {
     pub n_embd: u32,
@@ -2727,6 +3101,10 @@ pub struct ModelFacts {
     /// IQ2_S_TM tensor set bit 0 and read as "F32 present, IQ2_S_TM absent". Two wrong
     /// answers, no error. The assertion below is what stops the same silence at 64.
     pub weight_kinds: u64,
+    /// What the mega grid seat governs on this model (see [`MegaSeat`]). The tuner
+    /// resolves it from the model's workflow and the backend's form policy; a bench
+    /// literal that has not asked says `None`.
+    pub mega_seat: MegaSeat,
 }
 
 /// The front of a gemma4 layer offered to `mega_layer` (when `mega_front_wanted`):

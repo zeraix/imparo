@@ -536,10 +536,16 @@ mod imp {
         pub(crate) fn imparo_cuda_device_tag(dst: *mut u8, len: u32) -> u32;
         pub(crate) fn imparo_cuda_begin();
         pub(crate) fn imparo_cuda_begin_forward(decode: u32);
+        pub(crate) fn imparo_cuda_set_materialized_prefill_tail(
+            absolute_start: u64,
+            active_tokens: u32,
+        ) -> i32;
         pub(crate) fn imparo_cuda_set_batch_geometry(
             absolute_start: u64,
             active_tokens: u32,
             phase: u32,
+            canonical_start: u64,
+            canonical_tokens: u32,
         ) -> i32;
         pub(crate) fn imparo_cuda_decode_prepare(
             token: u32,
@@ -552,6 +558,8 @@ mod imp {
             start_pos: u32,
             argmax: u32,
         ) -> i32;
+        pub(crate) fn imparo_cuda_verification_body_begin(rows: u32, start: u32)
+        -> i32;
         pub(crate) fn imparo_cuda_flush();
         pub(crate) fn imparo_cuda_end() -> i32;
         pub(crate) fn imparo_cuda_last_gpu_us() -> f64;
@@ -710,6 +718,16 @@ mod imp {
         pub(crate) fn imparo_cuda_set_knob(idx: u32, value: u32);
         pub(crate) fn imparo_cuda_knob(idx: u32) -> u32;
         pub(crate) fn imparo_cuda_buf_count() -> u32;
+        pub(crate) fn imparo_cuda_matmat_output_prefix(
+            wkind: u32,
+            w_off: u64,
+            n_in: u32,
+            canonical_out: u32,
+            n_out: u32,
+            src: u32,
+            dst: u32,
+            n_tok: u32,
+        );
         pub(crate) fn imparo_cuda_matmat(
             wkind: u32,
             w_off: u64,
@@ -875,6 +893,24 @@ mod imp {
             k_hadamard_nrot: u32,
             v_hadamard_nrot: u32,
         );
+        pub(crate) fn imparo_cuda_kv_head_postprocess_store(
+            k_buf: u32,
+            v_buf: u32,
+            k_norm_off: u64,
+            v_rms_norm: u32,
+            head_dim: u32,
+            eps: f32,
+            n_kv: u32,
+            start_pos: u32,
+            n_tok: u32,
+            rope_dim: u32,
+            rope_base: f32,
+            freqs: *const f32,
+            k_hadamard_nrot: u32,
+            v_hadamard_nrot: u32,
+            layer: u32,
+            ring: u32,
+        ) -> u32;
         pub(crate) fn imparo_cuda_kv_store(
             src: u32,
             layer: u32,
@@ -908,6 +944,19 @@ mod imp {
             kdq: u32,
             vdq: u32,
         );
+        pub(crate) fn imparo_cuda_matmat_shortconv(
+            wkind: u32,
+            proj_off: u64,
+            conv_off: u64,
+            src: u32,
+            bcx: u32,
+            state: u32,
+            state_off: u32,
+            out: u32,
+            width: u32,
+            kernel: u32,
+            n_tok: u32,
+        ) -> u32;
         pub(crate) fn imparo_cuda_shortconv(
             bcx: u32,
             w_off: u64,
@@ -954,6 +1003,16 @@ mod imp {
         );
         pub(crate) fn imparo_cuda_softcap(a: u32, cap: f32, n: u32);
         pub(crate) fn imparo_cuda_argmax(src: u32, dst: u32, n: u32);
+        pub(crate) fn imparo_cuda_verify_greedy_and_restore(
+            src: u32,
+            tokens: u32,
+            dst: u32,
+            recur: u32,
+            snap: u32,
+            vocab: u32,
+            rows: u32,
+            elems: u32,
+        ) -> i32;
         pub(crate) fn imparo_cuda_row(
             wkind: u32,
             w_off: u64,
@@ -973,6 +1032,16 @@ mod imp {
             dst: u32,
             n_tok: u32,
         );
+        pub(crate) fn imparo_cuda_ple_gather_combine_prefix(
+            proj: u32,
+            tokens_buf: u32,
+            w_offset: u64,
+            source_width: u32,
+            output_width: u32,
+            emb_scale: f32,
+            comb_scale: f32,
+            n_tok: u32,
+        );
         pub(crate) fn imparo_cuda_ple_gather_combine(
             proj: u32,
             tokens_buf: u32,
@@ -984,6 +1053,9 @@ mod imp {
         );
     }
 
+    pub(crate) fn imparo_cuda_has_greedy_verification() -> bool {
+        cfg!(feature = "cuda-speculative")
+    }
     pub(crate) fn backend_artifact_sha256() -> Result<Option<[u8; 32]>, String> {
         Ok(None)
     }
@@ -1011,9 +1083,11 @@ mod imp_dynamic {
             imparo_cuda_device_tag(dst: *mut u8, len: u32) -> u32 = 0;
             imparo_cuda_begin() -> () = ();
             imparo_cuda_begin_forward(decode: u32) -> () = ();
-            imparo_cuda_set_batch_geometry(absolute_start: u64, active_tokens: u32, phase: u32) -> i32 = LOAD_ERROR;
+            imparo_cuda_set_materialized_prefill_tail(absolute_start: u64, active_tokens: u32) -> i32 = LOAD_ERROR;
+            imparo_cuda_set_batch_geometry(absolute_start: u64, active_tokens: u32, phase: u32, canonical_start: u64, canonical_tokens: u32) -> i32 = LOAD_ERROR;
             imparo_cuda_decode_prepare(token: u32, start_pos: u32, argmax: u32) -> i32 = 0;
             imparo_cuda_prefill_prepare(tokens: *const u32, count: u32, start_pos: u32, argmax: u32) -> i32 = 0;
+            imparo_cuda_verification_body_begin(rows: u32, start: u32) -> i32 = 0;
             imparo_cuda_flush() -> () = ();
             imparo_cuda_end() -> i32 = LOAD_ERROR;
             imparo_cuda_program_pack_install(pack: *const super::ProgramPackWire, struct_size: u32) -> i32 = LOAD_ERROR;
@@ -1051,6 +1125,7 @@ mod imp_dynamic {
             imparo_cuda_set_knob(idx: u32, value: u32) -> () = ();
             imparo_cuda_knob(idx: u32) -> u32 = 0;
             imparo_cuda_buf_count() -> u32 = 0;
+            imparo_cuda_matmat_output_prefix(wkind: u32, w_off: u64, n_in: u32, canonical_out: u32, n_out: u32, src: u32, dst: u32, n_tok: u32) -> () = ();
             imparo_cuda_matmat(wkind: u32, w_off: u64, n_in: u32, n_out: u32, src: u32, dst: u32, n_tok: u32, src_row: u32) -> () = ();
             imparo_cuda_matmat_gated(gate_kind: u32, gate_off: u64, up_kind: u32, up_off: u64, n_in: u32, n_out: u32, src: u32, dst: u32, tmp: u32, n_tok: u32, fused_epilogue: u32) -> () = ();
             imparo_cuda_ffn_gated_down(gate_kind: u32, gate_off: u64, up_kind: u32, up_off: u64, down_kind: u32, down_off: u64, n_in: u32, n_mid: u32, n_out: u32, src: u32, gated_tmp: u32, dst: u32, n_tok: u32) -> u32 = 0;
@@ -1066,6 +1141,7 @@ mod imp_dynamic {
             imparo_cuda_hadamard(buf: u32, n: u32, nrot: u32) -> () = ();
             imparo_cuda_head_norm_rope_hadamard(buf: u32, w_off: u64, head_dim: u32, eps: f32, n_heads: u32, start_pos: u32, n_tok: u32, rope_dim: u32, rope_base: f32, freqs: *const f32, hadamard_nrot: u32) -> () = ();
             imparo_cuda_kv_head_postprocess(k_buf: u32, v_buf: u32, k_norm_off: u64, head_dim: u32, eps: f32, n_kv: u32, start_pos: u32, n_tok: u32, rope_dim: u32, rope_base: f32, freqs: *const f32, k_hadamard_nrot: u32, v_hadamard_nrot: u32) -> () = ();
+            imparo_cuda_kv_head_postprocess_store(k_buf: u32, v_buf: u32, k_norm_off: u64, v_rms_norm: u32, head_dim: u32, eps: f32, n_kv: u32, start_pos: u32, n_tok: u32, rope_dim: u32, rope_base: f32, freqs: *const f32, k_hadamard_nrot: u32, v_hadamard_nrot: u32, layer: u32, ring: u32) -> u32 = 0;
             imparo_cuda_kv_store(src: u32, layer: u32, width: u32, start_pos: u32, n_tok: u32, is_v: u32, ring: u32) -> () = ();
             imparo_cuda_kv_dequant(layer: u32, width: u32, slots: u32, is_v: u32, scratch: u32, ring: u32) -> () = ();
             imparo_cuda_attention(kv_layer: u32, head_dim: u32, n_heads: u32, n_kv: u32, kv_width: u32, start_pos: u32, qk_scale: f32, window: u32, n_tok: u32, ring: u32, q: u32, out: u32, kdq: u32, vdq: u32) -> () = ();
@@ -1085,6 +1161,7 @@ mod imp_dynamic {
             imparo_cuda_argmax(src: u32, dst: u32, n: u32) -> () = ();
             imparo_cuda_row(wkind: u32, w_off: u64, width: u32, index: u32, scale: f32, dst: u32, dst_off: u32) -> () = ();
             imparo_cuda_rows(wkind: u32, w_off: u64, width: u32, table_rows: u32, tokens_buf: u32, scale: f32, dst: u32, n_tok: u32) -> () = ();
+            imparo_cuda_ple_gather_combine_prefix(proj: u32, tokens_buf: u32, w_offset: u64, source_width: u32, output_width: u32, emb_scale: f32, comb_scale: f32, n_tok: u32) -> () = ();
             imparo_cuda_ple_gather_combine(proj: u32, tokens_buf: u32, w_offset: u64, width: u32, emb_scale: f32, comb_scale: f32, n_tok: u32) -> () = ();
         } };
     }
@@ -1141,6 +1218,86 @@ mod imp_dynamic {
         };
     }
     fields!(declare_api);
+
+    // Optional additive symbol: an older dynamic library keeps host verification.
+    type GreedyVerificationFn =
+        unsafe extern "C" fn(u32, u32, u32, u32, u32, u32, u32, u32) -> i32;
+    fn greedy_verification_fn() -> Option<GreedyVerificationFn> {
+        static FUNCTION: OnceLock<Option<GreedyVerificationFn>> = OnceLock::new();
+        *FUNCTION.get_or_init(|| {
+            let api = api().ok()?;
+            api._library
+                .symbol(b"imparo_cuda_verify_greedy_and_restore\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<*mut c_void, GreedyVerificationFn>(p)
+                })
+        })
+    }
+    pub(crate) fn imparo_cuda_has_greedy_verification() -> bool {
+        greedy_verification_fn().is_some()
+    }
+    pub(crate) unsafe fn imparo_cuda_verify_greedy_and_restore(
+        src: u32,
+        tokens: u32,
+        dst: u32,
+        recur: u32,
+        snap: u32,
+        vocab: u32,
+        rows: u32,
+        elems: u32,
+    ) -> i32 {
+        greedy_verification_fn().map_or(-1, |f| unsafe {
+            f(src, tokens, dst, recur, snap, vocab, rows, elems)
+        })
+    }
+
+    /// Additive semantic capability: older ABI34 libraries retain the ordinary DAG.
+    /// Keep this independent of both mandatory symbols and the Step-1 tool group.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn imparo_cuda_matmat_shortconv(
+        wkind: u32,
+        proj_off: u64,
+        conv_off: u64,
+        src: u32,
+        bcx: u32,
+        state: u32,
+        state_off: u32,
+        out: u32,
+        width: u32,
+        kernel: u32,
+        n_tok: u32,
+    ) -> u32 {
+        type MatmatShortconv = unsafe extern "C" fn(
+            u32,
+            u64,
+            u64,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+        ) -> u32;
+        static FUNCTION: OnceLock<Option<MatmatShortconv>> = OnceLock::new();
+        let function = FUNCTION.get_or_init(|| {
+            let api = api().ok()?;
+            api._library
+                .symbol(b"imparo_cuda_matmat_shortconv\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<*mut c_void, MatmatShortconv>(p)
+                })
+        });
+        function.map_or(0, |f| unsafe {
+            f(
+                wkind, proj_off, conv_off, src, bcx, state, state_off, out, width,
+                kernel, n_tok,
+            )
+        })
+    }
 
     struct Step1Api {
         last_gpu_us: Option<unsafe extern "C" fn() -> f64>,
@@ -2187,7 +2344,7 @@ mod native_kv_smoke_tests {
         let run = |enabled: bool| -> (Vec<f32>, Vec<f32>) {
             unsafe {
                 imparo_cuda_set_knob(39, u32::from(enabled));
-                assert_eq!(imparo_cuda_set_batch_geometry(0, N_TOK, 0), 0);
+                assert_eq!(imparo_cuda_set_batch_geometry(0, N_TOK, 0, 0, N_TOK), 0);
                 imparo_cuda_begin();
                 imparo_cuda_write(CUR, 0, cur.as_ptr(), cur.len() as u64);
                 imparo_cuda_write(
@@ -2312,7 +2469,7 @@ mod native_kv_smoke_tests {
         // incomplete mask is exactly what the tuner must reject.
         unsafe {
             imparo_cuda_set_knob(39, 1);
-            assert_eq!(imparo_cuda_set_batch_geometry(1, N_TOK, 0), 0);
+            assert_eq!(imparo_cuda_set_batch_geometry(1, N_TOK, 0, 1, N_TOK), 0);
             imparo_cuda_begin();
             imparo_cuda_write(CUR, 0, cur.as_ptr(), cur.len() as u64);
             imparo_cuda_write(PER_LAYER, 0, per_layer.as_ptr(), per_layer.len() as u64);
@@ -2481,5 +2638,43 @@ mod native_step1_smoke_tests {
         );
         assert_eq!(wrong_family.observed_knob_mask & (1_u64 << 7), 0);
         assert_eq!(unsafe { imparo_cuda_set_tuner_mode(0) }, 0);
+    }
+}
+
+#[cfg(all(test, feature = "cuda-static"))]
+mod canonical_batch_wire_tests {
+    #[test]
+    fn native_geometry_validates_both_physical_and_canonical_intervals() {
+        // No device initialization is needed: this exercises the actual native
+        // ABI27 setter and its overflow/phase validation before any launch.
+        use super::imparo_cuda_set_batch_geometry as set;
+        unsafe {
+            assert_eq!(set(576, 2, 0, 512, 66), 0);
+            assert_eq!(set(768, 2, 0, 768, 2), 0);
+            for args in [
+                (576, 2, 0, 577, 1),
+                (576, 2, 0, 512, 65),
+                (576, 2, 0, 512, 67),
+                (576, 0, 0, 512, 64),
+                (576, 1, 1, 512, 65),
+                (u64::MAX, 1, 0, 0, 1),
+            ] {
+                assert_ne!(set(args.0, args.1, args.2, args.3, args.4), 0);
+            }
+            assert_eq!(set(576, 1, 1, 576, 1), 0);
+            use super::imparo_cuda_set_materialized_prefill_tail as tail;
+            assert_ne!(tail(576, 1), 0); // Decode cannot become a Prefill suffix.
+            assert_eq!(set(0, 128, 0, 0, 128), 0);
+            assert_eq!(tail(64, 64), 0);
+            assert_eq!(tail(112, 16), 0); // Nested pruning preserves the reference end.
+            for (start, tokens) in [(63, 64), (64, 65), (128, 0), (u64::MAX, 1)] {
+                assert_eq!(set(0, 128, 0, 0, 128), 0);
+                assert_ne!(tail(start, tokens), 0);
+            }
+            assert_eq!(set(576, 2, 0, 512, 66), 0);
+            assert_ne!(tail(512, 66), 0); // Cannot materialize the already cached prefix.
+            assert_eq!(set(0, 128, 0, 0, 128), 0);
+            assert_eq!(tail(64, 64), 0);
+        }
     }
 }

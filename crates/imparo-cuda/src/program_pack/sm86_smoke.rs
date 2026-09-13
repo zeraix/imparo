@@ -766,6 +766,7 @@ fn triton_pack_linux_aot_loads_and_runs_on_clean_windows_sm86() {
 
 fn query_candidate(backend: &crate::CudaBackend, group: &str, variant: &[u8; 32]) {
     let facts = imparo_backend::ModelFacts {
+        mega_seat: imparo_backend::MegaSeat::None,
         n_embd: 1024,
         n_ff: 4096,
         n_head: 8,

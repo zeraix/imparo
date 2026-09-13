@@ -13,7 +13,7 @@ use imparo_backend::BufId;
 
 #[cfg(feature = "cuda-gate0-capture")]
 use crate::gate0_capture::{CaptureOp, CaptureRun};
-use crate::gpu_support::{layer_skip_log, tail_align, tail_split};
+use crate::gpu_support::{layer_skip_log, tail_align, tail_split, tail_split_min_rows};
 use crate::{Attention, KvSource, ModelPlan};
 
 // GEMMA4'S PRIVATE BUFFER SLOTS. These were named Gate, Back and PerLayer in the shared
@@ -79,6 +79,23 @@ pub fn prepare_device(wf: &mut Gemma4) -> Result<(), String> {
         .map_err(|rc| format!("backend quantized-weight admission failed rc={rc}"))
 }
 
+// Read-only transaction witness. Unlike gprobe this neither ends/begins the
+// forward nor changes sidecar eligibility. It is for eager execution only.
+fn ffn_witness_dump(
+    path: &std::path::Path,
+    name: &str,
+    buf: BufId,
+    n: usize,
+) -> Result<(), String> {
+    let mut values = vec![0.0_f32; n];
+    be().read(buf, 0, &mut values);
+    let mut bytes = Vec::with_capacity(n * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path.join(name), bytes).map_err(|e| e.to_string())
+}
+
 // gemma4's layer graph, and nothing else. Everything that used to sit beside it --
 // allocating activations, sizing the rings, growing the cache, the footprint probes --
 // read the plan and the shared state and nothing about gemma4, so it is `Workflow<A>`'s
@@ -116,8 +133,33 @@ pub fn batch(
     let n_layers = c.n_layers as usize;
     let ple = wf.plan.embed.per_layer_dim.unwrap_or(0);
     let b = u32::try_from(tokens.len()).map_err(|_| "batch too large".to_string())?;
+    let all_logits = wf.state.output_demand.requires_all_positions();
+    let layer_outputs = wf
+        .state
+        .layer_outputs
+        .as_ref()
+        .is_some_and(crate::layer_outputs::LayerOutputCapture::active);
+    let greedy_return =
+        wf.state.output_demand == crate::OutputDemand::GreedyVerification;
+    if greedy_return
+        && (!be().supports_greedy_verification()
+            || wf.state.verification_prefix_tokens != tokens.len()
+            || argmax
+            || wf.plan.recurrent_elems() != 0)
+    {
+        return Err("Gemma4 device greedy verification requires a complete non-recurrent prefix".into());
+    }
+    if all_logits && (argmax || b == 0) {
+        return Err(
+            "all-position logits require a nonempty batch without scalar argmax".into(),
+        );
+    }
+    let output_words = c
+        .vocab_size
+        .checked_mul(if all_logits { b } else { 1 })
+        .ok_or("all-position logits exceed device element range")?;
     let sp = u32::try_from(start_pos).map_err(|_| "position too large".to_string())?;
-    let width = ple * c.n_layers; // per-layer embedding row width
+    let source_width = ple * c.n_layers; // immutable quantized table row pitch
     probe_first("gpu batch entry");
     wf.gpu_fit_batch(tokens.len())?;
     let mw = &wf.w;
@@ -135,13 +177,96 @@ pub fn batch(
     let gate0_capture_active = gate0_capture.is_active();
     #[cfg(not(feature = "cuda-gate0-capture"))]
     let gate0_capture_active = false;
-    // A replayed graph hides every intermediate boundary. Explicit capture therefore
-    // takes the ordinary encode path; the feature/env-off path is the original branch.
-    let replayed = if gate0_capture_active {
+    let output_reference_lab = !all_logits
+        && cfg!(feature = "cuda-speculative")
+        && std::env::var("IMPARO_OUTPUT_REFERENCE_LAB").as_deref() == Ok("1");
+    if output_reference_lab {
+        if std::env::var("IMPARO_NO_HOSTCONFIG").as_deref() != Ok("1") {
+            return Err("output reference experiment requires NOHOST".into());
+        }
+        if gate0_capture_active
+            || std::env::var_os("IMPARO_CUDA_PREFILL_SIDECAR_GRAPH_LAB").is_some()
+            || std::env::var_os("IMPARO_CUDA_PREFILL_GRAPH_LAB").is_some()
+        {
+            return Err("output reference experiment requires eager execution".into());
+        }
+    }
+    let last_own = wf
+        .plan
+        .layers
+        .iter()
+        .rposition(|l| l.kv_source == KvSource::Own);
+    #[cfg(feature = "cuda-speculative")]
+    if std::env::var("IMPARO_STATE_DEMAND_LAB").as_deref() == Ok("1") {
+        // Demand belongs to this physical batch, not to an outer multi-chunk
+        // request. State-only execution stops before the last KV owner's FFN.
+        let ffn_layers = if wf.state.output_demand.wants_logits() {
+            n_layers
+        } else {
+            last_own.unwrap_or(n_layers)
+        };
+        let declared = be()
+            .set_forward_demand_lab(
+                ffn_layers as u32,
+                wf.state.output_demand.wants_logits(),
+            )
+            .map_err(|rc| format!("GPU work demand failed rc={rc}"))?;
+        if !declared {
+            return Err("backend does not support the state-demand laboratory".into());
+        }
+    }
+    // On state-only chunks the last owner's own PLE is after the final KV write.
+    // Its layer slice and all shared-KV successors have no consumer. Keep source
+    // table pitch separate from the compact projected activation row pitch.
+    let mut ple_layers = if !decode
+        && !wf.state.output_demand.wants_logits()
+        && !gate0_capture_active
+        && gpu_probe_layer() == usize::MAX
+        && be().prefill_ple_prefix_elision(b)
+    {
+        last_own.filter(|&owner| owner > 0).unwrap_or(n_layers)
+    } else {
+        n_layers
+    };
+    let mut width = ple * ple_layers as u32;
+    if width != source_width && std::env::var_os("IMPARO_LAYER_SKIP_LOG").is_some() {
+        eprintln!(
+            "[imparo] demand: PLE prefix layers={ple_layers}/{n_layers} rows={b} source_width={source_width} output_width={width}"
+        );
+    }
+    // M1's final normalized X remains live after the head. Copy that feature
+    // outside Graph capture/replay, keeping the assistant pointer out of the graph.
+    // Other observers and multi-token verification retain their inline capture.
+    let defer_decode_capture = cfg!(feature = "cuda-speculative")
+        && decode
+        && !all_logits
+        && argmax
+        && layer_outputs
+        && wf.state.output_demand.wants_logits()
+        && !gate0_capture_active
+        && gpu_probe_layer() == usize::MAX
+        && std::env::var("IMPARO_LAB_MTP_M1_GRAPH").as_deref() == Ok("1");
+    if defer_decode_capture {
+        static REPORTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[imparo] mtp-m1-graph deferred-capture=1");
+        }
+    }
+    let replayed = if all_logits
+        || gate0_capture_active
+        || (!decode && (layer_outputs || output_reference_lab))
+    {
         false
     } else if decode {
-        be().decode_prepare(tokens[0], sp, argmax)
-            .map_err(|rc| format!("GPU decode prepare failed rc={rc}"))?
+        // Defer only the eligible final feature observer; the actual M1 argmax
+        // and all backend validity checks retain their existing contracts.
+        be().decode_prepare(
+            tokens[0],
+            sp,
+            argmax && (!layer_outputs || defer_decode_capture),
+        )
+        .map_err(|rc| format!("GPU decode prepare failed rc={rc}"))?
     } else {
         be().prefill_prepare(tokens, sp, argmax)
             .map_err(|rc| format!("GPU prefill prepare failed rc={rc}"))?
@@ -149,7 +274,20 @@ pub fn batch(
     if replayed {
         be().end()
             .map_err(|rc| format!("GPU forward failed rc={rc}"))?;
+        if defer_decode_capture {
+            if let Some(capture) = &wf.state.layer_outputs {
+                capture.record((n_layers - 1) as u32, sp, b, BufId::X)?;
+            }
+            static REPORTED_REPLAY: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED_REPLAY.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[imparo] mtp-m1-graph replay=1");
+            }
+        }
         probe_first("gpu after submit");
+        if !wf.state.output_demand.wants_logits() {
+            return Ok(());
+        }
         if argmax {
             out.resize(1, 0.0);
             be().read(BufId::Tmp, 0, out);
@@ -167,7 +305,8 @@ pub fn batch(
     }
     // A backend may use a decode-specific submission lifecycle; the default
     // remains `begin()`, so CPU and Metal retain their established behavior.
-    be().begin_forward(decode);
+    // Existing graphs produce a single output row; full-position verification is eager.
+    be().begin_forward(decode && !all_logits);
 
     // embedding, scaled by sqrt(n_embd)
     //
@@ -197,6 +336,12 @@ pub fn batch(
         }
         _ => false,
     };
+    // Staged rows retain their immutable full-table pitch. Prefix compaction is
+    // only valid for the direct gather path, which accepts an explicit source pitch.
+    if ple_staged {
+        ple_layers = n_layers;
+        width = source_width;
+    }
     let gathered = be().gather_rows(
         wkind,
         mw.token_embd.offset as u64,
@@ -233,11 +378,12 @@ pub fn batch(
     if ple > 0 {
         if let (Some(pm), Some(pt)) = (mw.per_layer_model_proj, mw.per_layer_token_embd)
         {
-            be().matmat(
+            be().matmat_output_prefix(
                 imparo_gguf::weights::weight_kind(pm.ggml_type)
                     .expect("validated at load") as u32,
                 pm.offset as u64,
                 n_embd,
+                source_width,
                 width,
                 BufId::X,
                 PER_LAYER,
@@ -249,7 +395,7 @@ pub fn batch(
                 mw.per_layer_proj_norm.offset,
                 ple,
                 eps,
-                b * c.n_layers,
+                b * ple_layers as u32,
                 ple,
                 0,
             );
@@ -264,10 +410,11 @@ pub fn batch(
                     b,
                 );
             } else {
-                be().ple_gather_combine(
+                be().ple_gather_combine_prefix(
                     PER_LAYER,
                     BufId::Tokens,
                     pt.offset as u64,
+                    source_width,
                     width,
                     (f64::from(ple)).sqrt() as f32,
                     inv_sqrt2,
@@ -284,6 +431,9 @@ pub fn batch(
     // rows and silently replays stale embeddings for a later prompt of the same
     // shape. Backends without split-Prefill replay inherit a conservative no-op.
     if !decode
+        && !all_logits
+        && !layer_outputs
+        && !output_reference_lab
         && be()
             .prefill_body_prepare(tokens, sp, argmax)
             .map_err(|rc| format!("GPU prefill body prepare failed rc={rc}"))?
@@ -291,6 +441,9 @@ pub fn batch(
         be().end()
             .map_err(|rc| format!("GPU forward failed rc={rc}"))?;
         probe_first("gpu after body submit");
+        if !wf.state.output_demand.wants_logits() {
+            return Ok(());
+        }
         if argmax {
             out.resize(1, 0.0);
             be().read(BufId::Tmp, 0, out);
@@ -304,6 +457,31 @@ pub fn batch(
         {
             wf.kv_scan(sp as usize + b as usize);
         }
+        return Ok(());
+    }
+
+    // Keep host-staged embedding/PLE outside the graph. Re-encode every body
+    // with current geometry; publish the MTP feature after graph execution.
+    let verification_submission = if greedy_return
+        && b == 3
+        && !gate0_capture_active
+        && gpu_probe_layer() == usize::MAX
+    {
+        be().verification_body_begin(b, sp)
+            .map_err(|rc| format!("GPU verification capture begin failed rc={rc}"))?
+    } else {
+        imparo_backend::VerificationSubmission::Eager
+    };
+    let defer_verify_capture =
+        verification_submission != imparo_backend::VerificationSubmission::Eager;
+    if verification_submission == imparo_backend::VerificationSubmission::Replay {
+        be().end()
+            .map_err(|rc| format!("GPU verification replay failed rc={rc}"))?;
+        if let Some(capture) = &wf.state.layer_outputs {
+            capture.record((n_layers - 1) as u32, sp, b, BufId::X)?;
+        }
+        out.resize(3, 0.0);
+        be().read(BufId::Tmp, 0, out);
         return Ok(());
     }
 
@@ -325,8 +503,7 @@ pub fn batch(
     // chunk of 512 tokens does far more GPU work per dispatch, where extra command
     // buffers may only add commits. Prefill defaults to 0 but is swept by imparo-tune
     // rather than assumed. Layers, not dispatches, so a flush never lands mid-layer.
-    let flush_every =
-        crate::gpu_support::flush_layers_bounded(b == 1, wf.plan.layers.len());
+    let flush_every = crate::gpu_support::flush_layers_bounded(b, wf.plan.layers.len());
     // Decode ramps the first chunks geometrically (1, 2, 4, ... capped at flush_every)
     // instead of a fixed modulus. The GPU is idle until the FIRST commit, so the first
     // chunk's encode is the one that can never be hidden -- at a cadence of 7 that was
@@ -346,12 +523,8 @@ pub fn batch(
     // The last layer that writes KV. Everything after its kv_store -- its own attention,
     // o_proj, FFN and PLE projections, and every later (shared-KV) layer -- is dead work
     // for rows whose logits nobody reads (#127, refined to the operator in #130).
-    let last_own = wf
-        .plan
-        .layers
-        .iter()
-        .rposition(|l| l.kv_source == KvSource::Own);
-    let n_run = if wf.state.logits_wanted {
+
+    let n_run = if wf.state.output_demand.wants_logits() {
         n_layers
     } else {
         last_own.map_or(n_layers, |l| l + 1)
@@ -365,8 +538,51 @@ pub fn batch(
     // so each row's arithmetic is the one it had in the wide chunk. Not taken when the
     // chunk is under 2 x TAIL_ROWS, so the move never overlaps itself.
     const TAIL_ROWS: u32 = 64;
-    let tail = if wf.state.logits_wanted && b >= 2 * TAIL_ROWS && last_own.is_some() {
-        tail_split(b, tail_align())
+    let tail_override = if !gate0_capture_active && gpu_probe_layer() == usize::MAX {
+        be().shared_kv_prefill_tail_rows()
+    } else {
+        None
+    };
+    // The wider shape family is intentional: 33/65 -> 16 changed full logits in
+    // the first screen. Preserve the established short-chunk route.
+    let tail = if !all_logits
+        && wf.state.output_demand.wants_logits()
+        && b >= 2 * TAIL_ROWS
+        && last_own.is_some()
+    {
+        if let Some(rows) = tail_override {
+            // Retain the established start alignment: changing a row's position
+            // inside a tile changed logits on non-aligned batches in the lab.
+            // Keep source and destination disjoint.
+            if b >= 2 * rows {
+                tail_split_min_rows(b, tail_align(), rows)
+            } else {
+                None
+            }
+        } else {
+            tail_split(b, tail_align())
+        }
+    } else {
+        None
+    };
+    // The cold output-tail reference is distinct from actual resumed rows.
+    #[cfg(feature = "cuda-speculative")]
+    let projection_reference = if output_reference_lab
+        && wf.state.output_demand.wants_logits()
+        && !decode
+        && last_own.is_some()
+    {
+        let cell = crate::prefill_batch() as u32;
+        let base = sp - sp % cell;
+        let canonical = b + sp - base;
+        let minimum = tail_override.unwrap_or(TAIL_ROWS);
+        if canonical >= 2 * TAIL_ROWS && canonical >= 2 * minimum {
+            tail_split_min_rows(canonical, tail_align(), minimum)
+                .filter(|(cut, rows)| *cut > 0 && *rows > 8 && *rows < 128)
+                .map(|(cut, rows)| (base + cut, rows))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -376,13 +592,16 @@ pub fn batch(
     if layer_skip_log() {
         eprintln!(
             "[imparo] prefill chunk b={b}: running {n_run} of {n_layers} layers (logits_wanted={}, tail={tail:?})",
-            wf.state.logits_wanted
+            wf.state.output_demand.wants_logits()
         );
     }
     // Set by a layer's PLE tail when it already wrote the NEXT layer's normalised input
     // (or the final norm) in the same dispatch; that norm's own dispatch is then skipped.
     let mut input_norm_ready = false;
     let mut final_norm_ready = false;
+    let elide_unused_query = !wf.state.output_demand.wants_logits()
+        && !gate0_capture_active
+        && be().prefill_unused_query_elision();
     for li in 0..n_run {
         let layer = wf.plan.layers[li];
         let lw = &mw.layers[li];
@@ -446,7 +665,7 @@ pub fn batch(
                 } else {
                     Some((mw.layers[li + 1].attn_norm.offset, BufId::Cur))
                 }
-            } else if li + 1 == n_layers && wf.state.logits_wanted {
+            } else if li + 1 == n_layers && wf.state.output_demand.wants_logits() {
                 Some((mw.output_norm.offset, BufId::X))
             } else {
                 None
@@ -601,61 +820,76 @@ pub fn batch(
                     n_embd as usize,
                 );
             }
-            be().matmat(
-                wkind(&lw.wq),
-                lw.wq.offset as u64,
-                n_embd,
-                n_head * hd,
-                BufId::Cur,
-                BufId::Q,
-                b,
-            );
-            if li == gpu_probe_layer() {
-                gprobe("Qcur", BufId::Q, 0, (n_head * hd) as usize);
-            }
-            if li == gpu_probe_layer() {
-                gprobe("Qcur_full", BufId::Q, 0, (b * n_head * hd) as usize);
-            }
-            // Quantized-K defense, llama.cpp's own (attn_rot_k): rotate Q and K by an
-            // orthonormal blockwise Hadamard before the cache quantization. Scores are
-            // invariant -- (Hq)-dot-(Hk) = q-dot-k -- and the rotation spreads each
-            // 32-value block's energy so the shared 4-bit scale stops starving the
-            // small values. f16 caches skip all of it: bytes untouched.
-            let q_hadamard_nrot = if KvType::k() == KvType::F16 {
-                0
-            } else {
-                had_nrot("IMPARO_HAD_K", kv_quant_route.key, hd)?
-            };
-            if li == gpu_probe_layer() {
-                // Preserve the individually observable operations on the requested probe
-                // layer; normal execution uses the backend's semantic fusion hook.
-                be().rms_norm(
+            let query_needed =
+                !elide_unused_query || Some(li) != last_own || li == gpu_probe_layer();
+            if query_needed {
+                be().matmat(
+                    wkind(&lw.wq),
+                    lw.wq.offset as u64,
+                    n_embd,
+                    n_head * hd,
+                    BufId::Cur,
                     BufId::Q,
-                    lw.attn_q_norm.offset,
-                    hd,
-                    eps,
-                    b * n_head,
-                    hd,
-                    0,
-                );
-                be().rope(BufId::Q, rope_dim, rope_base, hd, n_head, sp, b, rope_freqs);
-                if q_hadamard_nrot != 0 {
-                    be().hadamard(BufId::Q, b * n_head * hd, q_hadamard_nrot);
-                }
-            } else {
-                be().head_norm_rope_hadamard(
-                    BufId::Q,
-                    lw.attn_q_norm.offset,
-                    hd,
-                    eps,
-                    n_head,
-                    sp,
                     b,
-                    rope_dim,
-                    rope_base,
-                    rope_freqs,
-                    q_hadamard_nrot,
                 );
+                if li == gpu_probe_layer() {
+                    gprobe("Qcur", BufId::Q, 0, (n_head * hd) as usize);
+                }
+                if li == gpu_probe_layer() {
+                    gprobe("Qcur_full", BufId::Q, 0, (b * n_head * hd) as usize);
+                }
+                // Quantized-K defense, llama.cpp's own (attn_rot_k): rotate Q and K by an
+                // orthonormal blockwise Hadamard before the cache quantization. Scores are
+                // invariant -- (Hq)-dot-(Hk) = q-dot-k -- and the rotation spreads each
+                // 32-value block's energy so the shared 4-bit scale stops starving the
+                // small values. f16 caches skip all of it: bytes untouched.
+                let q_hadamard_nrot = if KvType::k() == KvType::F16 {
+                    0
+                } else {
+                    had_nrot("IMPARO_HAD_K", kv_quant_route.key, hd)?
+                };
+                if li == gpu_probe_layer() {
+                    // Preserve the individually observable operations on the requested probe
+                    // layer; normal execution uses the backend's semantic fusion hook.
+                    be().rms_norm(
+                        BufId::Q,
+                        lw.attn_q_norm.offset,
+                        hd,
+                        eps,
+                        b * n_head,
+                        hd,
+                        0,
+                    );
+                    be().rope(
+                        BufId::Q,
+                        rope_dim,
+                        rope_base,
+                        hd,
+                        n_head,
+                        sp,
+                        b,
+                        rope_freqs,
+                    );
+                    if q_hadamard_nrot != 0 {
+                        be().hadamard(BufId::Q, b * n_head * hd, q_hadamard_nrot);
+                    }
+                } else {
+                    be().head_norm_rope_hadamard(
+                        BufId::Q,
+                        lw.attn_q_norm.offset,
+                        hd,
+                        eps,
+                        n_head,
+                        sp,
+                        b,
+                        rope_dim,
+                        rope_base,
+                        rope_freqs,
+                        q_hadamard_nrot,
+                    );
+                }
+            } else if layer_skip_log() {
+                eprintln!("[imparo] demand: omitted unused Q at layer {li}, rows={b}");
             }
 
             let kv_width = n_kv * hd;
@@ -754,7 +988,7 @@ pub fn batch(
         let kv_layer = mega_kv_layer;
         if Some(li) == last_own {
             // The chunk's last state write is behind us (#130).
-            if !wf.state.logits_wanted {
+            if !wf.state.output_demand.wants_logits() {
                 break;
             }
             if let Some((r0, bt)) = tail {
@@ -774,6 +1008,8 @@ pub fn batch(
                 );
                 sp += r0;
                 b = bt;
+                be().set_materialized_prefill_tail(sp, b)
+                    .map_err(|rc| format!("GPU materialized tail failed rc={rc}"))?;
                 if layer_skip_log() {
                     eprintln!(
                         "[imparo]   tail inside layer {li}: rows {r0}.. as a {b}-row batch at sp={sp}"
@@ -916,6 +1152,21 @@ pub fn batch(
                     })
                 });
         if !mega_front_done {
+            #[cfg(feature = "cuda-speculative")]
+            if Some(li) == last_own && b > 8 && b < 128 {
+                if let Some((reference_start, reference_tokens)) = projection_reference
+                {
+                    if !be()
+                        .set_projection_reference_lab(reference_start, reference_tokens)
+                        .map_err(|rc| format!("output projection reference rc={rc}"))?
+                    {
+                        return Err(
+                            "backend lacks output projection reference experiment"
+                                .into(),
+                        );
+                    }
+                }
+            }
             be().matmat(
                 wkind(&lw.wo),
                 lw.wo.offset as u64,
@@ -1061,6 +1312,73 @@ pub fn batch(
         if !mega_done {
             // A backend may own the complete gate/up/down sidecar route, but probes
             // and explicit Gate0 capture retain the materialized G/U boundaries.
+            static WITNESS_LAYER: std::sync::OnceLock<usize> =
+                std::sync::OnceLock::new();
+            let witness_layer = *WITNESS_LAYER.get_or_init(|| {
+                if std::env::var_os("IMPARO_CUDA_FFN_WITNESS_DIR").is_none() {
+                    return usize::MAX;
+                }
+                std::env::var("IMPARO_CUDA_FFN_WITNESS_LAYER")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0)
+            });
+            let ffn_witness = if li == witness_layer && b > 1 {
+                static ROOT: std::sync::OnceLock<Option<std::path::PathBuf>> =
+                    std::sync::OnceLock::new();
+                static INDEX: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                ROOT.get_or_init(|| {
+                    std::env::var_os("IMPARO_CUDA_FFN_WITNESS_DIR")
+                        .map(std::path::PathBuf::from)
+                })
+                .as_ref()
+                .map(|root| {
+                    root.join(format!(
+                        "ffn-{:03}",
+                        INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ))
+                })
+            } else {
+                None
+            };
+            if let Some(path) = &ffn_witness {
+                if std::env::var("IMPARO_NO_HOSTCONFIG").as_deref() != Ok("1") {
+                    return Err(
+                        "FFN witness requires NOHOST laboratory execution".into()
+                    );
+                }
+                if std::env::var_os("IMPARO_CUDA_PREFILL_SIDECAR_GRAPH_LAB").is_some()
+                    || std::env::var_os("IMPARO_CUDA_PREFILL_GRAPH_LAB").is_some()
+                {
+                    return Err(
+                    "FFN witness requires eager execution; Graph flags must be absent"
+                        .into(),
+                );
+                }
+                std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+                ffn_witness_dump(path, "input.raw", BufId::Cur, (b * n_embd) as usize)?;
+            }
+            #[cfg(feature = "cuda-owner-lab")]
+            let phase = imparo_backend::DecodeFfnPhase {
+                layer: li as u32,
+                gate_kind: wkind(&lw.ffn_gate),
+                up_kind: wkind(&lw.ffn_up),
+                down_kind: wkind(&lw.ffn_down),
+                gate_off: lw.ffn_gate.offset as u64,
+                up_off: lw.ffn_up.offset as u64,
+                down_off: lw.ffn_down.offset as u64,
+                n_in: n_embd,
+                n_mid: n_ff,
+                n_out: n_embd,
+                src: BufId::Cur,
+                dst: BufId::X,
+                tokens: b,
+                activation: layer.ffn.activation().epilogue(),
+            };
+            #[cfg(feature = "cuda-owner-lab")]
+            be().decode_ffn_boundary(phase, true)
+                .map_err(|rc| format!("FFN entry boundary rc={rc}"))?;
             let fused_ffn = !gate0_needs_down_input
                 && li != gpu_probe_layer()
                 && be().ffn_gated_down(
@@ -1185,6 +1503,24 @@ pub fn batch(
                 if li == gpu_probe_layer() {
                     gprobe("ffn_down_out", BufId::X, 0, (b * n_embd) as usize);
                 }
+            }
+            #[cfg(feature = "cuda-owner-lab")]
+            be().decode_ffn_boundary(phase, false)
+                .map_err(|rc| format!("FFN exit boundary rc={rc}"))?;
+            if let Some(path) = &ffn_witness {
+                ffn_witness_dump(path, "down.raw", BufId::X, (b * n_embd) as usize)?;
+                if !fused_ffn {
+                    ffn_witness_dump(path, "gated.raw", BufId::G, (b * n_ff) as usize)?;
+                }
+                let meta = serde_json::json!({"layer":li,"tokens":b,"start":sp,
+                "n_in":n_embd,"n_mid":n_ff,"n_out":n_embd,"fused":fused_ffn,
+                "gate_offset":lw.ffn_gate.offset,"up_offset":lw.ffn_up.offset,
+                "down_offset":lw.ffn_down.offset,"kind":wkind(&lw.ffn_gate)});
+                std::fs::write(
+                    path.join("meta.json"),
+                    serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
             }
             let projection_follows =
                 ple > 0 && lw.inp_gate.is_some() && lw.proj.is_some();
@@ -1313,7 +1649,9 @@ pub fn batch(
                     let next_norm = if b == 1 {
                         if li + 1 < n_run {
                             Some((mw.layers[li + 1].attn_norm.offset, BufId::Cur))
-                        } else if li + 1 == n_layers && wf.state.logits_wanted {
+                        } else if li + 1 == n_layers
+                            && wf.state.output_demand.wants_logits()
+                        {
                             Some((mw.output_norm.offset, BufId::X))
                         } else {
                             None
@@ -1419,11 +1757,13 @@ pub fn batch(
         (b as u64 - 1) * n_embd as u64,
         n_embd as usize,
     );
-    // last token only: final norm and the tied lm_head, in the SAME command buffer.
+    // Final norm and tied head cover exactly the requested rows in the same command buffer.
     // Splitting it cost a sync plus a round trip of the hidden state per token.
-    // Skipped for a non-final prefill chunk (WorkflowState::logits_wanted): nothing reads
+    // Skipped for a non-final prefill chunk (WorkflowState::output_demand): nothing reads
     // those logits; the command buffer still ends so the chunk's writes land.
-    let logits_wanted = wf.state.logits_wanted;
+    let logits_wanted = wf.state.output_demand.wants_logits();
+    let output_rows = if all_logits { b } else { 1 };
+    let output_row = if all_logits { 0 } else { b - 1 };
     if logits_wanted {
         // final_norm_ready: the last layer's tail already wrote the normed row into X
         // (dual form of the sandwich boundary); only the norm dispatch is skipped.
@@ -1433,10 +1773,18 @@ pub fn batch(
                 mw.output_norm.offset,
                 n_embd,
                 eps,
-                1,
+                output_rows,
                 n_embd,
-                (b - 1) * n_embd,
+                output_row * n_embd,
             );
+        }
+        // Gemma MTP consumes the post-final-norm LM-head feature. In LastToken
+        // mode only the last row is normalized/committed; verification normalizes
+        // every row so rejection can select its last accepted input.
+        if !defer_decode_capture && !defer_verify_capture {
+            if let Some(capture) = &wf.state.layer_outputs {
+                capture.record((n_layers - 1) as u32, sp, b, BufId::X)?;
+            }
         }
         be().matmat_from(
             imparo_gguf::weights::weight_kind(mw.token_embd.ggml_type)
@@ -1446,11 +1794,11 @@ pub fn batch(
             c.vocab_size,
             BufId::X,
             BufId::Logits,
-            1,
-            b - 1,
+            output_rows,
+            output_row,
         );
         if let Some(cap) = wf.plan.output.logit_softcap {
-            be().softcap(BufId::Logits, cap, c.vocab_size);
+            be().softcap(BufId::Logits, cap, output_words);
         }
         if let Some(p) = pipe {
             be().argmax_feed(
@@ -1464,7 +1812,21 @@ pub fn batch(
                 .end_async()
                 .map_err(|rc| format!("GPU pipelined step failed rc={rc}"));
         }
-        if argmax {
+        if greedy_return {
+            // Reuse the existing finite/argmax/accepted-prefix transaction. Gemma4
+            // has no recurrent payload; KV/history and hidden commit stay with the caller.
+            be().verify_greedy_and_restore(
+                BufId::Logits,
+                BufId::Tokens,
+                BufId::Tmp,
+                BufId::Recur,
+                BufId::RecurSnap,
+                c.vocab_size,
+                b,
+                0,
+            )
+            .map_err(|rc| format!("Gemma4 device greedy verification rc={rc}"))?;
+        } else if argmax {
             // The pick runs where the logits already are; only the index crosses back.
             // TMP is free here -- nothing reads it after the layer loop.
             be().argmax(BufId::Logits, BufId::Tmp, c.vocab_size);
@@ -1473,6 +1835,12 @@ pub fn batch(
     probe_first("gpu after writes");
     be().end()
         .map_err(|rc| format!("GPU forward failed rc={rc}"))?;
+    crate::gpu_support::prefill_region_ended();
+    if defer_decode_capture || defer_verify_capture {
+        if let Some(capture) = &wf.state.layer_outputs {
+            capture.record((n_layers - 1) as u32, sp, b, BufId::X)?;
+        }
+    }
     probe_first("gpu after submit");
 
     if !logits_wanted {
@@ -1480,11 +1848,14 @@ pub fn batch(
         gate0_capture.finalize()?;
         return Ok(());
     }
-    if argmax {
+    if greedy_return {
+        out.resize(3, 0.0);
+        be().read(BufId::Tmp, 0, out);
+    } else if argmax {
         out.resize(1, 0.0);
         be().read(BufId::Tmp, 0, out); // one u32 in a float's clothing; see caller
     } else {
-        out.resize(c.vocab_size as usize, 0.0);
+        out.resize(output_words as usize, 0.0);
         be().read(BufId::Logits, 0, out);
     }
     #[cfg(feature = "cuda-gate0-capture")]

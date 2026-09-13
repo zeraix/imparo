@@ -170,7 +170,7 @@ uint32_t g_attn_stream_slices = 32;
 // change, only which threadgroup performs them. IMPARO_ATTN_HQ=1 reverts.
 uint32_t g_attn_stream_hq = 2;
 extern "C" void imparo_metal_set_attn_stream_hq(uint32_t v) {
-    g_attn_stream_hq = v >= 2u ? 2u : 1u;
+    g_attn_stream_hq = v >= 3u ? 3u : (v >= 2u ? 2u : 1u);
 }
 extern "C" uint32_t imparo_metal_attn_stream_hq_current(void) { return g_attn_stream_hq; }
 extern "C" uint32_t imparo_metal_attn_stream_slices_current(void) {
@@ -362,40 +362,32 @@ uint32_t g_qcomb          = 1;
 // bench confirms it (16-token forwards: 19.05s at boundary 15 -> 10.25s at 47).
 uint32_t g_nb8_max        = 47;
 uint32_t g_nb8_shape      = 0;   // 0: two simdgroups / 64 threads; 1: one / 32
-// GEMV boundary: batches of 2..g_gemv_max_tok tokens take the GEMV (TOKEN_TILE 4);
-// above it, the GEMM family (nb8 then wide). TUNER-OWNED (hostconfig v11). The
-// boundary was pinned at 1 while the multi-token GEMV wobbled (task #5); the wobble
-// is root-caused (arena aliasing, fixed at the resource level), so the choice is a
-// performance question again. NOTE the GEMV's k-order differs from the GEMM family's,
-// so moving this boundary legitimately shifts logits for whole chunks of 2..N tokens
-// -- pinned lengths chunk wide (128, 464) and are unaffected.
-uint32_t g_gemv_max_tok   = 1;
-// THE SAME BOUNDARY FOR THE TILE-MAJOR FAMILY, and it is a different number because the
-// two kernels fail differently. imparo_blk_gemv reads the whole weight stream ONCE PER
-// TOKEN (the weight loop sits inside its token loop), so its cost is linear: on
-// Qwen3.8-27B, 102 ms per token at every width measured. rt_gemm reads the stream once
-// and multiplies a whole 64-token tile whether or not the tokens exist, so its cost is
-// FLAT below one tile: 713 ms at 64 tokens. Flat beats linear above 713/102 = 7 tokens.
+// WHERE THE GEMV ENDS, for every weight family: a dispatch of ONE row takes the decode
+// GEMV; two rows or more take the GEMM family (Q4_0: nb8 then the wide tile; Q8_0: the
+// staged GEMM; block quants: the register-tiled GEMM). Fixed at 1 and not tuned, because
+// of the KV identity contract (docs/kv-identity-grid.md): two chunkings of one prompt must
+// write the same K/V bytes, and the GEMV's k-order is not the GEMM's -- a row summed by
+// the GEMV (simd_sum over sub-blocks) is not bit-equal to the same row summed by the MMA
+// k-loop. So the kernel a row takes may depend on whether it is alone in its dispatch (a
+// decode step) but never on how many other rows share its chunk. Measured on Qwen3.8-27B
+// at n=2000: with the Q8 crossing at 32, a batch of 64 (16-row tail) differed from a
+// batch of 512 (464-row tail) from layer 0's alpha/beta projections on; at 1 the two are
+// byte-equal. The Q4_0 crossing has the same property (E4B at IMPARO_GEMV_MAX=32 differs).
+// Evidence: docs/evidence/bracket/2026-09-11-gemv-crossing-vs-chunk-identity.md.
 //
-// Measured, one chunk, Qwen3.8-27B UD-Q4_K_S (the cliff this replaces):
-//     n_tok      4      8     16     32     63  |    64    128
-//     ms       406    816   1625   3313   6965  |   713   1311
-// 63 tokens cost 9.8x what 64 cost. A prompt one token short of a tile paid ten times.
-//
-// THE SEAT IS 6, and it is where the two lines cross rather than where a tile ends. Same
-// model, each width run BOTH ways (IMPARO_BLK_GEMV_MAX_TOK=64 against 0), ms per chunk:
+// What the rule costs is a few narrow prefill tails. The block-quant GEMV reads the whole
+// weight stream once PER TOKEN (its weight loop sits inside its token loop) and the GEMM
+// reads it once per padded 64-token tile, so below one tile the GEMV is linear and the
+// GEMM flat. Qwen3.8-27B UD-Q4_K_S, one chunk, ms (2026-09-09):
 //     n_tok      4      5      6  |     7      8     10
 //     gemv   407.2  509.0  614.0  | 715.6  820.5 1024.2     linear, 102 ms per token
 //     gemm   689.7  691.6  693.2  | 692.4  691.2  694.4     flat, one padded tile
-// so 2..6 tokens keep the GEMV and 7 up take the GEMM. IMPARO_BLK_GEMV_MAX_TOK re-runs
-// that A/B. NOT tuner-owned: the tuner has no sub-tile prefill workload, and a knob it
-// cannot rank in its own regime is worse than a seat with the measurement written down.
+// A prompt whose last chunk is 2..6 rows pays up to 485 ms once; a chunk policy that
+// balances the tail instead of leaving it ragged removes such tails. The Q8 token tile and
+// the multi-token Q4 GEMV stay compiled and are reached only through the diagnostic.
 //
-// NOTE, as for g_gemv_max_tok: the GEMV's k-order is not the GEMM's, so moving this
-// boundary legitimately shifts the logits of chunks 2..N tokens wide. Measured against
-// the GEMV as reference (IMPARO_BLK_GEMV_ALWAYS=1), same top-10 in the same order:
-// 5.236949 against 5.236382 at 16 tokens, 6.255108 against 6.254503 at 522.
-uint32_t g_blk_gemv_max_tok = 6;
+// IMPARO_GEMV_MAX=N re-runs the A/B: every family's GEMV up to N rows. Nothing persists it.
+uint32_t g_gemv_max_tok   = 1;
 // Force the QT 8 path, which halves threadgroup memory (12 KB against 24) and doubles the
 // KV re-reads. A diagnostic for whether occupancy or traffic binds this kernel.
 uint32_t g_attn_short     = 0;
@@ -464,7 +456,9 @@ uint32_t g_delta_kd = 0u;   // key coordinate = Q/K head width
 uint32_t g_delta_vd = 0u;   // value coordinate = V head width
 // Must equal DELTA_SGS * 32 in imparo.metal: the kernel divides the state's rows among
 // its simdgroups by that count, so a smaller launch would leave rows unowned.
-constexpr uint32_t DELTA_THREADS = 32u * 32u;
+// Threads per delta-rule threadgroup: DELTA_SGS simdgroups, the same macro the kernel is
+// compiled with (IMPARO_DELTA_SGS, read once where the library's macros are set).
+static uint32_t g_delta_sgs = 32u;
 // K/V row width (kv heads x head dim) per slot, 0 = not given: the kernel reads the
 // stride from its uniform instead of compiling it in.
 uint32_t g_attn_kvws[QCOMB_HD_SLOTS] = { 0u, 0u, 0u, 0u };
@@ -757,7 +751,10 @@ static int mega_level(void) {
     if (lvl < 0) { const char * e = getenv("IMPARO_MEGA_FFN"); lvl = (e == nullptr) ? 5 : (int)strtol(e, nullptr, 10); if (lvl < 0) { lvl = 0; } }
     return lvl;
 }
-static bool mega_ffn_wanted(void) { return mega_level() >= 1; }
+// The mega pipelines are built at any level >= 1; an entry needs >= 2 (its min_level). Level 1
+// once dispatched the stage-1 FFN block alone; that kernel is gone (task #203: it read the
+// layer seat without the layer route's fast-tier check, and nothing tuned reached it).
+static bool mega_blocks_wanted(void) { return mega_level() >= 1; }
 static uint32_t g_gpu_cores = 0;            // IORegistry gpu-core-count; 0 = unreadable
 // THE PIPELINE FAMILIES, and THE GRID IS PER FAMILY. One shape for every architecture would
 // mean a new architecture can shrink an existing model's grid: the pipeline limit is a
@@ -770,12 +767,39 @@ constexpr uint32_t MEGA_ARCH_GEMMA4 = 0u, MEGA_ARCH_LFM2 = 1u, MEGA_ARCH_QWEN35 
 constexpr uint32_t MEGA_ARCH_COUNT = 3u;
 static uint32_t g_mega_threads_limit[MEGA_ARCH_COUNT] = { 0u, 0u, 0u };   // derived at init; 0 = no pipeline for this family
 static uint32_t g_mega_nsg_limit[MEGA_ARCH_COUNT] = { 0u, 0u, 0u };   // single-threadgroup pipeline limit, not the grid's
-static uint32_t g_mega_tgs[MEGA_ARCH_COUNT] = { 1u, 1u, 1u };   // derived from the detected device at init
+// THE GRID SEAT IS PER PIPELINE: per family AND per head-dim slot (task #203). E4B's hd-256
+// and hd-512 layers are two compiled pipelines with different footprints, and admission is a
+// pipeline's register footprint, so one seat for both would hold the 35 windowed layers at
+// whatever the 7 deep ones admit. Slot 0 is the smaller head dim (the mega_tgs knob), slot 1
+// the larger (mega_tgs_large). One per core by default; a stored tune value or IMPARO_MEGA_TGS
+// moves it.
+static uint32_t g_mega_tgs[MEGA_ARCH_COUNT][2] = { { 1u, 1u }, { 1u, 1u }, { 1u, 1u } };
+// What the admission probe found a pipeline will hold resident, as a threadgroup count,
+// PER WIDTH (task #203): indexed by family, head-dim slot and simdgroups per threadgroup,
+// because admission is a register footprint and the footprint is per thread -- a limit taken
+// at 16 simdgroups says nothing about 32 (18 x 32 timed out under a limit measured at 16).
+// 0 = not measured in this process. MEASURED BY THE TUNER, never by the engine:
+// imparo_metal_mega_admission() runs it during discovery at every width the sweep may set,
+// and the registry ranks the grid knobs under it. The engine applies the stored values as
+// written and never reads this.
+constexpr uint32_t MEGA_NSG_MAX = 32u;
+static uint32_t g_mega_tgs_probed[MEGA_ARCH_COUNT][2][MEGA_NSG_MAX + 1u] = {};
+// The family the tuner asked about last (MEGA_ARCH_COUNT = none): what the registry reads back.
+static uint32_t g_mega_probe_family = MEGA_ARCH_COUNT;
 static uint32_t g_mega_nsg[MEGA_ARCH_COUNT] = { 16u, 16u, 16u };
-// The seat the tuner asks for, applied to every family and clamped per family (0 = derive).
-static uint32_t g_mega_tgs_req = 0u, g_mega_nsg_req = 0u;
+// The seats the tuner asks for -- the grid per slot, the width per family -- applied to every
+// family and clamped per pipeline (0 = derive).
+static uint32_t g_mega_tgs_req[2] = { 0u, 0u }, g_mega_nsg_req = 0u;
 static bool g_mega_tgs_explicit = false;   // env-only wider-grid experiment; a stored knob is not one
 static uint32_t mega_core_seat(void) { return g_gpu_cores > 0u ? g_gpu_cores : 1u; }
+// READ ONLY: what the probe measured for `arch`, or 0 when it has not run in this process or
+// ran at another threadgroup width (the one-per-core floor is then the only known-safe grid).
+static uint32_t mega_ceiling(uint32_t arch, uint32_t slot) {
+    if (arch >= MEGA_ARCH_COUNT || slot >= 2u) { return 0u; }
+    const uint32_t nsg = g_mega_nsg[arch];
+    if (nsg == 0u || nsg > MEGA_NSG_MAX) { return 0u; }
+    return g_mega_tgs_probed[arch][slot][nsg];
+}
 // What the last entry of each family DERIVED, so the knob's readback reports what is running
 // rather than the compiled seat (#74's requested-vs-running rule). 0 = never derived.
 static uint32_t g_mega_derived_nsg[MEGA_ARCH_COUNT] = { 0u, 0u, 0u };
@@ -865,6 +889,9 @@ static const bool MEGA_PROGRAM_DEFAULT_LFM2 = true;
 // qwen35 starts on the PER-LAYER form: the per-token program is worth what its admission
 // measures (task #167), and nothing has measured it for this entry size yet.
 static const bool MEGA_PROGRAM_DEFAULT_Q35 = false;
+// By family index (MEGA_ARCH_GEMMA4, MEGA_ARCH_LFM2, MEGA_ARCH_QWEN35): the entry dispatch and
+// the tuner's applicability question (imparo_metal_mega_seat_form) read the same table.
+static const bool MEGA_PROGRAM_DEFAULTS[MEGA_ARCH_COUNT] = { MEGA_PROGRAM_DEFAULT_E4B, MEGA_PROGRAM_DEFAULT_LFM2, MEGA_PROGRAM_DEFAULT_Q35 };
 // THE PROGRAM RING (task #153): entries recorded per layer into a device ring -- 4 region slots
 // (the debug slots' rotation, so a pipelined region's entries are not overwritten for four
 // regions) x MEGA_PROG_CAP entries, ONE ring for every architecture (task #158 gave them one
@@ -906,9 +933,9 @@ static bool mega_attn_sliced(void) {
 // were waiting for a core); at 18x16 the same run is clean (design doc, constraint 8). The
 // grid is per dispatch (the barrier counter is reset by the last threadgroup out), so only
 // the deep layers pay it.
-static uint32_t mega_deep_tgs(uint32_t arch) {
+static uint32_t mega_deep_tgs(uint32_t arch, uint32_t slot) {
     const uint32_t cores = g_gpu_cores > 0u ? g_gpu_cores : 7u;
-    return std::max(1u, std::min(g_mega_tgs[arch], cores));
+    return std::max(1u, std::min(g_mega_tgs[arch][slot], cores));
 }
 // THE OTHER HALF OF ADMISSION: THREADGROUP MEMORY. The max-threads verdict is the
 // compiler's REGISTER answer and says nothing about the row every threadgroup forms for
@@ -925,11 +952,11 @@ static uint32_t mega_deep_tgs(uint32_t arch) {
 //
 // So the grid is capped by what the row costs. Every architecture gets this; the two whose
 // rows are 8 KB are unaffected, which is the point.
-static uint32_t mega_tgs_for_row(uint32_t arch, uint32_t tgmem_bytes) {
+static uint32_t mega_tgs_for_row(uint32_t arch, uint32_t slot, uint32_t tgmem_bytes) {
     const uint32_t cores = g_gpu_cores > 0u ? g_gpu_cores : 7u;
     const uint32_t limit = g_tgmem_limit > 0u ? g_tgmem_limit : 32768u;
     const uint32_t per_core = std::max(1u, tgmem_bytes > 0u ? limit / tgmem_bytes : limit);
-    return std::max(1u, std::min(g_mega_tgs[arch], cores * per_core));
+    return std::max(1u, std::min(g_mega_tgs[arch][slot], cores * per_core));
 }
 // SIMDGROUPS PER THREADGROUP, DERIVED FROM WHAT THE PHASES RUN OVER.
 // A phase strides tile-major units over the grid's simdgroups, so it runs ceil(items / G)
@@ -1023,10 +1050,10 @@ static MegaGrid mega_grid_derive(uint32_t arch, const uint32_t * u, uint32_t tgs
 }
 // The deep body's geometry for a layer: slices per (KV head, sub-group) so the items fill the
 // deep grid, refused (0) when the items or the partials do not fit.
-static uint32_t mega_attn_deep_slices(uint32_t arch, uint32_t n_heads, uint32_t n_kv, uint32_t hd) {
+static uint32_t mega_attn_deep_slices(uint32_t arch, uint32_t slot, uint32_t n_heads, uint32_t n_kv, uint32_t hd) {
     const uint32_t hq = mega_attn_hq(hd);
     const uint32_t n_sub = (n_heads / n_kv + hq - 1u) / hq;
-    const uint32_t tgs = mega_deep_tgs(arch);
+    const uint32_t tgs = mega_deep_tgs(arch, slot);
     if (n_kv * n_sub > tgs) { return 0u; }
     const uint32_t slices = std::max(1u, std::min(MEGA_ATTN_MAX_SLICES, tgs / (n_kv * n_sub)));
     if ((uint64_t)n_heads * slices * (hd + 2u) > g_mega_scratch_words) { return 0u; }
@@ -1062,17 +1089,26 @@ static bool mega_clamp_arch(uint32_t arch) {
     const uint32_t nsg_max = std::max(1u, std::min(32u, g_mega_nsg_limit[arch]));
     if (g_mega_nsg[arch] < 1u) { g_mega_nsg[arch] = 1u; moved = true; }
     if (g_mega_nsg[arch] > nsg_max) { g_mega_nsg[arch] = nsg_max; moved = true; }
-    uint32_t tgs_max = std::max(1u, g_mega_threads_limit[arch] / (g_mega_nsg[arch] * 32u));
-    if (!g_mega_tgs_explicit) { tgs_max = std::min(tgs_max, mega_core_seat()); }
-    if (g_mega_tgs[arch] < 1u) { g_mega_tgs[arch] = 1u; moved = true; }
-    if (g_mega_tgs[arch] > tgs_max) { g_mega_tgs[arch] = tgs_max; moved = true; }
+    const uint32_t tgs_max = std::max(1u, g_mega_threads_limit[arch] / (g_mega_nsg[arch] * 32u));
+    // THE GRID IS NOT CAPPED HERE (task #203). One per core is the DEFAULT, a stored tune value
+    // is applied as written, IMPARO_MEGA_TGS wins; the only bound is the pipeline's own width
+    // budget above. The LIMIT a value must respect -- how many threadgroups this pipeline holds
+    // resident -- is the tuner's business: imparo_metal_mega_admission() measures it during
+    // discovery and the tuner only writes a value under it (docs/tuner-design.md: derive the
+    // limit, tune the value). A value above it that reaches the engine anyway (a kernel that
+    // grew, an env experiment) costs one spin cap per region and the failsafe's re-run on the
+    // dispatch path -- the M4 Pro run at 36 x 16 (handoff/mac-m4-mega-admission.md) -- never a hang.
+    for (uint32_t s = 0; s < 2u; ++s) {
+        if (g_mega_tgs[arch][s] < 1u) { g_mega_tgs[arch][s] = 1u; moved = true; }
+        if (g_mega_tgs[arch][s] > tgs_max) { g_mega_tgs[arch][s] = tgs_max; moved = true; }
+    }
     return moved;
 }
 // Applies the requested seat to every family; each one clamps to its own limit.
 static bool mega_clamp(void) {
     bool moved = false;
     for (uint32_t a = 0; a < MEGA_ARCH_COUNT; ++a) {
-        if (g_mega_tgs_req != 0u) { g_mega_tgs[a] = g_mega_tgs_req; }
+        for (uint32_t s = 0; s < 2u; ++s) { if (g_mega_tgs_req[s] != 0u) { g_mega_tgs[a][s] = g_mega_tgs_req[s]; } }
         if (g_mega_nsg_req != 0u) { g_mega_nsg[a] = g_mega_nsg_req; }
         moved |= mega_clamp_arch(a);
     }
@@ -1089,9 +1125,21 @@ static uint32_t mega_shape_min(const uint32_t * v) {
     }
     return m != 0u ? m : v[MEGA_ARCH_GEMMA4];
 }
-extern "C" void imparo_metal_set_mega_tgs(uint32_t v) { g_mega_tgs_req = v; if (mega_clamp()) { NSLog(@"imparo metal: mega_tgs %u limited by grid policy / pipeline width; running %u x %u", v, mega_shape_min(g_mega_tgs), mega_shape_min(g_mega_nsg)); } }
-extern "C" void imparo_metal_set_mega_nsg(uint32_t v) { g_mega_nsg_req = v; if (mega_clamp()) { NSLog(@"imparo metal: mega_nsg %u limited by grid policy / pipeline width; running %u x %u", v, mega_shape_min(g_mega_tgs), mega_shape_min(g_mega_nsg)); } }
-extern "C" uint32_t imparo_metal_mega_tgs_current(void) { return mega_shape_min(g_mega_tgs); }
+// The grid seat of one slot, min over the families with pipelines (the readback rule above).
+static uint32_t mega_seat_min(uint32_t slot) {
+    uint32_t v[MEGA_ARCH_COUNT];
+    for (uint32_t a = 0; a < MEGA_ARCH_COUNT; ++a) { v[a] = g_mega_tgs[a][slot]; }
+    return mega_shape_min(v);
+}
+static void mega_set_tgs_slot(uint32_t slot, uint32_t v, const char * knob) {
+    g_mega_tgs_req[slot] = v;
+    if (mega_clamp()) { NSLog(@"imparo metal: %s %u limited by the pipeline's width budget; running %u x %u", knob, v, mega_seat_min(slot), mega_shape_min(g_mega_nsg)); }
+}
+extern "C" void imparo_metal_set_mega_tgs(uint32_t v) { mega_set_tgs_slot(0u, v, "mega_tgs"); }
+extern "C" void imparo_metal_set_mega_tgs_large(uint32_t v) { mega_set_tgs_slot(1u, v, "mega_tgs_large"); }
+extern "C" void imparo_metal_set_mega_nsg(uint32_t v) { g_mega_nsg_req = v; if (mega_clamp()) { NSLog(@"imparo metal: mega_nsg %u limited by the pipeline's width budget; running %u/%u x %u", v, mega_seat_min(0u), mega_seat_min(1u), mega_shape_min(g_mega_nsg)); } }
+extern "C" uint32_t imparo_metal_mega_tgs_current(void) { return mega_seat_min(0u); }
+extern "C" uint32_t imparo_metal_mega_tgs_large_current(void) { return mega_seat_min(1u); }
 // The seat is a floor, so the running value is what the last entry derived from it; reporting
 // the floor as if it were the grid would be the lie #74 forbids.
 extern "C" uint32_t imparo_metal_mega_nsg_current(void) {
@@ -1138,6 +1186,11 @@ uint64_t g_cvt_seq   = 0;
 // (NA, NB, SGX, SGY): tokens-per-simdgroup, rows-per-simdgroup, and how many simdgroups
 // span each axis. Threads = SGX*SGY*32; accumulators per simdgroup = NA*NB.
 constexpr uint32_t RT_CANDIDATES = 7;
+// THE TILE a register-tiled pipeline is compiled for, as one index: a wide shape (its
+// RT_SHAPES row) or one of the two narrow 64x8 tiles. The per-format pipeline cache is
+// keyed by it, so a shape change (the tuner's rt_shape sweep builds every shape in one
+// process) reaches a pipeline compiled for THAT shape, never the first one built.
+enum { RT_TILE_NB8 = RT_CANDIDATES, RT_TILE_NB8B = RT_CANDIDATES + 1, RT_TILES = RT_CANDIDATES + 2 };
 // RT_TOKENS decides how many times a batch re-reads the weight matrix -- ceil(n_tok /
 // RT_TOKENS) passes -- so it is the lever on the staging third of this kernel's time.
 //
@@ -1203,7 +1256,7 @@ constexpr uint32_t RT_SHAPES[RT_CANDIDATES][4] = {
 //     lanes / nr0                 q8_decode_sgs / q8_decode_rows      decode
 //     nb8_shape / nb8_max         q8_token_tile / q8_batch_sgs        narrow batch
 //     rt_shape                    st_gemm_shape                       wide prefill
-//     gemv_max_tok                q8_gemv_max_tok                     the route boundary
+//     g_gemv_max_tok, one row for both families: the route boundary (not a knob)
 constexpr uint32_t ST_GEMM_CANDIDATES = 12;
 constexpr uint32_t Q8_BLOCK_ELEMENTS = 32;    // Q8_0 wire-format block width
 // {ROWS, TOKENS, NSG}. MUST match the IMPARO_ST_GEMM list in imparo.metal: the host sizes
@@ -1249,9 +1302,6 @@ int32_t  g_q8_design_pin       = -1;
 // winner is a portable default.
 uint32_t g_st_gemm_large_shape   = 3;
 uint32_t g_q8_full_tiles         = 1;
-// The fork routes a Q8 matrix multiply above eight columns; below it the token-tile
-// kernel reuses each weight byte across the tile.
-uint32_t g_q8_gemv_max_tok     = 8;
 uint32_t g_q8_all              = 0;   // build every candidate, for sweeping only
 // WHICH THREADGROUP AXIS CARRIES THE TOKEN GROUPS. Threadgroups are enumerated x
 // fastest, so the x axis decides what is reused between neighbouring threadgroups:
@@ -1415,9 +1465,10 @@ struct Context {
     // a model carries is not known until it loads, and building all of them at init would
     // be GPU-resident code for kernels nothing dispatches.
     id<MTLLibrary> lib;
-    // [variant][wfmt + 32*rowmajor]. The variant is the rt entry point the route
-    // would have taken anyway: plain, _h (half-activation mirror), _gh (gated pair).
-    id<MTLComputePipelineState> p_rt_fmt[3][64];
+    // [variant][tile][wfmt + 32*rowmajor]. The variant is the rt entry point the route
+    // would have taken anyway: plain, _h (half-activation mirror), _gh (gated pair); the
+    // tile is a wide shape's index or one of the two narrow tiles (RT_TILE_*).
+    id<MTLComputePipelineState> p_rt_fmt[3][RT_TILES][64];
     id<MTLComputePipelineState> p_gather_fmt[32];
     id<MTLComputePipelineState> p_gemv_fmt[64];
     id<MTLComputePipelineState> p_repack_q8_tm;
@@ -1453,7 +1504,6 @@ struct Context {
     // Flash-decoding for hd <= 128 (slot 0), grouped by KV head: HQ 2 / 4 / 8. nil where not built.
     id<MTLComputePipelineState> p_attn_dec_fd[3];
     id<MTLComputePipelineState> p_attn_dec_vec[2];   // vector decode kernel, one per head-dim slot
-    id<MTLComputePipelineState> p_mega_ffn = nil;    // mega FFN block (IMPARO_MEGA_FFN=1)
     id<MTLComputePipelineState> p_mega_ffn_ple = nil; // the mega layer block (IMPARO_MEGA_FFN>=2), slot 0's instantiation
     id<MTLComputePipelineState> p_mega_layer[2] = { nil, nil }; // per head-dim slot (the attention phase is compile-time in HD)
     id<MTLComputePipelineState> p_mega_q35[2] = { nil, nil };   // the qwen35 layer block per head-dim slot (the weight format comes from the entry, not the pipeline)
@@ -1490,6 +1540,10 @@ struct Context {
     // identity-placement, same four flavors as the HQ=1 stream pipelines.
     id<MTLComputePipelineState> p_attn_dec_stream_g2, p_attn_dec_stream_g2_id,
         p_attn_dec_stream_g2_q, p_attn_dec_stream_g2_q_id;
+    // The same sharing at hd 256, two and three query heads per threadgroup ([0] = 2,
+    // [1] = 3): what the threadgroup budget allows at that head dim.
+    id<MTLComputePipelineState> p_attn_dec_stream_g256[2], p_attn_dec_stream_g256_id[2],
+        p_attn_dec_stream_g256_q[2], p_attn_dec_stream_g256_q_id[2];
     id<MTLComputePipelineState> p_attn_pre_qtile, p_mma_peak, p_mma_loaded, p_mma_dev_a;
     id<MTLComputePipelineState> p_scoremix;
     id<MTLComputePipelineState> p_spill[8];   // the NACC ladder
@@ -2093,7 +2147,7 @@ static bool mega_check_error(void) {
 // regrown (see mega_scratch_ensure). It holds the FFN staging row and the deep attention body's
 // partials, n_heads x MEGA_ATTN_MAX_SLICES x (hd + 2) floats.
 extern "C" int imparo_metal_mega_reserve(uint32_t n_mid, uint32_t attn_heads, uint32_t attn_hd) {
-    if (!mega_ffn_wanted()) { return 0; }
+    if (!mega_blocks_wanted()) { return 0; }
     const uint64_t attn_words = (uint64_t)attn_heads * MEGA_ATTN_MAX_SLICES * (attn_hd + 2u);
     const uint32_t words = (uint32_t)std::max<uint64_t>(n_mid, attn_words);
     const bool ok = mega_scratch_ensure(words);
@@ -2336,10 +2390,10 @@ extern "C" void imparo_metal_set_weight_kind_types(const uint32_t * pairs, uint3
 // source has a decode brick.
 static bool wfmt_has_brick(uint32_t src) {
     switch (src) {
-        // The ggml types tm_sub32 decodes: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XS,
-        // IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS.
-        case 10: case 11: case 12: case 13: case 14: case 17: case 18:
-        case 20: case 21: case 22: case 23: return true;
+        // The ggml types tm_sub32 decodes: Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+        // IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M.
+        case 3: case 6: case 7: case 10: case 11: case 12: case 13: case 14: case 16:
+        case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: return true;
         default: return false;                       // a format with no brick arm
     }
 }
@@ -2448,6 +2502,7 @@ void dispatch1(id<MTLComputePipelineState> p, NSUInteger n, uint8_t cat) {
 }
 
 }  // namespace
+
 // The mega program's flush (task #153): defined with the entry functions (needs their structs),
 // called from the region ends above them.
 static void mega_prog_flush(void);
@@ -2927,8 +2982,6 @@ extern "C" void imparo_metal_set_kvq_rt(uint32_t ty, uint32_t lo, uint32_t hi) {
 }
 extern "C" void imparo_metal_set_nb8_max(uint32_t n) { g_nb8_max = n; }
 extern "C" void imparo_metal_set_gemv_max_tok(uint32_t n) { g_gemv_max_tok = n < 1u ? 1u : n; }
-extern "C" void imparo_metal_set_blk_gemv_max_tok(uint32_t n) { g_blk_gemv_max_tok = n; }
-extern "C" uint32_t imparo_metal_blk_gemv_max_tok_current(void) { return g_blk_gemv_max_tok; }
 extern "C" uint32_t imparo_metal_gemv_max_tok_current(void) { return g_gemv_max_tok; }
 extern "C" void imparo_metal_set_nb8_shape(uint32_t v) { g_nb8_shape = v & 1u; }
 extern "C" uint32_t imparo_metal_nb8_max_current(void) { return g_nb8_max; }
@@ -3118,10 +3171,6 @@ extern "C" uint32_t imparo_metal_st_gemm_large_shape(void) {
 }
 extern "C" void imparo_metal_set_q8_full_tiles(uint32_t on) { g_q8_full_tiles = on; }
 extern "C" uint32_t imparo_metal_q8_full_tiles(void) { return g_q8_full_tiles; }
-extern "C" void imparo_metal_set_q8_gemv_max_tok(uint32_t n) {
-    g_q8_gemv_max_tok = n < 1u ? 1u : n;
-}
-extern "C" uint32_t imparo_metal_q8_gemv_max_tok(void) { return g_q8_gemv_max_tok; }
 extern "C" void imparo_metal_set_q8_all(uint32_t on) { g_q8_all = on; }
 extern "C" void imparo_metal_set_q8_grid_token_x(uint32_t on) { g_q8_grid_token_x = on; }
 extern "C" void imparo_metal_set_q8_skip(uint32_t bits) { g_q8_skip = bits; }
@@ -3532,6 +3581,13 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
         }
         macros[@"IMPARO_DELTA_STAGE"] =
             [NSNumber numberWithUnsignedInt:delta_stage];
+        // Simdgroups per delta-rule threadgroup: 4, 8, 16 or 32 (the staging assigns four
+        // roles per token slot, so at least four). Both sides read this one value.
+        if (const char * dsg = getenv("IMPARO_DELTA_SGS")) {
+            const uint32_t v = (uint32_t)atoi(dsg);
+            if (v == 4u || v == 8u || v == 16u || v == 32u) { g_delta_sgs = v; }
+        }
+        macros[@"IMPARO_DELTA_SGS"] = [NSNumber numberWithUnsignedInt:g_delta_sgs];
         // The row pipeline in the delta rule; 0 is the row-at-a-time form, for the A/B.
         uint32_t delta_pipe = 1u;
         if (const char * dp = getenv("IMPARO_DELTA_PIPE")) {
@@ -3952,6 +4008,8 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                 for (int i = 0; i < 3; ++i) { g.p_attn_dec_stream_q[i] = make_cv(sn[i], cv_q); }
                 g.p_attn_dec_stream_g2_q =
                     make_cv(@"imparo_attention_decode_stream_dk512_g2", cv_q);
+                g.p_attn_dec_stream_g256_q[0] = make_cv(@"imparo_attention_decode_stream_dk256_g2", cv_q);
+                g.p_attn_dec_stream_g256_q[1] = make_cv(@"imparo_attention_decode_stream_dk256_g3", cv_q);
             }
             for (int gi = 0; gi < 3; ++gi) {
                 g.p_attn_dec_scoretile_gqa_q[gi] = make_cv(kGqaScoretileNames[gi], cv_q);
@@ -4035,8 +4093,10 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             NSString * sn[3] = { @"imparo_attention_decode_stream_dk128", @"imparo_attention_decode_stream_dk256", @"imparo_attention_decode_stream_dk512" };
             for (int i = 0; i < 3; ++i) { g.p_attn_dec_stream[i] = make_cv(sn[i], cv_empty); }
             g.p_attn_dec_stream_g2 = make_cv(@"imparo_attention_decode_stream_dk512_g2", cv_empty);
+            g.p_attn_dec_stream_g256[0] = make_cv(@"imparo_attention_decode_stream_dk256_g2", cv_empty);
+            g.p_attn_dec_stream_g256[1] = make_cv(@"imparo_attention_decode_stream_dk256_g3", cv_empty);
         }
-        if (mega_ffn_wanted()) {
+        if (mega_blocks_wanted()) {
             // Same lane geometry as the decode GEMV it replaces (bit-identical rows).
             MTLFunctionConstantValues * cvm = [MTLFunctionConstantValues new];
             const uint32_t lanes = g_lanes, nr0 = 1u;
@@ -4044,7 +4104,6 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             [cvm setConstantValue:&nr0   type:MTLDataTypeUInt atIndex:2];
             const bool dbg = mega_dbg();
             [cvm setConstantValue:&dbg type:MTLDataTypeBool atIndex:18];
-            g.p_mega_ffn = make_cv(@"imparo_mega_ffn", cvm);
             for (uint32_t slot = 0; slot < 2u; ++slot) {
                 const uint32_t hd = g_qcomb_hds[slot];
                 g.p_mega_layer[slot] = (hd != 0u && hd % 32u == 0u)
@@ -4220,8 +4279,8 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             // ordinary runs additionally use the conservative one-group-per-core ceiling.
             g_gpu_cores = gpu_core_count();
             g_tgmem_limit = (uint32_t)[g.device maxThreadgroupMemoryLength];
-            // The limit must cover EVERY pipeline the block can dispatch: the stage-1 kernel and
-            // both head-dim slots of the layer kernel (E4B's global layers run slot 1). A slot's
+            // The limit must cover EVERY pipeline the block can dispatch: both head-dim slots of
+            // the layer kernel (E4B's global layers run slot 1). A slot's
             // maxTotalThreadsPerThreadgroup bounds a legal group, not groups per core. A
             // lower value also tightens the historical grid heuristic; the conservative
             // grid policy below does not infer two-group admission from a 1024-thread value.
@@ -4229,8 +4288,7 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             // g_mega_threads_limit. `tmax[arch]` is the min over that family's own pipelines.
             uint32_t tmax[MEGA_ARCH_COUNT] = { 0u, 0u, 0u };
             {
-                struct { uint32_t arch; id<MTLComputePipelineState> pipe; const char * name; } ps[7] = {
-                    { MEGA_ARCH_GEMMA4, g.p_mega_ffn,       "ffn(stage1)" },
+                struct { uint32_t arch; id<MTLComputePipelineState> pipe; const char * name; } ps[6] = {
                     { MEGA_ARCH_GEMMA4, g.p_mega_layer[0],  "layer_s0" },
                     { MEGA_ARCH_GEMMA4, g.p_mega_layer[1],  "layer_s1" },
                     { MEGA_ARCH_LFM2,   g.p_mega_lfm2[0],   "lfm2_s0" },
@@ -4239,7 +4297,7 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                     { MEGA_ARCH_QWEN35, g.p_mega_q35[1],    "q35_s1" },
                 };
                 NSMutableString * rep = [NSMutableString new];
-                for (uint32_t i = 0; i < 7u; ++i) {
+                for (uint32_t i = 0; i < 6u; ++i) {
                     if (ps[i].pipe == nil) { [rep appendFormat:@" %s=nil", ps[i].name]; continue; }
                     const uint32_t t = (uint32_t)[ps[i].pipe maxTotalThreadsPerThreadgroup];
                     uint32_t & fam = tmax[ps[i].arch];
@@ -4283,31 +4341,34 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                 g_mega_threads_limit[a] = cores_for_limit * tmax[a];
                 g_mega_nsg_limit[a] = tmax[a] / 32u;
                 g_mega_nsg[a] = std::max(1u, std::min(16u, tmax[a] / 64u));   // half the largest legal group
-                g_mega_tgs[a] = cores_for_limit;
+                // THE DEFAULT VALUE: one per core, what an untuned host runs. A stored tune
+                // value or IMPARO_MEGA_TGS moves it; the LIMIT it must respect is measured by
+                // the tuner, not here (task #203, docs/tuner-design.md).
+                g_mega_tgs[a][0] = g_mega_tgs[a][1] = cores_for_limit;
             }
             if (const char * e = getenv("IMPARO_MEGA_NSG")) { g_mega_nsg_req = (uint32_t)strtoul(e, nullptr, 10); }
             if (const char * e = getenv("IMPARO_MEGA_NSG_EXACT")) { g_mega_nsg_exact = strtoul(e, nullptr, 10) != 0ul; }
-            if (const char * e = getenv("IMPARO_MEGA_TGS")) {
-                g_mega_tgs_req = (uint32_t)strtoul(e, nullptr, 10);
-                g_mega_tgs_explicit = g_mega_tgs_req != 0u;
+            if (const char * e = getenv("IMPARO_MEGA_TGS")) {   // both slots: an experiment, not a tuned value
+                g_mega_tgs_req[0] = g_mega_tgs_req[1] = (uint32_t)strtoul(e, nullptr, 10);
+                g_mega_tgs_explicit = g_mega_tgs_req[0] != 0u;
             }
             if (mega_clamp()) {
-                NSLog(@"imparo metal: mega requested seat %ux%u clamped by %s / pipeline width; actual per-family grids follow",
-                      g_mega_tgs_req, g_mega_nsg_req, g_mega_tgs_explicit ? "experimental grid bound" : "one-threadgroup-per-core policy");
+                NSLog(@"imparo metal: mega requested seat %u/%ux%u clamped by the pipeline's width budget; actual per-family grids follow", g_mega_tgs_req[0], g_mega_tgs_req[1], g_mega_nsg_req);
             }
-            if (g_mega_tgs_explicit && g_mega_tgs_req > cores_for_limit) {
-                NSLog(@"imparo metal: explicit mega grid experiment (%u groups > %u cores); co-residency is NOT guaranteed", g_mega_tgs_req, cores_for_limit);
+            if (std::max(g_mega_tgs_req[0], g_mega_tgs_req[1]) > cores_for_limit) {
+                NSLog(@"imparo metal: mega grid %u/%u groups over %u cores from %s; admission is what the tuner measured for it, or an experiment",
+                      g_mega_tgs_req[0], g_mega_tgs_req[1], cores_for_limit, g_mega_tgs_explicit ? "IMPARO_MEGA_TGS" : "the stored tune values");
             }
             // Counters only until the first block dispatch sizes the partial scratch.
             g_mega_scratch_words = 0;
             mega_scratch_ensure(0u);
             if (mega_dbg()) { NSLog(@"imparo metal: mega DEBUG records on"); }
-            NSLog(@"imparo metal: mega blocks %s (gpu_cores=%u lanes=%u; per family gemma4=%ux%u lfm2=%ux%u qwen35=%ux%u)",
-                  (g.p_mega_ffn != nil && g.p_mega_ffn_ple != nil && g.mega_sync != nil) ? "built" : "UNAVAILABLE (needs MSL 3.2)",
+            NSLog(@"imparo metal: mega blocks %s (gpu_cores=%u lanes=%u; per family (slot0/slot1 x nsg) gemma4=%u/%ux%u lfm2=%u/%ux%u qwen35=%u/%ux%u)",
+                  (g.p_mega_ffn_ple != nil && g.mega_sync != nil) ? "built" : "UNAVAILABLE (needs MSL 3.2)",
                   g_gpu_cores, g_lanes,
-                  g_mega_tgs[MEGA_ARCH_GEMMA4], g_mega_nsg[MEGA_ARCH_GEMMA4],
-                  g_mega_tgs[MEGA_ARCH_LFM2], g_mega_nsg[MEGA_ARCH_LFM2],
-                  g_mega_tgs[MEGA_ARCH_QWEN35], g_mega_nsg[MEGA_ARCH_QWEN35]);
+                  g_mega_tgs[MEGA_ARCH_GEMMA4][0], g_mega_tgs[MEGA_ARCH_GEMMA4][1], g_mega_nsg[MEGA_ARCH_GEMMA4],
+                  g_mega_tgs[MEGA_ARCH_LFM2][0], g_mega_tgs[MEGA_ARCH_LFM2][1], g_mega_nsg[MEGA_ARCH_LFM2],
+                  g_mega_tgs[MEGA_ARCH_QWEN35][0], g_mega_tgs[MEGA_ARCH_QWEN35][1], g_mega_nsg[MEGA_ARCH_QWEN35]);
         }
         g.p_attn_dec_combine  = make(lib, @"imparo_attention_decode_combine");
         // Every kernel that inlines kv_slot references KV_PAGED_FC now, so the
@@ -4411,6 +4472,8 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                 for (int i = 0; i < 3; ++i) { g.p_attn_dec_stream_id[i] = make_cv(sn[i], cv_id); }
                 g.p_attn_dec_stream_g2_id =
                     make_cv(@"imparo_attention_decode_stream_dk512_g2", cv_id);
+                g.p_attn_dec_stream_g256_id[0] = make_cv(@"imparo_attention_decode_stream_dk256_g2", cv_id);
+                g.p_attn_dec_stream_g256_id[1] = make_cv(@"imparo_attention_decode_stream_dk256_g3", cv_id);
             }
             g.p_kvstore_id    = make_cv(@"imparo_kv_store", cv_id);
             g.p_kvstore_q4_id = make_cv(@"imparo_kv_store_q4", cv_id);
@@ -4431,6 +4494,8 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                     for (int i = 0; i < 3; ++i) { g.p_attn_dec_stream_q_id[i] = make_cv(sn[i], cv_qid); }
                     g.p_attn_dec_stream_g2_q_id =
                         make_cv(@"imparo_attention_decode_stream_dk512_g2", cv_qid);
+                    g.p_attn_dec_stream_g256_q_id[0] = make_cv(@"imparo_attention_decode_stream_dk256_g2", cv_qid);
+                    g.p_attn_dec_stream_g256_q_id[1] = make_cv(@"imparo_attention_decode_stream_dk256_g3", cv_qid);
                 }
             }
         }
@@ -5103,7 +5168,7 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
         g_refused += 1;
         return false;
     }
-    const bool use_gemm = n_tok > g_q8_gemv_max_tok;
+    const bool use_gemm = n_tok > g_gemv_max_tok;   // one row is the decode GEMV
 
     // One call, no decisions inline: `q8_geometry` owns the pair's choice AND the K-chunk
     // legality fallback, and `imparo_metal_q8_pick_shape` lets a test assert the rule with
@@ -5436,11 +5501,12 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
 
 // Defined with the weight-kind table further down (the load-time repack section); declared
 // here because matmat is their first user and C++ reads in order.
-static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowmajor);
 static id<MTLComputePipelineState> gather_pipeline_for_fmt(uint32_t wfmt);
 enum { RT_PLAIN = 0, RT_HALF = 1, RT_GATED_HALF = 2 };
 static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowmajor,
-                                                       uint32_t variant);
+                                                       uint32_t variant, uint32_t tile);
+// The narrow tile the nb8_shape knob selects, as a pipeline-cache index.
+static inline uint32_t rt_narrow_tile(void) { return g_nb8_shape ? RT_TILE_NB8B : RT_TILE_NB8; }
 static id<MTLComputePipelineState> gemv_pipeline_for_fmt(uint32_t wfmt, bool rowmajor);
 
 // `wkind` is the weight-type -> kernel table index (0 = F32, 1 = Q4_0, 2 = Q8_0).
@@ -5455,9 +5521,8 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
     const bool gated = w_off2 != NO_PAIR;
     const uint32_t vrows = gated ? 2u * n_out : n_out;   // rows the rt grid walks
     // one lane per token only pays off with a batch; decode keeps the split-row kernel
-    // Batches up to g_gemv_max_tok take the GEMV; above it, the GEMM family (nb8
-    // then wide). A tuned boundary again since the task-#5 wobble was root-caused
-    // and fixed -- see the g_gemv_max_tok declaration.
+    // One row takes the GEMV; above it, the GEMM family (nb8 then wide). Not a tuned
+    // boundary: see the g_gemv_max_tok declaration for the identity rule that fixes it.
     if (wkind > 3u && wfmt_for(wkind) == 0u) {
         NSLog(@"imparo metal: matmat got unknown weight kind %u (n_out=%u) -- load "
               @"validation should have rejected this model; refusing the dispatch", 
@@ -5485,7 +5550,7 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
         // selects the pipeline twin. They share the buffer indices and the epilogue
         // convention with Q4, nothing else: its
         // three routes have their own grid, threadgroup and boundary knobs.
-        if (g_skip_cat == (n_tok > g_q8_gemv_max_tok ? PC_MATMAT_PREFILL
+        if (g_skip_cat == (n_tok > g_gemv_max_tok ? PC_MATMAT_PREFILL
                                                     : PC_MATMAT_DECODE)) { return true; }
         return q8_matmat(wkind == 3u, w_off, w_off2, n_in, n_out, src, dst, n_tok, src_row);
     }
@@ -5508,8 +5573,14 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
     // Skips the WHOLE matmul, staging and write-back included, so it is comparable with
     // llama.cpp's GGML_METAL_SKIP_OP=MUL_MAT. IMPARO_SKIP_MMA only removes the multiplies
     // and the dequantisation from inside the kernel, which is a different quantity.
-    if (use_prefill  && g_skip_cat == PC_MATMAT_PREFILL) { return true; }
-    if (!use_prefill && g_skip_cat == PC_MATMAT_DECODE)  { return true; }
+    // The class a block-quant dispatch belongs to is decided by its width, not by the
+    // kernel family: one row is the decode GEMV, more is the prefill GEMM. Keyed on
+    // `use_prefill` alone, IMPARO_SKIP_CAT=matmat_decode left every block-quant GEMV
+    // running (the 27B's step read unchanged with the class "skipped") and the prefill
+    // skip would have dropped its decode GEMVs.
+    const bool decode_class = wfmt != 0u ? n_tok <= g_gemv_max_tok : !use_prefill;
+    if (!decode_class && g_skip_cat == PC_MATMAT_PREFILL) { return true; }
+    if (decode_class  && g_skip_cat == PC_MATMAT_DECODE)  { return true; }
     // Hazards are declared ONCE, at each dispatch, with the operand that dispatch actually
     // reads (the float source or its half mirror). A route-wide haz(src, dst) used to sit
     // here as well, so the mirror route's own declaration always found `dst` in the window
@@ -5563,7 +5634,7 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
     // UNTIL 2026-09-09 THIS ARM WAS TAKEN AT `n_tok < 64`, which named a token count where
     // the requirement is a destination big enough. That cost Qwen3.8-27B 6965 ms on a
     // 63-token prefill against 713 on a 64-token one, because the GEMV re-reads the whole
-    // weight stream per token. See `tile_fits` below and g_blk_gemv_max_tok's declaration.
+    // weight stream per token. See `tile_fits` below and g_gemv_max_tok's declaration.
     //
     // DIAGNOSTIC: IMPARO_BLK_GEMV_ALWAYS=1 sends EVERY tile-major matmul through the GEMV.
     // The GEMV and the GEMM read the same bytes with the same brick, so they must agree;
@@ -5571,15 +5642,6 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
     // the reference the sub-tile crossing was checked against.
     static int gemv_always = -1;
     if (gemv_always < 0) { gemv_always = getenv("IMPARO_BLK_GEMV_ALWAYS") != nullptr; }
-    static int bgmt_env = -1;
-    if (bgmt_env < 0) {
-        bgmt_env = 0;
-        if (const char * e = getenv("IMPARO_BLK_GEMV_MAX_TOK")) {
-            g_blk_gemv_max_tok = (uint32_t)atoi(e);
-            bgmt_env = 1;
-            NSLog(@"imparo metal: IMPARO_BLK_GEMV_MAX_TOK=%u", g_blk_gemv_max_tok);
-        }
-    }
     // WHAT THE GEMM ACTUALLY NEEDS IS ROOM, NOT A TOKEN COUNT. It reads and writes whole
     // 64-token tiles, so a sub-tile dispatch is legal exactly when both operands hold a
     // padded tile -- which a prefill chunk does (activations are allocated at max_batch)
@@ -5592,9 +5654,9 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
     const bool tile_fits = src < B_COUNT && dst < B_COUNT
                         && (uint64_t)g.sizes[dst] >= need_dst
                         && (uint64_t)g.sizes[src] >= need_src;
-    if (wfmt != 0u && (n_tok <= g_blk_gemv_max_tok || !tile_fits || gemv_always)) {
-        id<MTLComputePipelineState> gv =
-            gemv_pipeline_for_fmt(wfmt, wfmt_is_rowmajor(wkind));
+    const bool rowmajor = wfmt_is_rowmajor(wkind);
+    if (wfmt != 0u && (n_tok <= g_gemv_max_tok || !tile_fits || gemv_always)) {
+        id<MTLComputePipelineState> gv = gemv_pipeline_for_fmt(wfmt, rowmajor);
         if (gv == nil) { return false; }
         if (gated) { return false; }   // the pair has no GEMV twin; two dispatches instead
         haz(hb(src), hb(dst));
@@ -5643,7 +5705,7 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
         return true;
     }
     if (wfmt != 0u) {
-        pre = rt_pipeline_for_fmt(wfmt, wfmt_is_rowmajor(wkind), RT_PLAIN);
+        pre = rt_pipeline_for_fmt(wfmt, rowmajor, RT_PLAIN, g_rt_shape);
         // Dedup by the SHAPE too, not just the format: keying on (fmt, layout) alone hid
         // every projection after the first of a format and made a running route look
         // absent. An absent line has to mean absent.
@@ -5656,7 +5718,7 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
             if (fresh && n_seen < 64u) {
                 seen_mm[n_seen++] = key;
                 NSLog(@"imparo metal: matmat kind=%u fmt=%u %s n_in=%u n_out=%u n_tok=%u%s",
-                      wkind, wfmt, wfmt_is_rowmajor(wkind) ? "row-major" : "tile-major",
+                      wkind, wfmt, rowmajor ? "row-major" : "tile-major",
                       n_in, n_out, n_tok, gated ? " GATED" : "");
             }
         }
@@ -5698,11 +5760,30 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
         // tile. Same k-order into every output as the wide tile, so the swap is
         // BIT-IDENTICAL; the boundary and the tile variant are tuner-owned
         // (hostconfig v10), swept under shipping routing.
-        const bool nb8 = n_tok >= 2 && n_tok <= g_nb8_max
-                      && pre == g.p_rt[g_rt_shape]
-                      && g.p_rt_nb8 != nil && g.p_rt_nb8b != nil;
+        //
+        // THE NARROW TILE SERVES EVERY FAMILY THE WIDE ONE DOES. `rt_wide` says the
+        // dispatch is on the register-tiled route of ITS family -- the plain family's
+        // pipeline built at init, or the format's, compiled on first use -- and
+        // `rt_narrow` hands back that family's narrow twin of a variant. Until
+        // 2026-09-11 both this test and the tail split's asked for the plain family's
+        // wide pipeline by identity, so a block-quant batch of 2..nb8_max rows never
+        // reached the narrow tile: the 27B's 14-row final chunk ran the 64-token tile
+        // padded (docs/evidence/bracket/2026-09-11-27b-narrow-tile-every-family.md).
+        const bool rt_wide = pre != nil
+            && pre == (wfmt != 0u ? rt_pipeline_for_fmt(wfmt, rowmajor, RT_PLAIN, g_rt_shape)
+                                  : g.p_rt[g_rt_shape]);
+        auto rt_narrow = [&](uint32_t variant) -> id<MTLComputePipelineState> {
+            if (wfmt != 0u) { return rt_pipeline_for_fmt(wfmt, rowmajor, variant, rt_narrow_tile()); }
+            switch (variant) {
+                case RT_HALF:       return g_nb8_shape ? g.p_rt_nb8b_h  : g.p_rt_nb8_h;
+                case RT_GATED_HALF: return g_nb8_shape ? g.p_rt_nb8b_gh : g.p_rt_nb8_gh;
+                default:            return g_nb8_shape ? g.p_rt_nb8b    : g.p_rt_nb8;
+            }
+        };
+        const bool nb8 = n_tok >= 2 && n_tok <= g_nb8_max && rt_wide
+                      && rt_narrow(RT_PLAIN) != nil;
         if (nb8) {
-            pre = g_nb8_shape ? g.p_rt_nb8b : g.p_rt_nb8;
+            pre = rt_narrow(RT_PLAIN);
             static bool nb8_logged = false;
             if (!nb8_logged && getenv("IMPARO_NB8_LOG")) {
                 NSLog(@"imparo metal: nb8 tile engaged n_tok=%u n_out=%u shape=%u",
@@ -5783,9 +5864,9 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
                             ts_on = !(e && e[0] == '0'); ts_init = true; }
             const uint32_t tail_r = n_tok % wide_toks;
             const bool tail_split = ts_on && !nb8 && n_tok > wide_toks
-                                 && tail_r >= 1u && tail_r <= g_nb8_max
-                                 && pre == g.p_rt[g_rt_shape]
-                                 && g.p_rt_nb8 != nil && g.p_rt_nb8_h != nil;
+                                 && tail_r >= 1u && tail_r <= g_nb8_max && rt_wide
+                                 && rt_narrow(RT_PLAIN) != nil
+                                 && rt_narrow(gated ? RT_GATED_HALF : RT_HALF) != nil;
             const uint32_t main_tok = tail_split ? n_tok - tail_r : n_tok;
             // Every prefill width takes this path (HALF_A_MIN, declared above with the
             // measurement): the batch's width must not choose the precision, or a
@@ -5828,19 +5909,14 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
                     if (g_prof) { prof_end(); }
                     g_xh_src = src; g_xh_elems = need; g_xh_buf = B_XH;
                 }
+                const uint32_t hv = gated ? RT_GATED_HALF : RT_HALF;
                 if (wfmt != 0u) {
-                    // nb8 and the tail split both require `pre == g.p_rt[shape]`, so a
-                    // tile-major weight never reaches their tiles; only the two shape
-                    // variants are needed here.
-                    rt_sel = rt_pipeline_for_fmt(wfmt, wfmt_is_rowmajor(wkind),
-                                                 gated ? RT_GATED_HALF : RT_HALF);
+                    rt_sel = nb8 ? rt_narrow(hv)
+                                 : rt_pipeline_for_fmt(wfmt, rowmajor, hv, g_rt_shape);
                     if (rt_sel == nil) { return false; }   // refuse; never the wrong kernel
                 } else {
-                    rt_sel = gated
-                        ? (nb8 ? (g_nb8_shape ? g.p_rt_nb8b_gh : g.p_rt_nb8_gh)
-                               : g.p_rt_gh[g_rt_shape])
-                        : (nb8 ? (g_nb8_shape ? g.p_rt_nb8b_h : g.p_rt_nb8_h)
-                               : g.p_rt_h[g_rt_shape]);
+                    rt_sel = nb8 ? rt_narrow(hv)
+                                 : (gated ? g.p_rt_gh[g_rt_shape] : g.p_rt_h[g_rt_shape]);
                 }
                 src_bind = g_xh_buf;
             }
@@ -5899,10 +5975,8 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
                 // kernel adds src_row); WRITES are dispatch-relative, so the output and
                 // the epilogue mirror bind with a row offset instead.
                 const bool half_sel = (src_bind == g_xh_buf) && g_half_a;
-                id<MTLComputePipelineState> tp = gated
-                    ? (g_nb8_shape ? g.p_rt_nb8b_gh : g.p_rt_nb8_gh)
-                    : (half_sel ? (g_nb8_shape ? g.p_rt_nb8b_h : g.p_rt_nb8_h)
-                                : (g_nb8_shape ? g.p_rt_nb8b   : g.p_rt_nb8));
+                id<MTLComputePipelineState> tp =
+                    rt_narrow(gated ? RT_GATED_HALF : (half_sel ? RT_HALF : RT_PLAIN));
                 const uint32_t t_thr  = g_nb8_shape ? 32u : 64u;
                 const uint32_t t_src_row = src_row + main_tok;
                 [g.enc setComputePipelineState:tp];
@@ -5977,7 +6051,15 @@ extern "C" uint32_t imparo_metal_matmat_gated(uint32_t gate_kind, uint64_t gate_
                                               uint32_t up_kind, uint64_t up_off,
                                               uint32_t n_in, uint32_t n_out, uint32_t src,
                                               uint32_t dst, uint32_t n_tok) {
-    if (gate_kind != up_kind || (gate_kind != 1u && gate_kind != 2u && gate_kind != 3u)) { return 0u; }
+    // ONE FORMAT FOR BOTH TENSORS: the pair kernel stages gate and up through one WFMT.
+    // The plain families (Q4_0, the Q8_0 pair) and every tile-major format qualify; a
+    // layer whose gate and up were quantised differently keeps the two-projection path.
+    // Until 2026-09-11 only the plain kinds passed here, so a block-quant model ran gate,
+    // up with the activation epilogue reading G back, then down -- three passes over the
+    // activations where the pair makes one (docs/evidence/bracket/2026-09-11-27b-gated-pair.md).
+    if (gate_kind != up_kind) { return 0u; }
+    const bool plain = gate_kind == 1u || gate_kind == 2u || gate_kind == 3u;
+    if (!plain && wfmt_for(gate_kind) == 0u) { return 0u; }
     if (n_tok < 2u || g_epi_act == 0u) { return 0u; }
     // ONE BOUND BUFFER FOR BOTH WEIGHTS, so the pair has to live in one segment. With the
     // whole model in one segment every pair does, which is why this held until a tiered
@@ -6216,8 +6298,12 @@ extern "C" int imparo_metal_gather_rows(uint32_t wkind, uint64_t w_off, uint32_t
     // and `wfmt_for` (which answers for tile-major kinds) does not apply: ask the table.
     const uint32_t src_t = (g_wire_ggml_set && wkind < 64u) ? g_wire_ggml[wkind] : 0u;
     uint32_t gfmt = 0u;
+    // Every format whose row-major block is ONE scale run and one payload run. The
+    // multi-span formats (Q2_K, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) have no row-major scale
+    // pointer, which is why `serves_weight_type` refuses them row-major.
     switch (src_t) {
-        case 11: case 12: case 13: case 14: case 20: case 23: gfmt = src_t; break;
+        case 3: case 6: case 7: case 11: case 12: case 13: case 14: case 16: case 19:
+        case 20: case 23: case 29: gfmt = src_t; break;
         default: break;
     }
     if (gfmt == 0u && (wkind > 2u || g.p_gather[wkind] == nil)) {
@@ -7168,21 +7254,32 @@ extern "C" void imparo_metal_attention(uint32_t kv_layer, uint32_t head_dim, uin
         const uint32_t hdi = decode_hd_index(head_dim);
         const bool want_stream = (g_attn_stream || n_pos >= stream_min_pos)
                               && !gqa && hdi < 3u && window == 0u && ring == 0u;
-        // GQA row sharing needs the grouped heads to share a KV head, so the
-        // group size must divide the GQA ratio, and it is f16/hd-512 only.
-        const bool g2_built = kv_quant ? g.p_attn_dec_stream_g2_q != nil
-                                       : g.p_attn_dec_stream_g2 != nil;
-        const uint32_t hq_grp = (g_attn_stream_hq == 2u && head_dim == 512u
-                                 && n_kv > 0u && n_heads % 2u == 0u
-                                 && (n_heads / n_kv) % 2u == 0u && g2_built)
-                              ? 2u : 1u;
+        // GQA row sharing needs the grouped heads to share a KV head, so the group must
+        // divide the share. The variants built are what the threadgroup budget allows
+        // (HQ x (DK + nsg DK + 2 nsg + nsg C) floats): hd 512 x 2, hd 256 x 2 and x 3.
+        const uint32_t hq_want = g_attn_stream_hq;
+        id<MTLComputePipelineState> grp_sel = nil;
+        if (hq_want >= 2u && n_kv > 0u && n_heads % hq_want == 0u
+            && (n_heads / n_kv) % hq_want == 0u) {
+            if (head_dim == 512u && hq_want == 2u) {
+                grp_sel = kv_quant
+                    ? (ident && g.p_attn_dec_stream_g2_q_id != nil ? g.p_attn_dec_stream_g2_q_id
+                                                               : g.p_attn_dec_stream_g2_q)
+                    : (ident && g.p_attn_dec_stream_g2_id != nil ? g.p_attn_dec_stream_g2_id
+                                                             : g.p_attn_dec_stream_g2);
+            } else if (head_dim == 256u && hq_want <= 3u) {
+                const uint32_t gi = hq_want - 2u;
+                grp_sel = kv_quant
+                    ? (ident && g.p_attn_dec_stream_g256_q_id[gi] != nil
+                           ? g.p_attn_dec_stream_g256_q_id[gi] : g.p_attn_dec_stream_g256_q[gi])
+                    : (ident && g.p_attn_dec_stream_g256_id[gi] != nil
+                           ? g.p_attn_dec_stream_g256_id[gi] : g.p_attn_dec_stream_g256[gi]);
+            }
+        }
+        const uint32_t hq_grp = grp_sel != nil ? hq_want : 1u;
         id<MTLComputePipelineState> stream_sel = hdi >= 3u ? nil
-            : hq_grp == 2u
-            ? (kv_quant
-               ? (ident && g.p_attn_dec_stream_g2_q_id != nil ? g.p_attn_dec_stream_g2_q_id
-                                                          : g.p_attn_dec_stream_g2_q)
-               : (ident && g.p_attn_dec_stream_g2_id != nil ? g.p_attn_dec_stream_g2_id
-                                                        : g.p_attn_dec_stream_g2))
+            : hq_grp >= 2u
+            ? grp_sel
             : kv_quant
             ? (ident && g.p_attn_dec_stream_q_id[hdi] != nil ? g.p_attn_dec_stream_q_id[hdi]
                                                          : g.p_attn_dec_stream_q[hdi])
@@ -7481,7 +7578,9 @@ extern "C" bool imparo_metal_delta_net(uint32_t qkv, uint32_t alpha, uint32_t be
                                        uint32_t k_heads, uint32_t v_heads,
                                        uint32_t key_dim, uint32_t value_dim,
                                        uint32_t n_tok, float eps,
-                                       uint64_t norm_w_off, uint32_t gate) {
+                                       uint64_t norm_w_off, uint32_t gate,
+                                       uint32_t snap, uint32_t snap_off,
+                                       uint32_t snap_row) {
     if (g.p_delta_net == nil) { return false; }
     // The dims are compiled into the kernel's register array; a mismatch would read the
     // state with the wrong stride and still produce numbers.
@@ -7496,8 +7595,13 @@ extern "C" bool imparo_metal_delta_net(uint32_t qkv, uint32_t alpha, uint32_t be
     // a wrong answer waiting to be believed: refuse the whole rule instead, which the
     // model turns into an error. Same predicate as the capability, read once.
     if (fuse && imparo_metal_delta_net_fuses_epilogue() == 0u) { return false; }
+    // THE BOUNDARY SNAPSHOT: a checkpoint boundary `snap_row` tokens into the batch, and
+    // the plane that receives the matrix as of that row. None = UINT32_MAX, and then
+    // the slot is bound to the state buffer itself (bound always, task #152) with
+    // snap_row 0, which the kernel never reaches.
+    const bool snapping = snap != UINT32_MAX;
     haz(hb(qkv) | hb(alpha) | hb(beta) | hb(state) | (fuse ? hb(gate) : 0u),
-        (fuse ? hb(gate) : hb(out)) | hb(state));
+        (fuse ? hb(gate) : hb(out)) | hb(state) | (snapping ? hb(snap) : 0u));
     [g.enc setComputePipelineState:g.p_delta_net];
     [g.enc setBuffer:g.bufs[qkv] offset:g.buf_off[qkv] atIndex:0];
     [g.enc setBuffer:g.bufs[alpha] offset:g.buf_off[alpha] atIndex:1];
@@ -7530,9 +7634,14 @@ extern "C" bool imparo_metal_delta_net(uint32_t qkv, uint32_t alpha, uint32_t be
       [g.enc setBuffer:g.bufs[gb] offset:g.buf_off[gb] atIndex:13]; }
     const uint32_t fuse_flag = fuse ? 1u : 0u;
     [g.enc setBytes:&fuse_flag length:4 atIndex:14];
+    { const uint32_t sb = snapping ? snap : state;
+      const uint32_t so = snapping ? snap_off : state_off;
+      [g.enc setBuffer:g.bufs[sb] offset:g.buf_off[sb] + (NSUInteger)so * 4 atIndex:15]; }
+    const uint32_t snap_row_v = snapping ? snap_row : 0u;
+    [g.enc setBytes:&snap_row_v length:4 atIndex:16];
     g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_DELTA); }
     [g.enc dispatchThreadgroups:MTLSizeMake(v_heads, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(DELTA_THREADS, 1, 1)];
+          threadsPerThreadgroup:MTLSizeMake(g_delta_sgs * 32u, 1, 1)];
     if (g_prof) { prof_end(); }
     return true;
 }
@@ -7574,42 +7683,6 @@ extern "C" void imparo_metal_copy_strided(uint32_t dst, uint32_t src, uint32_t w
     if (g_prof) { prof_end(); }
 }
 
-// The mega FFN block: gate|up -> act*mul -> down as one persistent dispatch (kernel comment in
-// imparo.metal). `gtmp` and `utmp` are the two n_mid scratch rows the dispatch path writes
-// too. Returns false when the route is off or unavailable; the caller then dispatches.
-extern "C" bool imparo_metal_ffn_persistent(uint64_t gate_off, uint64_t up_off, uint64_t down_off,
-                                            uint32_t n_in, uint32_t n_mid, uint32_t n_out,
-                                            uint32_t src, uint32_t gtmp, uint32_t utmp, uint32_t dst) {
-    if (!mega_ffn_wanted() || !mega_route_open() || g.p_mega_ffn == nil || g.mega_sync == nil) { return false; }
-    mega_inject_if_pending();
-    if (n_in % 32u != 0u || n_mid % 32u != 0u || w_absent(gate_off) || w_absent(up_off) || w_absent(down_off)) { return false; }
-    haz(hb(src), hb(gtmp) | hb(utmp) | hb(dst));
-    [g.enc setComputePipelineState:g.p_mega_ffn];
-    const uint64_t go = wbind(g.enc, gate_off, 0);
-    const uint64_t uo = wbind(g.enc, up_off, 1);
-    const uint64_t dn = wbind(g.enc, down_off, 2);
-    [g.enc setBuffer:g.bufs[src]  offset:g.buf_off[src]  atIndex:3];
-    [g.enc setBuffer:g.bufs[gtmp] offset:g.buf_off[gtmp] atIndex:4];
-    [g.enc setBuffer:g.bufs[utmp] offset:g.buf_off[utmp] atIndex:5];
-    [g.enc setBuffer:g.bufs[dst]  offset:g.buf_off[dst]  atIndex:6];
-    [g.enc setBuffer:g.mega_sync offset:0 atIndex:7];
-    [g.enc setBytes:&go length:8 atIndex:8];
-    [g.enc setBytes:&uo length:8 atIndex:9];
-    [g.enc setBytes:&dn length:8 atIndex:10];
-    [g.enc setBytes:&n_in  length:4 atIndex:11];
-    [g.enc setBytes:&n_mid length:4 atIndex:12];
-    [g.enc setBytes:&n_out length:4 atIndex:13];
-    const uint32_t ffn_tgs = g_mega_tgs[MEGA_ARCH_GEMMA4], ffn_nsg = g_mega_nsg[MEGA_ARCH_GEMMA4];
-    [g.enc setBytes:&ffn_tgs length:4 atIndex:14];
-    static bool said = false;
-    if (!said) { NSLog(@"imparo metal: mega FFN block engaged (n_in=%u n_mid=%u n_out=%u tgs=%u threads=%u)", n_in, n_mid, n_out, ffn_tgs, ffn_nsg * 32u); said = true; }
-    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MEGA); }
-    g_mega_last_tgs = ffn_tgs;
-    [g.enc dispatchThreadgroups:MTLSizeMake(ffn_tgs, 1, 1) threadsPerThreadgroup:MTLSizeMake(ffn_nsg * 32u, 1, 1)];
-    if (g_prof) { prof_end(); }
-    return true;
-}
-
 // THE ENTRY (task #158 step 2): one shape for every architecture. MegaEntryGHost mirrors the
 // kernel's MegaEntryG (GPU addresses = MTLBuffer.gpuAddress + offset, the argument-buffer
 // encoding of pointers; weight offsets local to the address's segment; words; floats); the slot
@@ -7649,7 +7722,7 @@ struct MegaEntryFfi {
 };
 static_assert(sizeof(MegaEntryFfi) == 12u * 4u + 8u + MEGA_NP * 16u + MEGA_NU * 4u + MEGA_NF * 4u, "MegaEntryFfi drift");
 constexpr uint32_t SHORTCONV_MAX_HISTORY_HOST = 8u;   // the shader's SHORTCONV_MAX_HISTORY
-struct MegaTokenHost { uint32_t start_pos, dbg_slot, n_tg, entry_bytes, dbg_seq, entry_index, n_entries, pad3; };   // mirrors MegaToken
+struct MegaTokenHost { uint32_t start_pos, dbg_slot, n_tg, entry_bytes, dbg_seq, entry_index, n_entries, probe; };   // mirrors MegaToken
 // A weight's segment base address, and its offset local to that segment (the block adds
 // them). Absent weights get a valid address they never read and keep their sentinel offset.
 // Every referenced buffer is declared to the encoder: it is reached by address, not binding.
@@ -7684,6 +7757,196 @@ static id<MTLBuffer> mega_freqs_buffer(const float * freqs, uint32_t n_freqs) {
     tables.push_back({n, buf});
     return buf;
 }
+// THE ADMISSION PROBE (task #203).
+//
+// How many threadgroups of a given pipeline this GPU will hold resident at once is the one
+// input the grid seat cannot derive: `maxTotalThreadsPerThreadgroup` bounds ONE threadgroup,
+// and multiplying it by the core count is a grid-sizing heuristic, not a co-residency proof.
+// Both constants ever written into that heuristic were wrong on some machine:
+//
+//   2 * (cores - 2)   hung an M4 Pro -- every region timed out and ran on the dispatch path
+//                     (E4B decode 19.9 tok/s at 36x16 against 60.0 at 20x16, 2026-09-08)
+//   cores             its replacement, and 2.6% of this M3 Pro's E4B decode at depth
+//
+// A constant cannot be right for both, so the seat is MEASURED here, on the machine that is
+// running, with the kernel that will run. The probe dispatches the real pipeline in probe mode
+// (tok.probe): every threadgroup arrives at one grid barrier and leaves. It reads no entry and
+// writes nothing but the sync words, so a grid above admission costs one short spin cap and no
+// state -- it can never become the hang the seat itself could produce.
+//
+// WHY THE REAL PIPELINE. Admission is this kernel's register footprint. A trivial probe kernel
+// admits about 2.7x more (handoff/mac-m4-mega-admission.md), so a purpose-built probe would
+// measure a number no real dispatch can use.
+//
+// WHAT IT DOES NOT ANSWER: the threadgroup-memory half. The probe runs at the 16-byte minimum,
+// so it measures the register/co-residency ceiling alone; the row's threadgroup-memory cost is
+// the separate cap in mega_tgs_for_row, and the two multiply as they did before.
+static const uint32_t MEGA_PROBE_SPIN_K = 16u;   // 16 x 1024 spins, ~20 ms: an admitted grid arrives in microseconds, and a grid that does not is a display stall for exactly this long
+// IMPARO_MEGA_PROBE_CAP=<n> (test instrument): report "did not admit" for any grid above n,
+// WITHOUT dispatching it. The M4 Pro case -- a GPU that holds fewer threadgroups than this one
+// -- cannot be produced on an M3 Pro, and a fix for a hang must be exercised, not argued
+// (#193's rule). Set it to a number below the core count and the halve-down path runs too.
+static uint32_t mega_probe_cap(void) {
+    static uint32_t cap = 0u;
+    static bool read = false;
+    if (!read) {
+        read = true;
+        if (const char * e = getenv("IMPARO_MEGA_PROBE_CAP")) { cap = (uint32_t)strtoul(e, nullptr, 10); }
+    }
+    return cap;
+}
+
+// A DISCOVERY PROBE, with the same standing as imparo_metal_spill_rate: the TUNER calls it
+// (Backend::mega_admission) between regions, it dispatches on its own command buffer and
+// waits, and it clears the barrier counters -- so it refuses to run while a region is open.
+// The engine never calls it: an untuned host runs one threadgroup per core, a tuned one
+// applies the stored value as written, and the tuner only writes a value it measured under
+// this limit (docs/tuner-design.md: derive the limit, tune the value).
+//
+// Threadgroups that reached the barrier. == n_tg means the grid is admitted; 0 means the probe
+// could not run at all.
+static uint32_t mega_probe_arrivals(id<MTLComputePipelineState> pipe, uint32_t n_tg, uint32_t nsg) {
+    if (pipe == nil || g.queue == nil || g.mega_sync == nil || n_tg == 0u || nsg == 0u) { return 0u; }
+    if ((uint64_t)nsg * 32u > (uint64_t)[pipe maxTotalThreadsPerThreadgroup]) { return 0u; }
+    // The injected verdict comes BEFORE the dispatch: the point is to test the host's ladder
+    // and the engine underneath the answer, not to provoke a real timeout we already know how
+    // to survive. Report one threadgroup short, which is what a real shortfall looks like.
+    if (mega_probe_cap() != 0u && n_tg > mega_probe_cap()) { return n_tg - 1u; }
+    id<MTLBuffer> fb = mega_freqs_buffer(nullptr, 0u);
+    if (fb == nil) { return 0u; }
+    uint32_t * w = (uint32_t *)[g.mega_sync contents];
+    // A grid that does not admit never reaches mega_exit's reset, so the counters are cleared
+    // on BOTH sides of the dispatch: the next probe must start from zero, and the engine must
+    // find the buffer as it left it (mega_check_error reads words 3 and 15).
+    memset(w, 0, 16u * sizeof(uint32_t));
+    MegaEntryGHost ent; memset(&ent, 0, sizeof(ent));      // never read: the probe leaves before the entry loop
+    MegaTokenHost tok; memset(&tok, 0, sizeof(tok));
+    tok.n_tg = n_tg;
+    tok.entry_bytes = (uint32_t)sizeof(MegaEntryGHost);
+    tok.probe = MEGA_PROBE_SPIN_K;
+    id<MTLCommandBuffer> cb = [g.queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:pipe];
+    [e setBytes:&ent length:sizeof(ent) atIndex:0];
+    [e setBuffer:g.mega_sync offset:0 atIndex:1];
+    [e setBytes:&tok length:sizeof(tok) atIndex:2];
+    [e setBuffer:fb offset:0 atIndex:3];
+    [e setThreadgroupMemoryLength:16 atIndex:0];           // the probe forms no row; 16 = the binding's minimum (task #152)
+    [e dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(nsg * 32u, 1, 1)];
+    [e endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const uint32_t err = w[15];
+    // mega_step's timeout stores the arrivals it saw in bits 16..23; at phase 1 that count IS
+    // the number of threadgroups that started.
+    const uint32_t arrived = (err == 0u) ? n_tg : ((err >> 16) & 0xffu);
+    memset(w, 0, 16u * sizeof(uint32_t));
+    return arrived;
+}
+
+// The ladder is MULTIPLES OF THE CORE COUNT. A grid that is not a whole number of cores leaves
+// some cores hosting one threadgroup and some two, and every barrier waits for the doubled ones
+// -- the whole-core rule mega_grid_derive already searches under. Ascending, stopping at the
+// first failure, so the only over-capacity dispatch in the run is the one that answers the
+// question. If not even one per core admits, halve down; one threadgroup always admits.
+static uint32_t mega_probe_seat(id<MTLComputePipelineState> pipe, uint32_t cores, uint32_t nsg,
+                                uint32_t tgs_cap, const char * name) {
+    uint32_t best = 0u;
+    for (uint32_t k = 1u; k * cores <= tgs_cap; ++k) {
+        const uint32_t cand = k * cores;
+        uint32_t got = mega_probe_arrivals(pipe, cand, nsg);
+        // COULD NOT RUN is not DID NOT ADMIT. Answering 0 for a probe that never dispatched
+        // and treating it as a verdict would collapse the grid to one threadgroup on any host
+        // where the probe is unavailable -- worse than the policy it replaces. Leave the
+        // one-per-core policy standing and say which happened.
+        if (got == 0u) {
+            NSLog(@"imparo metal: mega admission probe %s could not run; the one-per-core policy stands (%u)", name, cores);
+            return cores;
+        }
+        // ONE RETRY. A threadgroup the GPU descheduled for another client (a browser's GPU
+        // process took the GPU in bursts here, task #123) reads exactly like a grid that does
+        // not admit, and a false negative would cost the grid for the whole process.
+        if (got != cand) { got = mega_probe_arrivals(pipe, cand, nsg); }
+        if (got != cand) {
+            // Never print a seat here when there is not one yet: at k = 1 the ladder has
+            // measured nothing and the halve-down below decides. Say which happened.
+            if (best != 0u) {
+                NSLog(@"imparo metal: mega admission probe %s: %u x %u threads -> %u of %u arrived; the seat is %u",
+                      name, cand, nsg * 32u, got, cand, best);
+            } else {
+                NSLog(@"imparo metal: mega admission probe %s: %u x %u threads -> %u of %u arrived; halving down",
+                      name, cand, nsg * 32u, got, cand);
+            }
+            break;
+        }
+        best = cand;
+    }
+    if (best == 0u) {
+        // Not even one threadgroup per core. Halve down; Metal guarantees one threadgroup of
+        // the pipeline's own maximum width, so 1 is the floor and it always admits.
+        for (uint32_t cand = cores / 2u; cand >= 1u; cand /= 2u) {
+            if (mega_probe_arrivals(pipe, cand, nsg) == cand) { best = cand; break; }
+        }
+        if (best == 0u) { best = 1u; }
+        NSLog(@"imparo metal: mega admission probe %s: one per core (%u) did NOT admit; seat %u", name, cores, best);
+    }
+    return best;
+}
+
+
+// MEASURE ONE PIPELINE'S CEILING at its family's seated width: the plain pipeline of (family,
+// head-dim slot). The seat is per pipeline (see g_mega_tgs), so the limit is too.
+static void mega_measure_ceiling(uint32_t family, uint32_t slot, uint32_t cores) {
+    __strong id<MTLComputePipelineState> * const plain[MEGA_ARCH_COUNT] =
+        { g.p_mega_layer, g.p_mega_lfm2, g.p_mega_q35 };
+    static const char * const nm[MEGA_ARCH_COUNT] = { "gemma4", "LFM2", "qwen35" };
+    if (family >= MEGA_ARCH_COUNT || slot >= 2u || g_mega_threads_limit[family] == 0u) { return; }
+    id<MTLComputePipelineState> pipe = plain[family][slot];
+    if (pipe == nil) { return; }   // no pipeline compiled for this slot (one attention geometry)
+    const uint32_t nsg = g_mega_nsg[family];
+    if (nsg == 0u || nsg > MEGA_NSG_MAX) { return; }
+    const uint32_t cap = std::max(1u, g_mega_threads_limit[family] / std::max(1u, nsg * 32u));
+    const uint32_t seat = mega_probe_seat(pipe, cores, nsg, cap, nm[family]);
+    g_mega_tgs_probed[family][slot][nsg] = seat;
+    NSLog(@"imparo metal: mega admission MEASURED %s slot %u (hd %u): %u threadgroups x %u threads (%.2f per core, cap %u)",
+          nm[family], slot, g_qcomb_hds[slot], seat, nsg * 32u, (double)seat / (double)std::max(1u, cores), cap);
+}
+
+// Backend::mega_admission (task #203): measure one pipeline's ceiling once per width and
+// report it; 0 = no pipeline at that slot, or a region is open (a probe inside a region would
+// clear the counters that region spins on -- the phantom-dispatch class of failure, never risked).
+extern "C" uint32_t imparo_metal_mega_admission(uint32_t family, uint32_t slot) {
+    if (family >= MEGA_ARCH_COUNT || slot >= 2u || g_mega_threads_limit[family] == 0u) { return 0u; }
+    if (g.enc != nil) { NSLog(@"imparo metal: mega admission probe refused: a region is open"); return 0u; }
+    if (g.mega_sync == nil) { mega_scratch_ensure(0u); }
+    if (mega_ceiling(family, slot) == 0u) { mega_measure_ceiling(family, slot, mega_core_seat()); }
+    g_mega_probe_family = family;
+    return mega_ceiling(family, slot);
+}
+// What the tuner's probe measured for the family it asked about, per slot (0 = nothing measured
+// in this process, or the width has moved since): the LIMIT the registry ranks a grid knob under.
+extern "C" uint32_t imparo_metal_mega_admission_current(uint32_t slot) {
+    return g_mega_probe_family < MEGA_ARCH_COUNT ? mega_ceiling(g_mega_probe_family, slot) : 0u;
+}
+// Whether any family compiled a plain pipeline at `slot` -- i.e. whether the model this process
+// compiled for has a second attention geometry. The registry's applicability question for the
+// second grid knob.
+extern "C" uint32_t imparo_metal_mega_slot_present(uint32_t slot) {
+    if (slot >= 2u) { return 0u; }
+    return (g.p_mega_layer[slot] != nil || g.p_mega_lfm2[slot] != nil || g.p_mega_q35[slot] != nil) ? 1u : 0u;
+}
+// Backend::mega_seat_form: 0 = no pipeline family, 1 = per-layer dispatches at the grid seat,
+// 2 = the per-token program at one threadgroup per core (task #153's default for the family,
+// or IMPARO_MEGA_PROGRAM). The tuner's applicability question; the same table the entry
+// dispatch reads, so the answer cannot drift from what runs.
+extern "C" uint32_t imparo_metal_mega_seat_form(uint32_t family) {
+    if (family >= MEGA_ARCH_COUNT || g_mega_threads_limit[family] == 0u) { return 0u; }
+    // A quantized cache takes the typed pipelines, which run one threadgroup per core
+    // (task #156), so with one configured the seat governs no grid either.
+    if (g_mega_kq_ty != 1u || g_mega_vq_ty != 1u) { return 2u; }
+    return mega_program_for(MEGA_PROGRAM_DEFAULTS[family]) ? 2u : 1u;
+}
+
 static uint64_t mega_baddr(uint32_t id) {
     [g.enc useResource:g.bufs[id] usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
     return (uint64_t)[g.bufs[id] gpuAddress] + (uint64_t)g.buf_off[id];
@@ -7784,16 +8047,26 @@ static bool mega_had_ok(uint32_t had, uint32_t hd) {
 // Refuses (false, nothing encoded) when the route is off or below the entry's level, a weight is
 // absent or in the slow tier, a buffer or cache is missing, or a grid / geometry rule breaks; the
 // caller then runs the dispatch path. A refusal flushes the pending program run first.
+// WHY AN ENTRY WAS REFUSED, on request (IMPARO_MEGA_REFUSE_LOG=1): the line of the rule that
+// refused it. A refusal is silent by design -- the layer takes the dispatch path -- which is
+// right for the engine and blind for the tuner, whose mega workload read 42 of 42 layers
+// refused with nothing to say which rule (task #203). Off, it costs one static read.
+static bool mega_refuse_log(void) {
+    static int on = -1;
+    if (on < 0) { on = getenv("IMPARO_MEGA_REFUSE_LOG") != nullptr ? 1 : 0; }
+    return on != 0;
+}
+#define MEGA_REFUSE() do { if (mega_refuse_log()) { NSLog(@"imparo metal: mega entry refused (imparo_metal.mm:%d)", __LINE__); } return false; } while (0)
 extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
     MegaProgRefuseGuard guard;   // a refusal flushes the pending program run first (task #153)
-    if (e == nullptr || e->arch >= MEGA_ARCH_COUNT || mega_level() < (int)e->min_level || !mega_route_open() || g.mega_sync == nil) { return false; }
+    if (e == nullptr || e->arch >= MEGA_ARCH_COUNT || mega_level() < (int)e->min_level || !mega_route_open() || g.mega_sync == nil) { MEGA_REFUSE(); }
     mega_inject_if_pending();
     const bool g4 = e->arch == MEGA_ARCH_GEMMA4;
     const bool attn_on = e->attn_on != 0u;
     const uint32_t hd = e->head_dim;
     const uint32_t n_embd = e->u[MEGA_U_N_EMBD], n_heads = e->u[MEGA_U_N_HEADS], n_kv = e->u[MEGA_U_N_KV];
     const uint32_t window = e->u[MEGA_U_WINDOW], had_k = e->u[MEGA_U_HAD_K], had_v = e->u[MEGA_U_HAD_V];
-    if (n_embd == 0u || n_embd % 4u != 0u) { return false; }
+    if (n_embd == 0u || n_embd % 4u != 0u) { MEGA_REFUSE(); }
     // THE ROW MUST FIT. Every threadgroup forms the layer's row in threadgroup memory, and a
     // core's budget is finite (32 KB here): at n_embd 8192 the row alone exceeds it and the
     // dispatch would be illegal, not slow. Refuse instead -- the layer takes the dispatch
@@ -7812,7 +8085,7 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
             NSLog(@"imparo metal: mega route refused -- the layer's row needs %llu B of threadgroup memory and a core has %u (n_embd=%u); the dispatch path takes it",
                   (uint64_t)tgmem_b + MEGA_TG_STATIC_BYTES, g_tgmem_limit, n_embd);
         }
-        return false;
+        MEGA_REFUSE();
     }
     // The pipeline family and the head-dim slot (only the attention body depends on the head dim).
     uint32_t slot_of = 2u;
@@ -7821,10 +8094,10 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
     // types; a layer whose types differ from that pair is refused (the dispatch path's rule).
     const uint32_t kv_kt = attn_on ? kv_eff_type(e->kv_layer, 0) : 1u, kv_vt = attn_on ? kv_eff_type(e->kv_layer, 1) : 1u;
     const bool kvq = kv_kt != 1u || kv_vt != 1u;
-    if (kvq && (kv_kt != g_mega_kq_ty || kv_vt != g_mega_vq_ty)) { return false; }
+    if (kvq && (kv_kt != g_mega_kq_ty || kv_vt != g_mega_vq_ty)) { MEGA_REFUSE(); }
     // The program form's default is per architecture (task #153): a table, so a new
     // architecture adds a row rather than another ternary.
-    static const bool prog_default[MEGA_ARCH_COUNT] = { MEGA_PROGRAM_DEFAULT_E4B, MEGA_PROGRAM_DEFAULT_LFM2, MEGA_PROGRAM_DEFAULT_Q35 };
+    const bool * const prog_default = MEGA_PROGRAM_DEFAULTS;
     const bool prog = mega_program_for(prog_default[e->arch]);
     __strong id<MTLComputePipelineState> * const plain_of[MEGA_ARCH_COUNT] = { g.p_mega_layer, g.p_mega_lfm2, g.p_mega_q35 };
     __strong id<MTLComputePipelineState> * const qp_of[MEGA_ARCH_COUNT]    = { g.p_mega_layer_q, g.p_mega_lfm2_q, g.p_mega_q35_q };
@@ -7839,22 +8112,25 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
     __strong id<MTLComputePipelineState> * progp = progp_of[e->arch];
     __strong id<MTLComputePipelineState> * progq = progq_of[e->arch];
     id<MTLComputePipelineState> pipe = nil;
+    uint32_t seat_slot = 0u;   // the pipeline slot whose grid seat this dispatch takes (task #203)
     if (attn_on) {
-        if (slot_of >= 2u) { return false; }
+        if (slot_of >= 2u) { MEGA_REFUSE(); }
         pipe = prog ? (kvq ? progq[slot_of] : progp[slot_of]) : (kvq ? qp[slot_of] : plain[slot_of]);
+        seat_slot = slot_of;
     } else {
         // Without the attention phase the head dim plays no part: any built slot serves the layer.
         __strong id<MTLComputePipelineState> * set = prog ? progp : plain;
-        pipe = set[0] != nil ? set[0] : set[1];
+        seat_slot = set[0] != nil ? 0u : 1u;
+        pipe = set[seat_slot];
     }
-    if (pipe == nil) { return false; }
+    if (pipe == nil) { MEGA_REFUSE(); }
     // The quantized and program variants run at one threadgroup per core (tasks #156, #153).
     // The grid is this FAMILY's (see g_mega_threads_limit): another architecture's kernel
     // never moves it.
     // The threadgroup count comes first -- it is capped by what this threadgroup's own row
     // costs, and a grid whose threadgroups cannot be co-resident waits at its first barrier
     // for threadgroups that never start.
-    uint32_t tgs = (kvq || prog) ? mega_deep_tgs(e->arch) : mega_tgs_for_row(e->arch, tgmem_b);
+    uint32_t tgs = (kvq || prog) ? mega_deep_tgs(e->arch, seat_slot) : mega_tgs_for_row(e->arch, seat_slot, tgmem_b);
     // Then the simdgroups. The seat is the FLOOR (the device's occupancy term, which the tuner
     // ranks); above it the count comes from what this entry's phases run over, so no phase pays
     // for a mostly-idle last wave. IMPARO_MEGA_NSG_EXACT=1 pins the seat instead, for the A/B.
@@ -7886,12 +8162,12 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
         // The attention phase: one token, a span within the vec limit or the grouped deep body,
         // the fold geometry (nsg a multiple of the slot count, at least twice it), the block's
         // threadgroup row holding the fold scratch, this layer's cache present.
-        if (n_kv == 0u || n_heads == 0u || n_heads % n_kv != 0u) { return false; }
-        if (!kvq && !prog && n_heads > tgs) { return false; }   // the f16 plain pipelines compute one vec item per threadgroup (constraint 8)
-        if (!mega_had_ok(had_k, hd) || !mega_had_ok(had_v, hd)) { return false; }   // the cache basis (task #156)
-        if (!mega_nsg_legal(nsg, e->arch, true, hd)) { return false; }   // the fold geometry, stated once above
-        if ((uint64_t)n_embd < (uint64_t)4u * (hd + 2u)) { return false; }
-        if (e->kv_layer >= g.kv_k.size() || g.kv_k[e->kv_layer] == nil || g.kv_v[e->kv_layer] == nil) { return false; }
+        if (n_kv == 0u || n_heads == 0u || n_heads % n_kv != 0u) { MEGA_REFUSE(); }
+        if (!kvq && !prog && n_heads > tgs) { MEGA_REFUSE(); }   // the f16 plain pipelines compute one vec item per threadgroup (constraint 8)
+        if (!mega_had_ok(had_k, hd) || !mega_had_ok(had_v, hd)) { MEGA_REFUSE(); }   // the cache basis (task #156)
+        if (!mega_nsg_legal(nsg, e->arch, true, hd)) { MEGA_REFUSE(); }   // the fold geometry, stated once above
+        if ((uint64_t)n_embd < (uint64_t)4u * (hd + 2u)) { MEGA_REFUSE(); }
+        if (e->kv_layer >= g.kv_k.size() || g.kv_k[e->kv_layer] == nil || g.kv_v[e->kv_layer] == nil) { MEGA_REFUSE(); }
         n_pos = (window > 0 && e->start_pos + 1 > window) ? window : e->start_pos + 1;
         // Threadgroups per head: the idle ones take a share of the span; the partials live in the
         // block's scratch (scratch_rows floats), which bounds the split. The vec regime cap
@@ -7900,10 +8176,10 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
         attn_split = std::max(1u, std::min(tgs / n_heads, e->scratch_rows / std::max(1u, n_heads * (hd + 2u))));
         if ((n_pos + attn_split - 1u) / attn_split > g_attn_vec_max_keys) {
             id<MTLComputePipelineState> dpipe = prog ? pipe : (kvq ? deepq[slot_of] : deepp[slot_of]);
-            if (!mega_attn_sliced() || dpipe == nil) { return false; }
-            attn_split = mega_attn_deep_slices(e->arch, n_heads, n_kv, hd);
-            if (attn_split == 0u) { return false; }
-            deep = true; pipe = dpipe; tgs = mega_deep_tgs(e->arch);
+            if (!mega_attn_sliced() || dpipe == nil) { MEGA_REFUSE(); }
+            attn_split = mega_attn_deep_slices(e->arch, seat_slot, n_heads, n_kv, hd);
+            if (attn_split == 0u) { MEGA_REFUSE(); }
+            deep = true; pipe = dpipe; tgs = mega_deep_tgs(e->arch, seat_slot);
             // The grid just changed, so the balance the simdgroup count was chosen for is
             // stale; choose it again from the same floor against the deep grid.
             if (!g_mega_nsg_exact) {
@@ -7926,30 +8202,30 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
         switch (sl.role) {
         case MEGA_SLOT_NONE: break;
         case MEGA_SLOT_WEIGHT:
-            if (w_absent(sl.off) || !w_fast(sl.off)) { return false; }
+            if (w_absent(sl.off) || !w_fast(sl.off)) { MEGA_REFUSE(); }
             break;
         case MEGA_SLOT_WEIGHT_OPT:
-            if (!w_fast(sl.off)) { return false; }
+            if (!w_fast(sl.off)) { MEGA_REFUSE(); }
             break;
         case MEGA_SLOT_BUF_R: case MEGA_SLOT_BUF_W: case MEGA_SLOT_BUF_RW:
-            if (sl.id >= B_COUNT || g.bufs[sl.id] == nil) { return false; }
+            if (sl.id >= B_COUNT || g.bufs[sl.id] == nil) { MEGA_REFUSE(); }
             if (sl.role != MEGA_SLOT_BUF_W) { rd |= hb(sl.id); }
             if (sl.role != MEGA_SLOT_BUF_R) { wr |= hb(sl.id); }
             break;
         case MEGA_SLOT_KV_K_R: case MEGA_SLOT_KV_K_W: case MEGA_SLOT_KV_V_R: case MEGA_SLOT_KV_V_W: {
-            if (!attn_on) { return false; }
+            if (!attn_on) { MEGA_REFUSE(); }
             const uint64_t hz = (sl.role == MEGA_SLOT_KV_V_R || sl.role == MEGA_SLOT_KV_V_W) ? HZ_KVV : HZ_KVK;
             rd |= hz;
             if (sl.role == MEGA_SLOT_KV_K_W || sl.role == MEGA_SLOT_KV_V_W) { wr |= hz; }
             break;
         }
         case MEGA_SLOT_KV_PT:
-            if (!attn_on || e->kv_layer >= g.kv_pt.size()) { return false; }
+            if (!attn_on || e->kv_layer >= g.kv_pt.size()) { MEGA_REFUSE(); }
             break;
-        default: return false;
+        default: MEGA_REFUSE();
         }
     }
-    if (!mega_scratch_ensure(e->scratch_rows)) { return false; }
+    if (!mega_scratch_ensure(e->scratch_rows)) { MEGA_REFUSE(); }
     if (attn_on) { ensure_kv_pt(e->kv_layer, (e->start_pos + 1u + KV_PAGE_CELLS - 1u) / KV_PAGE_CELLS); }
     if (attn_on && getenv("IMPARO_ATTN_WHICH")) {
         fprintf(stderr, "mega attn body=%s layer=%u hd=%u n_pos=%u split=%u hq=%u tgs=%u kvq=%u\n",
@@ -8002,12 +8278,12 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
     if (g_mega_dbg_seq == 0u && attn_on) { g_mega_dbg_cap_layer = e->kv_layer; }   // the KV capture's layer (MEGA_DBG)
     g_mega_dbg_seq += 1u;
     id<MTLBuffer> fb = mega_freqs_buffer(e->n_freqs != 0u ? e->freqs : nullptr, e->n_freqs);   // the rope factor table, or the 1-float dummy
-    if (fb == nil) { return false; }
+    if (fb == nil) { MEGA_REFUSE(); }
     if (prog) {
         // The program form (task #153): the entry joins the pending run; the run is one dispatch.
         mega_prog_alloc();
         if (!mega_prog_record(g_mega_prog, (uint32_t)sizeof(MegaEntryGHost), &ent, pipe, tgs, nsg, tgmem_b, fb,
-                              e->start_pos, attn_on, tok.dbg_seq, rd, wr)) { return false; }
+                              e->start_pos, attn_on, tok.dbg_seq, rd, wr)) { MEGA_REFUSE(); }
         guard.ok = true;
         return true;
     }
@@ -8431,10 +8707,11 @@ static_assert(sizeof(WXformWire) == 96, "transform wire drift");
 // first use and kept: a pipeline is GPU-resident code, and a model touches at most a
 // handful of formats.
 static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowmajor,
-                                                       uint32_t variant) {
-    if (wfmt == 0u || wfmt >= 32u || variant > RT_GATED_HALF || g.lib == nil) { return nil; }
+                                                       uint32_t variant, uint32_t tile) {
+    if (wfmt == 0u || wfmt >= 32u || variant > RT_GATED_HALF || tile >= RT_TILES
+        || g.lib == nil) { return nil; }
     const uint32_t slot = wfmt + (rowmajor ? 32u : 0u);
-    if (g.p_rt_fmt[variant][slot] != nil) { return g.p_rt_fmt[variant][slot]; }
+    if (g.p_rt_fmt[variant][tile][slot] != nil) { return g.p_rt_fmt[variant][tile][slot]; }
     MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
     [cv setConstantValue:&wfmt type:MTLDataTypeUInt atIndex:21];
     [cv setConstantValue:&rowmajor type:MTLDataTypeBool atIndex:22];
@@ -8456,24 +8733,29 @@ static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowma
     // branch overwrite the selection with `g.p_rt_h[shape]` dispatched a Q4_K tensor on
     // the Q4_0 kernel -- payload bytes read as half scales, Inf and NaN by construction,
     // with the "built the register-tiled GEMM for weight format 12" line in the log.
+    // The same entry points the plain family dispatches, compiled for this format: a
+    // wide shape by its index, or the narrow tile the route takes for 2..nb8_max rows.
     static const char * const SUF[3] = { "", "_h", "_gh" };
-    NSString * nm = [NSString stringWithFormat:@"imparo_rt_%u%s", g_rt_shape, SUF[variant]];
+    NSString * nm = tile < RT_CANDIDATES
+        ? [NSString stringWithFormat:@"imparo_rt_%u%s", tile, SUF[variant]]
+        : [NSString stringWithFormat:@"imparo_rt_nb8%s%s", tile == RT_TILE_NB8B ? "b" : "",
+                                     SUF[variant]];
     id<MTLFunction> f = [g.lib newFunctionWithName:nm constantValues:cv error:&e];
     if (f == nil) {
         NSLog(@"imparo metal: no rt function %@ for WFMT %u: %@", nm, wfmt, e);
         return nil;
     }
-    g.p_rt_fmt[variant][slot] = [g.device newComputePipelineStateWithFunction:f error:&e];
-    if (g.p_rt_fmt[variant][slot] == nil) {
+    g.p_rt_fmt[variant][tile][slot] = [g.device newComputePipelineStateWithFunction:f error:&e];
+    if (g.p_rt_fmt[variant][tile][slot] == nil) {
         NSLog(@"imparo metal: rt pipeline %@ for WFMT %u: %@", nm, wfmt, e);
     } else {
         NSLog(@"imparo metal: built the register-tiled GEMM %@ for weight format %u "
               @"(%s, max threads %lu, mma_fence=%u)", nm, wfmt,
               rowmajor ? "row-major" : "tile-major",
-              (unsigned long)[g.p_rt_fmt[variant][slot] maxTotalThreadsPerThreadgroup],
+              (unsigned long)[g.p_rt_fmt[variant][tile][slot] maxTotalThreadsPerThreadgroup],
               g_rt_mma_fence);
     }
-    return g.p_rt_fmt[variant][slot];
+    return g.p_rt_fmt[variant][tile][slot];
 }
 
 // THE BRICK'S GATE (test-only entry). Decodes `n_bytes` of ROW-MAJOR blocks of format
@@ -8483,13 +8765,15 @@ static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowma
 extern "C" int imparo_metal_decode_probe(uint32_t wfmt,
                                          const void * scales, uint64_t n_scale_bytes,
                                          const void * payload, uint64_t n_pay_bytes,
-                                         uint32_t n_elems, float * out) {
+                                         uint32_t n_elems, uint32_t as_half, float * out) {
     if (g.device == nil || g.lib == nil) { return 1; }
     if (wfmt == 0u || wfmt >= 32u || scales == nullptr || payload == nullptr
         || out == nullptr) { return 2; }
     if (n_elems == 0u || (n_elems % 32u) != 0u) { return 3; }
     MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
     [cv setConstantValue:&wfmt type:MTLDataTypeUInt atIndex:21];
+    const bool probe_half = as_half != 0u;
+    [cv setConstantValue:&probe_half type:MTLDataTypeBool atIndex:24];
     stamp_epi_act(cv);
     NSError * e = nil;
     id<MTLFunction> f = [g.lib newFunctionWithName:@"imparo_blk_decode_probe"
