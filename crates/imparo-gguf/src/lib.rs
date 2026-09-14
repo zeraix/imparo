@@ -1017,6 +1017,8 @@ fn same_handle_content_metadata(before: &fs::Metadata, after: &fs::Metadata) -> 
         && before.ctime_nsec() == after.ctime_nsec()
 }
 
+// Size and last-write time only: a same-size write that gets the same last-write time as
+// the opened state (two writes within one clock tick) is not observable here.
 #[cfg(windows)]
 fn same_handle_content_metadata(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -2099,10 +2101,21 @@ mod tests {
         let source = root.join("model.gguf");
         let original = fixture();
         fs::write(&source, &original).unwrap();
+        let first_write = fs::metadata(&source).unwrap().modified().unwrap();
         let snapshot = VerifiedGgufSnapshot::open(&source).unwrap();
         let mut changed = original;
         changed[0] = b'X';
         fs::write(&source, changed).unwrap();
+        // The rewrite keeps the size, and on Windows the held-content check compares only
+        // size and last-write time. Two writes microseconds apart can share one last-write
+        // time, so move it past the first write: the test then checks what that comparison
+        // can observe, not whether the clock ticked between the two writes.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(first_write + std::time::Duration::from_secs(2))
+            .unwrap();
         assert!(matches!(
             snapshot.read_document(),
             Err(GgufError::SourceChangedDuringSnapshot)
