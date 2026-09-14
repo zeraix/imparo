@@ -1786,8 +1786,9 @@ static uint64_t wlocal(uint64_t off, uint64_t sibling) {
 // the KV pool and its page tables. Membership changes as buffers come and go; the set is
 // committed at the next region begin. A set attached to the queue is made resident by the
 // queue's command buffers whether or not residency was requested (measured), so ATTACHMENT
-// is what the mega route needs, and the set is attached only while the placement's fast
-// tier fits the budget it was computed for.
+// is what correctness needs -- the mega route also waits for the first hold, see
+// mega_route_open -- and the set is attached only while the placement's fast tier fits the
+// budget it was computed for.
 //
 // NEVER WIRE ON A PATH SOMETHING IS WAITING ON. `requestResidency` returns only once the
 // whole set is resident, and on a cold process that is seconds: measured 1478 ms for LFM2's
@@ -1813,7 +1814,7 @@ static uint64_t wlocal(uint64_t off, uint64_t sibling) {
 // what `g_rset_ever_held` distinguishes.
 // IMPARO_METAL_RESIDENCY_IDLE_S: the window (default 180 s, 0 = hold for the process's
 // life). IMPARO_METAL_NO_RESIDENCY=1: no set at all (the A/B).
-static id     g_rset = nil;
+static id<MTLResidencySet> g_rset = nil;
 static bool   g_rset_dirty = false;
 static bool   g_rset_held = false;      // requestResidency called and not yet ended
 static bool   g_rset_ever_held = false; // ... at least once: the disk read is behind us
@@ -1843,138 +1844,131 @@ static void rset_init(void) {
     if (getenv("IMPARO_METAL_NO_RESIDENCY") != NULL) { return; }
     if (const char * e = getenv("IMPARO_METAL_RESIDENCY_IDLE_S")) { g_rset_idle_s = atoi(e); }
     if (g_rset_idle_s < 0) { g_rset_idle_s = 0; }
-    if (@available(macOS 15.0, *)) {
-        MTLResidencySetDescriptor * d = [[MTLResidencySetDescriptor alloc] init];
-        d.label = @"imparo fast tier";
-        d.initialCapacity = 512;
-        NSError * err = nil;
-        id<MTLResidencySet> r = [g.device newResidencySetWithDescriptor:d error:&err];
-        if (r == nil) {
-            NSLog(@"imparo metal: residency set unavailable (%@); per-command-buffer residency", err);
-            return;
-        }
-        g_rset = r;
-        g_rset_budget = g_placement_budget != 0 ? g_placement_budget
-                                                : (uint64_t)[g.device recommendedMaxWorkingSetSize];
-        NSLog(@"imparo metal: residency set on, held %d s past the last region (0 = always), "
-              "fast-tier budget %llu MiB", g_rset_idle_s, (unsigned long long)(g_rset_budget >> 20));
-        if (g_rset_idle_s > 0) {
-            g_rset_thread = std::thread([] {
-                std::unique_lock<std::mutex> lk(g_rset_mu);
-                while (!g_rset_stop) {
-                    g_rset_cv.wait_for(lk, std::chrono::seconds(1));
-                    if (g_rset_stop) { break; }
-                    if (!g_rset_held || g_rset_in_region) { continue; }
-                    if (CACurrentMediaTime() - g_rset_last_use < (double)g_rset_idle_s) { continue; }
-                    if (@available(macOS 15.0, *)) { [(id<MTLResidencySet>)g_rset endResidency]; }
-                    g_rset_held = false;
-                }
-            });
-            atexit(rset_stop_thread);
-        }
+    MTLResidencySetDescriptor * d = [[MTLResidencySetDescriptor alloc] init];
+    d.label = @"imparo fast tier";
+    d.initialCapacity = 512;
+    NSError * err = nil;
+    id<MTLResidencySet> r = [g.device newResidencySetWithDescriptor:d error:&err];
+    if (r == nil) {
+        NSLog(@"imparo metal: residency set unavailable (%@); per-command-buffer residency", err);
+        return;
+    }
+    g_rset = r;
+    g_rset_budget = g_placement_budget != 0 ? g_placement_budget
+                                            : (uint64_t)[g.device recommendedMaxWorkingSetSize];
+    NSLog(@"imparo metal: residency set on, held %d s past the last region (0 = always), "
+          "fast-tier budget %llu MiB", g_rset_idle_s, (unsigned long long)(g_rset_budget >> 20));
+    if (g_rset_idle_s > 0) {
+        g_rset_thread = std::thread([] {
+            std::unique_lock<std::mutex> lk(g_rset_mu);
+            while (!g_rset_stop) {
+                g_rset_cv.wait_for(lk, std::chrono::seconds(1));
+                if (g_rset_stop) { break; }
+                if (!g_rset_held || g_rset_in_region) { continue; }
+                if (CACurrentMediaTime() - g_rset_last_use < (double)g_rset_idle_s) { continue; }
+                [g_rset endResidency];
+                g_rset_held = false;
+            }
+        });
+        atexit(rset_stop_thread);
     }
 }
 // `commit` applies pending membership changes, so what it should scale with is the NUMBER of
 // allocations and how many of them changed -- not the set's bytes. Both are on the line.
 static uint32_t g_rset_n = 0;         // allocations in the set
 static uint32_t g_rset_changed = 0;   // add/remove calls since the last commit
-// THE TIER DID NOT FIT, so stop asking the OS to wire it. Set when a per-segment wire at load
-// runs past the host-stall budget, and never cleared: re-testing a bound by doing the thing it
-// exists to prevent is the mistake #182's ratchet comment names, and here the thing costs the
-// user their machine for two minutes. Attachment is untouched, so correctness and the mega
-// route (#154 needs the set ATTACHED, not held) are unaffected -- only the pages stay pageable,
-// which is what they were before #129.
+// THE TIER DID NOT FIT, so stop asking the OS to wire it. Set when one piece of the wire at
+// load runs past the host-stall budget, and never cleared: re-testing a bound by doing the
+// thing it exists to prevent is the mistake #182's ratchet comment names, and here the thing
+// costs the user their machine for two minutes. Attachment is untouched, so correctness is
+// unaffected and the pages stay pageable, which is what they were before #129. The mega
+// route is not: it opens only after the first hold (g_rset_attached_now), and a refused hold
+// never makes one, so decode stays on the dispatch path for the rest of the process.
 static bool g_rset_hold_refused = false;
 
 static void rset_add(id<MTLBuffer> b) {
     if (g_rset == nil || b == nil) { return; }
-    if (@available(macOS 15.0, *)) {
-        [(id<MTLResidencySet>)g_rset addAllocation:b];
-        g_rset_bytes += (uint64_t)[b length];
-        g_rset_n += 1;
-        g_rset_changed += 1;
-        g_rset_dirty = true;
-    }
+    [g_rset addAllocation:b];
+    g_rset_bytes += (uint64_t)[b length];
+    g_rset_n += 1;
+    g_rset_changed += 1;
+    g_rset_dirty = true;
 }
 static void rset_remove(id<MTLBuffer> b) {
     if (g_rset == nil || b == nil) { return; }
-    if (@available(macOS 15.0, *)) {
-        [(id<MTLResidencySet>)g_rset removeAllocation:b];
-        const uint64_t n = (uint64_t)[b length];
-        g_rset_bytes = n <= g_rset_bytes ? g_rset_bytes - n : 0;
-        if (g_rset_n) { g_rset_n -= 1; }
-        g_rset_changed += 1;
-        g_rset_dirty = true;
-    }
+    [g_rset removeAllocation:b];
+    const uint64_t n = (uint64_t)[b length];
+    g_rset_bytes = n <= g_rset_bytes ? g_rset_bytes - n : 0;
+    if (g_rset_n) { g_rset_n -= 1; }
+    g_rset_changed += 1;
+    g_rset_dirty = true;
 }
 // Region begin: commit membership changes, attach and request while under budget.
 static bool g_rset_attached_now(void) { return g_rset == nil || (g_rset_attached && g_rset_ever_held); }
 // Commit membership and attach; with `hold`, also ask the OS to keep the pages wired.
 // THE CALLER HOLDS g_rset_mu. Only the region END passes hold=true -- see the rule above.
 static void rset_sync(bool hold) {
-    if (@available(macOS 15.0, *)) {
-        const double t_commit0 = CACurrentMediaTime();
-        const uint32_t changed = g_rset_changed;
-        if (g_rset_dirty) {
-            [(id<MTLResidencySet>)g_rset commit];
-            g_rset_dirty = false;
-            g_rset_changed = 0;
-            // A committed set is no longer held: the membership it was held over is gone.
+    const double t_commit0 = CACurrentMediaTime();
+    const uint32_t changed = g_rset_changed;
+    if (g_rset_dirty) {
+        [g_rset commit];
+        g_rset_dirty = false;
+        g_rset_changed = 0;
+        // A committed set is no longer held: the membership it was held over is gone.
+        g_rset_held = false;
+    }
+    const double t_commit1 = CACurrentMediaTime();
+    if (g_rset_bytes > g_rset_budget) {
+        // The runtime sized the fast tier; landing here means a buffer grew past it
+        // (a KV pool beyond the reserve). Fall back to per-command-buffer residency.
+        if (g_rset_attached) {
+            [g.queue removeResidencySet:g_rset];
+            g_rset_attached = false;
+        }
+        if (g_rset_held) {
+            [g_rset endResidency];
             g_rset_held = false;
         }
-        const double t_commit1 = CACurrentMediaTime();
-        if (g_rset_bytes > g_rset_budget) {
-            // The runtime sized the fast tier; landing here means a buffer grew past it
-            // (a KV pool beyond the reserve). Fall back to per-command-buffer residency.
-            if (g_rset_attached) {
-                [g.queue removeResidencySet:(id<MTLResidencySet>)g_rset];
-                g_rset_attached = false;
-            }
-            if (g_rset_held) {
-                [(id<MTLResidencySet>)g_rset endResidency];
-                g_rset_held = false;
-            }
-            if (!g_rset_over_logged) {
-                g_rset_over_logged = true;
-                NSLog(@"imparo metal: fast tier over its budget (%llu of %llu MiB); "
-                      "per-command-buffer residency, the OS pages the weights",
-                      (unsigned long long)(g_rset_bytes >> 20),
-                      (unsigned long long)(g_rset_budget >> 20));
-            }
-            return;
+        if (!g_rset_over_logged) {
+            g_rset_over_logged = true;
+            NSLog(@"imparo metal: fast tier over its budget (%llu of %llu MiB); "
+                  "per-command-buffer residency, the OS pages the weights",
+                  (unsigned long long)(g_rset_bytes >> 20),
+                  (unsigned long long)(g_rset_budget >> 20));
         }
-        // ATTACHMENT IS THE GUARANTEE, and it happens once: a set attached to the queue is
-        // made resident by that queue's command buffers whether or not residency was
-        // requested. `requestResidency` only decides WHEN the pages are wired, and the tier
-        // is wired at load, so after load neither call does anything.
-        if (!g_rset_attached) {
-            [g.queue addResidencySet:(id<MTLResidencySet>)g_rset];
-            g_rset_attached = true;
-        }
-        if (hold && !g_rset_held && !g_rset_hold_refused) {
-            [(id<MTLResidencySet>)g_rset requestResidency];
-            g_rset_held = true;
-            g_rset_ever_held = true;
-        }
-        // TIMED APART, because they scale with different things: `commit` walks the
-        // MEMBERSHIP list, `requestResidency` walks the PAGES -- and every commit forces a
-        // wire, by clearing the held flag above. Measured on one unchanged 15509 MiB set:
-        //
-        //   quiet machine                     commit 0.0 ms, wire     26.8 ms
-        //   one other 15 GB process alive                    wire   4895.9 ms
-        //   memory over-subscribed                           wire 122177.6 ms
-        //
-        // So the bill is the pages, never the walk, and it is unbounded in memory pressure
-        // (that is the defect; this line is only how you see it). It runs at a region BEGIN,
-        // ahead of the region's GPU work, so report a slow one with both halves named.
-        const double t_end = CACurrentMediaTime();
-        if (t_end - t_commit0 > 0.001) {
-            NSLog(@"imparo metal: residency %s %llu MiB in %.1f ms "
-                  "(commit %.1f ms, wire %.1f ms, %u allocations, %u changed)",
-                  hold ? "held" : "attached", (unsigned long long)(g_rset_bytes >> 20),
-                  1e3 * (t_end - t_commit0), 1e3 * (t_commit1 - t_commit0),
-                  1e3 * (t_end - t_commit1), g_rset_n, changed);
-        }
+        return;
+    }
+    // ATTACHMENT IS THE GUARANTEE, and it happens once: a set attached to the queue is
+    // made resident by that queue's command buffers whether or not residency was
+    // requested. `requestResidency` only decides WHEN the pages are wired, and the tier
+    // is wired at load, so after load neither call does anything.
+    if (!g_rset_attached) {
+        [g.queue addResidencySet:g_rset];
+        g_rset_attached = true;
+    }
+    if (hold && !g_rset_held && !g_rset_hold_refused) {
+        [g_rset requestResidency];
+        g_rset_held = true;
+        g_rset_ever_held = true;
+    }
+    // TIMED APART, because they scale with different things: `commit` walks the
+    // MEMBERSHIP list, `requestResidency` walks the PAGES -- and every commit forces a
+    // wire, by clearing the held flag above. Measured on one unchanged 15509 MiB set:
+    //
+    //   quiet machine                     commit 0.0 ms, wire     26.8 ms
+    //   one other 15 GB process alive                    wire   4895.9 ms
+    //   memory over-subscribed                           wire 122177.6 ms
+    //
+    // So the bill is the pages, never the walk, and it is unbounded in memory pressure
+    // (that is the defect; this line is only how you see it). It runs at a region BEGIN,
+    // ahead of the region's GPU work, so report a slow one with both halves named.
+    const double t_end = CACurrentMediaTime();
+    if (t_end - t_commit0 > 0.001) {
+        NSLog(@"imparo metal: residency %s %llu MiB in %.1f ms "
+              "(commit %.1f ms, wire %.1f ms, %u allocations, %u changed)",
+              hold ? "held" : "attached", (unsigned long long)(g_rset_bytes >> 20),
+              1e3 * (t_end - t_commit0), 1e3 * (t_commit1 - t_commit0),
+              1e3 * (t_end - t_commit1), g_rset_n, changed);
     }
 }
 // Region begin: re-hold if an idle release let it go. That is cheap -- the pages are unwired
@@ -1986,9 +1980,29 @@ static void rset_begin(void) {
     g_rset_in_region = true;
     rset_sync(true);
 }
-// Called once every load-time allocation has joined the set. Attaches it, which is all the
-// mega route and correctness need; a later `addAllocation` dirties the set and the next
-// region re-commits, which is the pre-existing behaviour.
+// THE WEIGHT WINDOW: the largest piece of a fast segment that one step of the repack or of
+// the wire at load handles at once (the repack's twin, further down, is why there is a window).
+//
+// The cap is DERIVED from the headroom this placement actually has -- budget minus what the
+// fast tier already holds -- and half of that is left for everything else the process needs
+// (the KV pool, activations, the residency set's own accounting). Clamped so a tiny headroom
+// still makes progress and a huge one does not allocate more than a window needs to amortise
+// its command buffer. The wire at load (imparo_metal_wire_weights) pieces every fast segment
+// by the same windows, so its stall bound never meets a piece larger than this.
+static uint64_t weight_window_cap() {
+    uint64_t fast = 0;
+    for (const WSeg & s : g_wsegs) { if (s.tier == WT_FAST) { fast += s.bytes; } }
+    const uint64_t head = g_placement_budget > fast ? g_placement_budget - fast : 0;
+    uint64_t cap = head / 2;
+    const uint64_t lo = 64ull << 20, hi = 1024ull << 20;
+    if (cap < lo) { cap = lo; }
+    if (cap > hi) { cap = hi; }
+    return cap;
+}
+// Called once every load-time allocation has joined the set. Attaches it, which is all
+// correctness needs, and holds it, which the mega route waits for (g_rset_attached_now); a
+// later `addAllocation` dirties the set and the next region re-commits, which is the
+// pre-existing behaviour.
 extern "C" void imparo_metal_wire_weights(double stall_budget_s) {
     if (g_rset == nil) { return; }
     std::lock_guard<std::mutex> lk(g_rset_mu);
@@ -1999,9 +2013,10 @@ extern "C" void imparo_metal_wire_weights(double stall_budget_s) {
     //
     // What CAN be split is the paging. Metal makes a referenced resource resident WHOLE for
     // the duration of the command buffer that references it -- the same rule that made the
-    // repack wire 14.6 GB per window -- so one small command buffer per weight segment pages
-    // in that segment (<= 1024 MiB after the repack windows it) and nothing else. Fifteen
-    // short waits instead of one long one, and the host gets the GPU back between each.
+    // repack wire 14.6 GB per window -- so a residency set over a wrapper of one window of a
+    // segment pages in that window and nothing else. Every piece is at most
+    // weight_window_cap(): short waits instead of one long one, and the host gets the GPU back
+    // between each.
     //
     // The hold afterwards is then over pages that are already in, which is the 1.2 ms case,
     // not the 4275 ms one. That is the whole reason this can run at load: nothing is deferred
@@ -2010,16 +2025,46 @@ extern "C" void imparo_metal_wire_weights(double stall_budget_s) {
     uint32_t pieces = 0;
     double worst = 0.0;
     std::vector<id<MTLResidencySet>> per_seg;
-    if (@available(macOS 15.0, *)) {
-        for (const WSeg & sg : g_wsegs) {
-            if (sg.tier != WT_FAST || sg.buf == nil) { continue; }
+    std::vector<id<MTLBuffer>> wraps;   // a set is not relied on to keep its allocations alive
+    // THE PIECE IS A WINDOW, NOT A SEGMENT. A segment the repack never tiles used to be wired
+    // as one piece of its whole size: LFM2's one 2733 MiB segment took 1220-1504 ms cold and
+    // E4B's one 4005 MiB segment 1200-2314 ms, on an idle machine, past the 1000 ms budget.
+    // So a cold start refused the hold, and the mega route, which waits for the first hold,
+    // stayed closed for the process. The bound is for the OS making room, not for reading the
+    // file, and a window keeps a cold read under it.
+    const uint64_t page = 16384;
+    const uint64_t window = std::max(page, weight_window_cap() & ~(page - 1));
+    uint64_t planned = 0;
+    for (const WSeg & sg : g_wsegs) {
+        if (sg.tier == WT_FAST && sg.buf != nil) { planned += (sg.len + window - 1) / window; }
+    }
+    for (const WSeg & sg : g_wsegs) {
+        if (sg.tier != WT_FAST || sg.buf == nil) { continue; }
+        for (uint64_t w0 = 0; w0 < sg.len && !g_rset_hold_refused;) {
+            uint64_t span = std::min(window, sg.len - w0);
+            id<MTLBuffer> piece = sg.buf;
+            if (span != sg.len) {
+                // A wrapper binds its window only, as the repack's source windows do.
+                id<MTLBuffer> wrap = [g.device
+                    newBufferWithBytesNoCopy:(void *)((uint8_t *)[sg.buf contents] + w0)
+                                      length:(NSUInteger)span
+                                     options:MTLResourceStorageModeShared
+                                 deallocator:nil];
+                if (wrap != nil) {
+                    piece = wrap;
+                    wraps.push_back(wrap);
+                } else {
+                    span = sg.len - w0;   // no wrapper: wire the rest of the segment whole
+                }
+            }
+            w0 += span;
             MTLResidencySetDescriptor * d = [[MTLResidencySetDescriptor alloc] init];
-            d.label = @"imparo weight segment";
+            d.label = @"imparo weight window";
             d.initialCapacity = 1;
             NSError * err = nil;
             id<MTLResidencySet> one = [g.device newResidencySetWithDescriptor:d error:&err];
             if (one == nil) { continue; }   // fall through: the tier set below still wires it
-            [one addAllocation:sg.buf];
+            [one addAllocation:piece];
             [one commit];
             [g.queue addResidencySet:one];
             const double p0 = CACurrentMediaTime();
@@ -2028,22 +2073,22 @@ extern "C" void imparo_metal_wire_weights(double stall_budget_s) {
             worst = std::max(worst, took);
             per_seg.push_back(one);
             pieces += 1;
-            // ONE PIECE OVER THE BUDGET MEANS THE TIER DOES NOT FIT. A healthy piece is tens of
-            // milliseconds (26.0 ms worst, measured over 15 pieces of at most 1024 MiB); a piece
-            // that takes seconds is the OS evicting to make room, and the host cannot preempt
-            // it. Finishing the loop would pay that for every remaining segment and then again,
-            // whole, at the tier hold -- 122 s measured, with the Mac unusable throughout.
-            // Stop, and leave the rest pageable.
+            // ONE PIECE OVER THE BUDGET MEANS THE TIER DOES NOT FIT. A piece whose pages are
+            // already in memory is tens of milliseconds (26.0 ms worst, measured over 15
+            // pieces of at most 1024 MiB); a piece that takes seconds is the OS evicting to
+            // make room, and the host cannot preempt it. Finishing the loop would pay that
+            // for every remaining piece and then again, whole, at the tier hold -- 122 s
+            // measured, with the Mac unusable throughout. Stop, and leave the rest pageable.
             if (stall_budget_s > 0.0 && took > stall_budget_s) {
                 g_rset_hold_refused = true;
                 NSLog(@"imparo metal: wiring the fast tier stalled %.0f ms on one %llu MiB "
-                      "segment, past the %.0f ms budget; %u of %zu segments wired and the rest "
-                      "stay pageable (the OS faults them in). The set is still attached, so "
-                      "nothing else changes. IMPARO_CB_STALL_MS sets the budget, "
-                      "IMPARO_FAST_TIER_MB shrinks the tier.",
-                      1e3 * took, (unsigned long long)([sg.buf length] >> 20),
-                      1e3 * stall_budget_s, pieces, g_wsegs.size());
-                break;
+                      "piece, past the %.0f ms budget; %u of %llu pieces wired and the rest "
+                      "stay pageable (the OS faults them in). The mega route stays closed "
+                      "for this process: it opens after the first hold, and none is made. "
+                      "IMPARO_CB_STALL_MS sets the budget, IMPARO_FAST_TIER_MB shrinks the "
+                      "tier.",
+                      1e3 * took, (unsigned long long)([piece length] >> 20),
+                      1e3 * stall_budget_s, pieces, (unsigned long long)planned);
             }
         }
     }
@@ -2053,11 +2098,9 @@ extern "C" void imparo_metal_wire_weights(double stall_budget_s) {
     // their job and must let go -- otherwise they would keep the tier wired past the idle
     // release and #129's "a server left idle gives the memory back" would silently stop.
     rset_sync(true);
-    if (@available(macOS 15.0, *)) {
-        for (id<MTLResidencySet> one : per_seg) {
-            [one endResidency];
-            [g.queue removeResidencySet:one];
-        }
+    for (id<MTLResidencySet> one : per_seg) {
+        [one endResidency];
+        [g.queue removeResidencySet:one];
     }
     if (pieces != 0) {
         NSLog(@"imparo metal: weights wired in %u pieces in %.1f ms (worst piece %.1f ms)",
@@ -4364,7 +4407,7 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             mega_scratch_ensure(0u);
             if (mega_dbg()) { NSLog(@"imparo metal: mega DEBUG records on"); }
             NSLog(@"imparo metal: mega blocks %s (gpu_cores=%u lanes=%u; per family (slot0/slot1 x nsg) gemma4=%u/%ux%u lfm2=%u/%ux%u qwen35=%u/%ux%u)",
-                  (g.p_mega_ffn_ple != nil && g.mega_sync != nil) ? "built" : "UNAVAILABLE (needs MSL 3.2)",
+                  (g.p_mega_ffn_ple != nil && g.mega_sync != nil) ? "built" : "UNAVAILABLE (IMPARO_MEGA_FFN=0, no head dim divisible by 32, or a pipeline or sync buffer was not created)",
                   g_gpu_cores, g_lanes,
                   g_mega_tgs[MEGA_ARCH_GEMMA4][0], g_mega_tgs[MEGA_ARCH_GEMMA4][1], g_mega_nsg[MEGA_ARCH_GEMMA4],
                   g_mega_tgs[MEGA_ARCH_LFM2][0], g_mega_tgs[MEGA_ARCH_LFM2][1], g_mega_nsg[MEGA_ARCH_LFM2],
@@ -4712,16 +4755,14 @@ extern "C" int imparo_metal_arena(uint64_t bytes) {
         // arena in the residency set and inflated its fast-tier budget accounting.
         std::lock_guard<std::mutex> lk(g_rset_mu);
         rset_remove(g.arena_buf);
-        if (@available(macOS 15.0, *)) {
-            if (g_rset != nil) {
-                [(id<MTLResidencySet>)g_rset commit];
-                g_rset_dirty = false;
-                // A COMMIT CLEARS THE HOLD. Membership changed, so whatever
-                // `requestResidency` pinned is no longer pinned -- the next region has to
-                // ask again. Saying otherwise here would skip that ask and leave the tier
-                // pageable while the engine believed it was wired.
-                g_rset_held = false;
-            }
+        if (g_rset != nil) {
+            [g_rset commit];
+            g_rset_dirty = false;
+            // A COMMIT CLEARS THE HOLD. Membership changed, so whatever
+            // `requestResidency` pinned is no longer pinned -- the next region has to
+            // ask again. Saying otherwise here would skip that ask and leave the tier
+            // pageable while the engine believed it was wired.
+            g_rset_held = false;
         }
         g.arena_buf = nil;
     }
@@ -8886,21 +8927,8 @@ static WSeg * wseg_mut_at(uint64_t off) {
 // because a tensor that straddled two twins would be half repacked. The byte count is
 // unchanged by the layout rule, so a window's twin is the same length as its source.
 //
-// The cap is DERIVED from the headroom this placement actually has -- budget minus what the
-// fast tier already holds -- and half of that is left for everything else the process needs
-// (the KV pool, activations, the residency set's own accounting). Clamped so a tiny headroom
-// still makes progress and a huge one does not allocate more than a window needs to amortise
-// its command buffer.
-static uint64_t twin_window_cap() {
-    uint64_t fast = 0;
-    for (const WSeg & s : g_wsegs) { if (s.tier == WT_FAST) { fast += s.bytes; } }
-    const uint64_t head = g_placement_budget > fast ? g_placement_budget - fast : 0;
-    uint64_t cap = head / 2;
-    const uint64_t lo = 64ull << 20, hi = 1024ull << 20;
-    if (cap < lo) { cap = lo; }
-    if (cap > hi) { cap = hi; }
-    return cap;
-}
+// The window cap is weight_window_cap(), defined beside the wire at load, which pieces a
+// segment by the same windows.
 
 extern "C" int32_t imparo_metal_transform_weights(const WXformWire * jobs, uint32_t n,
                                                   uint8_t * applied) {
@@ -8925,7 +8953,7 @@ extern "C" int32_t imparo_metal_transform_weights(const WXformWire * jobs, uint3
     std::sort(todo.begin(), todo.end(),
               [&](uint32_t x, uint32_t y) { return jobs[x].off < jobs[y].off; });
 
-    const uint64_t page = 16384, cap = twin_window_cap();
+    const uint64_t page = 16384, cap = weight_window_cap();
     // The mapping is whole-file at offset 0 (imparo-gguf `Weights::open_with`), so a segment
     // offset IS a file offset and no translation is needed.
     int src_fd = -1;

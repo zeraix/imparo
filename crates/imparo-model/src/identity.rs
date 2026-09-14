@@ -24,14 +24,20 @@ impl ModelPlanIdentity {
 
     #[must_use]
     pub fn to_hex(self) -> String {
-        self.0
-            .iter()
-            .fold(String::with_capacity(64), |mut out, byte| {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{byte:02x}");
-                out
-            })
+        hex(&self.0)
     }
+}
+
+/// Lower-case hex, two digits a byte.
+#[must_use]
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 impl Display for ModelPlanIdentity {

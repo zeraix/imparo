@@ -65,7 +65,7 @@ pub fn active() -> Option<&'static dyn Backend> {
     #[cfg(any(feature = "cuda", feature = "cuda-dynamic"))]
     {
         static BE: imparo_cuda::CudaBackend = imparo_cuda::CudaBackend;
-        return Some(with_page(&BE));
+        Some(with_page(&BE))
     }
     #[cfg(all(
         target_os = "macos",
@@ -507,6 +507,13 @@ pub fn model_activation(plan: &crate::ModelPlan) -> Result<crate::Activation, St
     }
     Ok(seen.unwrap_or(crate::Activation::Gelu))
 }
+
+/// Static CUDA knob registry used when loading an explicit draft profile.
+#[cfg(feature = "cuda-speculative")]
+pub fn cuda_knob_registry() -> &'static [imparo_backend::KnobDecl] {
+    use imparo_backend::BackendKnobs as _;
+    imparo_cuda::CudaBackend.knob_registry()
+}
 #[cfg(test)]
 mod tests {
     use super::{StreamedWeightSpan, gpu_requested, normalize_streamed_spans};
@@ -598,11 +605,4 @@ mod tests {
                 .is_empty()
         );
     }
-}
-
-/// Static CUDA knob registry used when loading an explicit draft profile.
-#[cfg(feature = "cuda-speculative")]
-pub fn cuda_knob_registry() -> &'static [imparo_backend::KnobDecl] {
-    use imparo_backend::BackendKnobs as _;
-    imparo_cuda::CudaBackend.knob_registry()
 }

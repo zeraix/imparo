@@ -250,22 +250,12 @@ pub(crate) fn q8_tm_silu_pair_enabled() -> bool {
 
 #[must_use]
 pub(crate) fn q8_canonical_gate_up_pair_enabled() -> bool {
-    unsafe {
-        matches!(
-            imparo_cuda_knob(SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR),
-            1 | 2 | 3 | 4
-        )
-    }
+    unsafe { matches!(imparo_cuda_knob(SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR), 1..=4) }
 }
 
 #[must_use]
 pub(crate) fn q8_canonical_sidecar_enabled() -> bool {
-    unsafe {
-        matches!(
-            imparo_cuda_knob(SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR),
-            2 | 3 | 4
-        )
-    }
+    unsafe { matches!(imparo_cuda_knob(SLOT_MMQ_Q8_CANONICAL_GATE_UP_PAIR), 2..=4) }
 }
 
 #[must_use]

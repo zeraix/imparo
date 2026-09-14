@@ -128,11 +128,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: imparo-forward MODEL.gguf TOKEN...")?;
     if first == "--correctness-template" {
-        let _config = PathBuf::from(
+        #[cfg_attr(
+            not(any(feature = "cuda", feature = "cuda-dynamic")),
+            allow(unused_variables)
+        )]
+        let config = PathBuf::from(
             args.next()
                 .ok_or("--correctness-template needs CONFIG and MODEL")?,
         );
-        let _model_path = PathBuf::from(
+        #[cfg_attr(
+            not(any(feature = "cuda", feature = "cuda-dynamic")),
+            allow(unused_variables)
+        )]
+        let model_path = PathBuf::from(
             args.next()
                 .ok_or("--correctness-template needs CONFIG and MODEL")?,
         );
@@ -158,15 +166,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(any(feature = "cuda", feature = "cuda-dynamic"))]
         {
-            unsafe { std::env::set_var("IMPARO_HOST_CONFIG", &_config) };
-            let document = imparo_gguf::read(&_model_path)?;
-            let plan = build_plan(&document, &_model_path)?;
-            let weights = Weights::open_with(&document, &_model_path)?;
+            unsafe { std::env::set_var("IMPARO_HOST_CONFIG", &config) };
+            let document = imparo_gguf::read(&model_path)?;
+            let plan = build_plan(&document, &model_path)?;
+            let weights = Weights::open_with(&document, &model_path)?;
             let kv_layout_sha256 =
                 imparo_model::kv::effective_kv_byte_layout_profile(&plan, &kv, &kv)?
                     .sha256_identity();
             let receipt = imparo_cuda::correctness_receipt_template(
-                &_config,
+                &config,
                 weights.byte_len(),
                 weights.full_file_sha256(),
                 *plan.sha256_identity().as_bytes(),

@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14   # Apple arm64; macos-13 and earlier were Intel
+    runs-on: macos-15   # Apple arm64; the apple-silicon job in ci.yml says why not macos-14
     steps:
       - uses: actions/checkout@v4
       - name: Build

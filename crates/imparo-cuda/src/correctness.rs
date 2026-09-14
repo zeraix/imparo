@@ -614,7 +614,7 @@ mod tests {
                 })
                 .collect(),
             batch: Some(512),
-            path: Default::default(),
+            path: std::path::PathBuf::default(),
         }
     }
 

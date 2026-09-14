@@ -871,7 +871,7 @@ fn validate_tensor_envelope(bytes: &[u8]) -> Result<u64, String> {
 }
 
 fn encode_tensor(rows: usize, cols: usize, values: &[f32]) -> Result<Vec<u8>, String> {
-    if values.len() != rows.checked_mul(cols).unwrap_or(usize::MAX) {
+    if values.len() != rows.saturating_mul(cols) {
         return Err("Gate0 tensor value count does not match shape".to_string());
     }
     let payload = values
@@ -1110,7 +1110,7 @@ fn executable_identity_for(path: &Path) -> Result<Value, String> {
     }
     let mut reader = BufReader::new(file);
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     let mut length = 0_u64;
     loop {
         let count = reader.read(&mut buffer).map_err(|error| {
@@ -1148,16 +1148,7 @@ fn sha256(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(
-        String::with_capacity(bytes.len() * 2),
-        |mut output, byte| {
-            use std::fmt::Write as _;
-            write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-            output
-        },
-    )
-}
+use crate::identity::hex;
 
 fn tokens_sha256(tokens: &[u32]) -> String {
     let mut hash = Sha256::new();

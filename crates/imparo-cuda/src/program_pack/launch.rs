@@ -232,8 +232,7 @@ fn validate_invocation(
             || shape
                 .one_of
                 .as_ref()
-                .map(|allowed| !allowed.contains(&value))
-                .unwrap_or(false)
+                .is_some_and(|allowed| !allowed.contains(&value))
         {
             return Err(
                 "Program invocation shape is outside variant constraints".into()
@@ -281,8 +280,8 @@ fn validate_tensor(
         || tensor.device_ptr % u64::from(slot.alignment) != 0
         || tensor.extents.len() != usize::from(slot.rank)
         || tensor.strides.len() != usize::from(slot.rank)
-        || tensor.extents.iter().any(|extent| *extent == 0)
-        || tensor.strides.iter().any(|stride| *stride == 0)
+        || tensor.extents.contains(&0)
+        || tensor.strides.contains(&0)
         || !slot.allowed_dtypes.contains(&tensor.dtype)
         || !slot.allowed_quantizations.contains(&tensor.quantization)
         || !slot.allowed_layouts.contains(&tensor.layout)
@@ -296,8 +295,7 @@ fn validate_tensor(
             || allowed
                 .one_of
                 .as_ref()
-                .map(|values| !values.contains(extent))
-                .unwrap_or(false)
+                .is_some_and(|values| !values.contains(extent))
         {
             return Err("Program tensor extent violates adapter authority".into());
         }
@@ -309,8 +307,7 @@ fn validate_tensor(
             || allowed
                 .one_of
                 .as_ref()
-                .map(|values| !values.contains(stride))
-                .unwrap_or(false)
+                .is_some_and(|values| !values.contains(stride))
         {
             return Err("Program tensor stride violates adapter authority".into());
         }
@@ -320,9 +317,7 @@ fn validate_tensor(
 
 fn tensor_value(value: Option<&ProgramValue>) -> Result<&ProgramTensorValue, String> {
     match value {
-        Some(ProgramValue::Tensor(value)) | Some(ProgramValue::State(value)) => {
-            Ok(value)
-        }
+        Some(ProgramValue::Tensor(value) | ProgramValue::State(value)) => Ok(value),
         _ => Err("Program tensor constraint targets a non-tensor slot".into()),
     }
 }

@@ -1,0 +1,7 @@
+# The oldest macOS the build supports. The Metal bridge uses residency sets
+# (MTLResidencySet), which macOS 15 introduced, so the Rust link and the bridge
+# (crates/imparo-metal/build.rs reads this) both target 15.0, and the binaries declare
+# 15.0 as their minimum. `force` stops a value already set in the shell from lowering it.
+# Other platforms ignore the variable.
+[env]
+MACOSX_DEPLOYMENT_TARGET = { value = "15.0", force = true }

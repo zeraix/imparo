@@ -34,6 +34,7 @@
 //! The half-A mirror (XH/XH2) and the KVQ diagnostics are Metal-side host logic and
 //! do not exist here; a CUDA port decides its own activation-precision staging.
 
+#[allow(clippy::wildcard_imports)] // the native backend's whole FFI surface
 use crate::ffi::*;
 use core::mem::size_of;
 use imparo_backend::{
@@ -52,6 +53,7 @@ static ACTIVATION: AtomicU32 = AtomicU32::new(Epilogue::Gelu as u32);
 static KV_K: AtomicU32 = AtomicU32::new(1);
 static KV_V: AtomicU32 = AtomicU32::new(1);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_field_names)] // each field is the SHA-256 of a different thing
 struct CorrectnessModelIdentity {
     model_sha256: [u8; 32],
     model_plan_sha256: [u8; 32],
@@ -1051,7 +1053,7 @@ impl Backend for CudaBackend {
         n_tok: u32,
     ) {
         unsafe {
-            imparo_cuda_matmat(wkind, w_off, n_in, n_out, b(src), b(dst), n_tok, 0)
+            imparo_cuda_matmat(wkind, w_off, n_in, n_out, b(src), b(dst), n_tok, 0);
         }
     }
     fn matmat_from(
@@ -1075,7 +1077,7 @@ impl Backend for CudaBackend {
                 b(dst),
                 n_tok,
                 src_row,
-            )
+            );
         }
     }
     fn matmat_gated(
@@ -1148,7 +1150,7 @@ impl Backend for CudaBackend {
                 } else {
                     0
                 },
-            )
+            );
         }
         true
     }
@@ -1348,7 +1350,7 @@ impl Backend for CudaBackend {
                 scale,
                 b(dst),
                 n_rows,
-            )
+            );
         }
         true
     }
@@ -1375,7 +1377,7 @@ impl Backend for CudaBackend {
                 row_stride,
                 base_off,
                 has_w,
-            )
+            );
         }
     }
     fn rms_norm_from(
@@ -1401,7 +1403,7 @@ impl Backend for CudaBackend {
                 row_stride,
                 base_off,
                 has_w,
-            )
+            );
         }
     }
     fn use_decode_projection_preparation(&self) -> bool {
@@ -1572,7 +1574,7 @@ impl Backend for CudaBackend {
                 n_row,
                 b(add),
                 output_scale,
-            )
+            );
         }
         true
     }
@@ -1601,7 +1603,7 @@ impl Backend for CudaBackend {
             return false;
         }
         unsafe {
-            imparo_cuda_rms_norm_add_project(b(dst), w_off, width, eps, n_row, b(add))
+            imparo_cuda_rms_norm_add_project(b(dst), w_off, width, eps, n_row, b(add));
         }
         true
     }
@@ -1715,7 +1717,7 @@ impl Backend for CudaBackend {
                 start_pos,
                 n_tok,
                 p,
-            )
+            );
         }
     }
     fn hadamard(&self, buf: BufId, n: u32, nrot: u32) {
@@ -1740,7 +1742,7 @@ impl Backend for CudaBackend {
                 n_tok,
                 u32::from(is_v),
                 ring,
-            )
+            );
         }
     }
     fn attention(
@@ -1811,7 +1813,7 @@ impl Backend for CudaBackend {
                 b(BufId::Attn),
                 b(BufId::Kdq),
                 b(BufId::Vdq),
-            )
+            );
         }
     }
     fn set_activation(&self, act: Epilogue) {
@@ -1828,10 +1830,10 @@ impl Backend for CudaBackend {
     fn act_mul(&self, a: BufId, bb: BufId, n: u32) {
         match ACTIVATION.load(Ordering::Relaxed) {
             x if x == Epilogue::Gelu as u32 => unsafe {
-                imparo_cuda_gelu_mul(b(a), b(bb), n)
+                imparo_cuda_gelu_mul(b(a), b(bb), n);
             },
             x if x == Epilogue::Silu as u32 => unsafe {
-                imparo_cuda_silu_mul(b(a), b(bb), n)
+                imparo_cuda_silu_mul(b(a), b(bb), n);
             },
             _ => unreachable!("act_mul requires GELU or SiLU activation"),
         }
@@ -1876,7 +1878,7 @@ impl Backend for CudaBackend {
         n_tok: u32,
     ) {
         unsafe {
-            imparo_cuda_mul_strided(b(a), b(bb), n, b_off, b_stride, a_stride, n_tok)
+            imparo_cuda_mul_strided(b(a), b(bb), n, b_off, b_stride, a_stride, n_tok);
         }
     }
     fn softcap(&self, a: BufId, cap: f32, n: u32) {
@@ -1937,7 +1939,7 @@ impl Backend for CudaBackend {
                 b(src),
                 b(dst),
                 n_tok,
-            )
+            );
         }
     }
     fn ple_gather_combine_prefix(
@@ -1961,7 +1963,7 @@ impl Backend for CudaBackend {
                 emb_scale,
                 comb_scale,
                 n_tok,
-            )
+            );
         }
     }
     fn ple_gather_combine(
@@ -1983,7 +1985,7 @@ impl Backend for CudaBackend {
                 emb_scale,
                 comb_scale,
                 n_tok,
-            )
+            );
         }
     }
     /// The gated form only: CUDA has no plain causal-conv kernel, and
@@ -2063,7 +2065,7 @@ impl Backend for CudaBackend {
                 width,
                 kernel,
                 n_tok,
-            )
+            );
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -2094,7 +2096,7 @@ impl Backend for CudaBackend {
                 width,
                 kernel,
                 n_tok,
-            )
+            );
         }
     }
     /// Part of the gated delta-net set, which CUDA does not serve; `supports_gated_delta`
@@ -2147,7 +2149,7 @@ impl Backend for CudaBackend {
                 || lab_mode.as_deref() == Some("mixed-ffn"),
             include_head: matches!(
                 lab_mode.as_deref(),
-                Some("head") | Some("down-head") | Some("q5")
+                Some("head" | "down-head" | "q5")
             ) && std::env::var_os("IMPARO_LAB_LFM2_Q5_DOWN_ONLY")
                 .is_none(),
         }

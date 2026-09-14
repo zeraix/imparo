@@ -1,6 +1,8 @@
 /build/
 /target/
 /target-*/
+# The fuzz crate is its own cargo workspace, so its build output lands next to its manifest.
+/crates/imparo-program-pack/fuzz/target/
 /evidence/
 /dist/
 /models/

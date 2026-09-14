@@ -357,8 +357,7 @@ pub(crate) fn validate_variant_authority(
     if !authority.allowed_numerical_classes.contains(&numerical)
         || authority
             .required_determinism
-            .map(|required| required != variant.determinism)
-            .unwrap_or(false)
+            .is_some_and(|required| required != variant.determinism)
     {
         return Err(
             "variant numerical/determinism class is not adapter-authorized".into(),
@@ -502,18 +501,14 @@ fn validate_adapter_descriptor(authority: &AdapterAuthority) -> Result<(), Strin
                 || shape.min > shape.max
                 || shape.multiple_of == 0
                 || shape.min % shape.multiple_of != 0
-                || shape
-                    .one_of
-                    .as_ref()
-                    .map(|values| {
-                        values.is_empty()
-                            || values.iter().any(|value| {
-                                *value < shape.min
-                                    || *value > shape.max
-                                    || *value % shape.multiple_of != 0
-                            })
-                    })
-                    .unwrap_or(false)
+                || shape.one_of.as_ref().is_some_and(|values| {
+                    values.is_empty()
+                        || values.iter().any(|value| {
+                            *value < shape.min
+                                || *value > shape.max
+                                || *value % shape.multiple_of != 0
+                        })
+                })
             {
                 return Err("compiled adapter extent domain is invalid".into());
             }
@@ -711,7 +706,7 @@ pub(crate) mod tests {
                         } else {
                             0
                         },
-                        rank: if is_pointer(*wire_type) { 1 } else { 0 },
+                        rank: u8::from(is_pointer(*wire_type)),
                         extent_authority: DescriptorAuthority::EngineAdapter,
                         stride_authority: DescriptorAuthority::EngineAdapter,
                         shapes: if matches!(
@@ -745,8 +740,7 @@ pub(crate) mod tests {
                             .alignments
                             .iter()
                             .find(|value| value.slot == *slot)
-                            .map(|value| value.bytes)
-                            .unwrap_or(1),
+                            .map_or(1, |value| value.bytes),
                         state_initialization: StateInitialization::None,
                         allowed_dtypes: if is_pointer(*wire_type) {
                             vec![Dtype::F16]

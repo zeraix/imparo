@@ -1056,6 +1056,7 @@ mod imp {
     pub(crate) fn imparo_cuda_has_greedy_verification() -> bool {
         cfg!(feature = "cuda-speculative")
     }
+    #[allow(clippy::unnecessary_wraps)] // one signature for the static and dynamic backends
     pub(crate) fn backend_artifact_sha256() -> Result<Option<[u8; 32]>, String> {
         Ok(None)
     }

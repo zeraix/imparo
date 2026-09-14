@@ -337,10 +337,11 @@ jobs:
           -- --nocapture --test-threads=1
 
   apple-silicon:
-    # macos-14+ hosted runners are Apple arm64 (M series) -- required: this job
-    # compiles the Metal backend for the machine the mac user actually has.
-    # macos-13 and earlier were Intel; never move this job there.
-    runs-on: macos-14
+    # An Apple arm64 (M series) runner is required: this job compiles the Metal backend
+    # for the machine the mac user actually has. macos-13 and earlier were Intel.
+    # macos-15, not macos-14: the build's minimum macOS is 15.0 (.cargo/config.toml says
+    # why), which needs the macOS 15 SDK; macos-14's default Xcode 15.4 ships the 14.5 SDK.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       # Caches ~/.cargo and target/ keyed by lockfile + toolchain; saves after the

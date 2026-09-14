@@ -261,13 +261,10 @@ pub(crate) fn choices(
                         if candidate.provider == ProgramProvider::BuiltIn {
                             return true;
                         }
-                        let applies = choice
-                            .variants
-                            .get(&candidate.variant_id)
-                            .map(|variant| {
-                                candidate_applicable(variant, facts, profile)
-                            })
-                            .unwrap_or(false);
+                        let applies =
+                            choice.variants.get(&candidate.variant_id).is_some_and(
+                                |variant| candidate_applicable(variant, facts, profile),
+                            );
                         if applies {
                             eligible.insert((group.clone(), candidate.variant_id));
                         }

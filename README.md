@@ -168,7 +168,8 @@ Model and backend availability remains qualification-specific.
 
 ## Quick Start
 
-Build Imparo from source with Rust 1.85 or later:
+Build Imparo from source with Rust 1.85 or later. On a Mac it needs Apple Silicon and
+macOS 15 or later:
 
 ```sh
 git clone https://github.com/zeraix/imparo.git

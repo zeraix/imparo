@@ -118,7 +118,7 @@ fn dump_verification_logits(
 /// logits mode, disables graphs, or replaces a device-selected token.
 #[cfg(feature = "cuda-owner-lab")]
 pub(crate) mod target_witness {
-    use super::*;
+    use super::{Architecture, BufId, Workflow};
     use std::{path::PathBuf, sync::OnceLock};
     struct Config {
         root: PathBuf,
@@ -277,12 +277,10 @@ pub(crate) mod target_witness {
                     "target witness requested an unavailable prefix snapshot".into()
                 );
             }
-            let actual_selected = if row + 1 < consumed {
-                Some(tokens[row + 1])
-            } else if row + 1 == consumed {
-                Some(packet[2])
-            } else {
-                None
+            let actual_selected = match (row + 1).cmp(&consumed) {
+                std::cmp::Ordering::Less => Some(tokens[row + 1]),
+                std::cmp::Ordering::Equal => Some(packet[2]),
+                std::cmp::Ordering::Greater => None,
             };
             let mut logits = vec![0.0; vocab];
             let mut recurrent = vec![0.0; n];
@@ -736,13 +734,13 @@ pub(crate) fn verify_workflow_tree<A: Architecture>(
             }
             let mut path = vec![0i32];
             let next = loop {
-                let node = *path.last().unwrap() as usize;
-                let next = picks[node];
+                let parent = *path.last().unwrap() as usize;
+                let next = picks[parent];
                 if path.len() == limit || stops.contains(&next) {
                     break next;
                 }
-                if let Some(child) = (node + 1..b)
-                    .find(|&j| parents[j] == node as i32 && tokens[j] == next)
+                if let Some(child) = (parent + 1..b)
+                    .find(|&j| parents[j] == parent as i32 && tokens[j] == next)
                 {
                     path.push(child as i32);
                 } else {

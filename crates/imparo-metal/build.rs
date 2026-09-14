@@ -8,6 +8,11 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
+    // The oldest macOS the build supports is set once, in .cargo/config.toml, for the
+    // Rust link and this bridge alike.
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    let min_macos = env::var("MACOSX_DEPLOYMENT_TARGET")
+        .expect("MACOSX_DEPLOYMENT_TARGET is set in .cargo/config.toml");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let native =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("MANIFEST_DIR"))
@@ -68,10 +73,10 @@ fn main() {
             "clang++",
             "-std=c++20",
             "-fobjc-arc",
-            "-mmacosx-version-min=13.0",
             "-O2",
             "-c",
         ])
+        .arg(format!("-mmacosx-version-min={min_macos}"))
         .arg("-I")
         .arg(&out)
         .arg(&src)

@@ -2000,16 +2000,15 @@ fn chat_completions(
                         Ok(())
                     })
                 };
-                match scoped {
-                    Err(e) => Err(std::io::Error::other(e)),
-                    Ok(()) => {
-                        let mut result =
-                            output.expect("draft scope did not invoke generation");
-                        if let (Ok(value), Some(at)) = (&mut result, finished) {
-                            value.decode_ms += at.elapsed().as_secs_f64() * 1e3;
-                        }
-                        result
+                if let Err(e) = scoped {
+                    Err(std::io::Error::other(e))
+                } else {
+                    let mut result =
+                        output.expect("draft scope did not invoke generation");
+                    if let (Ok(value), Some(at)) = (&mut result, finished) {
+                        value.decode_ms += at.elapsed().as_secs_f64() * 1e3;
                     }
+                    result
                 }
             } else {
                 generate(&mut **target, None)

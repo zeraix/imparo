@@ -127,6 +127,7 @@ impl Library {
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
+    #[allow(clippy::unused_self)] // the same signature as the Windows and Linux versions
     pub(crate) fn symbol(&self, _name: &'static [u8]) -> Result<*mut c_void, String> {
         Err("dynamic CUDA backends are unsupported on this OS".into())
     }
