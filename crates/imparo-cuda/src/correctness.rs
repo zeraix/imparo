@@ -662,7 +662,12 @@ mod tests {
         let expected = build(b"exact config", &stored(), &identity(&runtime)).unwrap();
         assert_eq!(expected.fingerprint.backend, "cuda");
         assert_eq!(expected.fingerprint.device_sm, 86);
-        assert_eq!(expected.fingerprint.numerical_space_version, 65);
+        // The fingerprint carries the registry's space version. Its one literal pin is
+        // registry_bump_invalidates_pre_boundary_cuda_configs in knobs.rs.
+        assert_eq!(
+            expected.fingerprint.numerical_space_version,
+            CudaBackend.space_version()
+        );
         assert_eq!(expected.fingerprint.selector_version, CUDA_SELECTOR_VERSION);
         assert_ne!(
             expected.fingerprint.selector_version,

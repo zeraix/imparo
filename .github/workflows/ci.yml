@@ -393,7 +393,11 @@ jobs:
              -p imparo-host -p imparo-model -p imparo-server
              -p imparo-program-pack
       - name: CUDA thin-runtime tests (no toolkit linkage)
-        run: cargo test --release --locked -p imparo-cuda --features cuda-dynamic
+        # The public export does not carry the oracle manifest and receipt that
+        # tracked_oracle_manifest_matches_the_compiled_contract reads
+        # (dev_harness/public-export.allowlist), so that test is skipped where they are absent.
+        run: cargo test --release --locked -p imparo-cuda --features cuda-dynamic --
+             ${{ hashFiles('dev_harness/refs/oracles/llama-4695f001-windows-sm86.json') == '' && '--skip tracked_oracle_manifest_matches_the_compiled_contract' || '' }}
       - name: Build CUDA thin server + tuner
         run: cargo build --release --locked -p imparo-server -p imparo-tune --features cuda-dynamic
       - name: Reject Python, PyTorch, or Triton runtime dependencies
@@ -452,7 +456,11 @@ jobs:
              -p imparo-host -p imparo-model -p imparo-server
              -p imparo-program-pack
       - name: CUDA thin-runtime tests (no toolkit linkage)
-        run: cargo test --release --locked -p imparo-cuda --features cuda-dynamic
+        # The public export does not carry the oracle manifest and receipt that
+        # tracked_oracle_manifest_matches_the_compiled_contract reads
+        # (dev_harness/public-export.allowlist), so that test is skipped where they are absent.
+        run: cargo test --release --locked -p imparo-cuda --features cuda-dynamic --
+             ${{ hashFiles('dev_harness/refs/oracles/llama-4695f001-windows-sm86.json') == '' && '--skip tracked_oracle_manifest_matches_the_compiled_contract' || '' }}
       - name: Build CUDA thin server + tuner
         run: cargo build --release --locked -p imparo-server -p imparo-tune --features cuda-dynamic
       - name: Reject Python, PyTorch, or Triton runtime dependencies

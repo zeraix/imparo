@@ -3,9 +3,6 @@
 //! Live CUDA tests are separately gated to SM86; these checks keep static exports,
 //! the Windows export table, optional dynamic loading and graph isolation in lockstep.
 
-#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
-use imparo_backend::BackendKnobs as _;
-
 const FFI: &str = include_str!("../src/ffi.rs");
 const BACKEND: &str = include_str!("../src/backend_impl.rs");
 const NATIVE: &str = include_str!("../native/imparo_cuda.cu");
@@ -57,7 +54,7 @@ fn step1_preserves_current_e4b_identity_and_dormant_program_pack() {
     let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
     assert_eq!(catalog["backend_abi"].as_u64(), Some(34));
     assert_eq!(imparo_cuda::CUDA_BACKEND_ABI, 34);
-    #[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
-    assert_eq!(imparo_cuda::CudaBackend.space_version(), 64);
+    // The space version's one literal pin is registry_bump_invalidates_pre_boundary_cuda_configs
+    // in src/knobs.rs.
     assert!(PROGRAM_PROFILE_IDENTITY.contains("identity_ready: false"));
 }
