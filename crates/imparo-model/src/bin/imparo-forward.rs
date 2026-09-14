@@ -641,7 +641,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             steady.sort_by(f64::total_cmp);
             if !steady.is_empty() {
                 let median_us = if steady.len() % 2 == 0 {
-                    (steady[steady.len() / 2 - 1] + steady[steady.len() / 2]) * 0.5
+                    steady[steady.len() / 2 - 1].midpoint(steady[steady.len() / 2])
                 } else {
                     steady[steady.len() / 2]
                 };

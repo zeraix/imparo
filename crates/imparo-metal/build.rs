@@ -8,11 +8,15 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
-    // The oldest macOS the build supports is set once, in .cargo/config.toml, for the
-    // Rust link and this bridge alike.
+    // The oldest macOS the build supports is set in .cargo/config.toml, for the Rust link
+    // and this bridge alike. A cargo run that does not read that file (cargo install --git,
+    // or --manifest-path from outside the workspace) leaves the variable unset, and the
+    // bridge still targets macOS 15: its residency-set calls do not compile below it. Such
+    // a binary declares rustc's default minimum, but its references to the macOS 15 classes
+    // are not weak, so an older system cannot bind them.
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
-    let min_macos = env::var("MACOSX_DEPLOYMENT_TARGET")
-        .expect("MACOSX_DEPLOYMENT_TARGET is set in .cargo/config.toml");
+    let min_macos =
+        env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| String::from("15.0"));
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let native =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("MANIFEST_DIR"))
