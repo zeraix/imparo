@@ -1,0 +1,104 @@
+{
+  "source_version": "flashinfer0.6.16.post3 installed headers",
+  "license": "Apache-2.0 for the FlashInfer headers except vendor/flashinfer/fp16.h, which is MIT; all per-file copyright notices retained.",
+  "files": [
+    {
+      "file": "flashinfer\\attention\\prefill.cuh",
+      "original_sha256": "2e5927bdc0d36ddb393cb4fab68c2e958d65d5b4b0085c969f7cfa777ecdfb5b"
+    },
+    {
+      "file": "flashinfer\\attention\\variants.cuh",
+      "original_sha256": "90a228dd71b3ce8030d663e2b16f67f840fe4a3e99912f8b47774d3fd905a080"
+    },
+    {
+      "file": "flashinfer\\attention\\variant_helper.cuh",
+      "original_sha256": "326c32f7722027da5002ca9297c84f74b604255f01e59263f193b2aee3edb159"
+    },
+    {
+      "file": "flashinfer\\utils.cuh",
+      "original_sha256": "da42b5f100ccb02a4c05c6f82157ce604dcc535b5d7c1b38a68e42865a7e650e"
+    },
+    {
+      "file": "flashinfer\\exception.h",
+      "original_sha256": "83126766f5b3ef24586eca68bcd3ebe45b1f8b1c5952fb55940421618175f271"
+    },
+    {
+      "file": "flashinfer\\math.cuh",
+      "original_sha256": "ad9461ba66273bf7e227af1e285a136b4e53f899fa60b3a41f08627ad738f2ed"
+    },
+    {
+      "file": "flashinfer\\attention\\mask.cuh",
+      "original_sha256": "aecde488616cbf433347534ba3d3862d7576eb35d50e3640f425e31dc95ef7a0"
+    },
+    {
+      "file": "flashinfer\\attention\\cascade.cuh",
+      "original_sha256": "3ce6de505884bbc4efc78e63b0719eef4fe31fe152defa9fa4f050898fa51210"
+    },
+    {
+      "file": "flashinfer\\attention\\state.cuh",
+      "original_sha256": "b2f59c104c2857e7e69f1837faf577525a292da98b375d5fb24dbcfc15d78159"
+    },
+    {
+      "file": "flashinfer\\vec_dtypes.cuh",
+      "original_sha256": "5b6c312a3736be4bdd2991c80038a3e3e8040ea8a302d3fb52332a50e3bac7a0"
+    },
+    {
+      "file": "flashinfer\\cp_async.cuh",
+      "original_sha256": "957a02a9d471280d333d7a2a98729f3753de69041870526e73a4f47bc6c94f06"
+    },
+    {
+      "file": "flashinfer\\pos_enc.cuh",
+      "original_sha256": "6a94df7647512f9474198ee99a04bf84b7dad9c65be1d10d8d20c9c9f9cf2abf"
+    },
+    {
+      "file": "flashinfer\\page.cuh",
+      "original_sha256": "02783ff09c102d1fa04707c5d659e35afb0361316e9036d5729d3184502b24ed"
+    },
+    {
+      "file": "flashinfer\\layout.cuh",
+      "original_sha256": "f000e64b9c718b0659fff1acf3c3fa0c2cdf5c75862cede645b16014bfa7aa2b"
+    },
+    {
+      "file": "flashinfer\\fastdiv.cuh",
+      "original_sha256": "5d79e2d63bd133f9da4fd3236342999cb585812eb07326ce55775d353ae62832"
+    },
+    {
+      "file": "flashinfer\\permuted_smem.cuh",
+      "original_sha256": "1929a5d1ebb27c67b1e9be3308adf5083957443448d73b6529c0e46c01d7ee84"
+    },
+    {
+      "file": "flashinfer\\mma.cuh",
+      "original_sha256": "f6df5d6475bf2fc33932399b7063894a2a4ed27cfabe45ae7cd239a1c61943e9"
+    },
+    {
+      "file": "flashinfer\\frag_layout_swizzle.cuh",
+      "original_sha256": "cae96de0e3fd9a4b7dbcdc1e0a6e9fdddd3b1d79f67a83de3b7e1cd4549b175a"
+    },
+    {
+      "file": "flashinfer\\fp16.h",
+      "original_sha256": "dcc4b12d9b041264c1cbf25e64659b17e86c259c0411f554680c25bdbd1ff6e6"
+    },
+    {
+      "file": "flashinfer\\attention\\default_prefill_params.cuh",
+      "original_sha256": "5b0545df7e134dc031e6a1179ec9c64a6d6b0e4d41b2cd98d3826165b3ed3615"
+    }
+  ],
+  "compatibility": [
+    "fastdiv uint32 exact division fallback for CUDA12.9 missing cuda::fast_mod_div",
+    "GNU always_inline to CUDA/MSVC forceinline",
+    "Linux ushort alias -> explicit unsigned short in math.cuh; same 16-bit asm operand",
+    "pos_enc.cuh GNU __restrict__ -> MSVC/CUDA __restrict, same alias qualifier; unused RoPE host template must still parse",
+    "Remove two optional pointer alias qualifiers from unused host BatchQKApplyLlama31Rotary signature; no attention device math changes"
+  ],
+  "attention_algorithm_modified": false,
+  "license_files": [
+    "vendor/flashinfer/LICENSE",
+    "vendor/flashinfer/NOTICE",
+    "vendor/flashinfer/licenses/LICENSE.fp16.txt"
+  ],
+  "notice_source": {
+    "tag": "v0.6.16",
+    "commit": "8da13a29c85f7e5b1c81878d933f84ae9fc4afa9",
+    "scope": "notice/license source; not a claim that installed 0.6.16.post3 headers are byte-identical to this tag"
+  }
+}

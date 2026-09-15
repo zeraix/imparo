@@ -23,7 +23,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST = ROOT / "dev_harness" / "public-export.allowlist"
-EXPECTED_ALLOWLIST_SHA256 = "370d29e3aece3cf961e3fac60f8d16122ba8825c00839070869d456b9a313ab4"
+EXPECTED_ALLOWLIST_SHA256 = "9bb1f78b0754099d2cf796633204c1cae2848251f27f424bd8a3fba5f0d3118e"
 REQUIRED_COMMUNITY_FILES = {
     ".github/ISSUE_TEMPLATE/bug_report.yml",
     ".github/ISSUE_TEMPLATE/config.yml",
@@ -220,7 +220,7 @@ class PublicAllowlistTests(unittest.TestCase):
         paths = public_export._parse_allowlist(
             raw, "dev_harness/public-export.allowlist"
         )
-        self.assertEqual(len(paths), 318)
+        self.assertEqual(len(paths), 380)
         self.assertEqual(paths, sorted(paths, key=lambda item: item.encode("utf-8")))
         self.assertEqual(set(paths) & REQUIRED_COMMUNITY_FILES, REQUIRED_COMMUNITY_FILES)
         self.assertEqual(set(paths) & REQUIRED_CONTROL_PLANE, REQUIRED_CONTROL_PLANE)
@@ -279,6 +279,40 @@ class PublicAllowlistTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "allowlist-size")
 
 
+class CudaSourceClosureTests(unittest.TestCase):
+    def test_reviewed_public_cuda_sources_are_complete(self) -> None:
+        paths = public_export._parse_allowlist(ALLOWLIST.read_bytes(), str(ALLOWLIST.name))
+        public_export.validate_cuda_sources({path: (ROOT / path).read_bytes() for path in paths})
+
+    def test_nested_and_conditional_includes_require_exported_exact_case(self) -> None:
+        root = "crates/imparo-cuda/native/"
+        files = {
+            root + "imparo_cuda.cu": b'#ifdef OPTIONAL\n#include "sm86/kernel.cuh"\n#endif\n',
+            root + "sm86/kernel.cuh": b'#include "../quant.cuh"\n',
+            root + "quant.cuh": b'#include <cuda_runtime.h>\n',
+        }
+        public_export.validate_cuda_sources(files)
+        files[root + "Quant.cuh"] = files.pop(root + "quant.cuh")
+        with self.assertRaises(public_export.PublicExportError) as error:
+            public_export.validate_cuda_sources(files)
+        self.assertEqual(error.exception.code, "cuda-source-missing")
+
+    def test_comments_are_ignored_but_continued_includes_are_checked(self) -> None:
+        path = "crates/imparo-cuda/native/imparo_cuda.cu"
+        files = {path: b'/*\n#include "unused.cuh"\n*/\n// #include "unused.cuh"\n'}
+        public_export.validate_cuda_sources(files)
+        files[path] += b'#include ' + bytes([92, 10]) + b'"missing.cuh"\n'
+        with self.assertRaises(public_export.PublicExportError):
+            public_export.validate_cuda_sources(files)
+
+    def test_separate_cuda_translation_unit_is_required(self) -> None:
+        files = {"crates/imparo-cuda/build.rs": b'"native/optional/dispatch.cu"'}
+        with self.assertRaises(public_export.PublicExportError):
+            public_export.validate_cuda_sources(files)
+        files["crates/imparo-cuda/native/optional/dispatch.cu"] = b"// provider\n"
+        public_export.validate_cuda_sources(files)
+
+
 class PublicExporterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -289,6 +323,26 @@ class PublicExporterTests(unittest.TestCase):
 
     def repo(self, name: str = "source") -> TemporaryRepository:
         return TemporaryRepository(self.root, name)
+
+    def test_cuda_dependency_present_only_in_source_is_rejected(self) -> None:
+        repo = self.repo()
+        source = "crates/imparo-cuda/native/imparo_cuda.cu"
+        header = "crates/imparo-cuda/native/quant.cuh"
+        tree = repo.commit(
+            {source: b'#include "quant.cuh"\n', header: b"// quantization\n"},
+            paths=sorted([repo.allowlist_path, source]),
+        )
+        with self.assertRaises(public_export.PublicExportError) as error:
+            repo.plan(tree)
+        self.assertEqual(error.exception.code, "cuda-source-missing")
+
+    def test_cuda_dependency_in_dirty_worktree_cannot_repair_selected_tree(self) -> None:
+        repo = self.repo()
+        source = "crates/imparo-cuda/native/imparo_cuda.cu"
+        tree = repo.commit({source: b'#include "quant.cuh"\n'})
+        repo.write("crates/imparo-cuda/native/quant.cuh", b"// untracked\n")
+        with self.assertRaises(public_export.PublicExportError):
+            repo.plan(tree)
 
     def test_fixed_tree_reads_blobs_not_dirty_worktree(self) -> None:
         repository = self.repo()

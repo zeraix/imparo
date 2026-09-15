@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -387,6 +388,51 @@ def _scan_blob(path: str, data: bytes) -> None:
     _scan_text(path, data)
 
 
+def validate_cuda_sources(files: dict[str, bytes]) -> None:
+    """Require native source closure in the selected blobs, including optional code.
+
+    Do not consult the working tree: an internal checkout can contain a dependency
+    that the allowlist silently drops. Conditional local includes are intentional
+    requirements too, because the public Cargo features still expose those builds.
+    CUDA/toolchain headers use angle includes and are supplied by the toolkit.
+    """
+    root = "crates/imparo-cuda/native/"
+    # Preserve string literals while removing comments, including commented includes.
+    escape = re.escape(chr(92))
+    quoted = "|".join(
+        f"{quote}(?:{escape}.|[^{quote}{escape}])*{quote}" for quote in ('"', "'")
+    )
+    tokens = re.compile(quoted + r"|//[^\n]*|/\*.*?\*/", re.S)
+    for path, data in files.items():
+        if not path.startswith(root) or PurePosixPath(path).suffix not in {
+            ".cu", ".cuh", ".h", ".inc", ".cpp",
+        }:
+            continue
+        text = data.decode("utf-8").replace(chr(92) + "\r\n", "").replace(chr(92) + "\n", "")
+        text = tokens.sub(
+            lambda match: " " + "\n" * match[0].count("\n")
+            if match[0].startswith(("//", "/*")) else match[0],
+            text,
+        )
+        for include in re.findall(r'^\s*#\s*include\s+"([^"\r\n]+)"', text, re.M):
+            candidates = (
+                posixpath.normpath(posixpath.join(posixpath.dirname(path), include)),
+                posixpath.normpath(root + include),
+            )
+            if not any(candidate.startswith(root) and candidate in files for candidate in candidates):
+                raise PublicExportError(
+                    "cuda-source-missing", "CUDA local include is absent from the public export", path,
+                )
+    # Separate translation units are named by build.rs rather than a #include.
+    build_path = "crates/imparo-cuda/build.rs"
+    for source in re.findall(rb'"(native/[^"\r\n]+\.cu)"', files.get(build_path, b"")):
+        path = "crates/imparo-cuda/" + source.decode("utf-8")
+        if path not in files:
+            raise PublicExportError(
+                "cuda-source-missing", "CUDA build input is absent from the public export", path,
+            )
+
+
 def build_plan(
     source: Path | str,
     requested_tree: str = "HEAD",
@@ -434,6 +480,7 @@ def build_plan(
         files.append(
             ExportFile(path, entry.mode, entry.oid, data, hashlib.sha256(data).hexdigest())
         )
+    validate_cuda_sources({file.path: file.data for file in files})
     return ExportPlan(
         source=source_root,
         requested_tree=requested_tree,
