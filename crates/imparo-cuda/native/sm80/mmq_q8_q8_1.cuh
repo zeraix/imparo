@@ -26,6 +26,7 @@
 // mmq-load-tiles.cuh, mmq-vec-dot.cuh, mma.cuh and mmq-config-ampere.cuh.
 
 #pragma once
+#include "../lfm_retained_policy.cuh"
 
 #include "mmq_q8_replay_plan.h"
 
@@ -660,11 +661,14 @@ inline LaunchResult launch_aligned_whole_k(
         BlockQ8_1Mmq * output_q8,
         uint32_t n_in, uint32_t n_out, uint32_t n_tok,
         uint32_t out_stride, uint32_t row_base, cudaStream_t stream,
-        imparo_sm80_mmq::LaunchInfo * info = nullptr) {
+        imparo_sm80_mmq::LaunchInfo * info = nullptr,
+        bool batch_invariant = false) {
     static_assert(Epilogue == 0 || Epilogue == 2 || Epilogue == 3
         || Epilogue == 4,
         "aligned Q8 MMQ supports only registered SiLU sidecar stores");
-    if (!w || !x || !y || n_tok <= 8 || n_in == 0 || n_in % 256 != 0
+    if (!w || !x || !y
+        || (n_tok <= 8 && !(batch_invariant && n_tok >= 1 && n_tok <= 16))
+        || n_in == 0 || n_in % 256 != 0
         || n_out == 0 || n_out % Rows != 0 || out_stride == 0
         || out_stride % Rows != 0 || row_base % Rows != 0
         || row_base > out_stride || n_out > out_stride - row_base
@@ -708,7 +712,8 @@ inline LaunchResult launch_aligned_whole_k(
             const char *v=std::getenv("IMPARO_LAB_Q8_M16_ROW_OWNER");
             return v && std::strcmp(v,"1")==0;
         }();
-        if (row_owner_requested && (n_tok == 9 || (n_tok == 16 && tree_row_owner))) {
+        if (imparo_lfm_retained::common(row_owner_requested) && (n_tok == 9 || (n_tok == 16 && imparo_lfm_retained::wide_only(tree_row_owner))
+                || (batch_invariant && n_tok >= 1 && n_tok <= 16))) {
             static int row_owner_device = -1;
             static bool row_owner_sm86 = false;
             if (row_owner_device != device) {
@@ -723,7 +728,7 @@ inline LaunchResult launch_aligned_whole_k(
             if (row_owner_sm86) {
                 const auto narrow = launch_aligned_whole_k<TileMajor,0,false,4,
                     CanonicalLoadLanes,16,64,HalfwordLoads>(w,x,y,output_q8,
-                        n_in,n_out,n_tok,out_stride,row_base,stream,info);
+                        n_in,n_out,n_tok,out_stride,row_base,stream,info,batch_invariant);
                 if (narrow == LaunchResult::Launched) {
                     static const bool trace = std::getenv("IMPARO_Q8_ROW_OWNER_TRACE") != nullptr;
                     static bool traced = false;
@@ -733,7 +738,7 @@ inline LaunchResult launch_aligned_whole_k(
                         traced = true;
                     }
                 }
-                if (narrow != LaunchResult::NotSupported) return narrow;
+                if (batch_invariant || narrow != LaunchResult::NotSupported) return narrow;
             }
         }
     }

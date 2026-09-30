@@ -23,7 +23,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST = ROOT / "dev_harness" / "public-export.allowlist"
-EXPECTED_ALLOWLIST_SHA256 = "9bb1f78b0754099d2cf796633204c1cae2848251f27f424bd8a3fba5f0d3118e"
+EXPECTED_ALLOWLIST_SHA256 = "b9bd6b4803834e85d44319758ab77619ca6104700a01d3700ec9df599e80403a"
 REQUIRED_COMMUNITY_FILES = {
     ".github/ISSUE_TEMPLATE/bug_report.yml",
     ".github/ISSUE_TEMPLATE/config.yml",
@@ -220,7 +220,7 @@ class PublicAllowlistTests(unittest.TestCase):
         paths = public_export._parse_allowlist(
             raw, "dev_harness/public-export.allowlist"
         )
-        self.assertEqual(len(paths), 380)
+        self.assertEqual(len(paths), 528)
         self.assertEqual(paths, sorted(paths, key=lambda item: item.encode("utf-8")))
         self.assertEqual(set(paths) & REQUIRED_COMMUNITY_FILES, REQUIRED_COMMUNITY_FILES)
         self.assertEqual(set(paths) & REQUIRED_CONTROL_PLANE, REQUIRED_CONTROL_PLANE)
@@ -454,6 +454,53 @@ class PublicExporterTests(unittest.TestCase):
                 with self.assertRaises(public_export.PublicExportError) as raised:
                     public_export._scan_blob(path, prefix + encoded + suffix)
                 self.assertEqual(raised.exception.code, "binary-digest")
+
+    def test_json_escapes_are_not_paths_but_escaped_paths_are(self) -> None:
+        # A letter, a colon and a newline inside a JSON string: the raw file holds a
+        # backslash after the colon, which is JSON encoding, not a drive path.
+        public_export._scan_blob("set.json", json.dumps({"code": "if a < d:" + chr(10) + "  b"}).encode())
+        windows = "Z:" + chr(92) + "private" + chr(92) + "file"
+        home = "/" + "Users" + "/someone/private"
+        for text in (windows, home):
+            with self.subTest(text=text):
+                with self.assertRaises(public_export.PublicExportError):
+                    public_export._scan_blob("set.json", json.dumps({"path": text}).encode())
+        with self.assertRaises(public_export.PublicExportError) as raised:
+            public_export._scan_blob("broken.json", ("{" + windows).encode())
+        self.assertEqual(raised.exception.code, "drive-absolute-path")
+
+    def test_reviewed_binary_may_carry_a_forbidden_suffix(self) -> None:
+        reviewed = "crates/imparo-cuda/native/sm86/w4a16_marlin/marlin-sm80.cubin"
+        self.assertIn(reviewed, public_export.BINARY_ALLOWLIST)
+        public_export.validate_public_path(reviewed)
+        for unreviewed in ("crates/x/other.cubin", "crates/x/data.bin"):
+            with self.subTest(path=unreviewed):
+                with self.assertRaises(public_export.PublicExportError) as raised:
+                    public_export.validate_public_path(unreviewed)
+                self.assertEqual(raised.exception.code, "private-path")
+        for path, (prefix, suffix, size, digest) in public_export.BINARY_ALLOWLIST.items():
+            with self.subTest(path=path):
+                data = (ROOT / path).read_bytes()
+                self.assertEqual((len(data), hashlib.sha256(data).hexdigest()), (size, digest))
+                public_export._scan_blob(path, data)
+
+    def test_allowlist_is_generated_from_the_denylist(self) -> None:
+        # Only meaningful where the deny list denies something, i.e. the source repository;
+        # a public checkout holds the exported files only.
+        from dev_harness import public_allowlist
+
+        rules = public_allowlist.parse_denylist(
+            (ROOT / public_allowlist.DENYLIST).read_text(encoding="utf-8")
+        )
+        try:
+            tracked = public_allowlist.tracked_files(ROOT)
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("not a Git checkout")
+        if not any(public_allowlist.is_denied(rules, path) for path in tracked):
+            self.skipTest("no denied file is tracked here (a public checkout)")
+        data, _ = public_allowlist.generate(ROOT)
+        self.assertEqual(ALLOWLIST.read_bytes(), data,
+                         "run: python3 dev_harness/public_allowlist.py --write")
 
     def test_allowlisted_symlink_mode_is_rejected(self) -> None:
         repository = self.repo()

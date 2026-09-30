@@ -95,6 +95,35 @@ pub const L2_PROGRAM: &[MegaPhase] = &[
     ph("", "l2_ph_tail", Barrier::None),
 ];
 
+/// LFM2-MoE: the ROUTED feed-forward of a decode layer as one dispatch (the mixer runs on the
+/// dispatch path before it). The dispatch path runs this tail as seven dependent dispatches --
+/// the residual + FFN norm, the router, the route, gate and up, the activation, down, the
+/// combine -- and this is three phases with two grid barriers:
+///
+///   R0  every threadgroup: xn = rms(x + o) * w_fn in threadgroup memory
+///   R1  the router's rows over the grid's simdgroups                          -> grid
+///   R2  every threadgroup forms the route from the router's rows (the same inputs in the same
+///       order, so every threadgroup picks the same experts), then the k experts' gate and up
+///       units: g = act(gate . xn) * (up . xn)                                 -> grid
+///   R3  n_embd output units, each summing its k experts' down rows in SLOT ORDER with the
+///       route's weights, then x = (x + o) + that sum.
+///   R4  (when the entry names one) every threadgroup forms the NEXT layer's operator norm
+///       of x after a grid barrier and writes its slice of `cur`: the next layer's norm
+///       dispatch -- a one-threadgroup kernel of pure latency, 9 us in the chain -- goes.
+///
+/// The mixer stays on the dispatch path. The whole short-convolution layer as one entry was
+/// built and measured +1.2% SLOWER than the tail alone at 5962 keys (in_proj's 768 units
+/// split badly over the entry's 18 x 17 grid), and removed.
+pub const L2M_PROGRAM: &[MegaPhase] = &[
+    ph("", "l2m_ph_ffn_norm", Barrier::None),
+    ph("", "l2m_ph_router", Barrier::Grid),
+    ph_rows("", "l2m_ph_gated", Barrier::Grid, "L2M_U_GATED_ROWS"),
+    // The next layer's norm needs every row of x, so a grid barrier -- and without it the
+    // dispatch ends here (a threadgroup barrier, nothing waits on it).
+    ph_rows("", "l2m_ph_down", Barrier::GridUnlessLocal("ent.u[L2M_U_HAS_NEXT] == 0u"), "MEGA_U_N_EMBD"),
+    ph("ent.u[L2M_U_HAS_NEXT] != 0u", "l2m_ph_next_norm", Barrier::None),
+];
+
 /// Qwen3.8 (task #165): the layer's mixer, then the shared SwiGLU tail. `kind` selects the
 /// mixer and is an entry word, so every threadgroup of the dispatch takes the same branch.
 /// The gate and up projections sit in ONE phase with no barrier between them: unit `un`

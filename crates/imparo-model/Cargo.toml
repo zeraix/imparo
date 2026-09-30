@@ -22,13 +22,19 @@ libc = "0.2.177"
 imparo-metal = { path = "../imparo-metal" }
 
 [features]
+# Speculation is part of the engine, not an experiment: the server serves a draft pairing
+# out of the box and a build without it refuses one at startup. `--no-default-features`
+# still compiles the engine without any speculation code.
+default = ["speculative"]
 cuda = ["dep:imparo-cuda", "imparo-cuda/cuda"]
 cuda-dynamic = ["dep:imparo-cuda", "imparo-cuda/cuda-dynamic"]
 # CUDA-only laboratory capture surface. This is deliberately not a default feature:
 # every capture inserts synchronization/readback boundaries and is inadmissible timing
 # evidence by construction.
 cuda-gate0-capture = ["cuda"]
-cuda-speculative = ["cuda", "imparo-cuda/cuda-speculative"]
+# Speculation that names no backend: pairing files, draft specs, observed prefill.
+speculative = []
+cuda-speculative = ["cuda", "speculative", "imparo-cuda/cuda-speculative"]
 cuda-owner-lab = ["cuda-speculative", "imparo-cuda/cuda-owner-lab"]
 [[bin]]
 name = "imparo-plan"

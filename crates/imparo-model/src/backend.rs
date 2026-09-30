@@ -174,14 +174,62 @@ pub fn enable_gpu(
     weights: &mut imparo_gguf::weights::Weights,
     plan: &crate::ModelPlan,
     capacity: usize,
-    max_batch: usize,
+) -> Result<(), String> {
+    enable_gpu_with_appended(weights, plan, capacity, &[])
+}
+
+/// [`enable_gpu`] for a mapping that holds more than the model: `appended` is the
+/// (offset, bytes) of each tensor past the model's own -- a paired drafter's -- which the
+/// weight placement must cover before any kernel reads one.
+///
+/// # Errors
+/// As [`enable_gpu`].
+pub fn enable_gpu_with_appended(
+    weights: &mut imparo_gguf::weights::Weights,
+    plan: &crate::ModelPlan,
+    capacity: usize,
+    appended: &[(u64, u64)],
 ) -> Result<(), String> {
     if !gpu_requested_from_env() {
         return Ok(());
     }
     let Some(be) = active() else { return Ok(()) }; // no GPU backend compiled in
+    // THE CHUNK IS DECIDED BEFORE ANYTHING IS SIZED FROM IT. Placement reserves KV state and
+    // activations for one chunk, so the tuned config's chunk for this model is read here,
+    // before placement; `IMPARO_BATCH` set by the user still wins. It was applied inside the
+    // backend's init, after placement had reserved for the compiled 512 -- harmless only
+    // while every stored chunk was 512.
+    if std::env::var("IMPARO_BATCH").is_err() {
+        if let Some(batch) = be.stored_prefill_batch(weights.model_bytes()) {
+            unsafe { std::env::set_var("IMPARO_BATCH", batch.to_string()) };
+        }
+    }
+    let max_batch = crate::prefill_batch();
     #[cfg(any(feature = "cuda", feature = "cuda-dynamic"))]
     install_cuda_correctness_identity_if_needed(weights, plan)?;
+    // Basis metadata changes model mathematics. Resolve and validate it before any
+    // device allocation, then register it on the initialized backend before execution.
+    let input_transforms = if plan.config.architecture == "qwen35" {
+        let document =
+            imparo_gguf::read(weights.source_path()).map_err(|e| e.to_string())?;
+        let transforms = crate::qwen35::weight_basis::from_document(
+            &document,
+            weights.source_path(),
+        )?;
+        for transform in &transforms {
+            if !weights.tensors.values().any(|tensor| {
+                tensor.offset as u64 == transform.weight_offset
+                    && tensor.ne[0] == u64::from(transform.width)
+            }) {
+                return Err(
+                    "Prism transform no longer names the loaded weight mapping".into(),
+                );
+            }
+        }
+        transforms
+    } else {
+        Vec::new()
+    };
     // BEFORE init_weights: the activation SPECIALISES the epilogue kernels at pipeline
     // build, and setting it afterwards is a silent no-op that would leave GELU.
     be.set_activation(model_activation(plan)?.epilogue());
@@ -191,14 +239,28 @@ pub fn enable_gpu(
     // network can carry several geometries -- gemma4's windowed layers are head_dim 256
     // and its full layers 512 -- which is what the LayerPlan comment says a model-level
     // field cannot express.
-    let mut hds: Vec<u32> = plan
+    // Each dim goes with its K/V row width (see below), from the target's layers and from a
+    // paired drafter's, whose attention runs on the same library.
+    let mut dims: Vec<(u32, u32)> = plan
         .layers
         .iter()
         .filter(|l| l.attention.is_attention())
-        .map(|l| l.attention.head_dim())
+        .map(|l| {
+            let hd = l.attention.head_dim();
+            (hd, plan.config.n_kv_heads * hd)
+        })
+        .chain(plan.drafter.iter().map(|d| (d.head_dim, d.kv_width())))
         .collect();
-    hds.sort_unstable();
-    hds.dedup();
+    dims.sort_unstable();
+    dims.dedup();
+    if let Some(pair) = dims.windows(2).find(|p| p[0].0 == p[1].0) {
+        return Err(format!(
+            "head dim {} comes with two K/V row widths ({} and {}); the attention library \
+             compiles one width per head dim",
+            pair[0].0, pair[0].1, pair[1].1
+        ));
+    }
+    let hds: Vec<u32> = dims.iter().map(|d| d.0).collect();
     // WHICH GGML TYPE EACH WIRE KIND IS. A backend switches kernels on the wire kind and
     // decodes by the ggml type; handing over the pairs keeps the mapping stated once, in
     // imparo-gguf, instead of copied into every backend.
@@ -206,14 +268,16 @@ pub fn enable_gpu(
     be.set_attention_head_dims(&hds);
     // The recurrent MATRIX's coordinates, same timing and same reason: the delta kernel
     // holds one of its rows per lane in registers, and a register array's size must be a
-    // constant expression. Absent (0, 0) when no layer carries one, and then no delta
-    // pipeline is built.
-    let (rec_k, rec_v) = plan.recurrent_dims()?.unwrap_or((0, 0));
-    be.set_recurrent_dims(rec_k, rec_v);
-    // The K/V row width goes with each dim: kv heads x head dim. Every K/V tile load in the
+    // constant expression. A plan with no such layer sets nothing, so a probe that set the
+    // dims itself (imparo-metalbench) keeps them; unset, no delta pipeline is built.
+    if let Some((rec_k, rec_v)) = plan.recurrent_dims()? {
+        be.set_recurrent_dims(rec_k, rec_v);
+    }
+    // The K/V row width goes with each dim: the kv heads of the plan that owns the dim x the
+    // head dim. Every K/V tile load in the
     // prefill attention kernels carries that stride, and compiled as a constant it is an
     // immediate in the address arithmetic instead of a uniform read per tile.
-    let kvws: Vec<u32> = hds.iter().map(|hd| plan.config.n_kv_heads * hd).collect();
+    let kvws: Vec<u32> = dims.iter().map(|d| d.1).collect();
     be.set_attention_kv_widths(&kvws);
     // WHERE THE WEIGHTS LIVE (docs/memory-tiers-and-fit.md): the common runtime decides,
     // once, from the plan, the configured context, the prefill batch and the backend's
@@ -248,6 +312,7 @@ pub fn enable_gpu(
     }
     let placement = crate::placement::plan_placement(
         &weights.tensors,
+        appended,
         plan,
         capacity,
         max_batch,
@@ -257,6 +322,18 @@ pub fn enable_gpu(
         "[imparo] {}",
         crate::placement::describe(&placement, capacity, max_batch)
     );
+    // Only a backend whose committed KV follows the blocks written can hold a device tier
+    // larger than one conversation without paying for it before it is used.
+    if be.kv_commits_on_demand() {
+        if let Some(tier) = crate::placement::kv_tier_bytes(&placement) {
+            crate::placement::set_kv_tier(tier);
+            eprintln!(
+                "[imparo] kv tier: {:.0} MiB (the fast tier less its weights, activations, \
+scratch and margin)",
+                tier as f64 / (1u64 << 20) as f64
+            );
+        }
+    }
     // IMPARO_PLACEMENT_LOG=1: every segment and every tensor, for a "weight offset is in
     // no segment" abort -- the answer is which tensor sits at that offset.
     if std::env::var("IMPARO_PLACEMENT_LOG").is_ok_and(|v| v == "1") {
@@ -279,6 +356,7 @@ pub fn enable_gpu(
     // Before the mapping is handed over: the repack reads converted tensors from the FILE,
     // not through the mapping, so those bytes never enter the page cache.
     be.set_weight_path(weights.source_path());
+    be.set_model_bytes(weights.model_bytes());
     // SAFETY: base_ptr/byte_len describe the live weight mmap, which outlives the process;
     // every segment was built from that mapping's own tensor table.
     match unsafe {
@@ -289,12 +367,68 @@ pub fn enable_gpu(
         )
     } {
         Ok(()) => {
+            be.register_weight_input_transforms(&input_transforms)?;
+            #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
+            imparo_cuda::knobs::prepare_e4b_retained_decode_policy(
+                u32::try_from(capacity)
+                    .map_err(|_| "E4B context capacity exceeds u32")?,
+                plan.config.n_embd,
+                plan.config.n_ff,
+                plan.config.n_layers,
+                plan.config.n_heads,
+                plan.config.n_kv_heads,
+            )
+            .map_err(|rc| {
+                format!("retained E4B policy domain admission failed rc={rc}")
+            })?;
             weights.mark_gpu();
             eprintln!(
                 "[imparo] {}: weights shared, GPU path enabled",
                 be.device_tag()
             );
             load_time_repack(weights, &placement, be)?;
+            #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
+            if imparo_cuda::knobs::lfm_retained_execution_enabled() {
+                // Inspect actual post-repack tensor layouts, not a model filename.
+                let down_kind = if capacity == 1024 { 3 } else { 2 };
+                for layer in 0..plan.config.n_layers {
+                    for (role, kind, width, rows) in [
+                        ("gate", 3, 2048, 10752),
+                        ("up", 3, 2048, 10752),
+                        ("down", down_kind, 10752, 2048),
+                    ] {
+                        let name = format!("blk.{layer}.ffn_{role}.weight");
+                        let tensor = weights
+                            .tensors
+                            .get(&name)
+                            .ok_or_else(|| format!("retained LFM missing {name}"))?;
+                        if tensor.n_dims != 2
+                            || tensor.ne[0] != width
+                            || tensor.ne[1] != rows
+                            || imparo_gguf::weights::weight_kind(tensor.ggml_type)
+                                .map(|k| k as u32)
+                                != Some(kind)
+                        {
+                            return Err(format!(
+                                "retained LFM tensor layout mismatch: {name}"
+                            ));
+                        }
+                    }
+                }
+                imparo_cuda::knobs::prepare_lfm_retained_policy(
+                    u32::try_from(capacity).map_err(|_| "LFM capacity exceeds u32")?,
+                    u32::try_from(max_batch).map_err(|_| "LFM batch exceeds u32")?,
+                    plan.config.n_embd,
+                    plan.config.n_ff,
+                    plan.config.n_layers,
+                    plan.config.n_heads,
+                    plan.config.n_kv_heads,
+                    down_kind,
+                )
+                .map_err(|rc| {
+                    format!("retained LFM domain admission failed rc={rc}")
+                })?;
+            }
             Ok(())
         }
         Err(rc) => Err(format!(
@@ -350,7 +484,7 @@ pub fn load_time_rule(
         return None;
     }
     let rule = imparo_gguf::weights::tm_applies(name, ggml_type, dims).ok()?;
-    if rule.readers.is_empty() {
+    if !rule.has_readers_for(dims) {
         return None;
     }
     let be = active()?;
@@ -407,7 +541,14 @@ fn load_time_repack(
             from_type: rule.from,
             to_type: rule.to,
             n_in: t.ne[0] as u32,
-            n_out: t.ne[1] as u32,
+            // EVERY ROW OF THE STACK, not one slice's. An expert tensor is
+            // `[n_in, n_out, n_expert]` -- n_expert matrices end to end -- and the
+            // transform permutes bytes inside a unit of `unit_rows`, so a stack whose
+            // slice rows divide the unit converts as one tall matrix. Passing ne[1] here
+            // converted expert 0 and left the other 31 row-major; the verify named it
+            // exactly, "differs from the rule at byte 2064384 of 66060288", which is where
+            // expert 1 begins.
+            n_out: (t.ne[1] * t.ne.get(2).copied().unwrap_or(1)) as u32,
             layout: block_layout(rule),
         });
     }
@@ -514,6 +655,50 @@ pub fn cuda_knob_registry() -> &'static [imparo_backend::KnobDecl] {
     use imparo_backend::BackendKnobs as _;
     imparo_cuda::CudaBackend.knob_registry()
 }
+/// Explicit laboratory overrides shared by server and correctness CLI.
+/// With neither legacy nor generic lab variable set, normal receipt loading is unchanged.
+#[cfg(feature = "cuda-speculative")]
+pub fn apply_lab_knobs_from_env() -> Result<(), String> {
+    // One existing registry/loader for every laboratory model. Keep the old
+    // DSpark environment name as an alias; conflicting sources are an error.
+    let generic = std::env::var_os("IMPARO_LAB_KNOBS");
+    let legacy = std::env::var_os("IMPARO_DSPARK_KNOBS");
+    if generic.is_some() && legacy.is_some() {
+        return Err(
+            "IMPARO_LAB_KNOBS and IMPARO_DSPARK_KNOBS are mutually exclusive".into(),
+        );
+    }
+    let Some(path) = generic.or(legacy) else {
+        return Ok(());
+    };
+    let values: std::collections::BTreeMap<String, u32> =
+        serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let registry = cuda_knob_registry();
+    for (name, value) in values {
+        let knob = registry
+            .iter()
+            .find(|k| k.name == name)
+            .ok_or_else(|| format!("unknown knob {name}"))?;
+        (knob.apply)(value);
+        if (knob.current)() != value {
+            return Err(format!("knob {name} rejected {value}"));
+        }
+        eprintln!("[imparo] lab existing knob {name}={value}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda-speculative"))]
+pub fn apply_lab_knobs_from_env() -> Result<(), String> {
+    if std::env::var_os("IMPARO_LAB_KNOBS").is_some()
+        || std::env::var_os("IMPARO_DSPARK_KNOBS").is_some()
+    {
+        return Err("CUDA laboratory knob overrides require cuda-speculative".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{StreamedWeightSpan, gpu_requested, normalize_streamed_spans};

@@ -4,7 +4,13 @@
 //! separately identified and require whole-model admission, never a fake native slot. Keeping the slot constants beside the declarations makes the stored tuner
 //! configuration an auditable contract instead of a second, implicit knob table.
 
-use crate::ffi::{imparo_cuda_knob, imparo_cuda_set_knob};
+use crate::ffi::{
+    imparo_cuda_e4b_ffn_w4a16, imparo_cuda_e4b_retained_decode_policy,
+    imparo_cuda_knob, imparo_cuda_ptq_prefill_tensorcore,
+    imparo_cuda_set_e4b_ffn_w4a16, imparo_cuda_set_e4b_retained_decode_policy,
+    imparo_cuda_set_knob, imparo_cuda_set_ptq_prefill_tensorcore,
+    imparo_cuda_set_weight_transfer_policy, imparo_cuda_weight_transfer_policy,
+};
 use imparo_backend::{
     BackendKnobs, KnobCategory, KnobDecl, SweepKind as Sw, Workload as Wl,
 };
@@ -68,6 +74,151 @@ const SLOT_MMQ_Q8_CANONICAL_DOWN_LARGE_MIN_TOKENS: u32 = 61;
 const SLOT_MMQ_Q8_CANONICAL_DOWN_SMALL_MAX_TOKENS: u32 = 62;
 const SLOT_MMQ_Q8_CANONICAL_LOAD_LANES: u32 = 63;
 
+pub(crate) const E4B_FFN_W4A16_KNOB: &str = "e4b_ffn_w4a16";
+static E4B_FFN_W4A16_APPLY_ERROR: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+fn e4b_ffn_w4a16_value() -> u32 {
+    // The native owner is authoritative, including a rejected hot change.
+    // A missing optional dynamic getter returns zero, never a desired value.
+    unsafe { imparo_cuda_e4b_ffn_w4a16() }
+}
+
+fn apply_e4b_ffn_w4a16(value: u32) {
+    let rc = unsafe { imparo_cuda_set_e4b_ffn_w4a16(value) };
+    E4B_FFN_W4A16_APPLY_ERROR.store(rc, std::sync::atomic::Ordering::Relaxed);
+    if rc != 0 {
+        eprintln!("[imparo] unified E4B FFN policy rejected value={value} rc={rc}");
+    }
+}
+
+pub(crate) fn e4b_ffn_w4a16_enabled() -> bool {
+    matches!(e4b_ffn_w4a16_value(), 1 | 2)
+}
+
+fn e4b_ffn_w4a16_status_result(status: i32) -> Result<(), i32> {
+    if status == 0 { Ok(()) } else { Err(status) }
+}
+
+pub(crate) fn e4b_ffn_w4a16_apply_status() -> Result<(), i32> {
+    e4b_ffn_w4a16_status_result(
+        E4B_FFN_W4A16_APPLY_ERROR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+pub(crate) const WEIGHT_TRANSFER_POLICY_KNOB: &str = "weight_transfer_policy";
+static WEIGHT_TRANSFER_POLICY_APPLY_ERROR: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+fn weight_transfer_policy_value() -> u32 {
+    unsafe { imparo_cuda_weight_transfer_policy() }
+}
+fn apply_weight_transfer_policy(value: u32) {
+    let rc = unsafe { imparo_cuda_set_weight_transfer_policy(value) };
+    WEIGHT_TRANSFER_POLICY_APPLY_ERROR.store(rc, std::sync::atomic::Ordering::Relaxed);
+    if rc != 0 {
+        eprintln!("[imparo] weight transfer policy rejected value={value} rc={rc}");
+    }
+}
+pub(crate) fn weight_transfer_policy_apply_status() -> Result<(), i32> {
+    e4b_ffn_w4a16_status_result(
+        WEIGHT_TRANSFER_POLICY_APPLY_ERROR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+pub(crate) const PTQ_PREFILL_TENSORCORE_KNOB: &str = "ptq_prefill_tensorcore";
+static PTQ_PREFILL_TENSORCORE_APPLY_ERROR: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+fn ptq_prefill_tensorcore_value() -> u32 {
+    // The native default and a missing optional dynamic implementation both read zero.
+    unsafe { imparo_cuda_ptq_prefill_tensorcore() }
+}
+fn apply_ptq_prefill_tensorcore(value: u32) {
+    let rc = unsafe { imparo_cuda_set_ptq_prefill_tensorcore(value) };
+    PTQ_PREFILL_TENSORCORE_APPLY_ERROR.store(rc, std::sync::atomic::Ordering::Relaxed);
+    if rc != 0 {
+        eprintln!(
+            "[imparo] PTQ Prefill Tensor Core policy rejected value={value} rc={rc}"
+        );
+    }
+}
+pub(crate) fn ptq_prefill_tensorcore_apply_status() -> Result<(), i32> {
+    e4b_ffn_w4a16_status_result(
+        PTQ_PREFILL_TENSORCORE_APPLY_ERROR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+pub(crate) const E4B_RETAINED_DECODE_POLICY_KNOB: &str = "e4b_retained_decode_policy";
+static E4B_RETAINED_DECODE_POLICY_APPLY_ERROR: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+fn e4b_retained_decode_policy_value() -> u32 {
+    unsafe { imparo_cuda_e4b_retained_decode_policy() }
+}
+fn apply_e4b_retained_decode_policy(value: u32) {
+    let rc = unsafe { imparo_cuda_set_e4b_retained_decode_policy(value) };
+    E4B_RETAINED_DECODE_POLICY_APPLY_ERROR
+        .store(rc, std::sync::atomic::Ordering::Relaxed);
+    if rc != 0 {
+        eprintln!("[imparo] retained E4B policy rejected value={value} rc={rc}");
+    }
+}
+/// Actual native model-owner selection, shared by target and assistant workflows.
+/// Missing dynamic support always reports disabled; this is never a desired value.
+pub fn e4b_retained_decode_policy_enabled() -> bool {
+    e4b_retained_decode_policy_value() == 1
+}
+pub(crate) fn e4b_retained_decode_policy_apply_status() -> Result<(), i32> {
+    e4b_ffn_w4a16_status_result(
+        E4B_RETAINED_DECODE_POLICY_APPLY_ERROR
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Bind the single fixed policy to a real, already admitted context domain.
+/// Called once after host configuration and model upload, before any forward.
+pub fn prepare_e4b_retained_decode_policy(
+    capacity: u32,
+    hidden: u32,
+    mid: u32,
+    layers: u32,
+    heads: u32,
+    kv_heads: u32,
+) -> Result<(), i32> {
+    e4b_retained_decode_policy_apply_status()?;
+    let rc = unsafe {
+        crate::ffi::imparo_cuda_prepare_e4b_retained_decode_policy(
+            capacity, hidden, mid, layers, heads, kv_heads,
+        )
+    };
+    e4b_ffn_w4a16_status_result(rc)
+}
+
+pub(crate) const LFM_RETAINED_EXECUTION_KNOB: &str = "lfm2_retained_execution";
+/// Selected policy before binding; execution uses the admitted domain below.
+pub fn lfm_retained_execution_enabled() -> bool {
+    crate::lfm_retained::current() == 1
+}
+pub fn lfm_retained_domain() -> u32 {
+    crate::lfm_retained::domain()
+}
+pub(crate) fn lfm_retained_apply_status() -> Result<(), i32> {
+    crate::lfm_retained::status()
+}
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_lfm_retained_policy(
+    capacity: u32,
+    batch: u32,
+    hidden: u32,
+    mid: u32,
+    layers: u32,
+    heads: u32,
+    kv_heads: u32,
+    down_kind: u32,
+) -> Result<(), i32> {
+    crate::lfm_retained::prepare(
+        capacity, batch, hidden, mid, layers, heads, kv_heads, down_kind,
+    )
+}
+
 pub(crate) const PREFILL_BCX_SHORTCONV_READY_KNOB: &str = "prefill_bcx_shortconv_ready";
 static PREFILL_BCX_SHORTCONV_READY: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
@@ -77,12 +228,23 @@ static FINITE_HISTORY_ROWS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
 pub(crate) fn is_workflow_knob(name: &str) -> bool {
-    name == FINITE_HISTORY_KNOB || name == PREFILL_BCX_SHORTCONV_READY_KNOB
+    name == FINITE_HISTORY_KNOB
+        || name == PREFILL_BCX_SHORTCONV_READY_KNOB
+        || name == E4B_FFN_W4A16_KNOB
+        || name == E4B_RETAINED_DECODE_POLICY_KNOB
+        || name == LFM_RETAINED_EXECUTION_KNOB
+        || name == PTQ_PREFILL_TENSORCORE_KNOB
+        || name == WEIGHT_TRANSFER_POLICY_KNOB
 }
 
 pub(crate) fn reset_workflow_defaults() {
-    FINITE_HISTORY_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
-    PREFILL_BCX_SHORTCONV_READY.store(0, std::sync::atomic::Ordering::Relaxed);
+    apply_ptq_prefill_tensorcore(0);
+    apply_weight_transfer_policy(0);
+    apply_e4b_ffn_w4a16(0);
+    apply_e4b_retained_decode_policy(0);
+    crate::lfm_retained::apply(0);
+    apply_finite_history_rows(0);
+    apply_prefill_bcx_shortconv_ready(0);
 }
 
 fn prefill_bcx_shortconv_ready_value() -> u32 {
@@ -90,6 +252,12 @@ fn prefill_bcx_shortconv_ready_value() -> u32 {
 }
 
 fn apply_prefill_bcx_shortconv_ready(value: u32) {
+    if !crate::lfm_retained::allow_workflow_change(
+        prefill_bcx_shortconv_ready_value(),
+        value,
+    ) {
+        return;
+    }
     PREFILL_BCX_SHORTCONV_READY
         .store(u32::from(value == 1), std::sync::atomic::Ordering::Relaxed);
 }
@@ -103,6 +271,9 @@ fn finite_history_rows_value() -> u32 {
 }
 
 fn apply_finite_history_rows(value: u32) {
+    if !crate::lfm_retained::allow_workflow_change(finite_history_rows_value(), value) {
+        return;
+    }
     // Only the fully screened minimum64 route is a formal candidate. The wider
     // experimental grid remains separate and cannot receive receipt authority.
     FINITE_HISTORY_ROWS.store(
@@ -195,7 +366,14 @@ pub(crate) fn slot_for_name(name: &str) -> Option<u32> {
 const D256_VEC_MODES: &[u32] = &[0, 1, 2];
 #[cfg(not(feature = "cuda-speculative"))]
 const D256_VEC_MODES: &[u32] = &[0, 1];
-const CUDA_SPACE_VERSION: u32 = 68;
+// Space69 admits the mode2 D256 parallel combine under its existing shape guard.
+// Space70 registers the unified M1/M3 W4A16 FFN as an external owner policy.
+// Space72 adds mode2: packed Prefill reuse only in the short retained domain.
+// Version 74 binds tuner measurements to model input bases and executable GQA/codec domains.
+// PTQ Tensor Core candidates need independent numerical/whole-model admission;
+// no slot 64 is reserved because the current native proof mask is only 64 bits.
+// Version 75 adds opt-in D256/H24/KV4 M1 specialization through existing slot 36.
+const CUDA_SPACE_VERSION: u32 = 79;
 pub(crate) const D64_ATTENTION_KNOB: &str = "attn_d64_mma_prefill";
 pub(crate) const D64_FA2_MODE: u32 = 2;
 // The provider is currently linked only by the owner laboratory source build.
@@ -370,6 +548,24 @@ macro_rules! value_knob {
     (@tuple) => { None };
 }
 
+// These kernels are bypassed by the explicit PTQ1/BF16 bridge. A mixed model may
+// still run legacy projections; a PTQ/BF16-only model must not rank their knobs.
+fn legacy_projection_knobs(m: &imparo_backend::ModelFacts) -> bool {
+    m.weight_kinds & ((1_u64 << 1) | (1_u64 << 2) | (1_u64 << 3)) != 0
+}
+
+fn gqa4(m: &imparo_backend::ModelFacts) -> bool {
+    m.n_kv != 0 && m.n_kv.checked_mul(4) == Some(m.n_head)
+}
+
+fn small_attention_heads(m: &imparo_backend::ModelFacts) -> bool {
+    gqa4(m)
+        || (m.n_kv != 0
+            && m.n_kv.checked_mul(2) == Some(m.n_head)
+            && (matches!(m.head_dim, 256 | 512)
+                || matches!(m.deep_head_dim, 256 | 512)))
+}
+
 /// All native CUDA choices that the shared tuner may persist.
 ///
 /// Registry order is sweep order. Coupled MMQ and narrow-MMVQ choices therefore sit
@@ -382,6 +578,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::DecodeMix,
         bit_affecting = true,
+        applies = legacy_projection_knobs,
         tuple = "decode_mmvq"
     ),
     value_knob!(
@@ -398,7 +595,8 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         &[0, 256, 1024],
         true,
         Wl::DecodeMix,
-        bit_affecting = true
+        bit_affecting = true,
+        applies = legacy_projection_knobs
     ),
     value_knob!(
         "mmq_full_rows",
@@ -407,6 +605,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         true,
         Wl::PrefillGemm,
         bit_affecting = true,
+        applies = legacy_projection_knobs,
         tuple = "prefill_mmq"
     ),
     value_knob!(
@@ -416,6 +615,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         true,
         Wl::PrefillGemm,
         bit_affecting = true,
+        applies = legacy_projection_knobs,
         tuple = "prefill_mmq"
     ),
     value_knob!(
@@ -425,7 +625,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::AttentionPrefillDeep,
         bit_affecting = true,
-        applies = |m| m.head_dim == 256
+        applies = |m| m.head_dim == 256 && gqa4(m)
     ),
     value_knob!(
         "attn_d512_workspace_mib",
@@ -442,7 +642,8 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         &[0, 1, 2, 4],
         true,
         Wl::AttentionPrefillDeep,
-        bit_affecting = true
+        bit_affecting = true,
+        applies = gqa4
     ),
     value_knob!(
         "attn_softmax_warps",
@@ -450,7 +651,8 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         &[0, 1, 2, 4, 8],
         true,
         Wl::AttentionDecode,
-        bit_affecting = true
+        bit_affecting = true,
+        applies = small_attention_heads
     ),
     value_knob!(
         "attn_value_tiles",
@@ -459,7 +661,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         true,
         Wl::AttentionDecode,
         bit_affecting = false,
-        applies = |m| m.head_dim != 64
+        applies = |m| m.head_dim != 64 && small_attention_heads(m)
     ),
     value_knob!(
         "attn_stream_part_cap",
@@ -467,7 +669,8 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         &[0, 4, 8, 12, 16, 24, 32],
         false,
         Wl::AttentionDecodeDeep,
-        bit_affecting = true
+        bit_affecting = true,
+        applies = small_attention_heads
     ),
     value_knob!(
         "narrow_gemv_warps",
@@ -476,6 +679,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         true,
         Wl::DecodeMix,
         bit_affecting = true,
+        applies = legacy_projection_knobs,
         tuple = "decode_mmvq"
     ),
     value_knob!(
@@ -495,6 +699,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::DecodeMix,
         bit_affecting = true,
+        applies = legacy_projection_knobs,
         tuple = "decode_mmvq"
     ),
     value_knob!(
@@ -540,6 +745,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::PrefillGemm,
         bit_affecting = true,
+        applies = legacy_projection_knobs,
         tuple = "prefill_mmq"
     ),
     value_knob!(
@@ -549,6 +755,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::PrefillGemm,
         bit_affecting = true,
+        applies = legacy_projection_knobs,
         tuple = "prefill_mmq"
     ),
     value_knob!(
@@ -558,6 +765,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::PrefillGemm,
         bit_affecting = true,
+        applies = legacy_projection_knobs,
         tuple = "prefill_mmq"
     ),
     value_knob!(
@@ -567,6 +775,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::PrefillGemm,
         bit_affecting = true,
+        applies = legacy_projection_knobs,
         tuple = "prefill_mmq"
     ),
     value_knob!(
@@ -575,16 +784,17 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         &[0, 1],
         false,
         Wl::DecodeMix,
-        bit_affecting = true
+        bit_affecting = true,
+        applies = legacy_projection_knobs
     ),
     value_knob!(
         "attn_d256_tiled",
         SLOT_ATTN_D256_TILED,
-        &[0, 1],
+        &[0, 1, 2],
         false,
         Wl::AttentionPrefillDeep,
         bit_affecting = true,
-        applies = |m| m.head_dim == 256
+        applies = |m| m.head_dim == 256 && (gqa4(m) || (m.n_head == 24 && m.n_kv == 4))
     ),
     value_knob!(
         "attn_d256_vec",
@@ -593,7 +803,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::AttentionDecodeDeep,
         bit_affecting = true,
-        applies = |m| m.head_dim == 256
+        applies = |m| m.head_dim == 256 && gqa4(m)
     ),
     value_knob!(
         "attn_d256_virtual_stream",
@@ -602,7 +812,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::AttentionPrefillDeep,
         bit_affecting = true,
-        applies = |m| m.head_dim == 256
+        applies = |m| m.head_dim == 256 && gqa4(m)
     ),
     value_knob!(
         "attn_d256_fused",
@@ -611,7 +821,7 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         false,
         Wl::AttentionPrefillDeep,
         bit_affecting = true,
-        applies = |m| m.head_dim == 256
+        applies = |m| m.head_dim == 256 && gqa4(m)
     ),
     value_knob!(
         "attn_d512_mma",
@@ -643,10 +853,14 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
     value_knob!(
         "attn_decode_specialized",
         SLOT_ATTN_DECODE_SPECIALIZED,
-        &[0, 1],
+        // Modes 0/1 keep their original meaning; mode 2 additionally allows the
+        // bounded GQA6 M1/F16 route. Native code owns KV/capture/runtime guards.
+        &[0, 1, 2],
         false,
         Wl::AttentionDecodeDeep,
-        bit_affecting = true
+        bit_affecting = true,
+        applies = |m| small_attention_heads(m)
+            || (m.head_dim == 256 && m.n_head == 24 && m.n_kv == 4)
     ),
     value_knob!(
         "attn_d64_mma_prefill",
@@ -1303,6 +1517,140 @@ pub static CUDA_KNOBS: &[KnobDecl] = &[
         workload: Wl::PrefillFfnTransaction,
     },
     KnobDecl {
+        name: E4B_FFN_W4A16_KNOB,
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &[],
+        cross_check: None,
+        // Facts only filter the model domain. Native admission still proves all
+        // 42 Q4 FFNs, GELU/resident layout, SM86/30SM and the frozen provider.
+        applies: Some(|m| {
+            cfg!(all(feature = "cuda-speculative", target_os = "windows"))
+                && m.n_experts == 0
+                && m.n_layers == 42
+                && m.n_embd == 2560
+                && m.n_ff == 10240
+                && m.weight_kinds & (1 << 1) != 0
+        }),
+        tuple: None,
+        category: KnobCategory::EndToEnd,
+        // 1 restores canonical Prefill; 2 reuses packed weights only in domain1.
+        values: &[0, 1, 2],
+        apply: apply_e4b_ffn_w4a16,
+        current: e4b_ffn_w4a16_value,
+        screened: false,
+        sweep: Sw::External,
+        // The existing M1 micro-workload is only a label here: External prevents
+        // it from selecting the M1 and M3 numerical families independently.
+        workload: Wl::DecodeFfnTransaction,
+    },
+    KnobDecl {
+        name: WEIGHT_TRANSFER_POLICY_KNOB,
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &[],
+        cross_check: None,
+        applies: None,
+        tuple: None,
+        category: KnobCategory::EndToEnd,
+        values: &[0, 1],
+        apply: apply_weight_transfer_policy,
+        current: weight_transfer_policy_value,
+        screened: false,
+        sweep: Sw::External,
+        workload: Wl::DecodeFfnTransaction,
+    },
+    KnobDecl {
+        name: PTQ_PREFILL_TENSORCORE_KNOB,
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &[],
+        cross_check: None,
+        // Shape filter only. Native route evidence and independent numerical plus
+        // complete-model quality admission remain required before promotion.
+        applies: Some(|m| {
+            m.n_experts == 0
+                && m.n_embd == 5120
+                && m.n_ff == 17408
+                && m.weight_kinds & (1_u64 << 39) != 0
+        }),
+        tuple: None,
+        category: KnobCategory::EndToEnd,
+        values: &[0, 1, 2, 3],
+        apply: apply_ptq_prefill_tensorcore,
+        current: ptq_prefill_tensorcore_value,
+        screened: false,
+        sweep: Sw::External,
+        workload: Wl::PrefillGemm,
+    },
+    KnobDecl {
+        name: E4B_RETAINED_DECODE_POLICY_KNOB,
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &[],
+        cross_check: None,
+        // Facts only filter the model domain. Native admission still proves all
+        // 42 Q4 FFNs, resident layout, SM86/30SM and Q4 KV before execution.
+        applies: Some(|m| {
+            cfg!(all(feature = "cuda-speculative", target_os = "windows"))
+                && m.n_experts == 0
+                && m.n_layers == 42
+                && m.n_embd == 2560
+                && m.n_ff == 10240
+                && m.n_head == 8
+                && m.n_kv == 2
+                && m.head_dim == 256
+                && m.deep_head_dim == 512
+                && m.weight_kinds & (1 << 1) != 0
+        }),
+        tuple: None,
+        category: KnobCategory::EndToEnd,
+        values: &[0, 1],
+        apply: apply_e4b_retained_decode_policy,
+        current: e4b_retained_decode_policy_value,
+        screened: false,
+        sweep: Sw::External,
+        // The existing M1 micro-workload is only a label here: External prevents
+        // it from selecting the M1 and M3 numerical families independently.
+        workload: Wl::DecodeFfnTransaction,
+    },
+    KnobDecl {
+        name: LFM_RETAINED_EXECUTION_KNOB,
+        legal: None,
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &[],
+        cross_check: None,
+        applies: Some(|m| {
+            cfg!(all(feature = "cuda-speculative", target_os = "windows"))
+                && m.n_experts == 0
+                && m.n_layers == 30
+                && m.n_embd == 2048
+                && m.n_ff == 10752
+                && m.n_head == 32
+                && m.n_kv == 8
+                && m.head_dim == 64
+                && m.weight_kinds & (1 << 3) != 0
+        }),
+        tuple: None,
+        category: KnobCategory::EndToEnd,
+        values: &[0, 1],
+        apply: crate::lfm_retained::apply,
+        current: crate::lfm_retained::current,
+        screened: false,
+        sweep: Sw::External,
+        workload: Wl::DecodeFfnTransaction,
+    },
+    KnobDecl {
         name: FINITE_HISTORY_KNOB,
         legal: None,
         bit_affecting: true,
@@ -1509,6 +1857,125 @@ mod tests {
     }
 
     #[test]
+    fn unified_w4a16_ffn_is_one_external_workflow_policy() {
+        let d = CUDA_KNOBS
+            .iter()
+            .find(|d| d.name == E4B_FFN_W4A16_KNOB)
+            .unwrap();
+        assert!(is_workflow_knob(d.name));
+        assert_eq!(slot_for_name(d.name), None);
+        assert_eq!(d.values, &[0, 1, 2]);
+        assert!(d.bit_affecting);
+        assert_eq!(d.category, KnobCategory::EndToEnd);
+        assert_eq!(d.sweep, Sw::External);
+        assert_eq!(d.workload, Wl::DecodeFfnTransaction);
+        assert!(d.derive.is_none() && d.candidates.is_none() && d.tuple.is_none());
+        let applies = d.applies.unwrap();
+        let base = imparo_backend::ModelFacts {
+            n_embd: 2560,
+            n_ff: 10240,
+            n_head: 8,
+            n_kv: 2,
+            head_dim: 256,
+            deep_head_dim: 512,
+            n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
+            n_layers: 42,
+            layer_dispatches: 0,
+            weight_kinds: 1 << 1,
+            mega_seat: imparo_backend::MegaSeat::None,
+        };
+        assert_eq!(
+            applies(&base),
+            cfg!(all(feature = "cuda-speculative", target_os = "windows"))
+        );
+        assert!(!applies(&imparo_backend::ModelFacts {
+            n_embd: 2048,
+            ..base
+        }));
+        assert!(!applies(&imparo_backend::ModelFacts { n_ff: 8192, ..base }));
+        assert!(!applies(&imparo_backend::ModelFacts {
+            n_layers: 41,
+            ..base
+        }));
+        assert!(!applies(&imparo_backend::ModelFacts {
+            n_experts: 1,
+            experts_used: 0,
+            windowed_layers: 0,
+            ..base
+        }));
+        assert!(!applies(&imparo_backend::ModelFacts {
+            weight_kinds: 1 << 2,
+            ..base
+        }));
+    }
+
+    #[test]
+    fn retained_e4b_is_one_external_policy_not_a_native_slot() {
+        let d = CUDA_KNOBS
+            .iter()
+            .find(|d| d.name == E4B_RETAINED_DECODE_POLICY_KNOB)
+            .unwrap();
+        assert!(is_workflow_knob(d.name));
+        assert_eq!(slot_for_name(d.name), None);
+        assert_eq!(d.values, &[0, 1]);
+        assert!(d.bit_affecting);
+        assert_eq!(d.category, KnobCategory::EndToEnd);
+        assert_eq!(d.sweep, Sw::External);
+        assert_eq!(d.workload, Wl::DecodeFfnTransaction);
+        assert!(d.derive.is_none() && d.candidates.is_none() && d.tuple.is_none());
+        let applies = d.applies.unwrap();
+        let base = imparo_backend::ModelFacts {
+            n_embd: 2560,
+            n_ff: 10240,
+            n_head: 8,
+            n_kv: 2,
+            head_dim: 256,
+            deep_head_dim: 512,
+            n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
+            n_layers: 42,
+            layer_dispatches: 0,
+            weight_kinds: 1 << 1,
+            mega_seat: imparo_backend::MegaSeat::None,
+        };
+        assert_eq!(
+            applies(&base),
+            cfg!(all(feature = "cuda-speculative", target_os = "windows"))
+        );
+        assert!(!applies(&imparo_backend::ModelFacts {
+            n_embd: 2048,
+            ..base
+        }));
+        assert!(!applies(&imparo_backend::ModelFacts { n_ff: 8192, ..base }));
+        assert!(!applies(&imparo_backend::ModelFacts {
+            n_layers: 41,
+            ..base
+        }));
+        assert!(!applies(&imparo_backend::ModelFacts {
+            n_experts: 1,
+            experts_used: 0,
+            windowed_layers: 0,
+            ..base
+        }));
+        assert!(!applies(&imparo_backend::ModelFacts {
+            weight_kinds: 1 << 2,
+            ..base
+        }));
+    }
+
+    #[test]
+    fn unified_w4a16_policy_apply_errors_reach_prepare_unchanged() {
+        assert_eq!(e4b_ffn_w4a16_status_result(0), Ok(()));
+        // The optional dynamic bridge's missing-symbol result must not enable a
+        // policy or become a successful phase preparation; native refusal too.
+        assert_eq!(e4b_ffn_w4a16_status_result(-70), Err(-70));
+        assert_eq!(e4b_ffn_w4a16_status_result(1), Err(1));
+    }
+
+    #[test]
     fn registry_covers_each_consumed_slot_once() {
         let native: Vec<_> = CUDA_KNOBS
             .iter()
@@ -1608,7 +2075,7 @@ mod tests {
 
     #[test]
     fn registry_bump_invalidates_pre_boundary_cuda_configs() {
-        assert_eq!(CUDA_SPACE_VERSION, 68);
+        assert_eq!(CUDA_SPACE_VERSION, 79);
     }
 
     #[test]
@@ -1741,6 +2208,8 @@ mod tests {
             head_dim: 64,
             deep_head_dim: 64,
             n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
             n_layers: 30,
             layer_dispatches: 30,
             weight_kinds: 1 << 2,
@@ -1857,7 +2326,7 @@ mod tests {
             .find(|decl| decl.name == "attn_decode_specialized")
             .expect("decode specialization registry entry");
         assert!(decl.bit_affecting);
-        assert_eq!(decl.values, &[0, 1]);
+        assert_eq!(decl.values, &[0, 1, 2]);
         assert_eq!(decl.workload, Wl::AttentionDecodeDeep);
 
         let native = include_str!("../native/imparo_cuda.cu");
@@ -1905,6 +2374,8 @@ mod tests {
             head_dim: 64,
             deep_head_dim: 64,
             n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
             n_layers: 0,
             layer_dispatches: 0,
             weight_kinds: 0,
@@ -1918,6 +2389,8 @@ mod tests {
             head_dim: 256,
             deep_head_dim: 256,
             n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
             n_layers: 0,
             layer_dispatches: 0,
             weight_kinds: 0,
@@ -1946,6 +2419,8 @@ mod tests {
             head_dim: 64,
             deep_head_dim: 64,
             n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
             n_layers: 0,
             layer_dispatches: 0,
             weight_kinds: 0,
@@ -1984,6 +2459,8 @@ mod tests {
             head_dim: 64,
             deep_head_dim: 64,
             n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
             n_layers: 30,
             layer_dispatches: 9,
             weight_kinds: 1 << 3,
@@ -2026,6 +2503,8 @@ mod tests {
             head_dim: 64,
             deep_head_dim: 64,
             n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
             n_layers: 30,
             layer_dispatches: 0,
             weight_kinds: 1 << 2,
@@ -2089,6 +2568,8 @@ mod tests {
             head_dim: 64,
             deep_head_dim: 64,
             n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
             n_layers: 30,
             layer_dispatches: 0,
             weight_kinds: 1 << 3,
@@ -2167,6 +2648,8 @@ mod tests {
             head_dim: 64,
             deep_head_dim: 64,
             n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
             n_layers: 30,
             layer_dispatches: 0,
             weight_kinds: 1 << 3,
@@ -2190,7 +2673,14 @@ mod tests {
             .find(|decl| decl.name == "attn_d64_mma_prefill")
             .expect("D64 MMA prefill registry entry");
         assert!(decl.bit_affecting);
-        assert_eq!(decl.values, &[0, 1]);
+        assert_eq!(
+            decl.values,
+            if cfg!(feature = "cuda-speculative") {
+                &[0, 1, 2][..]
+            } else {
+                &[0, 1][..]
+            }
+        );
         assert_eq!(decl.workload, Wl::AttentionPrefillDeep);
         assert!(decl.applies.is_some());
 
@@ -2281,5 +2771,166 @@ mod tests {
         assert_eq!(decl.after, &["prefill_exact128_sm86_route"]);
         assert_eq!((decl.current)(), 0);
         assert!(decl.applies.is_some());
+    }
+}
+
+#[cfg(test)]
+mod ptq_tuner_tests {
+    use super::*;
+    fn facts() -> imparo_backend::ModelFacts {
+        imparo_backend::ModelFacts {
+            n_embd: 5120,
+            n_ff: 17408,
+            n_head: 24,
+            n_kv: 4,
+            head_dim: 256,
+            deep_head_dim: 256,
+            n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
+            n_layers: 64,
+            layer_dispatches: 18,
+            weight_kinds: (1_u64 << 39) | (1_u64 << 40),
+            mega_seat: imparo_backend::MegaSeat::None,
+        }
+    }
+    fn applies(name: &str, m: &imparo_backend::ModelFacts) -> bool {
+        CUDA_KNOBS
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap()
+            .applies
+            .is_none_or(|f| f(m))
+    }
+    #[test]
+    fn ptq_tensorcore_is_external_receipt_bound_and_shape_filtered() {
+        let d = CUDA_KNOBS
+            .iter()
+            .find(|d| d.name == PTQ_PREFILL_TENSORCORE_KNOB)
+            .unwrap();
+        assert_eq!(slot_for_name(d.name), None);
+        assert!(is_workflow_knob(d.name));
+        assert!(d.bit_affecting);
+        assert_eq!(d.category, KnobCategory::EndToEnd);
+        assert_eq!(d.sweep, Sw::External);
+        assert_eq!(d.workload, Wl::PrefillGemm);
+        assert_eq!(d.values, &[0, 1, 2, 3]);
+        let mut m = facts();
+        assert!(applies(d.name, &m));
+        for kind in [0, 1, 2, 3, 40] {
+            m.weight_kinds = 1_u64 << kind;
+            assert!(!applies(d.name, &m));
+        }
+        m = facts();
+        m.n_embd = 2560;
+        assert!(!applies(d.name, &m));
+        m = facts();
+        m.n_ff = 10752;
+        assert!(!applies(d.name, &m));
+        m = facts();
+        m.n_experts = 8;
+        assert!(!applies(d.name, &m));
+    }
+    #[test]
+    fn gqa6_skips_unreachable_attention_and_legacy_projection_knobs() {
+        let m = facts();
+        for name in [
+            "attn_d256_workspace_mib",
+            "attn_d256_vec",
+            "attn_d256_virtual_stream",
+            "attn_d256_fused",
+            "attn_score_key_groups",
+            "attn_softmax_warps",
+            "attn_value_tiles",
+            "attn_stream_part_cap",
+            "gemv_warps",
+            "narrow_gemv_warps",
+            "narrow_gemv_max_width",
+            "mmq_full_rows",
+            "mmq_full_tile_min_efficiency",
+            "streamk_numeric",
+            "mmq_llama_compat",
+            "mmq_virtual_512",
+            "mmq_canonical_full_tile",
+            "rms_threads",
+            "rms_norm_add",
+        ] {
+            assert!(!applies(name, &m), "unreachable {name}");
+        }
+        assert!(applies("attn_threads", &m));
+    }
+    #[test]
+    fn gqa6_prefill_mode2_keeps_existing_slot_and_exact_geometry() {
+        let name = "attn_d256_tiled";
+        let d = CUDA_KNOBS.iter().find(|d| d.name == name).unwrap();
+        assert_eq!(slot_for_name(name), Some(29));
+        assert_eq!(d.values, &[0, 1, 2]);
+        assert_eq!(d.workload, Wl::AttentionPrefillDeep);
+        assert!(d.bit_affecting);
+        assert!(applies(name, &facts()));
+        for (h, k, dim) in [(12, 2, 256), (48, 8, 256), (24, 4, 512), (24, 0, 256)] {
+            let mut m = facts();
+            m.n_head = h;
+            m.n_kv = k;
+            m.head_dim = dim;
+            assert!(!applies(name, &m));
+        }
+        let mut m = facts();
+        m.n_head = 16;
+        assert!(applies(name, &m));
+    }
+    #[test]
+    fn gqa6_mode2_extends_only_the_exact_decode_geometry() {
+        let name = "attn_decode_specialized";
+        let d = CUDA_KNOBS.iter().find(|d| d.name == name).unwrap();
+        assert_eq!(slot_for_name(name), Some(36));
+        assert!(!is_workflow_knob(name));
+        assert_eq!(d.values, &[0, 1, 2]);
+        assert_eq!(d.sweep, Sw::Values);
+        assert_eq!(d.workload, Wl::AttentionDecodeDeep);
+        assert!(d.bit_affecting);
+        assert!(d.legal.is_none() && d.candidates.is_none());
+        assert!(applies(name, &facts()));
+        for (heads, kv, dim) in [
+            (12, 2, 256),
+            (48, 8, 256),
+            (24, 4, 64),
+            (24, 4, 512),
+            (24, 3, 256),
+            (24, 0, 256),
+            (24, u32::MAX, 256),
+        ] {
+            let mut m = facts();
+            m.n_head = heads;
+            m.n_kv = kv;
+            m.head_dim = dim;
+            assert!(
+                !applies(name, &m),
+                "unsupported geometry {heads}/{kv}/D{dim}"
+            );
+        }
+        // Preserve the previously supported GQA4 and D256 GQA2 geometries.
+        for heads in [16, 8] {
+            let mut m = facts();
+            m.n_head = heads;
+            assert!(applies(name, &m));
+        }
+    }
+    #[test]
+    fn known_q4_q8_domains_remain_eligible_and_invalid_heads_fail_closed() {
+        let mut m = facts();
+        m.n_head = 16;
+        assert!(applies("attn_d256_tiled", &m));
+        for kind in [1, 2, 3] {
+            m.weight_kinds = 1_u64 << kind;
+            assert!(applies("gemv_warps", &m));
+            assert!(applies("mmq_full_rows", &m));
+        }
+        m.n_kv = 0;
+        assert!(!gqa4(&m));
+        assert!(!small_attention_heads(&m));
+        m.n_kv = u32::MAX;
+        assert!(!gqa4(&m));
+        assert!(!small_attention_heads(&m));
     }
 }

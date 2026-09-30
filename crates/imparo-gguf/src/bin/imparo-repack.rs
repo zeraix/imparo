@@ -137,7 +137,7 @@ fn plan_tensors(
             Ok(rule) => {
                 if opts.only.as_deref().is_some_and(|k| k != rule.from_name) {
                     kept.push((t.name.clone(), rule.from_name, "kept by --only"));
-                } else if rule.readers.is_empty() && !opts.write_unread {
+                } else if !rule.has_readers_for(&t.dimensions) && !opts.write_unread {
                     kept.push((t.name.clone(), rule.from_name, "no backend reads the tile-major kind yet (--write-unread to write it)"));
                 } else {
                     plan.push((t.clone(), rule));

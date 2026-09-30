@@ -2,6 +2,85 @@
 
 use core::ffi::c_void;
 
+// Source-build bring-up interface; dynamic releases retain their existing ABI and
+// advertise no Bonsai/DeltaNet capability until native admission is complete.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GatedDeltaWire {
+    pub a_off: u64,
+    pub dt_off: u64,
+    pub qkv: u32,
+    pub alpha: u32,
+    pub beta: u32,
+    pub state: u32,
+    pub state_off: u32,
+    pub state_out_off: u32,
+    pub out: u32,
+    pub snap: u32,
+    pub snap_off: u32,
+    pub snap_row: u32,
+    pub k_heads: u32,
+    pub v_heads: u32,
+    pub key_dim: u32,
+    pub value_dim: u32,
+    pub n_tok: u32,
+    pub eps: f32,
+}
+#[cfg(feature = "cuda-static")]
+unsafe extern "C" {
+    // Static-only extension: runtime-loaded backends retain the existing row-copy ABI.
+    pub(crate) fn imparo_cuda_copy_strided(
+        dst: u32,
+        src: u32,
+        width: u32,
+        src_off: u32,
+        src_stride: u32,
+        n_row: u32,
+    );
+    pub(crate) fn imparo_cuda_set_placement_reserve(bytes: u64) -> i32;
+    pub(crate) fn imparo_cuda_weight_basis_register(
+        offset: u64,
+        width: u32,
+        block: u32,
+        inverse: u32,
+        head_dim: u32,
+        key_heads: u32,
+        value_heads: u32,
+        signs: *const i8,
+    ) -> i32;
+    pub(crate) fn imparo_cuda_delta_net_run(op: *const GatedDeltaWire) -> i32;
+    pub(crate) fn imparo_cuda_plain_conv(
+        src: u32,
+        w_off: u64,
+        state: u32,
+        state_off: u32,
+        state_out_off: u32,
+        out: u32,
+        width: u32,
+        kernel: u32,
+        n_tok: u32,
+    );
+    pub(crate) fn imparo_cuda_plain_conv_snapshot(
+        src: u32,
+        state: u32,
+        state_off: u32,
+        snap: u32,
+        snap_off: u32,
+        width: u32,
+        kernel: u32,
+        n_tok: u32,
+    );
+    pub(crate) fn imparo_cuda_mul_strided_sigmoid(
+        a: u32,
+        b: u32,
+        width: u32,
+        b_off: u32,
+        b_stride: u32,
+        a_stride: u32,
+        n_rows: u32,
+    );
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RuntimeIdentityWire {
@@ -536,6 +615,36 @@ mod imp {
         pub(crate) fn imparo_cuda_device_tag(dst: *mut u8, len: u32) -> u32;
         pub(crate) fn imparo_cuda_begin();
         pub(crate) fn imparo_cuda_begin_forward(decode: u32);
+        pub(crate) fn imparo_cuda_prepare_projection_phase(
+            decode_or_verify: u32,
+        ) -> i32;
+        pub(crate) fn imparo_cuda_set_weight_transfer_policy(value: u32) -> i32;
+        pub(crate) fn imparo_cuda_weight_transfer_policy() -> u32;
+        pub(crate) fn imparo_cuda_set_ptq_prefill_tensorcore(value: u32) -> i32;
+        pub(crate) fn imparo_cuda_ptq_prefill_tensorcore() -> u32;
+        pub(crate) fn imparo_cuda_set_e4b_ffn_w4a16(value: u32) -> i32;
+        pub(crate) fn imparo_cuda_e4b_ffn_w4a16() -> u32;
+        pub(crate) fn imparo_cuda_set_e4b_retained_decode_policy(value: u32) -> i32;
+        pub(crate) fn imparo_cuda_e4b_retained_decode_policy() -> u32;
+        pub(crate) fn imparo_cuda_prepare_e4b_retained_decode_policy(
+            capacity: u32,
+            hidden: u32,
+            mid: u32,
+            layers: u32,
+            heads: u32,
+            kv_heads: u32,
+        ) -> i32;
+        #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
+        pub(crate) fn imparo_cuda_load_e4b_ffn_w4a16(
+            image: *const u8,
+            bytes: u64,
+            digest: *const u8,
+        ) -> i32;
+        #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
+        pub(crate) fn imparo_cuda_e4b_ffn_w4a16_module_identity(
+            out: *mut u8,
+            bytes: u32,
+        ) -> i32;
         pub(crate) fn imparo_cuda_set_materialized_prefill_tail(
             absolute_start: u64,
             active_tokens: u32,
@@ -659,6 +768,14 @@ mod imp {
         ) -> i32;
         pub(crate) fn imparo_cuda_write(id: u32, off: u64, src: *const f32, n: u64);
         pub(crate) fn imparo_cuda_write_u32(id: u32, off: u64, src: *const u32, n: u64);
+        #[cfg(feature = "cuda-speculative")]
+        pub(crate) fn imparo_cuda_gate_transfer_f32(
+            id: u32,
+            off: u64,
+            host: *mut f32,
+            n: u64,
+            upload: u32,
+        ) -> i32;
         pub(crate) fn imparo_cuda_read(id: u32, off: u64, dst: *mut f32, n: u64);
         pub(crate) fn imparo_cuda_read_kv(
             layer: u32,
@@ -1032,6 +1149,20 @@ mod imp {
             dst: u32,
             n_tok: u32,
         );
+        pub(crate) fn imparo_cuda_ple_norm_gather_combine_prefix(
+            proj: u32,
+            tokens: u32,
+            norm_offset: u64,
+            table_offset: u64,
+            ple_width: u32,
+            output_layers: u32,
+            source_width: u32,
+            input_scale: f32,
+            eps: f32,
+            emb_scale: f32,
+            comb_scale: f32,
+            n_tok: u32,
+        );
         pub(crate) fn imparo_cuda_ple_gather_combine_prefix(
             proj: u32,
             tokens_buf: u32,
@@ -1084,6 +1215,7 @@ mod imp_dynamic {
             imparo_cuda_device_tag(dst: *mut u8, len: u32) -> u32 = 0;
             imparo_cuda_begin() -> () = ();
             imparo_cuda_begin_forward(decode: u32) -> () = ();
+            imparo_cuda_prepare_projection_phase(decode_or_verify: u32) -> i32 = 0;
             imparo_cuda_set_materialized_prefill_tail(absolute_start: u64, active_tokens: u32) -> i32 = LOAD_ERROR;
             imparo_cuda_set_batch_geometry(absolute_start: u64, active_tokens: u32, phase: u32, canonical_start: u64, canonical_tokens: u32) -> i32 = LOAD_ERROR;
             imparo_cuda_decode_prepare(token: u32, start_pos: u32, argmax: u32) -> i32 = 0;
@@ -1162,6 +1294,7 @@ mod imp_dynamic {
             imparo_cuda_argmax(src: u32, dst: u32, n: u32) -> () = ();
             imparo_cuda_row(wkind: u32, w_off: u64, width: u32, index: u32, scale: f32, dst: u32, dst_off: u32) -> () = ();
             imparo_cuda_rows(wkind: u32, w_off: u64, width: u32, table_rows: u32, tokens_buf: u32, scale: f32, dst: u32, n_tok: u32) -> () = ();
+            imparo_cuda_ple_norm_gather_combine_prefix(proj: u32, tokens: u32, norm_offset: u64, table_offset: u64, ple_width: u32, output_layers: u32, source_width: u32, input_scale: f32, eps: f32, emb_scale: f32, comb_scale: f32, n_tok: u32) -> () = ();
             imparo_cuda_ple_gather_combine_prefix(proj: u32, tokens_buf: u32, w_offset: u64, source_width: u32, output_width: u32, emb_scale: f32, comb_scale: f32, n_tok: u32) -> () = ();
             imparo_cuda_ple_gather_combine(proj: u32, tokens_buf: u32, w_offset: u64, width: u32, emb_scale: f32, comb_scale: f32, n_tok: u32) -> () = ();
         } };
@@ -1219,6 +1352,173 @@ mod imp_dynamic {
         };
     }
     fields!(declare_api);
+
+    // Optional extension: old dynamic libraries stay valid with policy disabled.
+    type WeightTransferSetFn = unsafe extern "C" fn(u32) -> i32;
+    type WeightTransferGetFn = unsafe extern "C" fn() -> u32;
+    fn weight_transfer_fns() -> Option<(WeightTransferSetFn, WeightTransferGetFn)> {
+        static FUNCTIONS: OnceLock<Option<(WeightTransferSetFn, WeightTransferGetFn)>> =
+            OnceLock::new();
+        *FUNCTIONS.get_or_init(|| {
+            let api = api().ok()?;
+            let set = api
+                ._library
+                .symbol(b"imparo_cuda_set_weight_transfer_policy\0")
+                .ok()?;
+            let get = api
+                ._library
+                .symbol(b"imparo_cuda_weight_transfer_policy\0")
+                .ok()?;
+            Some(unsafe {
+                (
+                    std::mem::transmute::<*mut c_void, WeightTransferSetFn>(set),
+                    std::mem::transmute::<*mut c_void, WeightTransferGetFn>(get),
+                )
+            })
+        })
+    }
+    pub(crate) unsafe fn imparo_cuda_set_weight_transfer_policy(value: u32) -> i32 {
+        match weight_transfer_fns() {
+            Some((set, _)) => unsafe { set(value) },
+            None if value == 0 => 0,
+            None => LOAD_ERROR,
+        }
+    }
+    pub(crate) unsafe fn imparo_cuda_weight_transfer_policy() -> u32 {
+        weight_transfer_fns().map_or(0, |(_, get)| unsafe { get() })
+    }
+
+    type PtqPrefillSetFn = unsafe extern "C" fn(u32) -> i32;
+    type PtqPrefillGetFn = unsafe extern "C" fn() -> u32;
+    fn ptq_prefill_fns() -> Option<(PtqPrefillSetFn, PtqPrefillGetFn)> {
+        static FUNCTIONS: OnceLock<Option<(PtqPrefillSetFn, PtqPrefillGetFn)>> =
+            OnceLock::new();
+        *FUNCTIONS.get_or_init(|| {
+            let api = api().ok()?;
+            let set = api
+                ._library
+                .symbol(b"imparo_cuda_set_ptq_prefill_tensorcore\0")
+                .ok()?;
+            let get = api
+                ._library
+                .symbol(b"imparo_cuda_ptq_prefill_tensorcore\0")
+                .ok()?;
+            Some(unsafe {
+                (
+                    std::mem::transmute::<*mut c_void, PtqPrefillSetFn>(set),
+                    std::mem::transmute::<*mut c_void, PtqPrefillGetFn>(get),
+                )
+            })
+        })
+    }
+    pub(crate) unsafe fn imparo_cuda_set_ptq_prefill_tensorcore(value: u32) -> i32 {
+        match ptq_prefill_fns() {
+            Some((set, _)) => unsafe { set(value) },
+            None if value == 0 => 0,
+            None => LOAD_ERROR,
+        }
+    }
+    pub(crate) unsafe fn imparo_cuda_ptq_prefill_tensorcore() -> u32 {
+        ptq_prefill_fns().map_or(0, |(_, get)| unsafe { get() })
+    }
+
+    type E4bFfnW4a16SetFn = unsafe extern "C" fn(u32) -> i32;
+    type E4bFfnW4a16GetFn = unsafe extern "C" fn() -> u32;
+    fn e4b_ffn_w4a16_fns() -> Option<(E4bFfnW4a16SetFn, E4bFfnW4a16GetFn)> {
+        static FUNCTIONS: OnceLock<Option<(E4bFfnW4a16SetFn, E4bFfnW4a16GetFn)>> =
+            OnceLock::new();
+        *FUNCTIONS.get_or_init(|| {
+            let api = api().ok()?;
+            let set = api
+                ._library
+                .symbol(b"imparo_cuda_set_e4b_ffn_w4a16\0")
+                .ok()?;
+            let get = api._library.symbol(b"imparo_cuda_e4b_ffn_w4a16\0").ok()?;
+            Some(unsafe {
+                (
+                    std::mem::transmute::<*mut c_void, E4bFfnW4a16SetFn>(set),
+                    std::mem::transmute::<*mut c_void, E4bFfnW4a16GetFn>(get),
+                )
+            })
+        })
+    }
+    pub(crate) unsafe fn imparo_cuda_set_e4b_ffn_w4a16(value: u32) -> i32 {
+        match e4b_ffn_w4a16_fns() {
+            Some((set, _)) => unsafe { set(value) },
+            None if value == 0 => 0, // Legacy needs no optional provider.
+            None => LOAD_ERROR,
+        }
+    }
+    pub(crate) unsafe fn imparo_cuda_e4b_ffn_w4a16() -> u32 {
+        e4b_ffn_w4a16_fns().map_or(0, |(_, get)| unsafe { get() })
+    }
+
+    type E4bRetainedDecodePolicySetFn = unsafe extern "C" fn(u32) -> i32;
+    type E4bRetainedDecodePolicyGetFn = unsafe extern "C" fn() -> u32;
+    fn e4b_retained_decode_policy_fns()
+    -> Option<(E4bRetainedDecodePolicySetFn, E4bRetainedDecodePolicyGetFn)> {
+        static FUNCTIONS: OnceLock<
+            Option<(E4bRetainedDecodePolicySetFn, E4bRetainedDecodePolicyGetFn)>,
+        > = OnceLock::new();
+        *FUNCTIONS.get_or_init(|| {
+            let api = api().ok()?;
+            let set = api
+                ._library
+                .symbol(b"imparo_cuda_set_e4b_retained_decode_policy\0")
+                .ok()?;
+            let get = api
+                ._library
+                .symbol(b"imparo_cuda_e4b_retained_decode_policy\0")
+                .ok()?;
+            Some(unsafe {
+                (
+                    std::mem::transmute::<*mut c_void, E4bRetainedDecodePolicySetFn>(
+                        set,
+                    ),
+                    std::mem::transmute::<*mut c_void, E4bRetainedDecodePolicyGetFn>(
+                        get,
+                    ),
+                )
+            })
+        })
+    }
+    pub(crate) unsafe fn imparo_cuda_set_e4b_retained_decode_policy(value: u32) -> i32 {
+        match e4b_retained_decode_policy_fns() {
+            Some((set, _)) => unsafe { set(value) },
+            None if value == 0 => 0, // Legacy needs no optional provider.
+            None => LOAD_ERROR,
+        }
+    }
+    pub(crate) unsafe fn imparo_cuda_e4b_retained_decode_policy() -> u32 {
+        e4b_retained_decode_policy_fns().map_or(0, |(_, get)| unsafe { get() })
+    }
+
+    type E4bRetainedPrepareFn =
+        unsafe extern "C" fn(u32, u32, u32, u32, u32, u32) -> i32;
+    pub(crate) unsafe fn imparo_cuda_prepare_e4b_retained_decode_policy(
+        capacity: u32,
+        hidden: u32,
+        mid: u32,
+        layers: u32,
+        heads: u32,
+        kv_heads: u32,
+    ) -> i32 {
+        if unsafe { imparo_cuda_e4b_retained_decode_policy() } == 0 {
+            return 0;
+        }
+        static FUNCTION: OnceLock<Option<E4bRetainedPrepareFn>> = OnceLock::new();
+        match FUNCTION.get_or_init(|| {
+            let api = api().ok()?;
+            let p = api
+                ._library
+                .symbol(b"imparo_cuda_prepare_e4b_retained_decode_policy\0")
+                .ok()?;
+            Some(unsafe { std::mem::transmute::<*mut c_void, E4bRetainedPrepareFn>(p) })
+        }) {
+            Some(f) => unsafe { f(capacity, hidden, mid, layers, heads, kv_heads) },
+            None => LOAD_ERROR,
+        }
+    }
 
     // Optional additive symbol: an older dynamic library keeps host verification.
     type GreedyVerificationFn =

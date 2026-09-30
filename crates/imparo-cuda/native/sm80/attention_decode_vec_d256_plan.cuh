@@ -77,6 +77,39 @@ IMPARO_D256_PLAN_HD constexpr uint32_t graph_bucket_max(
         ? value.schedule_span - 1 : UINT32_MAX;
 }
 
+// The verifier captures up to three causal rows, each with its own M1 plan.
+// Bound replay by the earliest row whose fixed partial geometry would change.
+IMPARO_D256_PLAN_HD constexpr bool verification_bucket_max(
+        uint32_t start, uint32_t row, uint32_t ring,
+        uint32_t captured_span, uint32_t captured_partials, uint32_t * upper) {
+    if (!upper || row > 2 || start > UINT32_MAX - 2) return false;
+    Geometry value;
+    if (!geometry(start + row, 1, ring, &value)
+        || start + row < graph_bucket_min(value)
+        || captured_span != value.schedule_span
+        || captured_partials != value.partials) return false;
+    const uint32_t limit = graph_bucket_max(value);
+    *upper = limit == UINT32_MAX ? UINT32_MAX - 2 : limit - row;
+    return *upper >= start;
+}
+
+// A shared three-query kernel may reuse a graph only while all original M1
+// rows have the captured geometry. In particular P3 ends at start765, not767.
+IMPARO_D256_PLAN_HD constexpr bool shared_verification_bucket_max(
+        uint32_t start, uint32_t ring, uint32_t span, uint32_t partials,
+        uint32_t * upper) {
+    if (!upper || start > UINT32_MAX - 3) return false;
+    uint32_t limit = UINT32_MAX - 3;
+    for (uint32_t row = 0; row < 3; ++row) {
+        uint32_t row_limit = 0;
+        if (!verification_bucket_max(start, row, ring, span, partials, &row_limit))
+            return false;
+        if (row_limit < limit) limit = row_limit;
+    }
+    *upper = limit;
+    return true;
+}
+
 IMPARO_D256_PLAN_HD constexpr bool mapping_is_exact_partition(
         uint32_t schedule_span, uint32_t partials) {
     if (!partials || partials > kMaxPartials

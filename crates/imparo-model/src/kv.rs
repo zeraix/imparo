@@ -473,8 +473,115 @@ pub use imparo_kv::identity::{model_digest, resume_point};
 pub use imparo_kv::resident::{set_scrambled_tables, window_regions};
 pub use imparo_kv::state::{KvRuntime, bounded_geometry, full_layers, window_slack};
 
-/// Slots the first allocation covers. Growth is by `kv_round` from here.
+/// Slots the first allocation covers. Growth is by `kv_commit_rows` from here.
 pub(crate) const KV_FIRST_SLOTS: usize = 512;
+
+/// What the KV storage has committed, and what a background preparation is getting ready
+/// (docs/memory-tiers-and-fit.md section 12). Positions for layers sized by position, blocks
+/// for the layers the pool places.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KvCommit {
+    /// The pool places the full-attention layers: their storage follows its blocks, and
+    /// `kv_fit` leaves them alone.
+    pub pooled: bool,
+    /// Blocks the pooled layers' storage covers.
+    pub pool_blocks: usize,
+    /// Positions the last preparation covers; 0 when none is pending.
+    pub prefetched: usize,
+    /// Blocks the last pooled preparation covers; 0 when none is pending.
+    pub pool_prefetched: usize,
+    /// Blocks the pool's device tier holds (`pool_capacity_blocks`); 0 until the device path
+    /// is prepared.
+    pub pool_capacity: usize,
+}
+
+/// Blocks the pool's device tier holds: the KV tier (what the fast tier has left once the
+/// weights are placed) less the state that is not pooled, over the bytes one block takes
+/// across the pooled layers -- and never fewer than one conversation at `capacity`, which
+/// is what the reserve guarantees. Without a tier: one conversation.
+#[must_use]
+pub fn pool_capacity_blocks(
+    plan: &crate::ModelPlan,
+    capacity: usize,
+    ring_batch: usize,
+    kv_tier: Option<u64>,
+    max_view: Option<u64>,
+) -> usize {
+    let page = imparo_kv::page_cells();
+    let one_context = capacity / page;
+    let Some(tier) = kv_tier else {
+        return one_context;
+    };
+    let geom = state_geometry(plan, ring_batch);
+    let full = || geom.iter().filter(|g| matches!(g.kind, StateKind::Full));
+    // As the storage is allocated: K and V each at the wider of the two rows.
+    let block_bytes: u64 = full()
+        .map(|g| 2 * g.k_stride.max(g.v_stride) as u64 * page as u64)
+        .sum();
+    if block_bytes == 0 {
+        return one_context;
+    }
+    // As the reserve counts it: the rest of the reserve is state the pool does not place.
+    let pooled_reserve: u64 = full()
+        .map(|g| (g.k_stride + g.v_stride) as u64 * capacity as u64)
+        .sum();
+    let not_pooled = crate::placement::kv_reserve_bytes(plan, capacity, ring_batch)
+        .saturating_sub(pooled_reserve);
+    let mut blocks = tier.saturating_sub(not_pooled) / block_bytes;
+    // No layer side's storage may pass the backend's largest view.
+    let widest_side: u64 = full()
+        .map(|g| g.k_stride.max(g.v_stride) as u64 * page as u64)
+        .max()
+        .unwrap_or(0);
+    if let (Some(max), true) = (max_view, widest_side > 0) {
+        blocks = blocks.min(max / widest_side);
+    }
+    // IMPARO_KV_POOL_PAGES: at most this many, never less than one context. A test
+    // instrument: a gate runs the pool out with a few requests instead of hundreds.
+    if let Some(cap) = std::env::var("IMPARO_KV_POOL_PAGES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        blocks = blocks.min(cap);
+    }
+    usize::try_from(blocks)
+        .unwrap_or(usize::MAX)
+        .max(one_context)
+}
+
+/// Per-layer address space to reserve at load: the pooled layers for `pool_blocks`, every
+/// other layer for one conversation at `capacity`. Reserving costs no memory; only the
+/// storage in use is committed (docs/memory-tiers-and-fit.md section 12.3).
+#[must_use]
+pub fn kv_reserve_for_pool(
+    plan: &crate::ModelPlan,
+    capacity: usize,
+    ring_batch: usize,
+    pool_blocks: usize,
+) -> Vec<u64> {
+    let mut bytes = kv_bytes_for(plan, capacity, capacity, ring_batch);
+    let rows = pool_blocks * imparo_kv::page_cells();
+    for g in state_geometry(plan, ring_batch) {
+        if matches!(g.kind, StateKind::Full) {
+            bytes[g.layer as usize] = (rows * g.k_stride.max(g.v_stride)) as u64;
+        }
+    }
+    bytes
+}
+
+/// The rows a commit covers when `needed` are wanted: the next prefill-chunk boundary at or
+/// above them, within `cap`. A forward writes at most one chunk of rows, so storage that ends
+/// on a chunk boundary, with the next chunk prepared off the step's path, never makes a
+/// forward wait (docs/memory-tiers-and-fit.md section 12.3).
+#[must_use]
+pub(crate) fn kv_commit_rows(needed: usize, cap: usize) -> usize {
+    let step = crate::prefill_batch();
+    needed
+        .div_ceil(step)
+        .saturating_mul(step)
+        .min(cap)
+        .max(needed.min(cap))
+}
 
 /// Round a position count up to the next whole PAGE, with one page of headroom.
 ///
@@ -542,6 +649,25 @@ pub fn ring_mask(attention: crate::Attention, max_batch: usize) -> u32 {
     }
 }
 
+/// A paired drafter's caches, after the target's in the per-layer arrays: (array index, K/V
+/// row width). Every drafter layer attends over the whole committed context.
+fn drafter_kv_layers(
+    plan: &crate::ModelPlan,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let first = plan.config.n_layers as usize;
+    plan.drafter.iter().flat_map(move |d| {
+        (0..d.layers as usize).map(move |i| (first + i, d.kv_width() as usize))
+    })
+}
+
+/// K and V bytes per context position across a paired drafter's caches; zero without one.
+#[must_use]
+pub fn drafter_kv_bytes_per_token(plan: &crate::ModelPlan) -> u64 {
+    drafter_kv_layers(plan)
+        .map(|(_, w)| (KvType::k().row_bytes(w) + KvType::v().row_bytes(w)) as u64)
+        .sum()
+}
+
 /// Explicit logical KV geometry corresponding to [`kv_bytes_for`].
 ///
 /// CUDA consumes this alongside the byte budget. Keeping the derivation here means the
@@ -555,7 +681,7 @@ pub fn kv_layout_for(
 ) -> Vec<imparo_backend::KvLayout> {
     let c = &plan.config;
     let regions = window_regions();
-    let mut layouts = vec![imparo_backend::KvLayout::default(); c.n_layers as usize];
+    let mut layouts = vec![imparo_backend::KvLayout::default(); plan.kv_layer_count()];
     for (index, layout) in layouts.iter_mut().enumerate() {
         layout.layer = index as u32;
     }
@@ -572,6 +698,15 @@ pub fn kv_layout_for(
             layer: layer.index,
             reserved: 0,
             logical_slots: slots as u64,
+            k_stride: KvType::k().row_bytes(width) as u64,
+            v_stride: KvType::v().row_bytes(width) as u64,
+        };
+    }
+    for (index, width) in drafter_kv_layers(plan) {
+        layouts[index] = imparo_backend::KvLayout {
+            layer: index as u32,
+            reserved: 0,
+            logical_slots: kv_round(positions).min(capacity) as u64,
             k_stride: KvType::k().row_bytes(width) as u64,
             v_stride: KvType::v().row_bytes(width) as u64,
         };
@@ -598,7 +733,7 @@ pub fn kv_bytes_for(
 ) -> Vec<u64> {
     let c = &plan.config;
     let regions = window_regions();
-    let mut kv_bytes = vec![0_u64; c.n_layers as usize];
+    let mut kv_bytes = vec![0_u64; plan.kv_layer_count()];
     for layer in &plan.layers {
         if layer.kv_source != crate::KvSource::Own || !layer.attention.is_attention() {
             continue;
@@ -616,6 +751,10 @@ pub fn kv_bytes_for(
         // two -- exact for the shipped configs (f16/f16, q4_0/q4_0).
         let row = KvType::k().row_bytes(w).max(KvType::v().row_bytes(w));
         kv_bytes[layer.index as usize] = (row * slots) as u64;
+    }
+    for (index, w) in drafter_kv_layers(plan) {
+        let row = KvType::k().row_bytes(w).max(KvType::v().row_bytes(w));
+        kv_bytes[index] = (row * kv_round(positions).min(capacity)) as u64;
     }
     kv_bytes
 }
@@ -862,6 +1001,10 @@ pub trait KvPoolMember {
     /// The divisor is the PAGE, not a literal 64: this is a count of the blocks the
     /// pool hands out, and it allocates in `page_cells`.
     fn kv_capacity_blocks(&self) -> u32 {
+        let pool = self.state().kv_commit.pool_capacity;
+        if pool > 0 {
+            return u32::try_from(pool).unwrap_or(u32::MAX);
+        }
         (self.kv_runtime().capacity / imparo_kv::page_cells()) as u32
     }
     /// None is the unchanged legacy path; Some records physical window reach.
@@ -945,7 +1088,102 @@ pub trait KvPoolMember {
     /// Returns an error when the backend cannot allocate.
     fn kv_prepare_pool(&mut self) -> Result<(), String> {
         self.ensure_gpu_ready()?;
-        self.kv_fit(self.kv_runtime().capacity)
+        if !backend().supports_kv_incremental_commit() {
+            // CUDA's transactional arena needs complete byte counts and page layouts.
+            // Keep the proven eager pool storage; logical blocks still grow on demand.
+            return self.kv_fit(self.kv_runtime().capacity);
+        }
+        // From here the pool places the full-attention layers: their storage follows the
+        // blocks it hands out (`kv_commit_blocks`), not a position count. Nothing is
+        // committed ahead for a request that has not arrived.
+        let page = imparo_kv::page_cells();
+        let blocks = self.kv_runtime().slots / page;
+        let c = &mut self.state_mut().kv_commit;
+        c.pooled = true;
+        c.pool_blocks = blocks;
+        c.pool_prefetched = 0;
+        Ok(())
+    }
+    /// Make the pooled layers' storage reach `blocks` blocks before anything writes them,
+    /// and get the next chunk's worth ready off the step's path.
+    ///
+    /// # Errors
+    /// When the backend cannot commit the storage.
+    fn kv_commit_blocks(&mut self, blocks: usize) -> Result<(), String> {
+        if !self.state().kv_commit.pooled {
+            // Storage was committed at pool preparation on non-incremental backends.
+            return Ok(());
+        }
+        let page = imparo_kv::page_cells();
+        let cap = self.kv_capacity_blocks() as usize;
+        let step = (crate::prefill_batch() / page).max(1);
+        let c = self.state().kv_commit;
+        if blocks > c.pool_blocks {
+            let want = if c.pool_prefetched >= blocks {
+                c.pool_prefetched
+            } else {
+                blocks.div_ceil(step).saturating_mul(step)
+            }
+            .min(cap)
+            .max(blocks.min(cap));
+            backend()
+                .grow_kv(&self.kv_pooled_bytes(want))
+                .map_err(|rc| format!("kv commit to {want} blocks failed rc={rc}"))?;
+            let c = &mut self.state_mut().kv_commit;
+            c.pool_blocks = want;
+            c.pool_prefetched = 0;
+        }
+        let c = self.state().kv_commit;
+        if c.pool_blocks < cap
+            && c.pool_blocks - blocks.min(c.pool_blocks) < step
+            && c.pool_prefetched <= c.pool_blocks
+        {
+            let next = (c.pool_blocks + step).min(cap);
+            backend().kv_prefetch(&self.kv_pooled_bytes(next));
+            self.state_mut().kv_commit.pool_prefetched = next;
+        }
+        Ok(())
+    }
+    /// Shrink the pooled layers' storage to cover `blocks` blocks, rounded up to the step
+    /// the growth takes, once the pool holds nothing above them. The smaller storage maps
+    /// the same memory, so nothing moves; the pages above it go back to the system.
+    ///
+    /// # Errors
+    /// When the backend cannot replace the storage.
+    fn kv_release_blocks(&mut self, blocks: usize) -> Result<(), String> {
+        let c = self.state().kv_commit;
+        if !c.pooled {
+            return Ok(());
+        }
+        let page = imparo_kv::page_cells();
+        let step = (crate::prefill_batch() / page).max(1);
+        let cap = self.kv_capacity_blocks() as usize;
+        // One step at least: the next forward writes up to a chunk of rows, and a view
+        // that already covers them is the one growth never has to wait for.
+        let want = blocks.max(1).div_ceil(step).saturating_mul(step).min(cap);
+        if want >= c.pool_blocks {
+            return Ok(());
+        }
+        backend()
+            .kv_release(&self.kv_pooled_bytes(want))
+            .map_err(|rc| format!("kv release to {want} blocks failed rc={rc}"))?;
+        let c = &mut self.state_mut().kv_commit;
+        c.pool_blocks = want;
+        c.pool_prefetched = 0;
+        Ok(())
+    }
+    /// Bytes each layer's pooled storage takes for `blocks` blocks (0 for a layer the pool
+    /// does not place): the one size both growth and release ask the backend for.
+    fn kv_pooled_bytes(&self, blocks: usize) -> Vec<u64> {
+        let page = imparo_kv::page_cells();
+        let mut v = vec![0_u64; self.plan().kv_layer_count()];
+        for g in &self.kv_state_geometry() {
+            if matches!(g.kind, StateKind::Full) {
+                v[g.layer as usize] =
+                    (blocks * page * g.k_stride.max(g.v_stride)) as u64;
+            }
+        }
+        v
     }
     /// Apply per-layer block tables (the pool's placement decision).
     fn kv_apply_tables(&self, tables: &std::collections::BTreeMap<u32, Vec<u32>>) {
@@ -1243,6 +1481,12 @@ macro_rules! pool_tenant_for {
                 tables: &std::collections::BTreeMap<u32, Vec<u32>>,
             ) {
                 KvPoolMember::kv_apply_tables(self, tables);
+            }
+            fn kv_commit_blocks(&mut self, blocks: usize) -> Result<(), String> {
+                KvPoolMember::kv_commit_blocks(self, blocks)
+            }
+            fn kv_release_blocks(&mut self, blocks: usize) -> Result<(), String> {
+                KvPoolMember::kv_release_blocks(self, blocks)
             }
             fn kv_apply_region(&self, region: usize) {
                 KvPoolMember::kv_apply_region(self, region);

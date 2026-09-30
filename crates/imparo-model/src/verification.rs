@@ -1,5 +1,5 @@
 //! Greedy verification on the existing workflow and device state owner.
-use crate::kv::KvPoolMember;
+use crate::kv::{KvPoolMember, KvType};
 use crate::window_history::WindowHistory;
 use crate::{Architecture, Model, OutputDemand, Workflow};
 use imparo_backend::BufId;
@@ -72,6 +72,33 @@ fn select(
         }
     }
     Err("verification produced no logits".into())
+}
+
+/// `select` over device picks: `picks[i]` holds row i's argmax as u32 bits. The device pick
+/// cannot check that the logits are finite; `select` can.
+fn select_picks(
+    picks: &[f32],
+    tokens: &[u32],
+    vocab: u32,
+) -> Result<GreedyVerification, String> {
+    if picks.len() != tokens.len() {
+        return Err("verification row picks have an invalid length".into());
+    }
+    for (i, pick) in picks.iter().enumerate() {
+        let next = pick.to_bits();
+        if next >= vocab {
+            return Err(format!(
+                "verification row {i} picked {next}, outside the vocabulary"
+            ));
+        }
+        if i + 1 == tokens.len() || next != tokens[i + 1] {
+            return Ok(GreedyVerification {
+                consumed: i + 1,
+                next_token: next,
+            });
+        }
+    }
+    Err("verification produced no row picks".into())
 }
 
 /// Opt-in laboratory witness of the logits already read by the real verifier.
@@ -385,6 +412,21 @@ fn prepare_recurrent_plane<A: Architecture>(w: &mut Workflow<A>) -> Result<(), S
     Ok(())
 }
 
+/// IMPARO_VERIFY_LOG=1 names the path each block verification took and what it
+/// committed. Read once; off, it costs one branch per verification.
+fn verify_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IMPARO_VERIFY_LOG").as_deref() == Ok("1"))
+}
+
+/// IMPARO_TREE_FLOAT_Q=1: a tree verify's row-layout attention keeps Q in float instead of
+/// rounding it to half. Off by default. The causal entry keeps rounding, so with it on a chain
+/// laid out as a tree is no longer bit-equal to the causal forward.
+pub(crate) fn tree_float_q() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IMPARO_TREE_FLOAT_Q").as_deref() == Ok("1"))
+}
+
 pub(crate) fn verify_workflow<A: Architecture>(
     w: &mut Workflow<A>,
     tokens: &[u32],
@@ -412,17 +454,20 @@ pub(crate) fn verify_workflow_limited<A: Architecture>(
         || b == 1
         || b > cell - start % cell
     {
+        if verify_log() {
+            eprintln!(
+                "[verify] path=sequential b={b} start={start} device_flags={} host={} crosses_cell={}",
+                A::DEVICE_PREFIX_VERIFICATION && A::DEVICE_ALL_LOGITS,
+                w.state.host_forward,
+                b > cell - start % cell
+            );
+        }
         return verify_sequential(w, &tokens[..max_consumed], start);
     }
     if end > u32::MAX as usize {
         return Err("verification position exceeds device u32 range".into());
     }
-    let ring_batch = if w.state.kv_ring_batch == 0 {
-        cell
-    } else {
-        w.state.kv_ring_batch
-    };
-    let geom = crate::kv::state_geometry(&w.plan, ring_batch);
+    let geom = crate::kv::state_geometry(&w.plan, ring_batch(w));
     if geom.iter().any(|g| matches!(g.kind, imparo_kv::StateKind::Window { window, ring } if ring < window)) {
         return Err("verification window ring is smaller than its window".into());
     }
@@ -431,6 +476,11 @@ pub(crate) fn verify_workflow_limited<A: Architecture>(
     // Narrow old advertised coverage only after proving the real start survives.
     let Some(history) = w.state.window_history.for_verification(start, end, slack)
     else {
+        if verify_log() {
+            eprintln!(
+                "[verify] path=sequential b={b} start={start} reason=window_history"
+            );
+        }
         return verify_sequential(w, &tokens[..max_consumed], start);
     };
     let n = w.plan.recurrent_elems();
@@ -478,12 +528,19 @@ pub(crate) fn verify_workflow_limited<A: Architecture>(
     let device_return = max_consumed == b && cfg!(feature = "cuda-speculative")
         && A::DEVICE_GREEDY_VERIFICATION
         && be.supports_greedy_verification()
-        && std::env::var("IMPARO_LAB_DEVICE_GREEDY_VERIFY").as_deref() == Ok("1")
+        && (crate::e4b_retained_decode_policy_enabled()
+            || crate::lfm_retained_domain() != 0
+            || std::env::var("IMPARO_LAB_DEVICE_GREEDY_VERIFY").as_deref() == Ok("1"))
         // The witness promises complete logits, never a compressed return packet.
         && std::env::var_os("IMPARO_VERIFY_LOGITS_DUMP_DIR").is_none();
     #[cfg(feature = "cuda-owner-lab")]
     let quant_scope =
         unsafe { imparo_cuda::owner_lab::VerificationM1Quant::configured() };
+    // One pick per row on the device when the backend serves it: the host reads b indices,
+    // not b rows of logits. A logits dump needs the logits themselves.
+    let row_picks = !device_return
+        && be.supports_argmax_rows()
+        && std::env::var_os("IMPARO_VERIFY_LOGITS_DUMP_DIR").is_none();
     let forward = if device_return {
         w.forward_with_output_demand(
             tokens,
@@ -491,6 +548,15 @@ pub(crate) fn verify_workflow_limited<A: Architecture>(
             &mut logits,
             None,
             OutputDemand::GreedyVerification,
+            None,
+        )
+    } else if row_picks {
+        w.forward_with_output_demand(
+            tokens,
+            start,
+            &mut logits,
+            None,
+            OutputDemand::RowArgmax,
             None,
         )
     } else {
@@ -514,6 +580,11 @@ pub(crate) fn verify_workflow_limited<A: Architecture>(
             #[cfg(feature = "cuda-owner-lab")]
             target_witness::device_packet(w, tokens, start, &logits)?;
             Ok(GreedyVerification { consumed, next_token })
+        } else if row_picks {
+            if logits.len() != b {
+                return Err("invalid verification row pick count".into());
+            }
+            select_picks(&logits[..max_consumed], &tokens[..max_consumed], w.plan.config.vocab_size)
         } else {
             #[cfg(feature = "cuda-owner-lab")]
             dump_verification_logits(&logits, tokens, start, w.plan.config.vocab_size as usize)?;
@@ -545,6 +616,20 @@ pub(crate) fn verify_workflow_limited<A: Architecture>(
         }
     }
     let committed = start + accepted.consumed;
+    if verify_log() {
+        eprintln!(
+            "[verify] path=device b={b} start={start} out={} consumed={} next={}",
+            if device_return {
+                "packet"
+            } else if row_picks {
+                "row_picks"
+            } else {
+                "logits"
+            },
+            accepted.consumed,
+            accepted.next_token
+        );
+    }
     w.state.window_history = history;
     w.state
         .window_history
@@ -554,6 +639,26 @@ pub(crate) fn verify_workflow_limited<A: Architecture>(
     if w.state.recur_ckpt_at > committed {
         w.state.recur_ckpt = note;
         w.state.recur_ckpt_at = note_at;
+        w.state.recur_ckpt_on_device = false;
+    }
+    // THE GRID BOUNDARY THIS BLOCK CROSSED, if any: its state becomes the recurrent note, as a
+    // one-token decode step's does (`arm_recurrent_snapshot`). The forward already wrote it: slot
+    // j + 1 of RecurSnap holds the state after the block's first j tokens, and the block's last
+    // token leaves it live. Read now, before the next verify reuses the slots.
+    let grid = imparo_kv::grid_tokens();
+    let boundary = committed / grid * grid;
+    if !device_return && n != 0 && boundary > start {
+        let below = boundary - start;
+        let slot = if below == b {
+            (BufId::Recur, 0)
+        } else {
+            (
+                BufId::RecurSnap,
+                u32::try_from(below + 1).map_err(|_| "verification slot overflow")?,
+            )
+        };
+        w.state.recur_ckpt = crate::kv::read_recurrent(n as usize, slot.0, slot.1);
+        w.state.recur_ckpt_at = boundary;
         w.state.recur_ckpt_on_device = false;
     }
     #[cfg(feature = "cuda-owner-lab")]
@@ -570,6 +675,734 @@ pub(crate) fn verify_workflow_limited<A: Architecture>(
         }
     }
     Ok(accepted)
+}
+
+/// `BufId::RowLayout` words for a tree whose node i has parent `parents[i]` (-1 for the
+/// root, which continues the committed prefix): each node sits at `start` plus its depth,
+/// sees its ancestors and itself, and carries its first eight ancestors for the short
+/// convolution.
+///
+/// # Errors
+/// A tree of no nodes or of more than a layout holds, or parents out of order: the root first
+/// and every other parent before its child.
+pub fn tree_row_layout(start: usize, parents: &[i32]) -> Result<Vec<u32>, String> {
+    use imparo_backend::{ROW_LAYOUT_ANCESTORS, ROW_LAYOUT_MAX_ROWS, ROW_LAYOUT_WORDS};
+    let n = parents.len();
+    if n == 0 || n > ROW_LAYOUT_MAX_ROWS {
+        return Err(format!(
+            "a tree of {n} nodes; a row layout holds 1 to {ROW_LAYOUT_MAX_ROWS}"
+        ));
+    }
+    let mut depth = vec![0_u32; n];
+    let mut seen = vec![0_u64; n];
+    let mut up = vec![[0_u32; ROW_LAYOUT_ANCESTORS]; n];
+    let mut words = vec![0_u32; n * ROW_LAYOUT_WORDS];
+    for (i, &raw_parent) in parents.iter().enumerate() {
+        let parent = usize::try_from(raw_parent).ok();
+        if (i == 0) != parent.is_none() || parent.is_some_and(|p| p >= i) {
+            return Err(
+                "tree parents: the root first, every other parent before its child"
+                    .into(),
+            );
+        }
+        seen[i] = 1_u64 << i;
+        if let Some(p) = parent {
+            depth[i] = depth[p] + 1;
+            seen[i] |= seen[p];
+            let parent_up = up[p];
+            up[i][0] = p as u32;
+            up[i][1..].copy_from_slice(&parent_up[..ROW_LAYOUT_ANCESTORS - 1]);
+        }
+        let position = u32::try_from(start + depth[i] as usize)
+            .map_err(|_| "tree position exceeds u32")?;
+        let row = &mut words[i * ROW_LAYOUT_WORDS..(i + 1) * ROW_LAYOUT_WORDS];
+        row[0] = position;
+        row[1] = depth[i];
+        row[2] = seen[i] as u32;
+        row[3] = (seen[i] >> 32) as u32;
+        row[4..4 + ROW_LAYOUT_ANCESTORS].copy_from_slice(&up[i]);
+    }
+    Ok(words)
+}
+
+/// Where a tree verify keeps each node's input to every convolution window: one row of
+/// `row_elems` values per node in `BufId::RowInputs`, the windows side by side in layer order.
+pub(crate) struct RowInputLayout {
+    windows: Vec<RowWindow>,
+    /// Values per node.
+    pub(crate) row_elems: u32,
+    /// Recurrent state values the windows cover, over every layer.
+    state_elems: u32,
+}
+
+/// One convolution window: its layer, where its state starts in `BufId::Recur`, its shape, and
+/// where its inputs start in a node's row.
+struct RowWindow {
+    layer: usize,
+    state_off: u32,
+    width: u32,
+    history: u32,
+    input_off: u32,
+}
+
+impl RowInputLayout {
+    /// The layout of `windows` over `plan`. Refuses a window outside a recurrent layer or larger
+    /// than the layer's rolling state.
+    pub(crate) fn of(
+        plan: &crate::ModelPlan,
+        windows: &[crate::ConvWindow],
+    ) -> Result<Self, String> {
+        let regions = plan.recurrent_layout();
+        let mut out = Vec::with_capacity(windows.len());
+        let (mut row_elems, mut state_elems) = (0_u32, 0_u32);
+        for win in windows {
+            let layer = win.layer as usize;
+            let &(state_off, _, r_elems, _) = regions.get(layer).ok_or_else(|| {
+                format!("a convolution window on layer {layer}, past the plan")
+            })?;
+            let elems = win
+                .width
+                .checked_mul(win.history)
+                .filter(|&e| e != 0 && e <= r_elems)
+                .ok_or_else(|| {
+                    format!("layer {layer}'s convolution window does not fit its rolling state")
+                })?;
+            out.push(RowWindow {
+                layer,
+                state_off,
+                width: win.width,
+                history: win.history,
+                input_off: row_elems,
+            });
+            row_elems = row_elems
+                .checked_add(win.width)
+                .ok_or("row inputs overflow u32")?;
+            state_elems = state_elems
+                .checked_add(elems)
+                .ok_or("convolution windows overflow u32")?;
+        }
+        Ok(Self {
+            windows: out,
+            row_elems,
+            state_elems,
+        })
+    }
+
+    /// Where layer `layer`'s inputs start in a node's row, if the layer has a window.
+    pub(crate) fn input_off(&self, layer: usize) -> Option<u32> {
+        self.windows
+            .iter()
+            .find(|w| w.layer == layer)
+            .map(|w| w.input_off)
+    }
+}
+
+/// Where slot `s` (oldest first) of a rebuilt window comes from after an accepted path: the value
+/// `history - 1 - s` steps up from the path's last node -- a path node's kept input while the path
+/// reaches that far, the old window's slot beyond it. The same value the tree convolution read
+/// for that tap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowSource {
+    /// The input kept for the node at this index of the path.
+    PathNode(usize),
+    /// This slot of the window before the verify.
+    OldSlot(usize),
+}
+
+fn window_sources(path_len: usize, history: usize) -> Vec<WindowSource> {
+    let depth = path_len.saturating_sub(1);
+    (0..history)
+        .map(|s| {
+            let back = history - 1 - s;
+            if back <= depth {
+                WindowSource::PathNode(depth - back)
+            } else {
+                WindowSource::OldSlot(history + depth - back)
+            }
+        })
+        .collect()
+}
+
+/// Rebuilds every convolution window of the live recurrent state (plane 0) for the accepted path,
+/// from the nodes' kept inputs and the window before the verify. Host copies over shared buffers:
+/// call with the device idle.
+///
+/// `below_boundary`: when the path crossed a grid boundary, how many of its nodes lie below it.
+/// The whole recurrent state at that boundary is then built the same way from those nodes and
+/// returned (a tree runs only where the windows are all of the state). The checkpoint at the
+/// turn's end needs it -- the boundary a later request resumes on -- and nothing stands on that
+/// position again once the path has run past it.
+fn commit_conv_windows(
+    layout: &RowInputLayout,
+    path: &[i32],
+    below_boundary: Option<usize>,
+    state_elems: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    let be = crate::gpu_support::be();
+    let rows = path
+        .iter()
+        .map(|&node| u64::try_from(node).map_err(|_| format!("tree path node {node}")))
+        .collect::<Result<Vec<u64>, String>>()?;
+    let mut at_boundary = below_boundary.map(|_| vec![0.0_f32; state_elems]);
+    for win in &layout.windows {
+        let (width, history) = (win.width as usize, win.history as usize);
+        let mut old = vec![0.0_f32; width * history];
+        be.read(BufId::Recur, u64::from(win.state_off), &mut old);
+        // The window after the path's first `len` nodes.
+        let window_after = |len: usize, window: &mut [f32]| {
+            for (slot, source) in window_sources(len, history).into_iter().enumerate() {
+                let dst = &mut window[slot * width..(slot + 1) * width];
+                match source {
+                    WindowSource::PathNode(i) => be.read(
+                        BufId::RowInputs,
+                        rows[i] * u64::from(layout.row_elems)
+                            + u64::from(win.input_off),
+                        dst,
+                    ),
+                    WindowSource::OldSlot(s) => {
+                        dst.copy_from_slice(&old[s * width..(s + 1) * width]);
+                    }
+                }
+            }
+        };
+        if let (Some(k), Some(state)) = (below_boundary, at_boundary.as_mut()) {
+            let off = win.state_off as usize;
+            let slot = state
+                .get_mut(off..off + width * history)
+                .ok_or("a convolution window lies past the recurrent state")?;
+            window_after(k, slot);
+        }
+        let mut window = vec![0.0_f32; width * history];
+        window_after(rows.len(), &mut window);
+        be.write(BufId::Recur, u64::from(win.state_off), &window);
+    }
+    Ok(at_boundary.map(|state| state.iter().flat_map(|v| v.to_ne_bytes()).collect()))
+}
+
+/// The ring batch a verify's state geometry is built with: the configured one, or the prefill
+/// cell.
+fn ring_batch<A: Architecture>(w: &Workflow<A>) -> usize {
+    if w.state.kv_ring_batch == 0 {
+        crate::prefill_batch().max(1)
+    } else {
+        w.state.kv_ring_batch
+    }
+}
+
+/// Whether this model and backend run a draft tree through a row layout: a device forward that
+/// reads the layout, one pick per row, an f16 cache, no windowed layer, and a row layout at every
+/// attention head dim. Brings the device up; changes no conversation state.
+fn tree_rows_served<A: Architecture>(w: &mut Workflow<A>) -> Result<bool, String> {
+    if !A::ROW_LAYOUT_FORWARD
+        || !A::DEVICE_ALL_LOGITS
+        || w.state.host_forward
+        || KvType::k() != KvType::F16
+        || KvType::v() != KvType::F16
+    {
+        return Ok(false);
+    }
+    w.ensure_gpu_ready()?;
+    let be = crate::gpu_support::be();
+    if !be.supports_argmax_rows() {
+        return Ok(false);
+    }
+    let windowed = crate::kv::state_geometry(&w.plan, ring_batch(w))
+        .iter()
+        .any(|g| matches!(g.kind, imparo_kv::StateKind::Window { .. }));
+    // A commit rebuilds convolution windows only, so a tree runs only where they are the whole
+    // recurrent state.
+    let windows_cover = RowInputLayout::of(&w.plan, &A::conv_windows(&w.plan))
+        .is_ok_and(|layout| layout.state_elems == w.plan.recurrent_elems());
+    Ok(!windowed
+        && windows_cover
+        && w.plan.layers.iter().all(|l| {
+            !l.attention.is_attention()
+                || be.supports_row_layout(l.attention.head_dim())
+        }))
+}
+
+/// Everything a row-layout forward over `b` nodes at `start` needs before it runs: the recurrent
+/// checkpoint note taken out (returned, to be put back), the cache grown to `start + b`, the live
+/// recurrent state on plane 0, room for every node's convolution-window inputs (their layout is
+/// returned), and the layout words uploaded.
+fn stage_tree_forward<A: Architecture>(
+    w: &mut Workflow<A>,
+    words: &[u32],
+    start: usize,
+    b: usize,
+) -> Result<(usize, Vec<u8>, RowInputLayout), String> {
+    let row_inputs = RowInputLayout::of(&w.plan, &A::conv_windows(&w.plan))?;
+    let (note_at, note) = recurrent_note(w);
+    w.kv_fit(start + b)?;
+    prepare_recurrent_plane(w)?;
+    let be = crate::gpu_support::be();
+    if row_inputs.row_elems != 0 {
+        // Sized for the widest layout, so a tree of any size reuses the one buffer.
+        be.alloc(
+            BufId::RowInputs,
+            imparo_backend::ROW_LAYOUT_MAX_ROWS as u64
+                * u64::from(row_inputs.row_elems)
+                * 4,
+        )
+        .map_err(|rc| format!("row inputs allocation rc={rc}"))?;
+    }
+    be.alloc(
+        BufId::RowLayout,
+        (imparo_backend::ROW_LAYOUT_MAX_ROWS * imparo_backend::ROW_LAYOUT_WORDS * 4)
+            as u64,
+    )
+    .map_err(|rc| format!("row layout allocation rc={rc}"))?;
+    be.begin();
+    be.write_u32(BufId::RowLayout, 0, words);
+    be.end()
+        .map_err(|rc| format!("tree layout upload rc={rc}"))?;
+    Ok((note_at, note, row_inputs))
+}
+
+/// The target state after a row-layout forward: the fill index at `filled`, the window history
+/// and the recurrent checkpoint note as given, no snapshot pending, the causal output demand. It
+/// never touches the live recurrent state: the forward keeps every node's window inputs aside,
+/// and a commit rebuilds the accepted path's windows before this runs.
+fn settle_tree_state<A: Architecture>(
+    w: &mut Workflow<A>,
+    filled: usize,
+    history: WindowHistory,
+    note: Vec<u8>,
+    note_at: usize,
+) {
+    w.state.row_layout = 0;
+    w.state.output_demand = OutputDemand::LastToken;
+    w.state.kv_rt.filled = filled;
+    w.state.window_history = history;
+    w.state.recur_ckpt = note;
+    w.state.recur_ckpt_at = note_at;
+    w.state.recur_ckpt_on_device = false;
+    w.state.recur_snap = None;
+}
+
+/// Every node's logits from one row-layout forward over `tree` at `start`, then the target state
+/// as it was: fill index, window history and the recurrent checkpoint note. A probe of the tree
+/// forward, not the verify transaction.
+pub(crate) fn forward_workflow_tree_logits<A: Architecture>(
+    w: &mut Workflow<A>,
+    tree: &crate::speculative::DraftTree,
+    start: usize,
+    out: &mut Vec<f32>,
+) -> Result<(), String> {
+    let b = tree.tokens.len();
+    if tree.parents.len() != b {
+        return Err("tree tokens and parents differ in length".into());
+    }
+    validate(w, &tree.tokens, start)?;
+    let cell = crate::prefill_batch().max(1);
+    if !A::ROW_LAYOUT_FORWARD
+        || !A::DEVICE_ALL_LOGITS
+        || w.state.host_forward
+        || b > cell - start % cell
+    {
+        return Err(
+            "a tree forward runs as one device batch inside one prefill cell, on a forward that reads the row layout"
+                .into(),
+        );
+    }
+    let words = tree_row_layout(start, &tree.parents)?;
+    w.ensure_gpu_ready()?;
+    let be = crate::gpu_support::be();
+    if w.plan.layers.iter().any(|l| {
+        l.attention.is_attention() && !be.supports_row_layout(l.attention.head_dim())
+    }) {
+        return Err(
+            "the backend serves no row layout at this model's attention head dims"
+                .into(),
+        );
+    }
+    let history = w.state.window_history.clone();
+    let (note_at, note, _) = stage_tree_forward(w, &words, start, b)?;
+    w.state.row_layout = b as u32;
+    let result = w
+        .forward_with_output_demand(
+            &tree.tokens,
+            start,
+            out,
+            None,
+            OutputDemand::AllTokens,
+            None,
+        )
+        .and_then(|()| {
+            be.end()
+                .map_err(|rc| format!("tree forward completion rc={rc}"))
+        });
+    if result.is_err() {
+        let _ = be.end();
+    }
+    settle_tree_state(w, start, history, note, note_at);
+    result?;
+    let vocab = w.plan.config.vocab_size as usize;
+    if out.len() != b * vocab {
+        return Err(format!(
+            "tree forward returned {} logits for {b} nodes",
+            out.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The greedy walk down a verified tree: from the root, the child whose token is the target's
+/// pick at its parent, until the pick has no such child, is a stop token, or the path holds
+/// `limit` nodes. Returns the path (node indices, root first) and the pick after its last node,
+/// which the path does not consume.
+pub(crate) fn tree_accepted_path(
+    picks: &[u32],
+    tokens: &[u32],
+    parents: &[i32],
+    limit: usize,
+    stops: &[u32],
+) -> (Vec<i32>, u32) {
+    let mut path = vec![0_i32];
+    loop {
+        let parent = path[path.len() - 1] as usize;
+        let next = picks[parent];
+        if path.len() >= limit || stops.contains(&next) {
+            return (path, next);
+        }
+        let child = (parent + 1..tokens.len())
+            .find(|&j| parents[j] == parent as i32 && tokens[j] == next);
+        match child {
+            Some(j) => path.push(j as i32),
+            None => return (path, next),
+        }
+    }
+}
+
+/// Tree admission for the row-layout verify: a well-formed tree that fits here. False keeps the
+/// chain: the tree crosses the prefill cell or passes the cache's capacity.
+fn prepare_workflow_tree_rows<A: Architecture>(
+    w: &mut Workflow<A>,
+    tree: &crate::speculative::DraftTree,
+    start: usize,
+) -> Result<bool, String> {
+    let b = tree.tokens.len();
+    if tree.parents.len() != b {
+        return Err("tree tokens and parents differ in length".into());
+    }
+    tree_row_layout(start, &tree.parents)?;
+    let cell = crate::prefill_batch().max(1);
+    let end = start.checked_add(b).ok_or("tree position overflow")?;
+    if b > cell - start % cell || end > w.state.kv_rt.capacity {
+        return Ok(false);
+    }
+    validate(w, &tree.tokens, start)?;
+    Ok(true)
+}
+
+/// A tree verify through a row layout, then its commit:
+///
+/// ```text
+/// forward  node t roped at start + depth(t), its K/V stored at start + t, its input to every
+///          convolution window kept in RowInputs row t; one pick per node
+/// walk     tree_accepted_path over the picks
+/// commit   the K/V of path[i] moved from start + path[i] to start + i, where the two differ
+///          every convolution window rebuilt from the path's kept inputs and the old window
+///          fill index = start + path length
+/// ```
+///
+/// A failure before the commit leaves the target as it was.
+fn verify_workflow_tree_rows<A: Architecture>(
+    w: &mut Workflow<A>,
+    tree: &crate::speculative::DraftTree,
+    start: usize,
+    limit: usize,
+    stops: &[u32],
+) -> Result<crate::speculative::TreeVerification, String> {
+    // A path never holds more nodes than the tree, so a limit above the tree's size caps nothing.
+    let b = tree.tokens.len();
+    if tree.parents.len() != b || limit == 0 {
+        return Err(
+            "tree verify: tokens and parents differ in length, or the limit is 0"
+                .into(),
+        );
+    }
+    validate(w, &tree.tokens, start)?;
+    let end = start + b;
+    let cell = crate::prefill_batch().max(1);
+    if b > cell - start % cell || end > u32::MAX as usize {
+        return Err("a tree verify runs inside one prefill cell".into());
+    }
+    let words = tree_row_layout(start, &tree.parents)?;
+    let geom = crate::kv::state_geometry(&w.plan, ring_batch(w));
+    let slack = imparo_kv::state::window_slack(&geom);
+    let history = w
+        .state
+        .window_history
+        .for_verification(start, end, slack)
+        .ok_or("tree verify prefix coverage")?;
+    let ticket = history.clone().begin(start)?;
+    let (note_at, note, row_inputs) = stage_tree_forward(w, &words, start, b)?;
+    let be = crate::gpu_support::be();
+    w.state.window_history = history.clone();
+    w.state.row_layout = b as u32;
+    let vocab = w.plan.config.vocab_size;
+    let mut rows = Vec::new();
+    // THE TARGET DUMP (a data probe): every row's logits come back instead of its argmax, the picks
+    // are taken on the host, and each committed position's top candidates are written below.
+    let dump = target_dump();
+    let walk = w
+        .forward_with_output_demand(
+            &tree.tokens,
+            start,
+            &mut rows,
+            None,
+            if dump.is_some() {
+                OutputDemand::AllTokens
+            } else {
+                OutputDemand::RowArgmax
+            },
+            None,
+        )
+        .and_then(|()| {
+            be.end()
+                .map_err(|rc| format!("tree verify completion rc={rc}"))
+        })
+        .and_then(|()| {
+            let picks: Vec<u32> = if dump.is_some() {
+                let v = vocab as usize;
+                if rows.len() != b * v {
+                    return Err(format!(
+                        "tree verify returned {} logits for {b} nodes",
+                        rows.len()
+                    ));
+                }
+                rows.chunks(v)
+                    .map(|row| {
+                        let mut best = 0;
+                        for (i, x) in row.iter().enumerate() {
+                            if *x > row[best] {
+                                best = i;
+                            }
+                        }
+                        u32::try_from(best).unwrap_or(u32::MAX)
+                    })
+                    .collect()
+            } else {
+                if rows.len() != b {
+                    return Err(format!(
+                        "tree verify returned {} picks for {b} nodes",
+                        rows.len()
+                    ));
+                }
+                rows.iter().map(|v| v.to_bits()).collect()
+            };
+            if picks.iter().any(|&pick| pick >= vocab) {
+                return Err("tree verify pick outside the vocabulary".into());
+            }
+            Ok(tree_accepted_path(
+                &picks,
+                &tree.tokens,
+                &tree.parents,
+                limit,
+                stops,
+            ))
+        });
+    let (path, next_token) = match walk {
+        Ok(accepted) => accepted,
+        Err(e) => {
+            let _ = be.end();
+            settle_tree_state(w, start, history, note, note_at);
+            return Err(e);
+        }
+    };
+    if let Some(file) = dump {
+        let file = file.as_ref().map_err(Clone::clone)?;
+        write_target_dump(file, start, &path, &rows, vocab as usize)?;
+    }
+    // Each accepted node's rows move down to its depth. A node's depth never exceeds its batch
+    // row, so no copy overwrites the source of a later one.
+    let (from, to): (Vec<u32>, Vec<u32>) = path
+        .iter()
+        .enumerate()
+        .filter(|&(depth, &node)| node as usize != depth)
+        .map(|(depth, &node)| ((start + node as usize) as u32, (start + depth) as u32))
+        .unzip();
+    if !from.is_empty() {
+        for g in geom
+            .iter()
+            .filter(|g| matches!(g.kind, imparo_kv::StateKind::Full))
+        {
+            if !be.kv_move_rows(
+                g.layer,
+                g.k_stride as u64,
+                g.v_stride as u64,
+                &from,
+                &to,
+            ) {
+                settle_tree_state(w, start, history, note, note_at);
+                return Err(format!(
+                    "tree verify: the backend did not move layer {}'s accepted rows",
+                    g.layer
+                ));
+            }
+        }
+    }
+    // THE GRID BOUNDARY THIS PATH CROSSED, if any: its state becomes the recurrent note, as a
+    // one-token decode step's does when it crosses one (`arm_recurrent_snapshot`). Without it a
+    // speculative turn kept the note of its prompt, and the checkpoint at the turn's end was
+    // dropped for want of a recurrent state.
+    let committed = start + path.len();
+    let grid = imparo_kv::grid_tokens();
+    let boundary = committed / grid * grid;
+    let below_boundary = (boundary > start).then(|| boundary - start);
+    let crossed = match commit_conv_windows(
+        &row_inputs,
+        &path,
+        below_boundary,
+        w.plan.recurrent_elems() as usize,
+    ) {
+        Ok(state) => state,
+        Err(e) => {
+            settle_tree_state(w, start, history, note, note_at);
+            return Err(format!(
+                "tree verify recurrent commit: {e}; the KV rows moved, so device state recovery is unconfirmed"
+            ));
+        }
+    };
+    if verify_log() {
+        eprintln!(
+            "[verify] path=tree b={b} start={start} out=row_picks consumed={} moved_rows={} next={next_token} nodes={path:?} snapshot={}",
+            path.len(),
+            from.len(),
+            if crossed.is_some() { boundary } else { 0 }
+        );
+    }
+    let (note_at, note) = match crossed {
+        Some(state) => (boundary, state),
+        None => (note_at, note),
+    };
+    settle_tree_state(w, committed, history, note, note_at);
+    w.state
+        .window_history
+        .commit(ticket, start, committed, slack);
+    Ok(crate::speculative::TreeVerification { path, next_token })
+}
+
+/// Candidates per committed position in the target dump.
+const TARGET_DUMP_TOP: usize = 32;
+
+/// The file `IMPARO_DSPARK_TARGET_DUMP=PATH` names: for an offline replay that trains the drafter
+/// toward the target's distribution instead of the committed token alone. A path that cannot be
+/// opened fails every verify rather than leaving a run without its records.
+type TargetDump = Result<std::sync::Mutex<std::fs::File>, String>;
+
+fn target_dump() -> Option<&'static TargetDump> {
+    static FILE: std::sync::OnceLock<Option<TargetDump>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var("IMPARO_DSPARK_TARGET_DUMP").ok()?;
+        Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map(std::sync::Mutex::new)
+                .map_err(|e| format!("IMPARO_DSPARK_TARGET_DUMP={path}: {e}")),
+        )
+    })
+    .as_ref()
+}
+
+/// One record per verified tree: the target's distribution at every committed position.
+///
+/// ```text
+///   u32 x 3                    start, path length n, candidates k
+///   per path node d (0..n)     u32 position start + d + 1 (the position its row predicts),
+///                              u32 the target's pick there, u32 x k ids, f32 x k logits (largest first)
+/// ```
+///
+/// Row `path[d]` is the node at depth `d` of the accepted path, so its logits are the target's
+/// prediction for the committed token at `start + d + 1`; rows off the path are conditioned on
+/// tokens that were not committed and are not written.
+fn write_target_dump(
+    file: &std::sync::Mutex<std::fs::File>,
+    start: usize,
+    path: &[i32],
+    logits: &[f32],
+    vocab: usize,
+) -> Result<(), String> {
+    use std::io::Write;
+    let word = |v: usize| u32::try_from(v).unwrap_or(u32::MAX).to_le_bytes();
+    let mut out: Vec<u8> =
+        Vec::with_capacity(12 + path.len() * (8 + 8 * TARGET_DUMP_TOP));
+    out.extend_from_slice(&word(start));
+    out.extend_from_slice(&word(path.len()));
+    out.extend_from_slice(&word(TARGET_DUMP_TOP));
+    for (d, &node) in path.iter().enumerate() {
+        let node =
+            usize::try_from(node).map_err(|_| "target dump: a negative path node")?;
+        let row = logits
+            .get(node * vocab..(node + 1) * vocab)
+            .ok_or("target dump: a path node past the logits")?;
+        let mut order: Vec<usize> = (0..vocab).collect();
+        let by_value = |a: &usize, b: &usize| {
+            row[*b]
+                .partial_cmp(&row[*a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(b))
+        };
+        order.select_nth_unstable_by(TARGET_DUMP_TOP - 1, by_value);
+        order.truncate(TARGET_DUMP_TOP);
+        order.sort_unstable_by(by_value);
+        out.extend_from_slice(&word(start + d + 1));
+        out.extend_from_slice(&word(order[0]));
+        for &id in &order {
+            out.extend_from_slice(&word(id));
+        }
+        for &id in &order {
+            out.extend_from_slice(&row[id].to_le_bytes());
+        }
+    }
+    file.lock()
+        .map_err(|_| "target dump: the file's lock is poisoned".to_string())?
+        .write_all(&out)
+        .map_err(|e| format!("target dump: {e}"))
+}
+
+/// Tree admission: through a row layout where this model and backend run one, else the CUDA
+/// lab's tree where that feature is built, else none (the chain).
+pub(crate) fn prepare_greedy_tree<A: Architecture>(
+    w: &mut Workflow<A>,
+    tree: &crate::speculative::DraftTree,
+    start: usize,
+) -> Result<bool, String> {
+    if tree_rows_served(w)? {
+        return prepare_workflow_tree_rows(w, tree, start);
+    }
+    #[cfg(feature = "cuda-speculative")]
+    {
+        prepare_workflow_tree(w, tree, start)
+    }
+    #[cfg(not(feature = "cuda-speculative"))]
+    {
+        Ok(false)
+    }
+}
+
+/// The tree verify on the route `prepare_greedy_tree` admitted.
+pub(crate) fn verify_greedy_tree<A: Architecture>(
+    w: &mut Workflow<A>,
+    tree: &crate::speculative::DraftTree,
+    start: usize,
+    limit: usize,
+    stops: &[u32],
+) -> Result<crate::speculative::TreeVerification, String> {
+    if tree_rows_served(w)? {
+        return verify_workflow_tree_rows(w, tree, start, limit, stops);
+    }
+    #[cfg(feature = "cuda-speculative")]
+    {
+        verify_workflow_tree(w, tree, start, limit, stops)
+    }
+    #[cfg(not(feature = "cuda-speculative"))]
+    {
+        Err("tree verification unsupported by this model adapter".into())
+    }
 }
 
 /// Experimental tree adapter reuses the ordinary workflow, history ticket and
@@ -657,10 +1490,12 @@ pub(crate) fn verify_workflow_tree<A: Architecture>(
         || b != 16
         || parents.len() != b
         || limit == 0
-        || limit > 9
     {
         return Err("tree target capability/shape".into());
     }
+    // The cursor now supplies an output budget, which may exceed the tree depth.
+    // Parent validation bounds every native path to nine nodes; a larger budget
+    // cannot create a longer path and must not reject an otherwise valid tree.
     validate_tree_parents(parents)?;
     validate(w, tokens, start)?;
     let end = start + b;
@@ -668,12 +1503,7 @@ pub(crate) fn verify_workflow_tree<A: Architecture>(
     if b > cell - start % cell || end > u32::MAX as usize {
         return Err("tree crosses supported forward cell".into());
     }
-    let ring_batch = if w.state.kv_ring_batch == 0 {
-        cell
-    } else {
-        w.state.kv_ring_batch
-    };
-    let geom = crate::kv::state_geometry(&w.plan, ring_batch);
+    let geom = crate::kv::state_geometry(&w.plan, ring_batch(w));
     if geom
         .iter()
         .any(|g| matches!(g.kind, imparo_kv::StateKind::Window { .. }))
@@ -732,21 +1562,8 @@ pub(crate) fn verify_workflow_tree<A: Architecture>(
             if picks.iter().any(|&v| v >= w.plan.config.vocab_size) {
                 return Err("tree argmax outside vocabulary".into());
             }
-            let mut path = vec![0i32];
-            let next = loop {
-                let parent = *path.last().unwrap() as usize;
-                let next = picks[parent];
-                if path.len() == limit || stops.contains(&next) {
-                    break next;
-                }
-                if let Some(child) = (parent + 1..b)
-                    .find(|&j| parents[j] == parent as i32 && tokens[j] == next)
-                {
-                    path.push(child as i32);
-                } else {
-                    break next;
-                }
-            };
+            let (path, next) =
+                tree_accepted_path(&picks, tokens, parents, limit, stops);
             unsafe {
                 imparo_cuda::tree::commit(&path)?;
             }
@@ -791,4 +1608,118 @@ pub(crate) fn verify_workflow_tree<A: Architecture>(
         );
     }
     Ok(accepted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WindowSource, tree_accepted_path, tree_row_layout, window_sources};
+
+    #[test]
+    fn a_rebuilt_window_takes_path_inputs_then_old_slots() {
+        use WindowSource::{OldSlot, PathNode};
+        assert_eq!(window_sources(1, 2), vec![OldSlot(1), PathNode(0)]);
+        assert_eq!(window_sources(6, 2), vec![PathNode(4), PathNode(5)]);
+        assert_eq!(
+            window_sources(1, 3),
+            vec![OldSlot(1), OldSlot(2), PathNode(0)]
+        );
+        assert_eq!(
+            window_sources(2, 3),
+            vec![OldSlot(2), PathNode(0), PathNode(1)]
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_window_equals_the_path_shifted_into_the_old_window() {
+        for history in 1..=4 {
+            for path_len in 1..=6 {
+                // Old slot s holds 100 + s; the path's node i holds i.
+                let mut chain: Vec<usize> = (0..history).map(|s| 100 + s).collect();
+                chain.extend(0..path_len);
+                let rebuilt: Vec<usize> = window_sources(path_len, history)
+                    .into_iter()
+                    .map(|source| match source {
+                        WindowSource::PathNode(i) => i,
+                        WindowSource::OldSlot(s) => 100 + s,
+                    })
+                    .collect();
+                assert_eq!(
+                    rebuilt,
+                    &chain[chain.len() - history..],
+                    "history {history}, path of {path_len}"
+                );
+            }
+        }
+    }
+
+    /// A chain 0-1-2-3 and a branch 4-5 off node 1.
+    const PARENTS: [i32; 6] = [-1, 0, 1, 2, 1, 4];
+    const TOKENS: [u32; 6] = [10, 11, 12, 13, 20, 21];
+
+    #[test]
+    fn the_walk_follows_the_picks_into_a_branch() {
+        let picks = [11, 20, 99, 99, 21, 7];
+        assert_eq!(
+            tree_accepted_path(&picks, &TOKENS, &PARENTS, 8, &[]),
+            (vec![0, 1, 4, 5], 7)
+        );
+    }
+
+    #[test]
+    fn the_walk_ends_at_the_limit_a_stop_token_or_a_leaf() {
+        let picks = [11, 12, 13, 14, 21, 7];
+        assert_eq!(
+            tree_accepted_path(&picks, &TOKENS, &PARENTS, 2, &[]),
+            (vec![0, 1], 12)
+        );
+        assert_eq!(
+            tree_accepted_path(&picks, &TOKENS, &PARENTS, 8, &[12]),
+            (vec![0, 1], 12)
+        );
+        assert_eq!(
+            tree_accepted_path(&picks, &TOKENS, &PARENTS, 8, &[]),
+            (vec![0, 1, 2, 3], 14)
+        );
+        assert_eq!(
+            tree_accepted_path(&[5; 6], &TOKENS, &PARENTS, 8, &[]),
+            (vec![0], 5)
+        );
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
+    fn native_frontier_accepts_a_budget_above_its_depth() {
+        let parents = [-1, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6];
+        super::validate_tree_parents(&parents).unwrap();
+        let tokens: Vec<u32> = (0..16).collect();
+        let picks: Vec<u32> = (1..17).collect();
+        assert_eq!(
+            tree_accepted_path(&picks, &tokens, &parents, 16, &[]),
+            ((0..9).collect(), 9)
+        );
+        assert_eq!(
+            tree_accepted_path(&picks, &tokens, &parents, 3, &[]),
+            (vec![0, 1, 2], 3)
+        );
+        let mut invalid = parents;
+        invalid[9] = 8;
+        assert!(super::validate_tree_parents(&invalid).is_err());
+    }
+
+    #[test]
+    fn the_layout_holds_positions_visibility_and_ancestors() {
+        let words = tree_row_layout(100, &PARENTS).unwrap();
+        let row = |t: usize| &words[t * 12..(t + 1) * 12];
+        // Node 5: path 0, 1, 4, 5 -- depth 3, sees those four rows, ancestors 4, 1, 0.
+        assert_eq!(row(5)[0], 103);
+        assert_eq!(row(5)[1], 3);
+        assert_eq!(row(5)[2], 0b11_0011);
+        assert_eq!(row(5)[3], 0);
+        assert_eq!(&row(5)[4..7], &[4, 1, 0]);
+        // Node 3: the chain's fourth row.
+        assert_eq!(row(3)[0], 103);
+        assert_eq!(row(3)[2], 0b1111);
+        assert!(tree_row_layout(0, &[0, -1]).is_err());
+        assert!(tree_row_layout(0, &[-1, 1]).is_err());
+    }
 }

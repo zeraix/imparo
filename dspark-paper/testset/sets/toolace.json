@@ -1,0 +1,1141 @@
+{
+ "set": "toolace",
+ "source_max_tokens": 1024,
+ "provenance": {
+  "source": "Team-ACE/ToolACE",
+  "config": "default",
+  "split": "train",
+  "revision": "6bda777c88d21e5a204703c1ee45597a8fa4f734",
+  "no_schema": 0,
+  "builder": "dspark-paper/testset/build.py",
+  "params": {
+   "rounds_per_kind": 2,
+   "single_kind": 8,
+   "max_chars": 4000
+  },
+  "built": "2026-09-27T16:17:51+0800"
+ },
+ "conversations": [
+  {
+   "name": "ta-1",
+   "kind": "tools",
+   "source": "Team-ACE/ToolACE",
+   "source_id": "0",
+   "chars": 627,
+   "sha256": "47936d6e0df11535",
+   "turns": [
+    {
+     "kind": "tools",
+     "type": "first",
+     "text": "I'm considering investing and I'd like to know what's happening in the market right now. Could you get me the top market trends in the US?",
+     "result": "[{\"name\": \"Market Trends API\", \"results\": {\"trends\": [{\"name\": \"S&P 500\", \"description\": \"Standard & Poor's 500 Index is a market-capitalization-weighted index of the 500 largest U.S. publicly traded companies.\", \"data\": {\"current_value\": \"4172.80\", \"percentage_change\": \"+0.68%\"}}, {\"name\": \"DOW J\", \"description\": \"Dow Jones Industrial Average is a price-weighted average of 30 blue-chip stocks that are generally the leaders in their industry.\", \"data\": {\"current_value\": \"34479.60\", \"percentage_change\": \"+0.47%\"}}, {\"name\": \"NASDAQ\", \"description\": \"The NASDAQ Composite is a broad-based capitalization-weighted index of stocks in all three NASDAQ tiers: Global Select, Global Market and Capital Market.\", \"data\": {\"current_value\": \"13691.30\", \"percentage_change\": \"+0.90%\"}}]}}]"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Could you explain what SEC filings are and how they might be useful for an investor like me?"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "So, a couple of years ago, I invested in a tech startup without doing any proper research. It seemed like a hot trend at the time, but the company went belly up within a year. I ended up losing a good chunk of money. What are your thoughts on that?"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Could you provide me with the SEC filings for Apple? Also, I’m curious about how COVID-19 has affected people's mobility away from home in the US."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "newAddress",
+      "description": "Generates a new Ethereum address that can be used to send or receive funds. Do not lose the password! We can't restore access to an address if you lose it.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "password": {
+         "description": "The password for the new Ethereum address",
+         "type": "string"
+        }
+       },
+       "required": [
+        "password"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Market Trends API",
+      "description": "Get the latest market trends and relevant news for a specified country and language.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "trend_type": {
+         "description": "Trend type.",
+         "type": "string",
+         "enum": [
+          "MARKET_INDEXES",
+          "MOST_ACTIVE",
+          "GAINERS",
+          "LOSERS",
+          "CRYPTO",
+          "CURRENCIES",
+          "CLIMATE_LEADERS"
+         ]
+        },
+        "country": {
+         "description": "The country for which to get trends, specified as a 2-letter country code - see ISO 3166.",
+         "type": "string",
+         "default": "us"
+        },
+        "language": {
+         "description": "The language to use for the results, specified as a 2-letter language code - see ISO 639-1.",
+         "type": "string",
+         "default": "en"
+        }
+       },
+       "required": [
+        "trend_type"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Futures Prices",
+      "description": "Retrieve a list of current futures prices for various financial instruments.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "instrument_type": {
+         "description": "Type of financial instrument (e.g., commodity, currency, index)",
+         "type": "string"
+        },
+        "exchange": {
+         "description": "Name of the exchange (e.g., CME, ICE, NYMEX)",
+         "type": "string"
+        },
+        "start_string": {
+         "description": "Start string for the price data (YYYY-MM-DD)",
+         "type": "string"
+        },
+        "end_string": {
+         "description": "End string for the price data (YYYY-MM-DD)",
+         "type": "string"
+        }
+       },
+       "required": [
+        "instrument_type",
+        "exchange"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "SEC Filings",
+      "description": "Returns a list of SEC Filings for the requested company, including filing types, strings, and documents.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "identifier": {
+         "description": "Publicly traded company's stock symbol or Central Index Key (CIK)",
+         "type": "string",
+         "default": "aapl"
+        }
+       },
+       "required": [
+        "identifier"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "United States Away from Home Mobility API",
+      "description": "Retrieve daily data on the percentage change in time spent away from home in the United States, providing insights into the economic impact of the COVID-19 pandemic.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "string": {
+         "description": "The string for which to retrieve data (format: YYYY-MM-DD)",
+         "type": "string"
+        },
+        "state": {
+         "description": "The state for which to retrieve data (optional, default: all states)",
+         "type": "string"
+        }
+       },
+       "required": [
+        "string"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Calculate Sales Tax",
+      "description": "Retrieves the sales tax rate applicable to a specific address. This API accepts address inputs to deliver up-to-string, relevant local sales tax rates instantly.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "country": {
+         "description": "Set to one of the country codes listed in Supported Countries.",
+         "type": "string",
+         "default": "US"
+        },
+        "city": {
+         "description": "City name",
+         "type": "string",
+         "default": "Meridian"
+        },
+        "zip": {
+         "description": "Zip code",
+         "type": "string",
+         "default": "83646"
+        },
+        "street": {
+         "description": "Street address",
+         "type": "string",
+         "default": "936 Storey Ave"
+        }
+       },
+       "required": [
+        "country"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "ta-2",
+   "kind": "tools",
+   "source": "Team-ACE/ToolACE",
+   "source_id": "1",
+   "chars": 246,
+   "sha256": "b537e0b351158732",
+   "turns": [
+    {
+     "kind": "tools",
+     "type": "first",
+     "text": "Could you please find me some quotes about \"inspiration\"?",
+     "result": "[{\"name\": \"Quotes by Keywords\", \"results\": {\"quotes\": [{\"text\": \"The only way to achieve the impossible is to believe it is possible.\", \"author\": \"Charles Kingsleigh\"}, {\"text\": \"Don't watch the clock; do what it does. Keep going.\", \"author\": \"Sam Levenson\"}, {\"text\": \"Success is not the key to happiness. Happiness is the key to success. If you love what you are doing, you will be successful.\", \"author\": \"Albert Schweitzer\"}]}}]"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Could you summarize the meaning of the quote by Albert Schweitzer?"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Can you dig up some juicy details about the zip code 10001? I'm doing a mail-order flamingo business plan, don't ask why.",
+     "result": "[{\"name\": \"Get Zip Code Information\", \"results\": {\"information\": \"Zip code information for 10001, USA\", \"latitude\": 40.748817, \"longitude\": -73.985428, \"city\": \"New York\", \"state\": \"NY\", \"county\": \"New York\"}}]"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "Quotes by Keywords",
+      "description": "Returns a list of quotes containing the specified keyword.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "word": {
+         "description": "The keyword to search for in quotes.",
+         "type": "string"
+        }
+       },
+       "required": [
+        "word"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Zip Code Information",
+      "description": "Retrieve information about a specific zip code in the United States.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "country": {
+         "description": "The country code (default: 'us')",
+         "type": "string"
+        },
+        "postal_code": {
+         "description": "The zip code (default: '90210')",
+         "type": "string"
+        }
+       },
+       "required": [
+        "country",
+        "postal_code"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Weekly Hot 100 Chart",
+      "description": "Retrieve the Billboard Hot 100 chart for a specific string.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "string": {
+         "description": "The string for which to retrieve the chart (YYYY-MM-DD)",
+         "type": "string"
+        }
+       },
+       "required": [
+        "string"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Cars Information",
+      "description": "This API returns a list of cars information based on the provided parameters.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "model": {
+         "description": "The model of the vehicle.",
+         "type": "string"
+        },
+        "make": {
+         "description": "The manufacturer of the vehicle.",
+         "type": "string"
+        },
+        "year": {
+         "description": "The model year of the vehicle.",
+         "type": "string"
+        },
+        "fuel_type": {
+         "description": "The type of fuel used.",
+         "type": "string"
+        },
+        "drive": {
+         "description": "The drive transmission type.",
+         "type": "string"
+        },
+        "transmission": {
+         "description": "The type of transmission.",
+         "type": "string"
+        },
+        "cylinders": {
+         "description": "The number of cylinders.",
+         "type": "number"
+        },
+        "min_city_mpg": {
+         "description": "Minimum city fuel efficiency in miles per gallon.",
+         "type": "number"
+        },
+        "max_city_mpg": {
+         "description": "Maximum city fuel efficiency in miles per gallon.",
+         "type": "number"
+        },
+        "min_hwy_mpg": {
+         "description": "Minimum highway fuel efficiency in miles per gallon.",
+         "type": "number"
+        },
+        "max_hwy_mpg": {
+         "description": "Maximum highway fuel efficiency in miles per gallon.",
+         "type": "number"
+        },
+        "min_comb_mpg": {
+         "description": "Minimum combination (city + highway) fuel efficiency in miles per gallon.",
+         "type": "number"
+        },
+        "max_comb_mpg": {
+         "description": "Maximum combination (city + highway) fuel efficiency in miles per gallon.",
+         "type": "number"
+        },
+        "limit": {
+         "description": "How many results to return.",
+         "type": "string"
+        }
+       },
+       "required": []
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Lorem Ipsum Generator",
+      "description": "Generate a specified number of words of Lorem Ipsum text",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "amount": {
+         "description": "The number of words to generate",
+         "type": "integer"
+        }
+       },
+       "required": [
+        "amount"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Crawl",
+      "description": "Perform a Google search and return the HTML source of the results page.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "description": "The search query to perform.",
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "ta-3",
+   "kind": "tools",
+   "source": "Team-ACE/ToolACE",
+   "source_id": "2",
+   "chars": 313,
+   "sha256": "0001ac8fdc2d3126",
+   "turns": [
+    {
+     "kind": "tools",
+     "type": "first",
+     "text": "Hey, can you show me the list of football competitions that are currently televised in Peru?",
+     "result": "[{\"name\": \"GetCompetitions\", \"results\": {\"competitions\": [{\"id\": 1, \"name\": \"Copa Libertadores\", \"startDate\": \"2023-02-15\", \"endDate\": \"2023-11-20\"}, {\"id\": 2, \"name\": \"Copa Sudamericana\", \"startDate\": \"2023-03-05\", \"endDate\": \"2023-10-25\"}, {\"id\": 3, \"name\": \"Liga 1 Peru\", \"startDate\": \"2023-02-03\", \"endDate\": \"2023-12-05\"}]}}]"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "How important are manager images in sports marketing and branding?"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "I'd like to see this in practice! Can you fetch me a manager placeholder image for football? Let's bring these theories to life with some quality pixels.",
+     "result": "[{\"name\": \"Get Manager Placeholder Image\", \"results\": {\"image\": \"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQAQMAAAAew5lpAAAAA1BMVEX///+nxBvIAAAASElEQVR4nO3BAQ0AAADCoPdPbQ43oAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIB3AABUexBM.jpg\", \"sport_name\": \"football\"}}]"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "GetCompetitions",
+      "description": "Retrieve a list of football competitions that are televised in Peru.",
+      "parameters": {
+       "type": "object",
+       "properties": {},
+       "required": []
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Manager Placeholder Image",
+      "description": "Retrieve the manager placeholder image in PNG format for a specific sport.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "sport": {
+         "description": "The name of the sport for which the manager placeholder image is required.",
+         "type": "string"
+        }
+       },
+       "required": [
+        "sport"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Search Competition API",
+      "description": "Search for competitions in the sports domain",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "name": {
+         "description": "The name of the competition to search for",
+         "type": "string"
+        }
+       },
+       "required": [
+        "name"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Category Image",
+      "description": "Retrieve a category image for a specific sport or league.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "slug": {
+         "description": "Slug of the sport or league, e.g. `france` `champions-league` `intl`.",
+         "type": "string",
+         "default": "france"
+        }
+       },
+       "required": [
+        "slug"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "ta-4",
+   "kind": "tools",
+   "source": "Team-ACE/ToolACE",
+   "source_id": "3",
+   "chars": 355,
+   "sha256": "f71ec08c0a3d8d42",
+   "turns": [
+    {
+     "kind": "tools",
+     "type": "first",
+     "text": "Could you provide me with a list of upcoming Azure events? Please start with the first page of results.",
+     "result": "[{\"name\": \"GetFutureEvents\", \"results\": {\"events\": [{\"id\": \"EVT123\", \"title\": \"Azure maintenance window\", \"description\": \"Planned maintenance on Azure compute resources in West US\", \"start_string\": \"2022-07-24T08:00:00Z\", \"end_string\": \"2022-07-24T12:00:00Z\"}, {\"id\": \"EVT124\", \"title\": \"Azure network upgrade\", \"description\": \"Network upgrade in Azure East US datacenters\", \"start_string\": \"2022-07-26T01:00:00Z\", \"end_string\": \"2022-07-26T05:00:00Z\"}]}}]"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Could you tell me what languages are commonly spoken in Brazil?",
+     "result": "[{\"name\": \"Get Languages for Country\", \"results\": {\"languages\": [\"Portuguese\"]}}]"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "It's fascinating how languages shape our communication. Speaking of fascinating things, I recently discovered a deep affection for dogs. Do you have any information on various dog breeds?",
+     "result": "[{\"name\": \"Get All Dog Breeds\", \"results\": {\"dog_breeds\": [{\"name\": \"Labrador Retriever\", \"description\": \"The Labrador Retriever is a friendly, outgoing, and high-spirited companion.\", \"image_url\": \"https://example.com/images/labrador_retriever.jpg\"}, {\"name\": \"German Shepherd\", \"description\": \"The German Shepherd is a breed of medium to large-sized working dog that originated in Germany.\", \"image_url\": \"https://example.com/images/german_shepherd.jpg\"}, {\"name\": \"Golden Retriever\", \"description\": \"The Golden Retriever is a large, friendly dog breed known for its tolerant attitude.\", \"image_url\": \"https://example.com/images/golden_retriever.jpg\"}, {\"name\": \"Bulldog\", \"description\": \"The Bulldog is a medium-sized breed of dog that is muscular, heavy, and has a wrinkled face.\", \"image_url\": \"https://example.com/images/bulldog.jpg\"}, {\"name\": \"Beagle\", \"description\": \"The Beagle is a breed of small hound that is similar in appearance to the larger foxhound.\", \"image_url\": \"https://example.com/images/beagle.jpg\"}, {\"name\": \"Poodle\", \"description\": \"The Poodle is a breed of dog known for its curly coat and high intelligence.\", \"image_url\": \"https://example.com/images/poodle.jpg\"}, {\"name\": \"Rottweiler\", \"description\": \"The Rottweiler is a breed of domestic dog, regarded as medium-to-large or large.\", \"image_url\": \"https://example.com/images/rottweiler.jpg\"}, {\"name\": \"Yorkshire Terrier\", \"description\": \"The Yorkshire Terrier is a small dog breed of terrier type, developed during the 19th century in Yorkshire, England.\", \"image_url\": \"https://example.com/images/yorkshire_terrier.jpg\"}, {\"name\": \"Boxer\", \"description\": \"The Boxer is a medium to large, short-haired breed of dog, developed in Germany.\", \"image_url\": \"https://example.com/images/boxer.jpg\"}, {\"name\": \"Dachshund\", \"description\": \"The Dachshund is a short-legged, long-bodied, hound-type dog breed.\", \"image_url\": \"https://example.com/images/dachshund.jpg\"}]}}]"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "GetFutureEvents",
+      "description": "Retrieve a list of future Azure events, such as maintenance windows, upstrings, or other scheduled events.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "page": {
+         "description": "The page number to retrieve (default: 1)",
+         "type": "integer"
+        }
+       },
+       "required": [
+        "page"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Languages for Country",
+      "description": "Get a list of valid languages for a given country code.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "country": {
+         "description": "Country code of the country to get languages for. See [all available country codes](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2).",
+         "type": "string",
+         "default": "US"
+        }
+       },
+       "required": [
+        "country"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get All Dog Breeds",
+      "description": "This endpoint returns a list of all available dog breeds, along with their relevant information.",
+      "parameters": {
+       "type": "object",
+       "properties": {},
+       "required": []
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get LinkedIn Prostring by Sales Nav URL",
+      "description": "Retrieves a LinkedIn user's prostring data, including experience, education history, skills, and company-related details, given their Sales Navigator URL.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "linkedin_url": {
+         "description": "The LinkedIn Sales Navigator URL of the user to retrieve prostring data for.",
+         "type": "string"
+        }
+       },
+       "required": [
+        "linkedin_url"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Companies by SIC Code",
+      "description": "Retrieve a list of the top 100 companies that are related to a given SIC code.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "sic_code": {
+         "description": "SIC code to lookup.",
+         "type": "integer"
+        }
+       },
+       "required": [
+        "sic_code"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Search Strong's Number API",
+      "description": "Returns every verse containing the supplied Strong's number. Include LXX boolean option allows searching the Septuagint translation of the Old Testament when searching for a Greek word, enabling connections between New Testament words and Old Testament concepts.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "include-lxx": {
+         "description": "Include LXX translation in search results (true/false)",
+         "type": "boolean",
+         "default": true
+        },
+        "strongs-number": {
+         "description": "The Strong's number to search for",
+         "type": "string"
+        }
+       },
+       "required": [
+        "include-lxx",
+        "strongs-number"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "ta-5",
+   "kind": "tools",
+   "source": "Team-ACE/ToolACE",
+   "source_id": "4",
+   "chars": 466,
+   "sha256": "8991f230f083d1ba",
+   "turns": [
+    {
+     "kind": "tools",
+     "type": "first",
+     "text": "Can you generate a unique and memorable password for a new account I'm creating? Please use two phrases.",
+     "result": "[{\"name\": \"/madlibs-diceware\", \"results\": {\"password\": \"quickly-green-apple-slowly-red-banana\"}}]"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "By the way, you mentioned something about personality analysis. Could you tell me the difference between the Big Five and DISC personality tests?"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "That's interesting. Now, I have a personal quote that motivates me. Can you convert it to an audio file so that I can use it as my morning alarm? The quote is, \"Wake up with determination, go bed with satisfaction.\"",
+     "result": "[{\"name\": \"Get Synthesize\", \"results\": {\"audio_url\": \"https://synthesizedaudio.example.com/audio/1234567890\"}}]"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Synthesize",
+      "description": "Synthesizes the provided text and returns the corresponding audio URL.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "text": {
+         "description": "The text to be synthesized",
+         "type": "string"
+        }
+       },
+       "required": [
+        "text"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Big Five Personality Test Questionnaire",
+      "description": "Retrieve the Big Five Personality Test Questionnaire for personality analysis",
+      "parameters": {
+       "type": "object",
+       "properties": {},
+       "required": []
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Detect Language",
+      "description": "Detect the language of a given text with a confidence score",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "text": {
+         "description": "The text to be analyzed for language detection",
+         "type": "string"
+        },
+        "detectedcount": {
+         "description": "The number of languages to detect (default: 5)",
+         "type": "number",
+         "default": 5.0
+        }
+       },
+       "required": [
+        "text"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "/madlibs-diceware",
+      "description": "Generate a password using madlibs diceware. This API generates a password with a specified number of phrases, each consisting of an adverb, an adjective, and a noun.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "nphrase": {
+         "description": "The number of phrases in the generated password. Accepted values are 1 and 2.",
+         "type": "integer"
+        }
+       },
+       "required": [
+        "nphrase"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "DISC Personality Test Questionnaire",
+      "description": "This API returns all questions for the DISC Personality Test, a widely used framework for understanding individual personalities and behaviors.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "language": {
+         "description": "The language of the questionnaire (e.g., English, Spanish, French)",
+         "type": "string"
+        },
+        "question_type": {
+         "description": "The type of question to return (e.g., multiple-choice, open-ended)",
+         "type": "string"
+        }
+       },
+       "required": [
+        "language"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "ta-6",
+   "kind": "tools",
+   "source": "Team-ACE/ToolACE",
+   "source_id": "5",
+   "chars": 393,
+   "sha256": "c2c3684fe6e1f041",
+   "turns": [
+    {
+     "kind": "tools",
+     "type": "first",
+     "text": "Could you please show me the latest trending videos on YouTube?",
+     "result": "[{\"name\": \"Trending Videos\", \"results\": {\"videos\": [{\"id\": \"dQw4w9WgXcQ\", \"title\": \"Rick Astley - Never Gonna Give You Up\", \"description\": \"The classic song that has been popular for years as an internet meme.\", \"thumbnail\": \"https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg\", \"url\": \"https://www.youtube.com/watch?v=dQw4w9WgXcQ\", \"views\": 850000000, \"likes\": 10000000, \"comments\": 1300000}, {\"id\": \"CevxZvSJLk8\", \"title\": \"Katy Perry - Roar\", \"description\": \"Katy Perry's hit song with an empowering message.\", \"thumbnail\": \"https://i.ytimg.com/vi/CevxZvSJLk8/hqdefault.jpg\", \"url\": \"https://www.youtube.com/watch?v=CevxZvSJLk8\", \"views\": 3200000000, \"likes\": 12000000, \"comments\": 2250000}, {\"id\": \"kXYiU_JCYtU\", \"title\": \"Linkin Park - Numb\", \"description\": \"One of the most recognized songs from Linkin Park.\", \"thumbnail\": \"https://i.ytimg.com/vi/kXYiU_JCYtU/hqdefault.jpg\", \"url\": \"https://www.youtube.com/watch?v=kXYiU_JCYtU\", \"views\": 1500000000, \"likes\": 17000000, \"comments\": 1900000}]}}]"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Ah, there's nothing quite like sitting back and checking out what's trending. Today's scene seems diverse; it's fascinating to see Rick Astley, Katy Perry, and Linkin Park trending together - it really underscores the broad tastes across YouTube's audience!"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Could you also find out what the latest EuroMillions draw results were?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "Trending Videos",
+      "description": "Retrieves a list of trending videos from YouTube, filtered by locale, country, and type.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "hl": {
+         "description": "Locale/language for the request",
+         "type": "string",
+         "default": "en"
+        },
+        "gl": {
+         "description": "Country to get trending videos from",
+         "type": "string",
+         "default": "US"
+        },
+        "type": {
+         "description": "Type of trending videos",
+         "type": "string",
+         "default": "mu"
+        }
+       },
+       "required": []
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get All Characters",
+      "description": "Retrieve a list of characters from the Throne of Glass series.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "limit": {
+         "description": "The maximum number of characters to return",
+         "type": "integer"
+        },
+        "skip": {
+         "description": "The number of characters to skip before returning the results",
+         "type": "integer"
+        }
+       },
+       "required": []
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Get EuroMillions Draw Results",
+      "description": "Retrieve the draw results for a specific string from the EuroMillions lottery",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "string": {
+         "description": "The string for which you want to retrieve the draw results",
+         "type": "string",
+         "format": "string"
+        }
+       },
+       "required": [
+        "string"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "ta-7",
+   "kind": "tools",
+   "source": "Team-ACE/ToolACE",
+   "source_id": "6",
+   "chars": 828,
+   "sha256": "3850d42cf15ea6a9",
+   "turns": [
+    {
+     "kind": "tools",
+     "type": "first",
+     "text": "Could you grab the schedule for the upcoming baseball game on January 15th, 2024? I'm trying to plan a little get-together with some pals and thought catching the game would be a blast!",
+     "result": "[{\"name\": \"Get Baseball Schedule\", \"results\": {\"schedule\": [{\"string\": \"2024-01-15\", \"opponent\": \"New York Yankees\", \"time\": \"07:05 PM\"}, {\"string\": \"2024-01-15\", \"opponent\": \"Boston Red Sox\", \"time\": \"08:15 PM\"}]}}]"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Thanks for the information! By the way, I've noticed a lot of people are getting into sports betting recently. How popular has it become in recent years?"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Do you mind sharing the latest FIFA rankings with me? Also, could you pull up the top statistics for pitching leaders in the MLB for the current season? I want to get the entire hang of the scenario before indulging in any kind of betting."
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "For the FIFA rankings, please provide the current rankings for the men's league. Regarding the MLB pitching leaders, I'm interested in the Earned Run Average (ERA) statistic, for the regular season games, and please use the MLB sports code. Thanks!"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Baseball Schedule",
+      "description": "Retrieve the schedule of a baseball game on a specific string.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "string": {
+         "description": "Enter a string in YYYY-MM-DD format",
+         "type": "string"
+        }
+       },
+       "required": [
+        "string"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "FIFARankings",
+      "description": "Get the current FIFA rankings of Football teams, including their ranking position, team name, and country.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "league": {
+         "description": "The league to get rankings for (e.g. 'Men', 'Women', 'U20', etc.)",
+         "type": "string"
+        },
+        "season": {
+         "description": "The season to get rankings for (e.g. '2022', '2021', etc.)",
+         "type": "string"
+        }
+       },
+       "required": [
+        "league"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Pitching Leaders",
+      "description": "Retrieve the leaders for a given hitting statistic in the MLB domain.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "results": {
+         "description": "The number of results to return.",
+         "type": "integer"
+        },
+        "sort_column": {
+         "description": "The statistic to sort the leaders by.",
+         "type": "string"
+        },
+        "season": {
+         "description": "The season for which to retrieve the leaders.",
+         "type": "string"
+        },
+        "sports_code": {
+         "description": "The sports code for the MLB domain.",
+         "type": "string"
+        },
+        "game_type": {
+         "description": "The type of games to include in the leaders (e.g., regular season, playoffs).",
+         "type": "string"
+        }
+       },
+       "required": [
+        "results",
+        "sort_column",
+        "season",
+        "sports_code",
+        "game_type"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "GetTopSports",
+      "description": "Retrieves the top sports with their corresponding odds and probabilities",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "sport_type": {
+         "description": "The type of sport (e.g., football, basketball, etc.)",
+         "type": "string"
+        },
+        "league": {
+         "description": "The league or competition (e.g., NFL, NBA, etc.)",
+         "type": "string"
+        },
+        "string": {
+         "description": "The string for which the top sports data is required",
+         "type": "string"
+        }
+       },
+       "required": [
+        "sport_type",
+        "league",
+        "string"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "ta-8",
+   "kind": "tools",
+   "source": "Team-ACE/ToolACE",
+   "source_id": "7",
+   "chars": 504,
+   "sha256": "a9503055bebb8749",
+   "turns": [
+    {
+     "kind": "tools",
+     "type": "first",
+     "text": "I am planning a trip to Japan soon. Could you recommend games popular in Japan to help me understand more about the local culture?",
+     "result": "[{\"name\": \"Get Suggestion\", \"results\": {\"suggestions\": [{\"title\": \"Pokemon Sword\", \"description\": \"Catch, train, and battle Pokemon in the Galar region.\", \"rating\": 4.5}, {\"title\": \"Super Mario Odyssey\", \"description\": \"Embark on a globe-trotting adventure with Mario.\", \"rating\": 4.7}, {\"title\": \"Animal Crossing: New Horizons\", \"description\": \"Create your island paradise and interact with charming villagers.\", \"rating\": 4.8}]}}]"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "Those are some interesting suggestions! Out of the games you listed, do you have a personal favorite or any other game that you think is a must-try from Japan?"
+    },
+    {
+     "kind": "tools",
+     "type": "continued",
+     "text": "That's a great recommendation! Also, I am considering investing in a rental property in Tokyo. Can you help me estimate the rental value and possible income with an address of Nishi-Shinjuku, Shinjuku City, Tokyo?",
+     "result": "[{\"name\": \"Rental Property Calculator\", \"results\": {\"rental_value\": 300000, \"monthly_expenses\": 50000, \"annual_income\": 3600000}}]"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "Get Suggestion",
+      "description": "Returns a list of game suggestions based on the given term, language, and country.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "term": {
+         "description": "The search term to find game suggestions",
+         "type": "string"
+        },
+        "lang": {
+         "description": "The language to filter game suggestions",
+         "type": "string"
+        },
+        "country": {
+         "description": "The country to filter game suggestions",
+         "type": "string"
+        }
+       },
+       "required": [
+        "term"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Rental Property Calculator",
+      "description": "Calculates the rental property value based on the provided address and other parameters.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "address": {
+         "description": "The address of the rental property.",
+         "type": "string"
+        },
+        "bathrooms": {
+         "description": "The number of bathrooms in the property.",
+         "type": "number",
+         "default": 2.0
+        },
+        "accommostrings": {
+         "description": "The maximum number of people the property can accommostring.",
+         "type": "string",
+         "default": "2"
+        },
+        "bedrooms": {
+         "description": "The number of bedrooms in the property.",
+         "type": "number",
+         "default": 2.0
+        },
+        "currency": {
+         "description": "The currency to use for the calculation.",
+         "type": "string",
+         "default": ""
+        }
+       },
+       "required": [
+        "address"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "Languages by Country",
+      "description": "Returns a JSON object with information about languages spoken in a specific country in Africa.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "country_name": {
+         "description": "The name of the country in Africa",
+         "type": "string"
+        }
+       },
+       "required": [
+        "country_name"
+       ]
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

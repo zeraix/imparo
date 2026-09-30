@@ -608,6 +608,226 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Part of a unit file a restore wants: the bytes at `at`, read into `dst`.
+pub struct UnitPiece<'a> {
+    pub at: u64,
+    pub dst: &'a mut [u8],
+}
+
+/// A unit file opened for a direct read, its length already checked.
+pub struct UnitFile {
+    file: fs::File,
+    path: PathBuf,
+    len: u64,
+}
+
+impl UnitFile {
+    /// Reads `pieces` straight into their destinations. Pieces whose file ranges abut
+    /// are one positional scatter read, so an extent needed whole is one sweep of the
+    /// file, however its rows are spread in memory. Several threads may read one file:
+    /// the reads are positional.
+    ///
+    /// Returns how many scatter reads it took.
+    ///
+    /// # Errors
+    /// A piece past the end of the file, or a failed read.
+    pub fn read(&self, pieces: &mut [UnitPiece<'_>]) -> Result<usize, String> {
+        pieces.sort_by_key(|p| p.at);
+        let probe = crate::disk_probe();
+        let mut runs = 0;
+        let mut i = 0;
+        while i < pieces.len() {
+            let mut end = pieces[i].at + pieces[i].dst.len() as u64;
+            let mut j = i + 1;
+            while j < pieces.len() && pieces[j].at == end {
+                end += pieces[j].dst.len() as u64;
+                j += 1;
+            }
+            if end > self.len {
+                return Err(format!(
+                    "{}: a read up to {end} past its {} bytes",
+                    self.path.display(),
+                    self.len
+                ));
+            }
+            let t_run = probe.map(|_| std::time::Instant::now());
+            read_run(&self.file, pieces[i].at, &mut pieces[i..j])
+                .map_err(|e| format!("{}: {e}", self.path.display()))?;
+            if let Some(t) = t_run {
+                eprintln!(
+                    "[imparo] kv disk probe: read {:.1} MiB in {} pieces at {} in {:.2} ms",
+                    (end - pieces[i].at) as f64 / (1u64 << 20) as f64,
+                    j - i,
+                    pieces[i].at,
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            runs += 1;
+            i = j;
+        }
+        Ok(runs)
+    }
+
+    /// Drops the file's pages from the page cache: the rows now live where they were
+    /// read to, and a second copy of them in RAM would only push other pages out.
+    pub fn drop_cached(&self) {
+        let t = crate::disk_probe().map(|_| std::time::Instant::now());
+        drop_cached(&self.file, self.len);
+        if let Some(t) = t {
+            eprintln!(
+                "[imparo] kv disk probe: dropped {:.1} MiB of cached pages in {:.2} ms",
+                self.len as f64 / (1u64 << 20) as f64,
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+}
+
+/// How many vectors one `preadv` takes, from the system; 16 when it will not say, the
+/// least POSIX allows (`_XOPEN_IOV_MAX`).
+#[cfg(unix)]
+fn iov_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let n = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+        usize::try_from(n).ok().filter(|&n| n > 0).unwrap_or(16)
+    })
+}
+
+/// One scatter read: the pieces of `run` abut in the file, the first at `at`.
+#[cfg(unix)]
+fn read_run(
+    f: &fs::File,
+    mut at: u64,
+    run: &mut [UnitPiece<'_>],
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut iov: Vec<libc::iovec> = run
+        .iter_mut()
+        .filter(|p| !p.dst.is_empty())
+        .map(|p| libc::iovec {
+            iov_base: p.dst.as_mut_ptr().cast(),
+            iov_len: p.dst.len(),
+        })
+        .collect();
+    let mut first = 0;
+    while first < iov.len() {
+        let n = (iov.len() - first).min(iov_max());
+        // SAFETY: every vector points into a live `&mut [u8]` of `run` for its length, and
+        // `first..first + n` stays inside `iov`.
+        let got = unsafe {
+            libc::preadv(
+                f.as_raw_fd(),
+                iov[first..].as_ptr(),
+                n as libc::c_int,
+                at as libc::off_t,
+            )
+        };
+        if got < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if got == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        at += got as u64;
+        // Step past what arrived: whole vectors, then into a partly filled one.
+        let mut left = got as usize;
+        while left > 0 {
+            let v = &mut iov[first];
+            if left >= v.iov_len {
+                left -= v.iov_len;
+                first += 1;
+            } else {
+                // SAFETY: `left` is inside this vector's buffer.
+                v.iov_base = unsafe { v.iov_base.cast::<u8>().add(left).cast() };
+                v.iov_len -= left;
+                left = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
+// Windows has no preadv equivalent for arbitrary, unaligned destinations.
+// Read directly into each destination with an explicit offset; do not use a
+// shared seek/read cursor, since restore workers may read the same file.
+#[cfg(windows)]
+fn read_run(
+    f: &fs::File,
+    mut at: u64,
+    run: &mut [UnitPiece<'_>],
+) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    for piece in run {
+        let mut dst = &mut *piece.dst;
+        while !dst.is_empty() {
+            match f.seek_read(dst, at) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => {
+                    at += n as u64;
+                    dst = &mut dst[n..];
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drops a file's pages from the page cache once its bytes live where they were read to.
+///
+/// macOS has no fadvise. A shared read-only mapping of the file, invalidated with
+/// `msync`, discards its cached pages: 72 MiB in 0.9 ms, and none left resident by
+/// `mincore` afterwards (measured on an M3 Pro).
+#[cfg(target_os = "macos")]
+fn drop_cached(f: &fs::File, len: u64) {
+    use std::os::fd::AsRawFd;
+    let Ok(n) = usize::try_from(len) else {
+        return;
+    };
+    if n == 0 {
+        return;
+    }
+    // SAFETY: a fresh read-only mapping of the whole file, released before return.
+    unsafe {
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            n,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            f.as_raw_fd(),
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            return;
+        }
+        libc::msync(p, n, libc::MS_INVALIDATE);
+        libc::munmap(p, n);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drop_cached(f: &fs::File, len: u64) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: advice on an open descriptor; it touches no memory of ours.
+    unsafe {
+        libc::posix_fadvise(
+            f.as_raw_fd(),
+            0,
+            len as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn drop_cached(_f: &fs::File, _len: u64) {}
+
 /// Conversation ids come from clients; the on-disk name never trusts them.
 fn conv_file_name(id: &str) -> String {
     let mut h = Sha256::new();
@@ -676,6 +896,27 @@ impl Store {
     #[must_use]
     pub fn has_unit(&self, h: &UnitHash) -> bool {
         self.unit_path(h).exists()
+    }
+
+    /// Opens unit `h` for a direct read, after checking the file is `len` bytes long.
+    ///
+    /// # Errors
+    /// A missing file, or one of another length.
+    pub fn open_unit(&self, h: &UnitHash, len: u64) -> Result<UnitFile, String> {
+        let path = self.unit_path(h);
+        let file =
+            fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let got = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        if got != len {
+            return Err(format!(
+                "{}: {got} bytes where the layout says {len}",
+                path.display()
+            ));
+        }
+        Ok(UnitFile { file, path, len })
     }
 
     /// Commits a conversation's durable record. The manifest is the commit LINE: every
@@ -1259,6 +1500,59 @@ mod tests {
             .join(format!("imparo-kv-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn positioned_read_handles_scatter_eof_and_parallel_readers() {
+        let dir = tmpdir("positioned-read");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unit");
+        let data: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &data).unwrap();
+        let file = fs::File::open(&path).unwrap();
+        std::thread::scope(|scope| {
+            for base in [3usize, 517, 1033, 6001] {
+                let file = &file;
+                let data = &data;
+                scope.spawn(move || {
+                    for _ in 0..16 {
+                        let mut a = [0; 7];
+                        let mut b = [0; 503];
+                        let mut empty = [];
+                        let mut pieces = [
+                            UnitPiece {
+                                at: base as u64,
+                                dst: &mut a,
+                            },
+                            UnitPiece {
+                                at: (base + 7) as u64,
+                                dst: &mut empty,
+                            },
+                            UnitPiece {
+                                at: (base + 7) as u64,
+                                dst: &mut b,
+                            },
+                        ];
+                        read_run(file, base as u64, &mut pieces).unwrap();
+                        assert_eq!(a, data[base..base + 7]);
+                        assert_eq!(b, data[base + 7..base + 510]);
+                    }
+                });
+            }
+        });
+        let mut tail = [0; 2];
+        let error = read_run(
+            &file,
+            8191,
+            &mut [UnitPiece {
+                at: 8191,
+                dst: &mut tail,
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        drop(file);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn root() -> ConfigRoot {

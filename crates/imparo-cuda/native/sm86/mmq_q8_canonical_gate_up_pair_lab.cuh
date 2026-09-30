@@ -1,4 +1,5 @@
 #pragma once
+#include "../lfm_retained_policy.cuh"
 
 // Default-off canonical Q8 Gate/Up experiment; not a receipted runtime route.
 // Reuse the existing warp-pair MMA schedule, but read original GGUF blocks and
@@ -113,10 +114,11 @@ __global__ void fused_tail(const uint8_t *gate, const uint8_t *up,
 
 inline Pair::LaunchResult launch(const uint8_t *gate, const uint8_t *up,
         const BlockQ8_1Mmq *x, float *y, uint32_t n_in, uint32_t n_out,
-        uint32_t n_tok, cudaStream_t stream) {
+        uint32_t n_tok, cudaStream_t stream, bool batch_invariant = false) {
 #if defined(IMPARO_CUDA_SPECULATIVE)
     const char *live2 = std::getenv("IMPARO_LAB_Q8_CANONICAL_LIVE2");
-    if (n_tok == 9 && live2 && std::strcmp(live2, "1") == 0) {
+    if ((n_tok == 9 || (batch_invariant && n_tok >= 1 && n_tok <= 16))
+            && imparo_lfm_retained::common(live2 && std::strcmp(live2, "1") == 0)) {
         int live2_device = -1;
         if (cudaGetDevice(&live2_device) != cudaSuccess) return Pair::LaunchResult::Error;
         static int live2_configured_device = -1;
@@ -145,6 +147,7 @@ inline Pair::LaunchResult launch(const uint8_t *gate, const uint8_t *up,
             }
             return Pair::LaunchResult::Launched;
         }
+        if (batch_invariant) return Pair::LaunchResult::NotSupported;
     }
 #endif
     int device = -1;

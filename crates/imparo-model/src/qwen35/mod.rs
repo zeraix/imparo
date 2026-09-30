@@ -9,6 +9,7 @@
 //! device, and the two dispatch the SAME two recurrent ops in the same order.
 pub mod chat_format;
 pub mod plan;
+pub mod weight_basis;
 pub mod workflow_cpu;
 pub mod workflow_gpu;
 
@@ -22,5 +23,6 @@ crate::architecture!(Qwen35Arch => Qwen35 {
     batch_host:          workflow_cpu::batch,
     device_batch:        workflow_gpu::batch,
     device_prepare:      workflow_gpu::prepare_device,
+    device_rows:         workflow_gpu::rows,
     buffer_requirements: workflow_gpu::buffer_requirements,
 });

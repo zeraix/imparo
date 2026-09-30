@@ -55,3 +55,19 @@ pub use tenant::PoolTenant;
 pub fn log_on() -> bool {
     std::env::var("IMPARO_LOG").is_ok_and(|v| v != "0" && !v.is_empty())
 }
+
+/// Wall-clock milliseconds for an `IMPARO_KV_DISK_PROBE=1` line, or `None` with the probe
+/// off: the disk writer and the request thread stamp their lines on one clock, so the
+/// order of a commit and the lookup after it can be read off the log.
+pub(crate) fn disk_probe() -> Option<f64> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON
+        .get_or_init(|| std::env::var("IMPARO_KV_DISK_PROBE").is_ok_and(|v| v == "1"))
+    {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((now.as_secs() % 1000) as f64 * 1e3 + f64::from(now.subsec_micros()) / 1e3)
+}

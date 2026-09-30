@@ -18,15 +18,45 @@ use std::path::Path;
 
 use imparo_gguf::{Document, MetadataValue, Scalar};
 
-#[cfg(feature = "cuda-speculative")]
+pub mod accept_model;
+pub mod accept_offset;
+pub mod cost_model;
+#[cfg(feature = "speculative")]
 pub mod dspark;
+#[cfg(feature = "speculative")]
+pub mod dspark_forward;
 #[cfg(feature = "cuda-speculative")]
 pub mod gemma4_mtp;
 pub mod layer_outputs;
+pub mod ngram;
 pub mod speculative;
 mod verification;
+pub mod verify_cost;
 mod window_history;
-pub use verification::GreedyVerification;
+
+pub(crate) fn lfm_retained_domain() -> u32 {
+    #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
+    {
+        imparo_cuda::knobs::lfm_retained_domain()
+    }
+    #[cfg(not(all(feature = "cuda-speculative", target_os = "windows")))]
+    {
+        0
+    }
+}
+
+pub(crate) fn e4b_retained_decode_policy_enabled() -> bool {
+    #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
+    {
+        imparo_cuda::knobs::e4b_retained_decode_policy_enabled()
+    }
+    #[cfg(not(all(feature = "cuda-speculative", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+pub use verification::{GreedyVerification, tree_row_layout};
 pub mod backend;
 pub mod chat;
 pub mod cpu_support;
@@ -38,7 +68,9 @@ pub mod host;
 pub mod identity;
 pub mod kv;
 pub mod lfm2;
+pub mod lfm2moe;
 pub mod placement;
+pub mod qwen3;
 pub mod qwen35;
 pub use identity::ModelPlanIdentity;
 pub use imparo_cpu::ops;
@@ -144,6 +176,17 @@ impl Attention {
     }
 }
 
+/// A recurrent layer's rolling convolution window: `history` inputs of `width` values each,
+/// oldest first, at the start of the layer's recurrent region. A tree verify keeps each node's
+/// input to the window and a commit rebuilds the accepted path's window from them
+/// (docs/speculator-design.md section 7.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvWindow {
+    pub layer: u32,
+    pub width: u32,
+    pub history: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Activation {
     Gelu,
@@ -235,6 +278,12 @@ impl Activation {
     }
 }
 
+/// How a router's scores become the weights a token's picked experts carry.
+///
+/// Defined beside the backend trait because a gating kernel takes it: a plan reads it from
+/// the file and a device dispatch carries it, so one definition serves both.
+pub use imparo_backend::ExpertGating;
+
 /// The feed-forward half of a block.
 ///
 /// Dense and MoE are different SHAPES, not one shape with optional fields. A routed layer
@@ -250,6 +299,10 @@ pub enum Ffn {
         hidden: u32,
     },
     /// Routed experts, with an optional shared expert every token also runs.
+    ///
+    /// The last four fields are not bookkeeping: the router's scores are useless without
+    /// them, and a forward that guessed any one of them would produce fluent text with
+    /// the wrong experts. They are read from the file, like every other field here.
     Moe {
         activation: Activation,
         /// Hidden width of ONE expert.
@@ -260,6 +313,15 @@ pub enum Ffn {
         experts_used: u32,
         /// Hidden width of the always-on shared expert; 0 when there is none.
         shared_hidden: u32,
+        /// What turns the router's scores into weights.
+        gating: ExpertGating,
+        /// Whether the picked weights are renormalised to sum to 1 before the scale.
+        normalise_weights: bool,
+        /// Multiplies the picked weights; 1.0 when the file sets none.
+        weights_scale: f32,
+        /// Whether the layer carries `exp_probs_b`, a per-expert bias ADDED TO THE SCORES
+        /// BEFORE the pick -- so it changes which experts run, not only their weights.
+        expert_bias: bool,
     },
 }
 
@@ -398,9 +460,29 @@ pub struct ModelPlan {
     /// dispatch path. Only that route can fail a step; a plan without it never rolls
     /// back, and that decides how many planes of recurrent state it holds.
     pub mega_decode: bool,
+    /// A drafter paired with this model, running on its backend beside it. Set before the
+    /// device is enabled: the fit, the attention library and the per-layer KV arrays are all
+    /// sized from the plan.
+    pub drafter: Option<DrafterPlan>,
 }
 
 impl ModelPlan {
+    /// Entries in the per-layer KV arrays: the target's layers, then a paired drafter's.
+    #[must_use]
+    pub fn kv_layer_count(&self) -> usize {
+        self.config.n_layers as usize
+            + self.drafter.as_ref().map_or(0, |d| d.layers as usize)
+    }
+
+    /// Bytes a paired drafter's feature buffer (`BufId::DraftFeatures`) holds for `rows`
+    /// forward rows: one f32 residual per tap per row. Zero without a drafter.
+    #[must_use]
+    pub fn draft_feature_bytes(&self, rows: usize) -> u64 {
+        self.drafter.as_ref().map_or(0, |d| {
+            rows as u64 * d.taps.len() as u64 * u64::from(self.config.n_embd) * 4
+        })
+    }
+
     /// Planes of recurrent state (`BufId::Recur`), derived from the decode routes.
     ///
     /// A decode step reads one plane and writes another, so the plane it read IS its
@@ -469,6 +551,30 @@ impl ModelPlan {
             *out.entry(layer.attention.label()).or_insert(0) += per;
         }
         out
+    }
+}
+
+/// A block drafter (DSpark) paired with the target and run on its backend: the part of the
+/// drafter the target's allocations must make room for.
+///
+/// Beside the target's layers, not in `layers`: every target forward walks `layers`. Its
+/// attention caches follow the target's in the per-layer KV arrays, so they grow with the
+/// target's and the backend addresses them by layer index like any other cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrafterPlan {
+    /// Attention layers, each caching the whole committed context.
+    pub layers: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    /// The target layers whose outputs the drafter reads, ascending.
+    pub taps: Vec<u32>,
+}
+
+impl DrafterPlan {
+    /// K (or V) elements per cached row.
+    #[must_use]
+    pub fn kv_width(&self) -> u32 {
+        self.kv_heads * self.head_dim
     }
 }
 
@@ -541,11 +647,17 @@ pub struct WorkflowState {
     pub kv: cpu_support::KvCache,
     /// Device-side cache counters: capacity, allocated slots, positions filled.
     pub kv_rt: kv::KvRuntime,
+    /// What the KV storage has committed and what is being prepared; see `kv::KvCommit`.
+    pub kv_commit: kv::KvCommit,
     pub(crate) window_history: window_history::WindowHistory,
     /// Batch width the windowed KV rings were sized for; see `kv::ring_slots`.
     pub kv_ring_batch: usize,
     /// Batch width the activation buffers are currently sized for.
     pub gpu_batch: usize,
+    /// The narrowest activation layout this workflow keeps (0: none). A drafter that runs
+    /// its block on the target's per-row scratch sets it, so a one-row step does not shrink
+    /// the buffers the block needs.
+    pub activation_floor_rows: usize,
     /// Optional first activation width; KV ring capacity keeps its independent bound.
     /// Consumed only by the first GPU preparation. None preserves ordinary behavior.
     pub initial_gpu_batch: Option<usize>,
@@ -634,6 +746,17 @@ pub struct WorkflowState {
     pub verification_prefix_tokens: usize,
     /// Physical RecurSnap capacity, in whole-state slots.
     pub gpu_recur_snap_slots: usize,
+    /// Rows of the batch being encoded when `BufId::RowLayout` describes them (a tree): the
+    /// graph reads positions, visibility and ancestors from the layout. 0 for a causal batch.
+    pub row_layout: u32,
+    /// The route of the co-batched step being encoded (`Workflow::decode_rows`): how the
+    /// backend serves its projections' rows.
+    pub row_route: imparo_backend::RowRoute,
+    /// Every slot's state for co-batched decode, indexed by slot; the selected slot's entry is
+    /// stale (its values are the fields above). Empty until `Workflow::set_slots`.
+    pub slots: Vec<SlotState>,
+    /// The selected slot.
+    pub slot: u32,
 }
 
 /// What a pipelined decode step tells the device graph. See `WorkflowState::pipe`.
@@ -644,6 +767,42 @@ pub struct PipeStep {
     /// The input token is already in `BufId::Tokens[0]` (the previous step's pick); do
     /// not upload one.
     pub token_on_device: bool,
+}
+
+/// One conversation's host-side decode state in a slot (co-batched decode,
+/// docs/continuous-batching.md). The SELECTED slot's values live in `WorkflowState`'s own
+/// fields, so every one-row path reads them unchanged; `WorkflowState::slots[i]` holds slot
+/// i's while another slot is selected. The device side of a slot -- its page tables and
+/// recurrent buffers -- is the backend's (`Backend::select_slot`).
+#[derive(Clone, Debug, Default)]
+pub struct SlotState {
+    /// Positions filled (`kv::KvRuntime::filled`).
+    pub filled: usize,
+    /// The recurrent plane cursors (`WorkflowState::recur_plane`, `recur_plane_next`).
+    pub recur_plane: u32,
+    pub recur_plane_next: u32,
+    /// The boundary snapshot bookkeeping (`WorkflowState::recur_ckpt` and its two companions).
+    pub recur_ckpt: Vec<u8>,
+    pub recur_ckpt_at: usize,
+    pub recur_ckpt_on_device: bool,
+    /// Whole states the slot's own `BufId::RecurSnap` holds (`WorkflowState::gpu_recur_snap_slots`):
+    /// a verify grows the selected slot's buffer only, so the count is the slot's too.
+    pub gpu_recur_snap_slots: usize,
+}
+
+/// One row of a co-batched decode step (`Architecture::device_rows`): the slot it decodes in,
+/// its input token and position, and the recurrent planes its state is read from and written
+/// to (`WorkflowState::recur_decode_planes` of that slot).
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeRow {
+    pub slot: u32,
+    pub token: u32,
+    pub pos: u32,
+    pub plane_in: u32,
+    pub plane_out: u32,
+    /// The step ends on a checkpoint boundary: the row's state after it is kept in its slot's
+    /// `BufId::RecurSnap`, as a one-row decode keeps it (`arm_recurrent_snapshot`).
+    pub snap: bool,
 }
 
 /// A queued pipelined decode step, retired by `wait_step` or dropped by `discard_step`.
@@ -676,6 +835,18 @@ impl WorkflowState {
         (r, (r + 1) % self.recur_planes.max(1))
     }
 
+    /// Exchanges the live per-conversation fields with slot `s`'s saved ones.
+    fn slot_swap(&mut self, s: usize) {
+        let st = &mut self.slots[s];
+        std::mem::swap(&mut self.kv_rt.filled, &mut st.filled);
+        std::mem::swap(&mut self.recur_plane, &mut st.recur_plane);
+        std::mem::swap(&mut self.recur_plane_next, &mut st.recur_plane_next);
+        std::mem::swap(&mut self.recur_ckpt, &mut st.recur_ckpt);
+        std::mem::swap(&mut self.recur_ckpt_at, &mut st.recur_ckpt_at);
+        std::mem::swap(&mut self.recur_ckpt_on_device, &mut st.recur_ckpt_on_device);
+        std::mem::swap(&mut self.gpu_recur_snap_slots, &mut st.gpu_recur_snap_slots);
+    }
+
     /// A SYNCHRONOUS decode step succeeded: the plane it wrote is now the state, and the
     /// next encode reads it. The pipelined path defers the second half to `wait_step`,
     /// which is the only difference between the two (task #165).
@@ -703,6 +874,7 @@ impl WorkflowState {
                 slots: 0,
                 filled: 0,
             },
+            kv_commit: kv::KvCommit::default(),
             window_history: window_history::WindowHistory::new(
                 !host_forward
                     && plan
@@ -712,6 +884,7 @@ impl WorkflowState {
             ),
             kv_ring_batch: 0,
             gpu_batch: 0,
+            activation_floor_rows: 0,
             initial_gpu_batch: None,
             gpu_ready: false,
             host_forward,
@@ -736,6 +909,10 @@ impl WorkflowState {
             gpu_all_logits: false,
             verification_prefix_tokens: 0,
             gpu_recur_snap_slots: 0,
+            row_layout: 0,
+            row_route: imparo_backend::RowRoute::Fast,
+            slots: Vec::new(),
+            slot: 0,
             log: log_on(),
         }
     }
@@ -878,6 +1055,21 @@ pub trait Architecture: Sized + 'static {
     const DEVICE_PREFIX_VERIFICATION: bool = false;
     /// Device can select greedy prefixes and restore their recurrent state.
     const DEVICE_GREEDY_VERIFICATION: bool = false;
+    /// The device forward reads `WorkflowState::row_layout`: a batch described by
+    /// `BufId::RowLayout` runs at its rows' positions, visibility and convolution ancestors. A
+    /// forward that ignores the field would run such a batch as a causal chain and return
+    /// plausible, wrong rows, so the tree entries refuse an architecture without it.
+    const ROW_LAYOUT_FORWARD: bool = false;
+    /// Whether this architecture has a co-batched decode step (`device_rows`). Derived by
+    /// `architecture!` from the presence of a `device_rows` row, so a model without one is
+    /// refused its slots before any slot buffer is made.
+    const DEVICE_ROWS: bool = false;
+
+    /// The rolling convolution windows in this architecture's recurrent state, which a tree
+    /// commit rebuilds from the accepted path. None by default.
+    fn conv_windows(_plan: &ModelPlan) -> Vec<ConvWindow> {
+        Vec::new()
+    }
 
     /// Resolve them, rejecting a file that cannot be run rather than misreading it.
     ///
@@ -924,6 +1116,23 @@ pub trait Architecture: Sized + 'static {
         _argmax: bool,
     ) -> Result<(), String> {
         Err(no_device_workflow(&wf.plan))
+    }
+
+    /// One co-batched decode step on the device (docs/continuous-batching.md): row r decodes
+    /// `rows[r].token` in slot `rows[r].slot` at `rows[r].pos`, and its greedy pick goes to
+    /// `picks[r]`. With `logits`, row r's logits are also read back into
+    /// `logits[r * vocab .. (r + 1) * vocab]`. A row reads only its own token, position, cache
+    /// and state. The default refuses: it is built per architecture.
+    ///
+    /// # Errors
+    /// Always, unless overridden.
+    fn device_rows(
+        _wf: &mut Workflow<Self>,
+        _rows: &[DecodeRow],
+        _logits: Option<&mut Vec<f32>>,
+        _picks: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        Err("co-batched decode is not built for this architecture".into())
     }
 
     /// Architecture-owned model-admission work after common activation/KV allocation.
@@ -1011,11 +1220,14 @@ macro_rules! architecture {
         batch_host: $batch_host:path,
         $(device_batch:        $device_batch:path,)?
         $(device_prepare:      $device_prepare:path,)?
+        $(device_rows:         $device_rows:path,)?
         $(buffer_requirements: $buffer_requirements:path,)?
+        $(conv_windows:        $conv_windows:path,)?
         $(state_only_output_lab: $state_only_output:expr,)?
         $(device_all_logits: $device_all_logits:expr,)?
         $(device_prefix_verification: $device_prefix_verification:expr,)?
         $(device_greedy_verification: $device_greedy_verification:expr,)?
+        $(row_layout_forward: $row_layout_forward:expr,)?
     }) => {
         /// The architecture. A unit type: it carries no data, it NAMES a set of methods.
         /// The data is in the workflow, which is every model's data.
@@ -1031,6 +1243,7 @@ macro_rules! architecture {
             $(const DEVICE_ALL_LOGITS: bool = $device_all_logits;)?
             $(const DEVICE_PREFIX_VERIFICATION: bool = $device_prefix_verification;)?
             $(const DEVICE_GREEDY_VERIFICATION: bool = $device_greedy_verification;)?
+            $(const ROW_LAYOUT_FORWARD: bool = $row_layout_forward;)?
 
             fn prepare(
                 weights: &$crate::weights::Weights,
@@ -1074,12 +1287,33 @@ macro_rules! architecture {
             )?
 
             $(
+                const DEVICE_ROWS: bool = { let _ = $device_rows as fn(_, _, _, _) -> _; true };
+
+                fn device_rows(
+                    wf: &mut $alias,
+                    rows: &[$crate::DecodeRow],
+                    logits: ::std::option::Option<&mut ::std::vec::Vec<f32>>,
+                    picks: &mut ::std::vec::Vec<u32>,
+                ) -> ::std::result::Result<(), ::std::string::String> {
+                    $device_rows(wf, rows, logits, picks)
+                }
+            )?
+
+            $(
                 fn buffer_requirements(
                     plan: &$crate::ModelPlan,
                     b: usize,
                     capacity: usize,
                 ) -> ::std::vec::Vec<$crate::gpu_support::BufferRequirement> {
                     $buffer_requirements(plan, b, capacity)
+                }
+            )?
+
+            $(
+                fn conv_windows(
+                    plan: &$crate::ModelPlan,
+                ) -> ::std::vec::Vec<$crate::ConvWindow> {
+                    $conv_windows(plan)
                 }
             )?
 
@@ -1239,6 +1473,251 @@ impl<A: Architecture> kv::KvPoolMember for Workflow<A> {
     }
 }
 
+/// Co-batched decode (docs/continuous-batching.md): several conversations resident at once,
+/// each in a slot, and one forward that decodes a row for each.
+impl<A: Architecture> Workflow<A> {
+    /// Makes `n` slots. Slot 0 is the conversation live now; the others start empty. The
+    /// backend allocates each new slot's device state: its page tables, its per-conversation
+    /// buffers and the rings of the windowed layers.
+    ///
+    /// # Errors
+    /// With a decode step in flight, for an architecture without a co-batched step, for a
+    /// quantized cache (not built yet), a windowed layer without a ring or several window
+    /// regions per layer, or when the backend has no slots.
+    pub fn set_slots(&mut self, n: u32) -> Result<(), String> {
+        if n == 0 {
+            return Err("co-batched decode needs at least one slot".into());
+        }
+        if !A::DEVICE_ROWS {
+            return Err("co-batched decode is not built for this architecture".into());
+        }
+        if kv::KvType::k() != kv::KvType::F16 || kv::KvType::v() != kv::KvType::F16 {
+            return Err("co-batched decode reads an f16 cache only".into());
+        }
+        if !self.state.queued.is_empty() {
+            return Err("set_slots with a decode step in flight".into());
+        }
+        // A windowed layer's cache is a ring per conversation, so each slot holds its own
+        // rings. Only a ringed window qualifies: a window that is not a power of two gets a
+        // full-context cache with no page table, which no slot can have its own of.
+        let mut rings = Vec::new();
+        for g in kv::KvPoolMember::kv_state_geometry(self) {
+            match g.kind {
+                imparo_kv::StateKind::Full => {}
+                imparo_kv::StateKind::Window { ring, .. } if ring > 0 => {
+                    rings.push(g.layer);
+                }
+                imparo_kv::StateKind::Window { .. } => {
+                    return Err(format!(
+                        "co-batched decode: windowed layer {} has no ring",
+                        g.layer
+                    ));
+                }
+            }
+        }
+        // One ring per slot is the region rule co-batched decode keeps: a slot's windows are
+        // its own rings, so a second region inside them would have no owner.
+        if !rings.is_empty() && kv::window_regions() > 1 {
+            return Err(
+                "co-batched decode gives each slot its own window rings: IMPARO_KV_REGIONS \
+must be 1"
+                    .into(),
+            );
+        }
+        Workflow::ensure_gpu_ready(self)?;
+        let be = crate::backend::active().ok_or("co-batched decode needs a device")?;
+        if !be.set_slots(n, &rings) {
+            return Err("the backend has no co-batched decode slots".into());
+        }
+        let want = n as usize;
+        if self.state.slots.len() < want {
+            // The backend sizes a new slot's buffers like the selected slot's.
+            let snap_slots = self.state.gpu_recur_snap_slots;
+            self.state.slots.resize_with(want, || SlotState {
+                gpu_recur_snap_slots: snap_slots,
+                ..SlotState::default()
+            });
+        }
+        Ok(())
+    }
+
+    /// Makes slot `s` the live conversation: from here every one-row path -- prefill,
+    /// decode, capture, restore -- reads and writes slot `s`'s state.
+    ///
+    /// # Errors
+    /// For a slot that does not exist, with a decode step in flight, or when the slot's
+    /// buffers could not be made on its first select.
+    pub fn select_slot(&mut self, s: u32) -> Result<(), String> {
+        let n = self.state.slots.len();
+        if s as usize >= n {
+            return Err(format!("slot {s} does not exist ({n} slots)"));
+        }
+        if s == self.state.slot {
+            return Ok(());
+        }
+        if !self.state.queued.is_empty() {
+            return Err("select_slot with a decode step in flight".into());
+        }
+        let be = crate::backend::active().ok_or("co-batched decode needs a device")?;
+        if !be.select_slot(s) {
+            return Err(format!("slot {s}: its buffers could not be made"));
+        }
+        let cur = self.state.slot as usize;
+        self.state.slot_swap(cur);
+        self.state.slot_swap(s as usize);
+        self.state.slot = s;
+        Ok(())
+    }
+
+    /// Device bytes one slot's own state takes, beyond the pool's blocks: its recurrent
+    /// planes and their snapshot twin, and the rings of its windowed layers (K and V). A slot
+    /// other than 0 holds these from its first select to its release (`set_slots`).
+    #[must_use]
+    pub fn slot_state_bytes(&self) -> u64 {
+        let recur = u64::from(self.plan.recurrent_elems()) * 4;
+        let planes = u64::from(self.state.recur_planes.max(1));
+        let snapshots = self.state.gpu_recur_snap_slots.max(1) as u64;
+        let rings: u64 = kv::KvPoolMember::kv_state_geometry(self)
+            .iter()
+            .filter_map(|g| match g.kind {
+                imparo_kv::StateKind::Window { ring, .. } if ring > 0 => {
+                    Some((ring * (g.k_stride + g.v_stride)) as u64)
+                }
+                _ => None,
+            })
+            .sum();
+        recur * (planes + snapshots) + rings
+    }
+
+    /// Gives back slot `s`'s device buffers and forgets its host-side state; its next select
+    /// makes them again, as its first did. For a slot no conversation occupies, other than the
+    /// selected one. Returns whether buffers went back: none are held by a slot never
+    /// selected or given back already.
+    ///
+    /// # Errors
+    /// For the selected slot, one that does not exist, or with a decode step in flight.
+    pub fn release_slot(&mut self, s: u32) -> Result<bool, String> {
+        let n = self.state.slots.len();
+        if s as usize >= n {
+            return Err(format!("slot {s} does not exist ({n} slots)"));
+        }
+        if s == self.state.slot {
+            return Err(format!("slot {s} is selected: it keeps its buffers"));
+        }
+        if !self.state.queued.is_empty() {
+            return Err("release_slot with a decode step in flight".into());
+        }
+        let Some(be) = crate::backend::active() else {
+            return Ok(false);
+        };
+        if !be.release_slot(s) {
+            return Ok(false);
+        }
+        // The buffers the next select makes are the sizes these were, so the snapshot count
+        // that describes them stays.
+        let st = &mut self.state.slots[s as usize];
+        *st = SlotState {
+            gpu_recur_snap_slots: st.gpu_recur_snap_slots,
+            ..SlotState::default()
+        };
+        Ok(true)
+    }
+
+    /// One co-batched decode step: row r decodes token `rows[r].1` in slot `rows[r].0`, at
+    /// that slot's next position, its projections served on `route`. Returns each row's greedy
+    /// pick; with `logits`, also each row's logits, row after row.
+    ///
+    /// The caller has placed every row's next position (the pool's growth reserve). A row
+    /// whose step ends on a checkpoint boundary keeps its recurrent state there in its slot,
+    /// as the one-row decode does, so its turn's end has a checkpoint to store.
+    ///
+    /// # Errors
+    /// For a missing or repeated slot, a slot with nothing in it, a full slot, or a device
+    /// failure. On an error no slot moves.
+    pub fn decode_rows(
+        &mut self,
+        rows: &[(u32, u32)],
+        logits: Option<&mut Vec<f32>>,
+        route: imparo_backend::RowRoute,
+    ) -> Result<Vec<u32>, String> {
+        if !self.state.queued.is_empty() {
+            return Err("decode_rows with a decode step in flight".into());
+        }
+        let n = self.state.slots.len();
+        let planes = self.state.recur_planes.max(1);
+        let cap = self.state.kv_rt.capacity;
+        let recurrent = self.plan.recurrent_elems() > 0;
+        let grid = imparo_kv::grid_tokens();
+        let mut seen = vec![false; n];
+        let mut batch = Vec::with_capacity(rows.len());
+        for &(slot, token) in rows {
+            let si = slot as usize;
+            if si >= n || seen[si] {
+                return Err(format!("slot {slot} is missing or repeated in the step"));
+            }
+            seen[si] = true;
+            let (filled, next) = if slot == self.state.slot {
+                (self.state.kv_rt.filled, self.state.recur_plane_next)
+            } else {
+                (
+                    self.state.slots[si].filled,
+                    self.state.slots[si].recur_plane_next,
+                )
+            };
+            if filled == 0 || filled >= cap {
+                return Err(format!("slot {slot} holds {filled} of {cap} positions"));
+            }
+            batch.push(DecodeRow {
+                slot,
+                token,
+                pos: u32::try_from(filled).map_err(|_| "position exceeds u32")?,
+                plane_in: next,
+                plane_out: (next + 1) % planes,
+                snap: recurrent && (filled + 1) % grid == 0,
+            });
+        }
+        let mut picks = Vec::with_capacity(batch.len());
+        if batch.is_empty() {
+            return Ok(picks);
+        }
+        self.state.row_route = route;
+        A::device_rows(self, &batch, logits, &mut picks)?;
+        for r in &batch {
+            let (filled, plane, plane_next, ckpt, ckpt_at, ckpt_on_device) =
+                if r.slot == self.state.slot {
+                    let st = &mut self.state;
+                    (
+                        &mut st.kv_rt.filled,
+                        &mut st.recur_plane,
+                        &mut st.recur_plane_next,
+                        &mut st.recur_ckpt,
+                        &mut st.recur_ckpt_at,
+                        &mut st.recur_ckpt_on_device,
+                    )
+                } else {
+                    let st = &mut self.state.slots[r.slot as usize];
+                    (
+                        &mut st.filled,
+                        &mut st.recur_plane,
+                        &mut st.recur_plane_next,
+                        &mut st.recur_ckpt,
+                        &mut st.recur_ckpt_at,
+                        &mut st.recur_ckpt_on_device,
+                    )
+                };
+            *filled = r.pos as usize + 1;
+            *plane = r.plane_out;
+            *plane_next = r.plane_out;
+            if r.snap {
+                ckpt.clear();
+                *ckpt_at = r.pos as usize + 1;
+                *ckpt_on_device = true;
+            }
+        }
+        Ok(picks)
+    }
+}
+
 fn set_device_batch_geometry(
     absolute_start: usize,
     active_tokens: usize,
@@ -1270,6 +1749,41 @@ fn set_device_batch_geometry(
 /// This is an explicit initial-Prefill consumer, never an accepted-prefix verifier hook.
 pub type PrefillChunkObserver<'a> = dyn FnMut(usize, &[u32]) -> Result<(), String> + 'a;
 
+/// A forward run a chunk at a time (docs/continuous-batching.md, section 3): what its next
+/// chunk needs. A forward is `begin_forward`, `forward_chunk` until [`Prefill::done`], then
+/// `end_forward`, and the one-call forward makes exactly those calls in a row; so a prefill
+/// that other work runs between two of its chunks writes the bits one call writes. The slot it
+/// runs in must be the selected one at every call.
+#[must_use]
+pub struct Prefill {
+    start: usize,
+    len: usize,
+    done: usize,
+    /// The grid point whose recurrent state the forward keeps aside: the requested checkpoint,
+    /// else the last one it passes.
+    last_boundary: usize,
+    batch: usize,
+    output_demand: OutputDemand,
+    history_ticket: Option<window_history::Reach>,
+    on_gpu: bool,
+    prof: bool,
+    t_start: std::time::Instant,
+}
+
+impl Prefill {
+    /// Every token has run.
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.done == self.len
+    }
+
+    /// Where the next chunk starts.
+    #[must_use]
+    pub fn at(&self) -> usize {
+        self.start + self.done
+    }
+}
+
 /// The forward, written once for every architecture.
 ///
 /// The capacity check, the chunk width, anchoring chunk boundaries at ABSOLUTE positions,
@@ -1287,9 +1801,27 @@ impl<A: Architecture> Workflow<A> {
         output_demand: OutputDemand,
         mut observer: Option<&mut PrefillChunkObserver<'_>>,
     ) -> Result<(), String> {
+        let mut forward =
+            self.begin_forward(tokens.len(), start_pos, checkpoint, output_demand)?;
+        while !forward.done() {
+            self.forward_chunk(&mut forward, tokens, out, observer.as_deref_mut())?;
+        }
+        self.end_forward(forward)
+    }
+
+    /// What a forward of `len` tokens at `start_pos` does before its first chunk: the
+    /// checks, the device brought up, the cache grown to what it reaches, the recurrent state
+    /// reset at position 0 or kept aside at a requested checkpoint it starts on.
+    fn begin_forward(
+        &mut self,
+        len: usize,
+        start_pos: usize,
+        checkpoint: Option<usize>,
+        output_demand: OutputDemand,
+    ) -> Result<Prefill, String> {
         self.state.output_demand = OutputDemand::LastToken;
         let end = start_pos
-            .checked_add(tokens.len())
+            .checked_add(len)
             .ok_or_else(|| "forward position overflow".to_string())?;
         let grid = imparo_kv::grid_tokens();
         let last_boundary = checkpoint.unwrap_or(end / grid * grid);
@@ -1329,7 +1861,7 @@ impl<A: Architecture> Workflow<A> {
             // full-attention layers are 128 MiB of a 148 MiB cache at ctx 8192, and a
             // short conversation touches a fraction of it.
             let t = std::time::Instant::now();
-            Workflow::kv_fit(self, start_pos + tokens.len())?;
+            Workflow::kv_fit(self, end)?;
             let t_fit = t.elapsed().as_secs_f64() * 1e3;
             if prof && t_ready + t_fit > 1.0 {
                 eprintln!(
@@ -1388,88 +1920,145 @@ impl<A: Architecture> Workflow<A> {
             self.state.recur_ckpt_at = start_pos;
             self.state.recur_ckpt_on_device = false;
         }
-        let mut done = 0;
-        while done < tokens.len() {
-            // Chunk boundaries anchor at ABSOLUTE positions (multiples of `batch`), not
-            // at the tail's start: a continued conversation -- a forward at start_pos > 0,
-            // KV pool reuse -- must chunk exactly where a cold prefill of the same context
-            // would, or the two produce different batch shapes for the same tokens. A
-            // no-op for start_pos = 0 and for single-token decode steps.
-            let at = start_pos + done;
-            let n = (batch - (at % batch)).min(tokens.len() - done);
-            // A checkpoint boundary can fall INSIDE this chunk -- chunks are cut on the
-            // prefill grid (512) and units are 256, so an 800-token prefill runs
-            // [0,512) [512,800) and passes straight through 768. The batch is not cut to
-            // stand on it; it is told where it is and writes the state aside in passing.
-            // Cutting cost +29 ms of 1191 on that prefill; this costs one dispatch.
-            //
-            // Device path only, and not because the host cannot do it: nothing on the
-            // host path can USE the result. `kv_spill` refuses without a ready device,
-            // so a host-only run has no checkpoint to write. The old code read the
-            // DEVICE buffer here whichever path had run, which for a host forward
-            // described nothing.
-            if on_gpu {
-                self.arm_recurrent_snapshot(at, n, last_boundary);
-            }
-            let chunk = &tokens[done..done + n];
-            let t_chunk = std::time::Instant::now();
-            if on_gpu {
-                set_device_batch_geometry(
-                    at,
-                    n,
-                    imparo_backend::BatchPhase::Prefill,
-                    Some(batch),
-                )?;
-                // Only the last chunk's logits are used; the others skip the lm-head.
-                self.state.output_demand = if done + n == tokens.len() {
-                    output_demand
-                } else {
-                    OutputDemand::None
-                };
-                self.state.logits_wanted =
-                    self.state.output_demand != OutputDemand::None;
-                let mut r = A::device_batch(self, chunk, at, out, false);
-                if r.is_err() && n == 1 && self.state.recur_planes > 1 {
-                    // A one-token batch is a decode step, the form the mega-kernel runs; a
-                    // failed region there is rolled back and run once more on the dispatch
-                    // path (task #149), as `forward_next` and `wait_step` do.
-                    if let Some(be) = crate::backend::active() {
-                        eprintln!(
-                            "[imparo] decode batch at {at} failed: rolling back and re-running it on the dispatch path"
-                        );
-                        if be.mega_recover().is_ok() {
-                            self.state.recur_plane_next = self.state.recur_plane;
-                            self.arm_recurrent_snapshot(at, n, last_boundary);
-                            r = A::device_batch(self, chunk, at, out, false);
-                        }
+        Ok(Prefill {
+            start: start_pos,
+            len,
+            done: 0,
+            last_boundary,
+            batch,
+            output_demand,
+            history_ticket,
+            on_gpu,
+            prof,
+            t_start,
+        })
+    }
+
+    /// The forward's next chunk. `tokens` are the whole forward's, as it was begun with; the
+    /// last chunk leaves what the forward's output demand asks for in `out`.
+    fn forward_chunk(
+        &mut self,
+        forward: &mut Prefill,
+        tokens: &[u32],
+        out: &mut Vec<f32>,
+        observer: Option<&mut PrefillChunkObserver<'_>>,
+    ) -> Result<(), String> {
+        if tokens.len() != forward.len || forward.done() {
+            return Err(format!(
+                "forward chunk at {} for {} tokens: the forward has {} and ran {}",
+                forward.at(),
+                tokens.len(),
+                forward.len,
+                forward.done
+            ));
+        }
+        let (done, batch, on_gpu, last_boundary) = (
+            forward.done,
+            forward.batch,
+            forward.on_gpu,
+            forward.last_boundary,
+        );
+        // Chunk boundaries anchor at ABSOLUTE positions (multiples of `batch`), not at the
+        // tail's start: a continued conversation -- a forward at start_pos > 0, KV pool
+        // reuse -- must chunk exactly where a cold prefill of the same context would, or the
+        // two produce different batch shapes for the same tokens. A no-op for start_pos = 0
+        // and for single-token decode steps.
+        let at = forward.at();
+        let n = (batch - (at % batch)).min(tokens.len() - done);
+        // A checkpoint boundary can fall INSIDE this chunk -- chunks are cut on the
+        // prefill grid (512) and units are 256, so an 800-token prefill runs
+        // [0,512) [512,800) and passes straight through 768. The batch is not cut to
+        // stand on it; it is told where it is and writes the state aside in passing.
+        // Cutting cost +29 ms of 1191 on that prefill; this costs one dispatch.
+        //
+        // Device path only, and not because the host cannot do it: nothing on the
+        // host path can USE the result. `kv_spill` refuses without a ready device,
+        // so a host-only run has no checkpoint to write. The old code read the
+        // DEVICE buffer here whichever path had run, which for a host forward
+        // described nothing.
+        if on_gpu {
+            self.arm_recurrent_snapshot(at, n, last_boundary);
+        }
+        let chunk = &tokens[done..done + n];
+        let t_chunk = std::time::Instant::now();
+        if on_gpu {
+            set_device_batch_geometry(
+                at,
+                n,
+                imparo_backend::BatchPhase::Prefill,
+                Some(batch),
+            )?;
+            // Only the last chunk's logits are used; the others skip the lm-head.
+            self.state.output_demand = if done + n == tokens.len() {
+                forward.output_demand
+            } else {
+                OutputDemand::None
+            };
+            self.state.logits_wanted = self.state.output_demand != OutputDemand::None;
+            let mut r = A::device_batch(self, chunk, at, out, false);
+            if r.is_err() && n == 1 && self.state.recur_planes > 1 {
+                // A one-token batch is a decode step, the form the mega-kernel runs; a
+                // failed region there is rolled back and run once more on the dispatch
+                // path (task #149), as `forward_next` and `wait_step` do.
+                if let Some(be) = crate::backend::active() {
+                    eprintln!(
+                        "[imparo] decode batch at {at} failed: rolling back and re-running it on the dispatch path"
+                    );
+                    if be.mega_recover().is_ok() {
+                        self.state.recur_plane_next = self.state.recur_plane;
+                        self.arm_recurrent_snapshot(at, n, last_boundary);
+                        r = A::device_batch(self, chunk, at, out, false);
                     }
                 }
-                self.state.logits_wanted = true;
-                self.state.output_demand = OutputDemand::LastToken;
-                r?;
-                if n == 1 {
-                    self.state.recur_commit_step();
-                }
-            } else {
-                A::batch_host(self, chunk, at, out)?;
             }
-            // Per-chunk series (IMPARO_PROF=1): where a long prefill's time accumulates.
-            // Each chunk syncs -- its logits are read back -- so this is real wall time,
-            // not encode time.
-            if prof {
-                eprintln!(
-                    "[prof] chunk at={at} n={n} ms={:.1}",
-                    t_chunk.elapsed().as_secs_f64() * 1e3
-                );
+            self.state.logits_wanted = true;
+            self.state.output_demand = OutputDemand::LastToken;
+            r?;
+            if n == 1 {
+                self.state.recur_commit_step();
             }
-            done += n;
-            if on_gpu {
-                self.take_recurrent_snapshot(at);
-            }
-            if let Some(consume) = observer.as_deref_mut() {
-                consume(at, chunk)?;
-            }
+        } else {
+            A::batch_host(self, chunk, at, out)?;
         }
+        // Per-chunk series (IMPARO_PROF=1): where a long prefill's time accumulates.
+        // Each chunk syncs -- its logits are read back -- so this is real wall time,
+        // not encode time.
+        if forward.prof {
+            eprintln!(
+                "[prof] chunk at={at} n={n} ms={:.1}",
+                t_chunk.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        forward.done += n;
+        if on_gpu {
+            self.take_recurrent_snapshot(at);
+        }
+        if let Some(consume) = observer {
+            consume(at, chunk)?;
+        }
+        Ok(())
+    }
+
+    /// What a forward does after its last chunk: the window history committed, the positions
+    /// filled, the timing line.
+    #[allow(clippy::needless_pass_by_value)] // taken, so an ended forward cannot run on
+    fn end_forward(&mut self, forward: Prefill) -> Result<(), String> {
+        let Prefill {
+            start: start_pos,
+            len,
+            done,
+            batch,
+            history_ticket,
+            on_gpu,
+            t_start,
+            ..
+        } = forward;
+        if done != len {
+            return Err(format!(
+                "forward at {start_pos} ended after {done} of {len} tokens"
+            ));
+        }
+        let end = start_pos + len;
         if history_ticket.is_some() {
             let slack = imparo_kv::state::window_slack(
                 &kv::KvPoolMember::kv_state_geometry(self),
@@ -1478,15 +2067,14 @@ impl<A: Architecture> Workflow<A> {
                 .window_history
                 .commit(history_ticket, start_pos, end, slack);
         }
-        self.state.kv_rt.filled = start_pos + tokens.len();
+        self.state.kv_rt.filled = end;
         if self.state.log {
             let ms = t_start.elapsed().as_secs_f64() * 1e3;
             eprintln!(
-                "[imparo] forward tokens={} start_pos={start_pos} batch={batch} \
+                "[imparo] forward tokens={len} start_pos={start_pos} batch={batch} \
 backend={} ms={ms:.1} ms_per_token={:.2}",
-                tokens.len(),
                 if on_gpu { "gpu" } else { "cpu" },
-                ms / tokens.len() as f64
+                ms / len as f64
             );
         }
         Ok(())
@@ -1494,7 +2082,11 @@ backend={} ms={ms:.1} ms_per_token={:.2}",
 }
 
 impl<A: Architecture> Model for Workflow<A> {
-    #[cfg(feature = "cuda-speculative")]
+    fn weights(&self) -> &weights::Weights {
+        &self.weights
+    }
+
+    #[cfg(feature = "speculative")]
     fn with_draft(
         &mut self,
         spec: &speculative::DraftSpec,
@@ -1503,7 +2095,7 @@ impl<A: Architecture> Model for Workflow<A> {
         spec.run(self, run)
     }
 
-    #[cfg(feature = "cuda-speculative")]
+    #[cfg(feature = "speculative")]
     fn with_cached_draft(
         &mut self,
         spec: &speculative::DraftSpec,
@@ -1514,13 +2106,15 @@ impl<A: Architecture> Model for Workflow<A> {
         spec.run_cached(self, prompt, start, run)
     }
 
-    #[cfg(feature = "cuda-speculative")]
+    #[cfg(feature = "speculative")]
     fn clear_draft_cache(&mut self) -> Result<(), String> {
         // Exclusive model access before its weights drop.
+        #[cfg(feature = "cuda-speculative")]
         unsafe {
             imparo_cuda::dspark::detach()?;
-            imparo_cuda::gemma4_mtp::detach()
+            imparo_cuda::gemma4_mtp::detach()?;
         }
+        Ok(())
     }
 
     #[cfg(feature = "cuda-speculative")]
@@ -1537,15 +2131,13 @@ impl<A: Architecture> Model for Workflow<A> {
         self.forward_into_with_checkpoint(tokens, start_pos, out, None)
     }
 
-    #[cfg(feature = "cuda-speculative")]
     fn prepare_greedy_tree(
         &mut self,
         tree: &speculative::DraftTree,
         start: usize,
     ) -> Result<bool, String> {
-        verification::prepare_workflow_tree(self, tree, start)
+        verification::prepare_greedy_tree(self, tree, start)
     }
-    #[cfg(feature = "cuda-speculative")]
     fn verify_greedy_tree(
         &mut self,
         tree: &speculative::DraftTree,
@@ -1553,7 +2145,16 @@ impl<A: Architecture> Model for Workflow<A> {
         limit: usize,
         stops: &[u32],
     ) -> Result<speculative::TreeVerification, String> {
-        verification::verify_workflow_tree(self, tree, start, limit, stops)
+        verification::verify_greedy_tree(self, tree, start, limit, stops)
+    }
+
+    fn forward_tree_logits(
+        &mut self,
+        tree: &speculative::DraftTree,
+        start: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        verification::forward_workflow_tree_logits(self, tree, start, out)
     }
 
     fn verify_greedy_block(
@@ -1622,7 +2223,30 @@ impl<A: Architecture> Model for Workflow<A> {
         )
     }
 
-    #[cfg(feature = "cuda-speculative")]
+    fn prefill_begin(
+        &mut self,
+        len: usize,
+        start_pos: usize,
+        checkpoint: Option<usize>,
+    ) -> Result<Prefill, String> {
+        self.begin_forward(len, start_pos, checkpoint, OutputDemand::LastToken)
+    }
+
+    fn prefill_chunk(
+        &mut self,
+        prefill: &mut Prefill,
+        tokens: &[u32],
+        out: &mut Vec<f32>,
+        observer: Option<&mut PrefillChunkObserver<'_>>,
+    ) -> Result<(), String> {
+        self.forward_chunk(prefill, tokens, out, observer)
+    }
+
+    fn prefill_end(&mut self, prefill: Prefill) -> Result<(), String> {
+        self.end_forward(prefill)
+    }
+
+    #[cfg(feature = "speculative")]
     fn forward_prefill_observed(
         &mut self,
         tokens: &[u32],
@@ -1650,7 +2274,8 @@ impl<A: Architecture> Model for Workflow<A> {
     ) -> Result<(), String> {
         if !A::STATE_ONLY_OUTPUT_LAB
             || self.state.host_forward
-            || std::env::var("IMPARO_STATE_DEMAND_LAB").as_deref() != Ok("1")
+            || (!e4b_retained_decode_policy_enabled()
+                && std::env::var("IMPARO_STATE_DEMAND_LAB").as_deref() != Ok("1"))
         {
             return self.forward_into(tokens, start_pos, scratch);
         }
@@ -1714,6 +2339,26 @@ impl<A: Architecture> Model for Workflow<A> {
         Ok(imparo_cpu::ops::argmax_f32(&logits))
     }
 
+    fn set_slots(&mut self, n: u32) -> Result<(), String> {
+        Workflow::set_slots(self, n)
+    }
+    fn select_slot(&mut self, s: u32) -> Result<(), String> {
+        Workflow::select_slot(self, s)
+    }
+    fn release_slot(&mut self, s: u32) -> Result<bool, String> {
+        Workflow::release_slot(self, s)
+    }
+    fn slot_state_bytes(&self) -> u64 {
+        Workflow::slot_state_bytes(self)
+    }
+    fn decode_rows(
+        &mut self,
+        rows: &[(u32, u32)],
+        logits: Option<&mut Vec<f32>>,
+        route: imparo_backend::RowRoute,
+    ) -> Result<Vec<u32>, String> {
+        Workflow::decode_rows(self, rows, logits, route)
+    }
     fn decode_pipelined(&self) -> bool {
         if self.state.host_forward
             || !self.state.gpu_ready
@@ -1860,9 +2505,13 @@ impl<A: Architecture> Model for Workflow<A> {
 /// methods only because callers hold `Box<dyn Model>` -- `Architecture` has static methods
 /// and can never be a trait object.
 pub trait Model: kv::KvPoolMember {
+    /// The weight mapping this model reads. A paired drafter's tensors sit in it past the
+    /// target's.
+    fn weights(&self) -> &weights::Weights;
+
     /// Serialized request scope: the checked target owns its weights until the
     /// provider is detached. The callback cannot carry the provider to a worker.
-    #[cfg(feature = "cuda-speculative")]
+    #[cfg(feature = "speculative")]
     fn with_draft(
         &mut self,
         _spec: &speculative::DraftSpec,
@@ -1872,7 +2521,7 @@ pub trait Model: kv::KvPoolMember {
     }
 
     /// False leaves the target unchanged and does not invoke the callback.
-    #[cfg(feature = "cuda-speculative")]
+    #[cfg(feature = "speculative")]
     fn with_cached_draft(
         &mut self,
         _spec: &speculative::DraftSpec,
@@ -1882,7 +2531,7 @@ pub trait Model: kv::KvPoolMember {
     ) -> Result<bool, String> {
         Ok(false)
     }
-    #[cfg(feature = "cuda-speculative")]
+    #[cfg(feature = "speculative")]
     fn clear_draft_cache(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -1926,6 +2575,18 @@ pub trait Model: kv::KvPoolMember {
         _stops: &[u32],
     ) -> Result<speculative::TreeVerification, String> {
         Err("tree verification unsupported by this model adapter".into())
+    }
+
+    /// Every node's logits from one forward over a draft tree at `start`, the target state
+    /// left as it was: a probe of the tree forward, not the verify transaction. Row r of
+    /// `out` is node r's vocabulary.
+    fn forward_tree_logits(
+        &mut self,
+        _tree: &speculative::DraftTree,
+        _start: usize,
+        _out: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        Err("tree forward unsupported by this model adapter".into())
     }
 
     fn verify_greedy_block(
@@ -1977,9 +2638,45 @@ pub trait Model: kv::KvPoolMember {
         checkpoint: Option<usize>,
     ) -> Result<(), String>;
 
+    /// `forward_into_with_checkpoint` a chunk at a time ([`Prefill`]): `prefill_begin` for
+    /// `len` tokens at `start_pos`, `prefill_chunk` until [`Prefill::done`], then
+    /// `prefill_end`. The one-call forward makes these calls in a row, so work on other slots
+    /// may run between two chunks and the cache comes out the same. This slot must be the
+    /// selected one at every call.
+    ///
+    /// # Errors
+    /// As `forward_into_with_checkpoint`.
+    fn prefill_begin(
+        &mut self,
+        len: usize,
+        start_pos: usize,
+        checkpoint: Option<usize>,
+    ) -> Result<Prefill, String>;
+
+    /// The prefill's next chunk. `tokens` are the whole prefill's at every call; the last
+    /// chunk leaves the last token's logits in `out`. `observer` sees the chunk once it has
+    /// run (`forward_prefill_observed`).
+    ///
+    /// # Errors
+    /// As `forward_into_with_checkpoint`, or for tokens other than the prefill's or a
+    /// prefill with no chunk left.
+    fn prefill_chunk(
+        &mut self,
+        prefill: &mut Prefill,
+        tokens: &[u32],
+        out: &mut Vec<f32>,
+        observer: Option<&mut PrefillChunkObserver<'_>>,
+    ) -> Result<(), String>;
+
+    /// Ends a prefill whose every chunk has run: its positions are filled from here.
+    ///
+    /// # Errors
+    /// For a prefill with chunks left.
+    fn prefill_end(&mut self, prefill: Prefill) -> Result<(), String>;
+
     /// A consumer of each completed initial Prefill chunk, using the same forward.
     /// Failure stops the request; callers must not retry an already-consumed chunk.
-    #[cfg(feature = "cuda-speculative")]
+    #[cfg(feature = "speculative")]
     fn forward_prefill_observed(
         &mut self,
         _tokens: &[u32],
@@ -2035,6 +2732,45 @@ pub trait Model: kv::KvPoolMember {
     /// table rows are staged by the host (it needs the token on the host at encode time).
     fn decode_pipelined(&self) -> bool {
         false
+    }
+    /// Makes `n` co-batched decode slots (docs/continuous-batching.md); slot 0 is the
+    /// conversation live now (`Workflow::set_slots`).
+    ///
+    /// # Errors
+    /// Where co-batched decode is not built.
+    fn set_slots(&mut self, _n: u32) -> Result<(), String> {
+        Err("co-batched decode is not built for this model".to_string())
+    }
+    /// Makes slot `s` the live conversation (`Workflow::select_slot`).
+    ///
+    /// # Errors
+    /// Where co-batched decode is not built.
+    fn select_slot(&mut self, _s: u32) -> Result<(), String> {
+        Err("co-batched decode is not built for this model".to_string())
+    }
+    /// Gives back slot `s`'s buffers (`Workflow::release_slot`): whether any went back.
+    ///
+    /// # Errors
+    /// Where co-batched decode is not built.
+    fn release_slot(&mut self, _s: u32) -> Result<bool, String> {
+        Err("co-batched decode is not built for this model".to_string())
+    }
+    /// One co-batched decode step over `(slot, token)` rows (`Workflow::decode_rows`).
+    ///
+    /// # Errors
+    /// Where co-batched decode is not built.
+    fn decode_rows(
+        &mut self,
+        _rows: &[(u32, u32)],
+        _logits: Option<&mut Vec<f32>>,
+        _route: imparo_backend::RowRoute,
+    ) -> Result<Vec<u32>, String> {
+        Err("co-batched decode is not built for this model".to_string())
+    }
+    /// Device bytes one slot's own state takes (`Workflow::slot_state_bytes`); 0 where
+    /// co-batched decode is not built.
+    fn slot_state_bytes(&self) -> u64 {
+        0
     }
     /// Queue the decode step for `start_pos` without waiting for it. `Some(token)` is the
     /// step's input (the first step after a prefill); `None` means the previous queued
@@ -2133,6 +2869,8 @@ pub fn load(
     match plan.config.architecture.as_str() {
         "gemma4" => Ok(Box::new(gemma4::Gemma4::new(weights, plan, capacity)?)),
         "lfm2" => Ok(Box::new(lfm2::Lfm2::new(weights, plan, capacity)?)),
+        "lfm2moe" => Ok(Box::new(lfm2moe::Lfm2Moe::new(weights, plan, capacity)?)),
+        "qwen3" => Ok(Box::new(qwen3::Qwen3::new(weights, plan, capacity)?)),
         "qwen35" => Ok(Box::new(qwen35::Qwen35::new(weights, plan, capacity)?)),
         other => Err(format!(
             "no workflow for architecture '{other}'; build_plan accepted it, so the \
@@ -2148,6 +2886,8 @@ pub fn build_plan(document: &Document, path: &Path) -> Result<ModelPlan, PlanErr
     match arch {
         "gemma4" => gemma4::build(document, path),
         "lfm2" => lfm2::build(document, path),
+        "lfm2moe" => lfm2moe::build(document, path),
+        "qwen3" => qwen3::build(document, path),
         "qwen35" => qwen35::build(document, path),
         other => Err(PlanError::UnknownArchitecture(other.into())),
     }

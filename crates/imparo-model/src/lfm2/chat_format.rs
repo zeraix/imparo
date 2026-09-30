@@ -28,6 +28,7 @@ pub fn render(
     tools: &[Value],
     add_generation_prompt: bool,
     bos_token: &str,
+    reasoning_prefilled: bool,
 ) -> String {
     let mut out = String::from(bos_token);
     let mut first_message = 0_usize;
@@ -127,7 +128,15 @@ pub fn render(
     if add_generation_prompt {
         out.push_str(TURN_OPEN);
         out.push_str("assistant\n");
-        out.push_str(THINK_OPEN);
+        // WHOSE TEMPLATE PREFILLS THE CHANNEL. LFM2.5-2.6B's generation prompt ends in
+        // `<think>`, so the model answers inside the reasoning channel and its first
+        // generated marker is the CLOSING one. LFM2.5-8B-A1B's ends at the newline and the
+        // model opens the channel itself. Same markup otherwise, so one renderer with the
+        // difference as an argument -- writing the prefill for a file whose template does
+        // not have it feeds the model a token it was never trained to see there.
+        if reasoning_prefilled {
+            out.push_str(THINK_OPEN);
+        }
     }
     out
 }
@@ -149,6 +158,9 @@ fn thinking_of(message: &Value) -> Option<&str> {
 
 fn render_content(content: &Value) -> String {
     match content {
+        // The template renders content only `if message.get("content")`: an assistant turn
+        // that only calls a tool sends `content: null`, and that is no text, not "null".
+        Value::Null => String::new(),
         Value::String(text) => text.clone(),
         Value::Array(items) => {
             let mut out = String::new();
@@ -594,7 +606,25 @@ fn close_delimiter(stack: &mut Vec<char>, expected: char) {
 }
 
 /// LFM2's half of the chat seam.
-pub struct Codec;
+///
+/// ONE IMPL, TWO VALUES. The two LFM2.5 files differ in exactly one thing -- whether the
+/// generation prompt prefills `<think>` -- and everything else about the markup is shared.
+/// A second codec that forwarded to this one would silently take the DEFAULT of every
+/// method added to the trait later; a field does not.
+pub struct Codec {
+    /// Whether this file's generation prompt ends in `<think>`.
+    pub reasoning_prefilled: bool,
+}
+
+/// LFM2.5-2.6B and the other dense files: the prompt opens the reasoning channel.
+pub static CODEC_THINK_PREFILL: Codec = Codec {
+    reasoning_prefilled: true,
+};
+/// LFM2.5-8B-A1B: the prompt ends at the assistant's newline and the model opens the
+/// channel itself.
+pub static CODEC_NO_THINK_PREFILL: Codec = Codec {
+    reasoning_prefilled: false,
+};
 
 impl crate::chat::ChatCodec for Codec {
     fn markers_missing_from(&self, template_src: &str) -> Vec<&'static str> {
@@ -607,7 +637,13 @@ impl crate::chat::ChatCodec for Codec {
         add_generation_prompt: bool,
         bos: &str,
     ) -> String {
-        render(messages, tools, add_generation_prompt, bos)
+        render(
+            messages,
+            tools,
+            add_generation_prompt,
+            bos,
+            self.reasoning_prefilled,
+        )
     }
     fn split_channels(&self, text: &str, starts_inside: bool) -> (String, String) {
         split_reasoning(text, starts_inside)
@@ -648,13 +684,33 @@ impl crate::chat::ChatCodec for Codec {
 
 #[cfg(test)]
 mod tests {
+    /// THE ONE THING THE TWO LFM2.5 FILES DISAGREE ON. The 2.6B's template ends its
+    /// generation prompt with `<think>`; LFM2.5-8B-A1B's ends at the newline. Feeding the
+    /// prefill to the file that does not have it puts a token where the model never saw
+    /// one in training, and nothing else in the rendered prompt would differ.
+    #[test]
+    fn only_the_prefilled_codec_opens_the_reasoning_channel() {
+        use crate::chat::ChatCodec;
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let with = super::CODEC_THINK_PREFILL.render(&messages, &[], true, "<bos>");
+        let without =
+            super::CODEC_NO_THINK_PREFILL.render(&messages, &[], true, "<bos>");
+        assert!(with.ends_with("<|im_start|>assistant\n<think>"), "{with:?}");
+        assert!(without.ends_with("<|im_start|>assistant\n"), "{without:?}");
+        assert_eq!(with, format!("{without}<think>"));
+        // And the channel each prompt leaves the model in follows the prompt's own text,
+        // not the flag -- one walk serves both.
+        assert!(super::CODEC_THINK_PREFILL.prompt_ends_in_reasoning(&with));
+        assert!(!super::CODEC_NO_THINK_PREFILL.prompt_ends_in_reasoning(&without));
+    }
+
     /// The RENDERED PROMPT decides which channel the answer starts in, and only the
     /// CURRENT assistant turn counts: a `<think>` a user pasted, or one left in an older
     /// turn, is not this turn opening a channel.
     #[test]
     fn response_channel_follows_the_current_assistant_turn() {
         use crate::chat::ChatCodec;
-        let codec = super::Codec;
+        let codec = &super::CODEC_THINK_PREFILL;
         for (prompt, inside) in [
             ("<|im_start|>assistant\n<think>", true),
             ("<|im_start|>assistant\n<think></think>", false),
@@ -691,14 +747,14 @@ mod tests {
     #[test]
     fn the_user_turn_opener_is_what_render_emits() {
         use crate::chat::ChatCodec;
-        let open = super::Codec.user_turn_open();
+        let open = super::CODEC_THINK_PREFILL.user_turn_open();
         assert!(
             open.starts_with(super::TURN_OPEN),
             "{open} vs {}",
             super::TURN_OPEN
         );
         assert!(open.ends_with("user"));
-        let rendered = super::Codec.render(
+        let rendered = super::CODEC_THINK_PREFILL.render(
             &[serde_json::json!({"role": "user", "content": "hi"})],
             &[],
             false,
@@ -714,11 +770,32 @@ mod tests {
 
     use super::*;
 
+    /// An OpenAI client sends a call-only turn back with `content: null`. The template
+    /// renders no text there; the fallback printed `null` in front of the call.
+    #[test]
+    fn fallback_renders_null_content_as_no_text() {
+        let messages = [
+            json!({"role": "user", "content": "Weather in Oslo?"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_0", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\": \"Oslo\"}"}}]}),
+        ];
+        let rendered = render(&messages, &[], false, "", true);
+        assert!(
+            rendered.contains(
+                "<|im_start|>assistant\n<|tool_call_start|>[get_weather(city='Oslo')]\
+                 <|tool_call_end|><|im_end|>"
+            ),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains("null"), "{rendered:?}");
+    }
+
     #[test]
     fn fallback_render_matches_target_turn_shape_without_hardcoded_bos_id() {
         let messages = [json!({"role": "user", "content": "Hello"})];
         assert_eq!(
-            render(&messages, &[], true, "<bos>"),
+            render(&messages, &[], true, "<bos>", true),
             "<bos><|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>"
         );
     }
@@ -740,7 +817,7 @@ mod tests {
                 "tool_calls":[{"function":{"name":"weather","arguments":{"city":"Xi'an", "days":2}}}]
             }),
         ];
-        let rendered = render(&messages, &tools, false, "");
+        let rendered = render(&messages, &tools, false, "", true);
         assert!(rendered.starts_with(&format!(
             "<|im_start|>system\nBe concise.\nList of tools: [{}]<|im_end|>\n",
             compact_json(&tools[0])
@@ -860,7 +937,8 @@ mod tests {
                 continue;
             }
             let seen = &text[..end];
-            let settled = &seen[..seen.len() - Codec.unsettled_in_visible(seen)];
+            let settled =
+                &seen[..seen.len() - CODEC_THINK_PREFILL.unsettled_in_visible(seen)];
             let (visible, calls) = parse_tool_calls(settled);
             assert!(
                 visible.starts_with(&prior_visible),
@@ -891,7 +969,7 @@ mod tests {
     fn an_unclosed_opener_is_shown_by_the_parse_and_held_by_the_cut() {
         use crate::chat::ChatCodec;
         fn cut(t: &str) -> &str {
-            &t[..t.len() - Codec.unsettled_in_visible(t)]
+            &t[..t.len() - CODEC_THINK_PREFILL.unsettled_in_visible(t)]
         }
         assert_eq!(
             parse_tool_calls(cut("visible<|tool_call_sta")),
@@ -915,26 +993,33 @@ mod tests {
     #[test]
     fn the_two_cuts_ask_one_question_each() {
         use crate::chat::ChatCodec;
-        assert_eq!(Codec.unsettled_in_raw("answer</thi"), 5);
-        assert_eq!(Codec.unsettled_in_raw("plain text"), 0);
-        assert_eq!(Codec.unsettled_in_raw("a<|tool_call_start|>[ping()"), 0);
+        assert_eq!(CODEC_THINK_PREFILL.unsettled_in_raw("answer</thi"), 5);
+        assert_eq!(CODEC_THINK_PREFILL.unsettled_in_raw("plain text"), 0);
         assert_eq!(
-            Codec.unsettled_in_visible("a<|tool_call_start|>[ping()"),
+            CODEC_THINK_PREFILL.unsettled_in_raw("a<|tool_call_start|>[ping()"),
+            0
+        );
+        assert_eq!(
+            CODEC_THINK_PREFILL.unsettled_in_visible("a<|tool_call_start|>[ping()"),
             26
         );
-        assert_eq!(Codec.unsettled_in_visible("plain text"), 0);
+        assert_eq!(CODEC_THINK_PREFILL.unsettled_in_visible("plain text"), 0);
 
         let text = "<think>I could <|tool_call_start|>[ping()] here</think>the answer";
-        assert_eq!(Codec.unsettled_in_raw(text), 0, "raw text is fully settled");
+        assert_eq!(
+            CODEC_THINK_PREFILL.unsettled_in_raw(text),
+            0,
+            "raw text is fully settled"
+        );
         // What the ONE-cut form answered on this text, which is why it stalled: everything
         // from the opener on, so the `</think>` and the answer after it never went out.
         assert_eq!(
             crate::chat::think::unsettled_pair(text, CALL_OPEN, CALL_CLOSE),
             text.len() - "<think>I could ".len()
         );
-        let (r, v) = Codec.split_channels(text, false);
+        let (r, v) = CODEC_THINK_PREFILL.split_channels(text, false);
         assert_eq!(v, "the answer");
         assert!(r.contains(CALL_OPEN), "it stays in the reasoning, as prose");
-        assert_eq!(Codec.unsettled_in_visible(&v), 0);
+        assert_eq!(CODEC_THINK_PREFILL.unsettled_in_visible(&v), 0);
     }
 }

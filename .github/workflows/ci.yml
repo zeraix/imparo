@@ -363,9 +363,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
       - name: Harness tests (pure Python, no GPU or model)
-        # The public export does not carry the harness or these tests
-        # (dev_harness/public-export.allowlist), so the step runs only where they are.
-        if: hashFiles('dev_harness/harness.py') != ''
+        # Runs where the harness tests are present; the public export carries harness.py
+        # (dspark-paper/harness imports it) but not these tests (public-export.denylist).
+        if: hashFiles('dev_harness/test_harness.py') != ''
         working-directory: dev_harness
         run: python3 -m unittest test_harness test_det_gate test_seal_receipt test_speed_gate
 
@@ -417,9 +417,9 @@ jobs:
       - name: Build CUDA-enabled server + tuner (nvcc compiles + links, no GPU to run)
         run: cargo build --release --locked -p imparo-server -p imparo-tune --features cuda
       - name: Harness tests (pure Python, no GPU or model)
-        # The public export does not carry the harness or these tests
-        # (dev_harness/public-export.allowlist), so the step runs only where they are.
-        if: hashFiles('dev_harness/harness.py') != ''
+        # Runs where the harness tests are present; the public export carries harness.py
+        # (dspark-paper/harness imports it) but not these tests (public-export.denylist).
+        if: hashFiles('dev_harness/test_harness.py') != ''
         working-directory: dev_harness
         run: python3 -m unittest test_harness test_det_gate test_seal_receipt test_speed_gate
 
@@ -479,8 +479,8 @@ jobs:
           python -B dev_harness/verify_program_pack_release.py binary `
             target/release/imparo-server.exe target/release/imparo-tune.exe
       - name: Harness tests (pure Python, no GPU or model)
-        # The public export does not carry the harness or these tests
-        # (dev_harness/public-export.allowlist), so the step runs only where they are.
-        if: hashFiles('dev_harness/harness.py') != ''
+        # Runs where the harness tests are present; the public export carries harness.py
+        # (dspark-paper/harness imports it) but not these tests (public-export.denylist).
+        if: hashFiles('dev_harness/test_harness.py') != ''
         working-directory: dev_harness
         run: python -m unittest test_harness test_det_gate test_seal_receipt test_speed_gate

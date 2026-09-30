@@ -262,6 +262,67 @@ pub const MODEL_BENCHES: &[ModelBench] = &[
         mega_layers: None,
     },
     ModelBench {
+        arch: "lfm2moe",
+        // THE MAJORITY BLOCK IS SHORT-CONV + ROUTED. Of 24 blocks: 18 short-conv and 6
+        // attention, 2 dense feed-forward (0 and 1) and 22 routed. So the decode mix this
+        // ranks knobs on is the short-convolution projections plus the router.
+        //
+        // THE EXPERT STACKS ARE DELIBERATELY ABSENT. ffn_gate_exps / ffn_up_exps /
+        // ffn_down_exps are 3-D ([n_embd, n_ff_exp, n_expert]) and are served by the routed
+        // matmul, not by the matmul these sweeps measure -- naming them here would point a
+        // 2-D sweep at a stacked tensor. The routed matmul carries no seat of its own yet,
+        // which is the honest state: the knobs below govern the ~44% of a decode token that
+        // is NOT the experts.
+        //
+        // The dense ffn_gate/up/down exist at blk.0 and would resolve, but they are the
+        // shape 2 blocks of 24 run. Listing them would rank the knobs on a mix the engine
+        // mostly does not run -- the same rule qwen35's row states for its delta blocks.
+        decode_tensors: &["shortconv.in_proj", "shortconv.out_proj", "ffn_gate_inp"],
+        ple_tensors: None,
+        shortconv_tensor: Some("shortconv.conv"),
+        // Counted for one short-conv + routed decode layer: operator norm, in projection,
+        // short convolution, out projection, residual add, FFN norm, router matmul, gating,
+        // top-k (two dispatches: chunks then merge), work-row plan, the three expert
+        // matmuls, the activation multiply, the combine, residual add = 16.
+        //
+        // Cross-checked against the engine's own counter (IMPARO_PROF=1, 394 dispatches a
+        // token over 24 blocks): matmat_decode 89 = short-conv 18x2 + attention 6x4 +
+        // router 22 + dense FFN 2x3 + head 1, which is exactly 89.
+        layer_dispatches: 16,
+        // lfm2moe's workflow declares no mega row (crates/imparo-model/src/lfm2moe/mod.rs
+        // carries device_batch / device_prepare / buffer_requirements / device_all_logits /
+        // device_prefix_verification / row_layout_forward and no mega entry), so the grid
+        // knobs must not be offered for it -- the same reason qwen35 sets this false.
+        mega_entries: false,
+        mega_layers: None,
+    },
+    ModelBench {
+        arch: "qwen3",
+        // Every block is the same attention block (Qwen3-4B / 8B: no recurrent mixer, no
+        // routed feed-forward), so the decode mix is its seven projections.
+        decode_tensors: &[
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_output",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ],
+        ple_tensors: None,
+        shortconv_tensor: None,
+        // Counted with the engine's own counter (IMPARO_PROF=1, 8 decode steps on
+        // Qwen3-4B-Q4_K_M at 300 keys): 4640 dispatches / 8 = 580 a token = 36 blocks x 16
+        // + 4 outside the blocks. A block: 7 projections, 4 rms_norms (operator norm, Q and
+        // K head norms, FFN norm), 2 elementwise, 2 kv_stores, 1 attention. Past the vector
+        // attention kernel's key limit the attention is 2 dispatches (slices, combine).
+        layer_dispatches: 16,
+        // qwen3's workflow declares no mega row (crates/imparo-model/src/qwen3/mod.rs), so
+        // the grid knobs must not be offered for it.
+        mega_entries: false,
+        mega_layers: None,
+    },
+    ModelBench {
         arch: "qwen35",
         // blk.0 is a GATED DELTA-NET block, and 48 of this model's 64 blocks are: the
         // file's `full_attention_interval` is 4 and the attending block is the LAST of
@@ -317,6 +378,7 @@ mod tests {
     fn model_benches_are_explicit_and_unknown_architectures_fail_closed() {
         assert_eq!(super::bench_for("gemma4").unwrap().layer_dispatches, 21);
         assert_eq!(super::bench_for("lfm2").unwrap().layer_dispatches, 11);
+        assert_eq!(super::bench_for("qwen3").unwrap().layer_dispatches, 16);
         assert_eq!(super::bench_for("gemma4").unwrap().shortconv_tensor, None);
         assert_eq!(
             super::bench_for("lfm2").unwrap().shortconv_tensor,

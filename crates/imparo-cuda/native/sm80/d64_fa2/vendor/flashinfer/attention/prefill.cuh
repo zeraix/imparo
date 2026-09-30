@@ -467,11 +467,15 @@ __device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(T* x_first_half
  * \param kv_idx_base The base kv index.
  * \param kv_len The length of kv tensor.
  */
-template <bool produce_v, SharedMemFillMode fill_mode, typename KTraits>
+// Imparo optional address-only adapter. Dense instances remain identity.
+struct ImparoIdentityKvAddress {
+ template<class T> __device__ __forceinline__ T* operator()(T* p,uint32_t,uint32_t,uint32_t) const {return p;}
+};
+template <bool produce_v, SharedMemFillMode fill_mode, typename KTraits, typename AddressMap = ImparoIdentityKvAddress>
 __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem,
                                            uint32_t* smem_offset, typename KTraits::DTypeKV** gptr,
                                            const uint32_t stride_n, const uint32_t kv_idx_base,
-                                           const uint32_t kv_len, const dim3 tid = threadIdx) {
+                                           const uint32_t kv_len, const dim3 tid = threadIdx, const AddressMap address_map = {}) {
   // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
   using DTypeKV = typename KTraits::DTypeKV;
   constexpr bool IS_FP4 = is_fp4_type_v<DTypeKV>;
@@ -494,9 +498,9 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DTypeKV)); ++j) {
         // FP4 GMEM rows are packed 2x denser; load 64b (upper 64b of smem slot zeroed).
         if constexpr (IS_FP4) {
-          smem.template load_64b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+          smem.template load_64b_async<fill_mode>(*smem_offset, address_map(*gptr, kv_idx, kv_len, stride_n), kv_idx < kv_len);
         } else {
-          smem.template load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+          smem.template load_128b_async<fill_mode>(*smem_offset, address_map(*gptr, kv_idx, kv_len, stride_n), kv_idx < kv_len);
         }
         *smem_offset = smem.template advance_offset_by_column<8>(*smem_offset, j);
         *gptr += (IS_FP4 ? 4 : 8) * upcast_size<DTypeKV>();
@@ -517,9 +521,9 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
     for (uint32_t i = 0; i < NUM_MMA_KV * 2 / NUM_WARPS_Q; ++i) {
       // FP4 GMEM rows are packed 2x denser; load 64b (upper 64b of smem slot zeroed).
       if constexpr (IS_FP4) {
-        smem.template load_64b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+        smem.template load_64b_async<fill_mode>(*smem_offset, address_map(*gptr, kv_idx, kv_len, stride_n), kv_idx < kv_len);
       } else {
-        smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+        smem.load_128b_async<fill_mode>(*smem_offset, address_map(*gptr, kv_idx, kv_len, stride_n), kv_idx < kv_len);
       }
       *smem_offset =
           smem.template advance_offset_by_row<NUM_WARPS * 8, UPCAST_STRIDE>(*smem_offset);
@@ -2076,12 +2080,12 @@ __device__ __forceinline__ void vosplit_write_o(
  * \param rope_rcp_theta 1/(rope_theta), where rope_theta is the theta
  *   used in RoPE.
  */
-template <typename KTraits, typename Params, typename SmemStorage>
+template <typename KTraits, typename Params, typename SmemStorage, typename AddressMap = ImparoIdentityKvAddress>
 __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     const Params params, SmemStorage& smem_storage, const dim3 tid = threadIdx,
     const uint32_t bx = blockIdx.x, const uint32_t chunk_idx = blockIdx.y,
     const uint32_t kv_head_idx = blockIdx.z, const uint32_t num_chunks = gridDim.y,
-    const uint32_t num_kv_heads = gridDim.z) {
+    const uint32_t num_kv_heads = gridDim.z, const AddressMap address_map = {}) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -2278,7 +2282,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       // For single prefill, the absolute KV base is just chunk_start (no kv_indptr offset).
       const uint32_t kv_abs_base = chunk_start;
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
-                                                             k_stride_n, 0, chunk_size, tid);
+                                                             k_stride_n, 0, chunk_size, tid, address_map);
       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
                                     k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
       cp_async::commit_group();
@@ -2286,7 +2290,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         // Shared K/V: don't preload V(0) (it would clobber K(0)); V(0) is loaded
         // inside iter 0 after Q.K^T.
         produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
-                                                                v_stride_n, 0, chunk_size, tid);
+                                                                v_stride_n, 0, chunk_size, tid, address_map);
         produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
                                      v_stride_n, v_stride_h, 0, chunk_size, warp_idx, lane_idx);
         cp_async::commit_group();
@@ -2349,13 +2353,13 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
           // Load V(iter) into k_smem (time-shared) now that Q.K^T is done.
           produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
-              v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, iter * CTA_TILE_KV, chunk_size, tid);
+              v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, iter * CTA_TILE_KV, chunk_size, tid, address_map);
           cp_async::commit_group();
           cp_async::wait_group<0>();
         } else {
           produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
               k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
-              tid);
+              tid, address_map);
           produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
                                         k_stride_n, k_stride_h, (iter + 1) * CTA_TILE_KV,
                                         chunk_size, warp_idx, lane_idx);
@@ -2383,12 +2387,12 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
           // K(iter+1) goes into the shared buffer only after sfm*v consumed V(iter).
           produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
               k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
-              tid);
+              tid, address_map);
           cp_async::commit_group();
         } else {
           produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
               v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
-              tid);
+              tid, address_map);
           produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
                                        v_stride_n, v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
                                        warp_idx, lane_idx);

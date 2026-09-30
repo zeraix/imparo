@@ -337,9 +337,10 @@ inline cudaError_t launch_selected(
         const uint8_t * gate, const uint8_t * up,
         const BlockQ8_1Mmq * x, BlockQ8_1Mmq * output_q8,
         uint32_t n_in, uint32_t n_out, uint32_t n_tok, cudaStream_t stream,
-        bool match_m1_quant = false) {
+        bool match_m1_quant = false, bool batch_invariant = false) {
     // The existing TM route has admitted this shape; only live token fragments differ.
-    if ((n_tok == 9 || n_tok == 16)) {
+    if (n_tok == 9 || n_tok == 16
+            || (batch_invariant && n_tok >= 1 && n_tok <= 16)) {
         int live2_device = -1;
         cudaError_t err = cudaGetDevice(&live2_device);
         if (err != cudaSuccess) return err;
@@ -363,6 +364,7 @@ inline cudaError_t launch_selected(
                 gate, up, x, output_q8, n_in, n_out, n_tok, match_m1_quant);
             return cudaPeekAtLastError();
         }
+        if (batch_invariant) return cudaErrorNotSupported;
     }
     const char * flag = std::getenv("IMPARO_LAB_Q8_TM_STATIC_TAIL");
     bool tail = n_tok >= 49 && n_tok <= 56 && flag && flag[0] == '1';
@@ -404,7 +406,7 @@ inline bool supports(
         const BlockQ8_1Mmq * x, const BlockQ8_1Mmq * output_q8,
         uint32_t n_in, uint32_t n_out, uint32_t n_tok,
         uint32_t sm_version, uint32_t max_grid_x,
-        uint32_t max_grid_y) {
+        uint32_t max_grid_y, bool batch_invariant = false) {
     const uintptr_t pointers = reinterpret_cast<uintptr_t>(gate)
         | reinterpret_cast<uintptr_t>(up)
         | reinterpret_cast<uintptr_t>(x)
@@ -416,7 +418,8 @@ inline bool supports(
         && (pointers & 15u) == 0 && sm_version == 86
         && n_in != 0 && n_in % (kStageBlocks * kBlockValues) == 0
         && n_out != 0 && n_out % imparo_sm80_q8_mmq::kRows == 0
-        && n_tok > 8 && grid_x != 0 && grid_x <= max_grid_x
+        && (n_tok > 8 || (batch_invariant && n_tok >= 1 && n_tok <= 16))
+        && grid_x != 0 && grid_x <= max_grid_x
         && grid_y != 0 && grid_y <= max_grid_y;
 }
 
@@ -425,9 +428,10 @@ inline LaunchResult launch(
         const BlockQ8_1Mmq * x, BlockQ8_1Mmq * output_q8,
         uint32_t n_in, uint32_t n_out, uint32_t n_tok,
         uint32_t sm_version, uint32_t max_grid_x,
-        uint32_t max_grid_y, cudaStream_t stream, bool match_m1_quant = false) {
+        uint32_t max_grid_y, cudaStream_t stream, bool match_m1_quant = false,
+        bool batch_invariant = false) {
     if (!supports(gate, up, x, output_q8, n_in, n_out, n_tok,
-            sm_version, max_grid_x, max_grid_y)) {
+            sm_version, max_grid_x, max_grid_y, batch_invariant)) {
         return LaunchResult::NotSupported;
     }
 
@@ -452,7 +456,7 @@ inline LaunchResult launch(
     }
     if (!configured) return LaunchResult::NotSupported;
 
-    return launch_selected(gate, up, x, output_q8, n_in, n_out, n_tok, stream, match_m1_quant) == cudaSuccess
+    return launch_selected(gate, up, x, output_q8, n_in, n_out, n_tok, stream, match_m1_quant, batch_invariant) == cudaSuccess
         ? LaunchResult::Launched : LaunchResult::Error;
 }
 

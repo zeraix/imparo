@@ -159,6 +159,7 @@ pub fn build(
         layers,
         decode_interleave: true,
         mega_decode: true,
+        drafter: None,
         output: OutputPlan {
             final_norm: true,
             logit_softcap: None,
@@ -197,4 +198,14 @@ fn vocab_from_tensors(document: &imparo_gguf::Document) -> Option<u32> {
         .find(|t| t.name == "token_embd.weight")
         .and_then(|t| t.dimensions.last().copied())
         .and_then(|v| u32::try_from(v).ok())
+}
+
+/// LFM2's rolling state: every recurrent layer holds one short-convolution window,
+/// `kernel - 1` inputs of `n_embd` values (the `r_elems` `build` wrote).
+///
+/// Delegates: the rule is `r_elems / n_embd` and belongs to no single architecture, so it
+/// lives beside the other device-side plan helpers and LFM2-MoE reads the same one.
+#[must_use]
+pub fn conv_windows(plan: &crate::ModelPlan) -> Vec<crate::ConvWindow> {
+    crate::gpu_support::conv_windows(plan)
 }

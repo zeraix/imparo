@@ -1,0 +1,325 @@
+{
+ "set": "speedbench",
+ "source_max_tokens": 1024,
+ "provenance": {
+  "source": "nvidia/SPEED-Bench",
+  "config": "qualitative",
+  "split": "test",
+  "revision": "454f88454792dfa3ccfd7ef15fff248efde44cd1",
+  "skipped_over_cap": 1,
+  "builder": "dspark-paper/testset/build.py",
+  "params": {
+   "rounds_per_kind": 2,
+   "single_kind": 8,
+   "max_chars": 4000
+  },
+  "built": "2026-09-27T16:17:44+0800"
+ },
+ "conversations": [
+  {
+   "name": "sp-coding-1",
+   "kind": "coding",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "0daf539b787c4dccbb547330a8b4c3d7",
+   "chars": 187,
+   "sha256": "38b4416aa8bd6478",
+   "turns": [
+    {
+     "kind": "coding",
+     "type": "first",
+     "text": "import (\n    \"strings\"\n)\n\n// For a given string, flip lowercase characters to uppercase and uppercase to lowercase.\n// >>> FlipCase('Hello')\n// 'hELLO'\nfunc FlipCase(str string) string {\n"
+    }
+   ]
+  },
+  {
+   "name": "sp-coding-2",
+   "kind": "coding",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "135c7fe91faa48fd83ca5eac94c09f00",
+   "chars": 851,
+   "sha256": "71bb688daf8e872a",
+   "turns": [
+    {
+     "kind": "coding",
+     "type": "first",
+     "text": "\ndef valid_date(date):\n    \"\"\"You have to write a function which validates a given date string and\n    returns True if the date is valid otherwise False.\n    The date is valid if all of the following rules are satisfied:\n    1. The date string is not empty.\n    2. The number of days is not less than 1 or higher than 31 days for months 1,3,5,7,8,10,12. And the number of days is not less than 1 or higher than 30 days for months 4,6,9,11. And, the number of days is not less than 1 or higher than 29 for the month 2.\n    3. The months should not be less than 1 or higher than 12.\n    4. The date should be in the format: mm-dd-yyyy\n\n    for example: \n    valid_date('03-11-2000') => True\n\n    valid_date('15-01-2012') => False\n\n    valid_date('04-0-2040') => False\n\n    valid_date('06-04-2020') => True\n\n    valid_date('06/04/2020') => False\n    \"\"\"\n"
+    }
+   ]
+  },
+  {
+   "name": "sp-humanities-1",
+   "kind": "humanities",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "69d831e14137427fa31d6e67761555e7",
+   "chars": 218,
+   "sha256": "bdb89b4685794f00",
+   "turns": [
+    {
+     "kind": "humanities",
+     "type": "first",
+     "text": "Provide insights into the correlation between economic indicators such as GDP, inflation, and unemployment rates. Explain how fiscal and monetary policies affect those indicators."
+    },
+    {
+     "kind": "humanities",
+     "type": "continued",
+     "text": "Now, explain them again like I'm five."
+    }
+   ]
+  },
+  {
+   "name": "sp-math-1",
+   "kind": "math",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "47534ec0377943708c55cb1bfad6c83d",
+   "chars": 73,
+   "sha256": "19049bff4154be06",
+   "turns": [
+    {
+     "kind": "math",
+     "type": "first",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
+    }
+   ]
+  },
+  {
+   "name": "sp-math-2",
+   "kind": "math",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "f73440d5701f4feeaeffcacf282d5607",
+   "chars": 73,
+   "sha256": "19049bff4154be06",
+   "turns": [
+    {
+     "kind": "math",
+     "type": "first",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
+    }
+   ]
+  },
+  {
+   "name": "sp-qa-1",
+   "kind": "qa",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "a3ac2c931db84417a211b7d8756b5ff1",
+   "chars": 36,
+   "sha256": "28342f18eec5a305",
+   "turns": [
+    {
+     "kind": "qa",
+     "type": "first",
+     "text": "Who played anna in once upon a time?"
+    }
+   ]
+  },
+  {
+   "name": "sp-qa-2",
+   "kind": "qa",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "2caa2289a2574756bb51967df812c420",
+   "chars": 46,
+   "sha256": "ac5fd0f910a4a36d",
+   "turns": [
+    {
+     "kind": "qa",
+     "type": "first",
+     "text": "Where was the 2015 rugby union world cup held?"
+    }
+   ]
+  },
+  {
+   "name": "sp-rag-1",
+   "kind": "rag",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "87791f973349454392b3f0f17a09b88c",
+   "chars": 770,
+   "sha256": "943352f589559dff",
+   "turns": [
+    {
+     "kind": "rag",
+     "type": "first",
+     "text": "Evaluate the following movie reviews on a scale of 1 to 5, with 1 being very negative, 3 being neutral, and 5 being very positive:\n1. This movie released on Nov. 18, 2019, was phenomenal. The cinematography, the acting, the plot - everything was top-notch.\n2. Never before have I been so disappointed with a movie. The plot was predictable and the characters were one-dimensional. In my opinion, this movie is the worst one to have been released in 2022.\n3. The movie was okay. There were some parts I  enjoyed, but there were also parts that felt lackluster. This is a movie that was released in Feb 2018 and seems to be quite ordinary.\nReturn the answer as a JSON array of integers."
+    },
+    {
+     "kind": "rag",
+     "type": "continued",
+     "text": "Update your previous reply by including the release date as part of the JSON content."
+    }
+   ]
+  },
+  {
+   "name": "sp-reasoning-1",
+   "kind": "reasoning",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "459e9fdf35f34b8c95d5327ca99320af",
+   "chars": 73,
+   "sha256": "19049bff4154be06",
+   "turns": [
+    {
+     "kind": "reasoning",
+     "type": "first",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
+    }
+   ]
+  },
+  {
+   "name": "sp-reasoning-2",
+   "kind": "reasoning",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "8319d90fdbd84f42b18c840420381f34",
+   "chars": 73,
+   "sha256": "19049bff4154be06",
+   "turns": [
+    {
+     "kind": "reasoning",
+     "type": "first",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
+    }
+   ]
+  },
+  {
+   "name": "sp-stem-1",
+   "kind": "stem",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "7d07ba32e86544fca7130503b92c21b8",
+   "chars": 73,
+   "sha256": "19049bff4154be06",
+   "turns": [
+    {
+     "kind": "stem",
+     "type": "first",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
+    }
+   ]
+  },
+  {
+   "name": "sp-stem-2",
+   "kind": "stem",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "ce77d02cc5c342cba9c797dabc3fff26",
+   "chars": 73,
+   "sha256": "19049bff4154be06",
+   "turns": [
+    {
+     "kind": "stem",
+     "type": "first",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
+    }
+   ]
+  },
+  {
+   "name": "sp-writing-1",
+   "kind": "writing",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "5beba2e064e244a49a78aa83a0ae23e3",
+   "chars": 401,
+   "sha256": "d1162492fbb1cf8b",
+   "turns": [
+    {
+     "kind": "writing",
+     "type": "first",
+     "text": "Create advertising slogans for a pet grooming salon, including:\n- Main slogan (10-15 words)\n- Sub-slogan (15-20 words)\n- Service tagline (8-12 words)\n- Brand promise (10-15 words)\nThe slogans should reflect professional pet grooming and care services while emphasizing thoughtful care for pet owners. The slogans should be catchy, memorable, with warm and friendly wording, and a light, cheerful tone."
+    }
+   ]
+  },
+  {
+   "name": "sp-writing-2",
+   "kind": "writing",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "5b30259fc26e4f598e76f752d7f21177",
+   "chars": 551,
+   "sha256": "a0348180411c769b",
+   "turns": [
+    {
+     "kind": "writing",
+     "type": "first",
+     "text": "Historical Fiction: Write a scene from a story set during the height of the Roman Empire, focusing on a slice of a day in the life of a gladiator. Do not write a combat scene. Use sensory details to capture the sights, sounds, and smells of ancient Rome. Explore the gladiator's thoughts and emotions. The story should also touch on the larger political and social issues of the time period. The piece should feel like a slice of a larger story. Include a description of a unique scar or tattoo the gladiator has. First person, past tense, 1000 words."
+    }
+   ]
+  },
+  {
+   "name": "sp-multilingual-1",
+   "kind": "multilingual",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "6b37910e636747d68332efde376063dd",
+   "chars": 154,
+   "sha256": "abbc6ac71da84877",
+   "turns": [
+    {
+     "kind": "multilingual",
+     "type": "first",
+     "text": "สองในสามของนักเรียนที่โรงเรียนมัธยมต้นเบเกอร์เรียนวิชาดนตรี มีนักเรียนที่เรียนดนตรีทั้งหมด 834 คน จำนวนนักเรียนทั้งหมดที่โรงเรียนเบเกอร์มัธยมต้นเป็นเท่าไร"
+    }
+   ]
+  },
+  {
+   "name": "sp-multilingual-2",
+   "kind": "multilingual",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "e59cdda8b5f64d7f97b2ffa3628d6382",
+   "chars": 91,
+   "sha256": "56fde4cf5a905b92",
+   "turns": [
+    {
+     "kind": "multilingual",
+     "type": "first",
+     "text": "ما أصغر زاوية دوران (بالدرجات) حول مركز مخمس منتظم عكس عقارب الساعة ليعود إلى موضعه الأصلي؟"
+    }
+   ]
+  },
+  {
+   "name": "sp-summarization-1",
+   "kind": "summarization",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "de60de7fd5864529a973d3a50e967813",
+   "chars": 96,
+   "sha256": "9bc4a565c8668ad1",
+   "turns": [
+    {
+     "kind": "summarization",
+     "type": "first",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH\n\nSummarize:\n\n{article}"
+    }
+   ]
+  },
+  {
+   "name": "sp-summarization-2",
+   "kind": "summarization",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "93226c97d9184a57add0b751291c4535",
+   "chars": 122,
+   "sha256": "57ba4d683f1dcaf6",
+   "turns": [
+    {
+     "kind": "summarization",
+     "type": "first",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH\n\nPlease summarize the following text:\n\n{article}"
+    }
+   ]
+  },
+  {
+   "name": "sp-roleplay-1",
+   "kind": "roleplay",
+   "source": "nvidia/SPEED-Bench:qualitative",
+   "source_id": "43bec92a2f674c9d930afd3ced9299c5",
+   "chars": 493,
+   "sha256": "f3b834f5258a8c97",
+   "turns": [
+    {
+     "kind": "roleplay",
+     "type": "first",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH\n\n{role_name}! You only have a moment. Your life story is {role_description_and_catchphrases}. Speak quickly and only as yourself. Do not be polite, formal, or verbose. Any mention of external 'system' or 'model' status will break the timeline. Answer the questions now.\n\n"
+    },
+    {
+     "kind": "roleplay",
+     "type": "continued",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
+    },
+    {
+     "kind": "roleplay",
+     "type": "continued",
+     "text": "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
+    }
+   ]
+  }
+ ]
+}

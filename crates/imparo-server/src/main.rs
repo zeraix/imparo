@@ -9,10 +9,11 @@
 // The chat codec comes from the PLAN, not from an architecture named here. It has to be
 // reachable before the model is built: the template sniff below runs at load.
 use imparo_model::chat::ChatCodec;
-#[cfg(feature = "cuda-speculative")]
+#[cfg(feature = "speculative")]
 mod draft_pairing;
 mod host_fit;
 mod http;
+mod sched;
 mod template;
 
 use std::net::{TcpListener, TcpStream};
@@ -33,7 +34,7 @@ struct Engine {
     /// `KvPoolMember` method -- checked across both files before widening, not assumed --
     /// so naming the concrete type bought nothing and cost every other model.
     model: Box<dyn imparo_model::Model + Send>,
-    #[cfg(feature = "cuda-speculative")]
+    #[cfg(feature = "speculative")]
     draft_spec: Option<Arc<imparo_model::speculative::DraftSpec>>,
     tok: Tokenizer,
     /// This architecture's chat format: how a prompt is rendered without a template, and
@@ -48,6 +49,9 @@ struct Engine {
     /// Whether the scan was checked against a re-render at load and agreed. False
     /// means this template needs the slow path; see the probe at the call site.
     scan_trusted: bool,
+    /// The same check for the FIRST turn opener, where the system prompt and tool list end.
+    /// False means no checkpoint is taken there: that branch point has no slow path.
+    first_scan_trusted: bool,
     ctx: usize,
     /// The disk tier (docs/unified-kv-pool.md): durability across restart,
     /// conversation switch-in/out, resource fit. None when IMPARO_KV_DISK=0.
@@ -68,9 +72,12 @@ struct Engine {
     /// continuation cache (docs/unified-kv-pool.md). Emptied whenever the cache is
     /// overwritten or a forward fails mid-flight.
     resident: Vec<u32>,
+    /// Conversations that can decode at once, each in its own slot (co-batched decode,
+    /// docs/continuous-batching.md). 1 runs requests one at a time.
+    slots: usize,
 }
 
-#[cfg(feature = "cuda-speculative")]
+#[cfg(feature = "speculative")]
 impl Drop for Engine {
     fn drop(&mut self) {
         if let Err(e) = self.model.clear_draft_cache() {
@@ -163,24 +170,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cache_key_type: Option<String> = None;
     let mut cache_value_type: Option<String> = None;
     let mut template_file: Option<PathBuf> = None;
+    let mut draft_path: Option<PathBuf> = None;
     let mut draft_pairing_path: Option<PathBuf> = None;
-    let mut draft_kind: Option<String> = None;
     let mut draft_mask_token: Option<u32> = None;
+    let mut kv_idle_s: Option<u64> = None;
+    let mut parallel: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "-m" | "--model" => model_path = args.next().map(PathBuf::from),
+            // A DSpark drafter file, paired with the target at start (no manifest).
+            "--draft" => {
+                draft_path = Some(PathBuf::from(
+                    args.next().ok_or("--draft requires a drafter file")?,
+                ));
+            }
+            // A Gemma4 MTP pairing manifest (the CUDA drafter).
             "--draft-pairing" => {
                 draft_pairing_path = Some(PathBuf::from(
                     args.next()
                         .ok_or("--draft-pairing requires a manifest path")?,
                 ));
-            }
-            "--draft-kind" => {
-                draft_kind = Some(
-                    args.next()
-                        .ok_or("--draft-kind requires dspark or gemma4-mtp")?,
-                );
             }
             "--draft-mask-token" => {
                 draft_mask_token = Some(
@@ -197,7 +207,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(context_length);
             }
-            "--parallel" | "-md" | "--mmproj" => {
+            // Requests that decode at once, like llama.cpp's --parallel.
+            "-np" | "--parallel" => {
+                parallel = Some(
+                    args.next()
+                        .ok_or("--parallel requires a number of requests")?
+                        .parse()
+                        .map_err(|_| "invalid --parallel")?,
+                );
+            }
+            "-md" | "--mmproj" => {
                 let _ = args.next();
             }
             // KV cache types, like llama.cpp's -ctk/-ctv: f16 (default) | q4_0 | q8_0.
@@ -207,22 +226,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A user-supplied jinja template file overriding the GGUF-embedded one
             // (llama.cpp's --chat-template-file).
             "--chat-template-file" => template_file = args.next().map(PathBuf::from),
+            // Seconds without a request before idle conversations' KV goes back to the
+            // system (0: after every request). Default: the backend's residency hold.
+            "--kv-idle-s" => {
+                kv_idle_s = Some(
+                    args.next()
+                        .ok_or("--kv-idle-s requires a number of seconds")?
+                        .parse()
+                        .map_err(|_| "invalid --kv-idle-s")?,
+                );
+            }
             _ => {}
         }
     }
-    #[cfg(not(feature = "cuda-speculative"))]
-    if draft_pairing_path.is_some()
-        || draft_kind.is_some()
-        || draft_mask_token.is_some()
-    {
-        return Err(
-            "draft pairing currently requires the cuda-speculative build feature"
-                .into(),
-        );
+    #[cfg(not(feature = "speculative"))]
+    if draft_path.is_some() || draft_pairing_path.is_some() || draft_mask_token.is_some() {
+        return Err("draft pairing requires the speculative build feature".into());
     }
     let path = model_path.ok_or(
         "usage: imparo-server -m MODEL.gguf [--port N] [-c N] \
-                                 [--cache-type-k T] [--cache-type-v T] [--draft-pairing PATH --draft-kind dspark|gemma4-mtp] [--draft-mask-token ID]",
+                                 [--cache-type-k T] [--cache-type-v T] [--kv-idle-s S] [--parallel N] [--draft DSPARK.gguf [--draft-mask-token ID]] [--draft-pairing GEMMA4_MTP.json]",
     )?;
     // Only configure when a flag was given: with no flags the engine falls back to the
     // IMPARO_CTK/IMPARO_CTV environment (probe binaries and harnesses use that), and
@@ -246,26 +269,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // From the PLAN, and before the model exists: the template sniff below runs at load.
     let chat = imparo_model::chat::codec(&plan)?;
     imparo_model::host::log_footprint("plan");
-    #[cfg(feature = "cuda-speculative")]
+    #[cfg(feature = "speculative")]
     let pairing = draft_pairing::load(
         &path,
+        &document,
         &plan.config.architecture,
+        draft_path.as_deref(),
         draft_pairing_path.as_deref(),
-        draft_kind.as_deref(),
         draft_mask_token,
     )?;
-    #[cfg(feature = "cuda-speculative")]
-    let backing = pairing
-        .as_ref()
-        .map_or(path.as_path(), |(p, _)| p.as_path());
-    #[cfg(not(feature = "cuda-speculative"))]
-    let backing = path.as_path();
-    let mut weights = Weights::open_with(&document, backing)?;
-    imparo_model::backend::enable_gpu(
+    // A paired drafter's file is mapped right after the target's, in the same range: its
+    // tensors sit past the target's, and the weight placement covers them before any kernel
+    // reads one.
+    #[cfg(feature = "speculative")]
+    let mut weights = match &pairing {
+        Some((draft, _)) => Weights::open_with_appended(&document, &path, draft)?,
+        None => Weights::open_with(&document, &path)?,
+    };
+    #[cfg(not(feature = "speculative"))]
+    let mut weights = Weights::open_with(&document, &path)?;
+    #[cfg(feature = "speculative")]
+    let appended = match &pairing {
+        Some((_, spec)) => spec.appended_spans(&weights, plan.config.n_layers)?,
+        None => Vec::new(),
+    };
+    // The drafter's caches, attention dims and feature rows are sized from the plan, so the plan
+    // carries the drafter before the device is enabled. Without it every request's attach is
+    // refused ("the target's plan does not carry this drafter").
+    #[cfg(feature = "speculative")]
+    let plan = match &pairing {
+        Some((_, spec)) => imparo_model::ModelPlan {
+            drafter: spec.drafter_plan(&weights, plan.config.n_layers)?,
+            ..plan
+        },
+        None => plan,
+    };
+    #[cfg(not(feature = "speculative"))]
+    let appended: Vec<(u64, u64)> = Vec::new();
+    imparo_model::backend::enable_gpu_with_appended(
         &mut weights,
         &plan,
         context_length,
-        imparo_model::prefill_batch(),
+        &appended,
     )?;
     #[cfg(feature = "cuda-speculative")]
     draft_pairing::apply_knobs()?;
@@ -424,10 +469,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // has both paged attention and an implemented Device -> Host mover. Metal's unified
     // path does not change and, importantly, never pretends to perform a host transfer.
     let caps = imparo_model::backend::active().map(imparo_backend::Backend::pool_caps);
+    // Whether a backend holds the weights -- asked of the model, not re-read from IMPARO_GPU.
+    // Reading the variable here kept its old meaning (unset = CPU) after unset came to mean
+    // GPU, so a server started without it ran every request on the single-resident path.
     let eligibility = pool_eligibility(
         !std::env::var("IMPARO_KV_POOL").is_ok_and(|v| v == "0"),
         model.plan().layers.iter().any(|_| true),
-        std::env::var("IMPARO_GPU").is_ok_and(|v| v != "0" && !v.is_empty()),
+        model.weights().gpu_enabled(),
         caps,
     );
     let pool_mode = match eligibility {
@@ -467,6 +515,13 @@ placement grid; running the single-resident path"
                 eprintln!(
                     "[imparo] kv pool: {} full-attention layers, {blocks} blocks/layer",
                     layers.len()
+                );
+                let positions = blocks as usize * imparo_kv::page_cells();
+                let ctx = model.kv_runtime().capacity.max(1);
+                eprintln!(
+                    "[imparo] kv pool tier: {positions} positions, {} conversations at the \
+full {ctx}-token context",
+                    positions / ctx
                 );
                 let strides: std::collections::BTreeMap<u32, (usize, usize)> = model
                     .kv_state_geometry()
@@ -557,6 +612,7 @@ placement grid; running the single-resident path"
                         host_capacity_bytes,
                         layers,
                         blocks,
+                        ctx.div_ceil(imparo_kv::page_cells()),
                         model.kv_checkpoint_slack(),
                         strides,
                         root,
@@ -586,7 +642,13 @@ by re-rendering (slower)",
     // a finished turn, a new user message). The scan is the fast path and the re-render
     // is what it replaces, so if the two disagree the answer is not "use the fast one" --
     // it is "this template needs the slow one", and the request path is told which.
-    let scan_trusted = !user_open.is_empty() && {
+    //
+    // The FIRST opener gets the same question against a render of the system message alone:
+    // where the system prompt and tool list end, the branch point every conversation with this
+    // system prompt shares. It has no slow path, so a disagreement only turns that point off.
+    let (scan_trusted, first_scan_trusted) = if user_open.is_empty() {
+        (false, false)
+    } else {
         let probe = |n: usize| -> Vec<u32> {
             let msgs: Vec<Value> = vec![
                 json!({"role": "system", "content": "You are a probe."}),
@@ -631,18 +693,71 @@ by re-rendering (slower)",
 re-render says {expect}; branch points will be found by re-rendering (slower)"
             );
         }
-        ok
+        let system = probe(1);
+        let expect_first = full.iter().zip(&system).take_while(|(a, b)| a == b).count();
+        let first = first_subsequence(&full, &user_open);
+        let first_ok = first == Some(expect_first);
+        if !first_ok {
+            eprintln!(
+                "[imparo] chat: the first turn opener is at {first:?} where the system \
+message alone renders {expect_first} tokens; no checkpoint at the system prompt's end"
+            );
+        }
+        (ok, first_ok)
+    };
+    // CO-BATCHED DECODE (docs/continuous-batching.md): a slot per conversation that decodes
+    // at once. Only with the pool, whose page tables give each conversation blocks of its
+    // own; 8 unless --parallel says otherwise. A model or cache the co-batched step does not
+    // serve yet runs requests one at a time, as before.
+    let slots = if pool_mode.is_none()
+        || std::env::var("IMPARO_NO_REUSE").is_ok_and(|v| v == "1")
+    {
+        1
+    } else {
+        parallel.unwrap_or(8).max(1)
+    };
+    let mut pool_mode = pool_mode;
+    let slots = if slots > 1 {
+        match model.set_slots(u32::try_from(slots)?) {
+            Ok(()) => {
+                // A slot's own state (rings, recurrent buffers) is device memory beside the
+                // pool's blocks: every slot but the first is charged its pages while it holds
+                // them (docs/continuous-batching.md, section 4).
+                let state = model.slot_state_bytes();
+                let pages = pool_mode.as_mut().map_or(0, |pl| {
+                    let pages = usize::try_from(state)
+                        .unwrap_or(usize::MAX)
+                        .div_ceil(pl.page_bytes().max(1));
+                    pl.set_slot_pages(pages);
+                    pages
+                });
+                eprintln!(
+                    "[imparo] co-batched decode: {slots} slots, {:.1} MiB of state each beyond the first ({pages} pages)",
+                    state as f64 / f64::from(1u32 << 20)
+                );
+                slots
+            }
+            Err(e) => {
+                eprintln!(
+                    "[imparo] co-batched decode off ({e}); requests run one at a time"
+                );
+                1
+            }
+        }
+    } else {
+        1
     };
     let disk = store.clone().map(imparo_kv::disk::DiskQueue::new);
     let engine = Arc::new(Mutex::new(Engine {
         model,
-        #[cfg(feature = "cuda-speculative")]
+        #[cfg(feature = "speculative")]
         draft_spec: pairing.map(|(_, spec)| Arc::new(spec)),
         tok,
         chat,
         bos_text,
         user_open,
         scan_trusted,
+        first_scan_trusted,
         ctx: context_length,
         store,
         disk,
@@ -651,6 +766,7 @@ re-render says {expect}; branch points will be found by re-rendering (slower)"
         disk_cap,
         resident_conv: String::new(),
         resident: Vec::new(),
+        slots,
     }));
     // Graceful shutdown: bytes now move to disk only at switch-out, so a
     // SIGTERM/SIGINT must spill the ACTIVE conversation before the process dies
@@ -663,9 +779,7 @@ re-render says {expect}; branch points will be found by re-rendering (slower)"
             let mut rx = rx;
             let mut b = [0u8; 1];
             let _ = rx.read(&mut b);
-            let mut engine = engine
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut engine = sched::lock_engine(&engine);
             let Engine {
                 model,
                 store,
@@ -674,7 +788,9 @@ re-render says {expect}; branch points will be found by re-rendering (slower)"
                 ..
             } = &mut *engine;
             if let Some(pl) = pool.as_mut() {
-                if let Some(label) = pl.active.clone() {
+                // A request still running is lost with the process; its conversation is
+                // not written half made.
+                if let Some(label) = pl.active.clone().filter(|l| !pl.is_pinned(l)) {
                     if let Err(e) =
                         pl.switch_out(&**model, store.as_ref(), disk.as_ref(), &label)
                     {
@@ -693,18 +809,171 @@ re-render says {expect}; branch points will be found by re-rendering (slower)"
             std::process::exit(0);
         });
     }
+    // THE KV TIER'S RELEASE. Idle conversations stay resident while the server is busy, so a
+    // switch back costs nothing; they leave when it has been idle for the backend's release
+    // window, or when the system reports memory pressure.
+    {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || kv_trimmer(&engine, kv_idle_s));
+    }
+    // THE ENGINE LOOP: the one thread that runs chat requests (sched.rs). A connection's
+    // thread reads its request, hands it over as a job and sends what the loop writes back.
+    let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+    let submitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let engine = Arc::clone(&engine);
+        let submitted = Arc::clone(&submitted);
+        std::thread::spawn(move || sched::run(&engine, &queue, &submitted));
+    }
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("[imparo] listening http://127.0.0.1:{port}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let engine = Arc::clone(&engine);
+        let jobs = jobs.clone();
+        let submitted = Arc::clone(&submitted);
         std::thread::spawn(move || {
-            if let Err(e) = serve_one(stream, &engine) {
+            if let Err(e) = serve_one(stream, &engine, &jobs, &submitted) {
                 eprintln!("[imparo] connection error: {e}");
             }
         });
     }
     Ok(())
+}
+
+/// When the last request finished, in milliseconds on `process_ms`'s clock; 0 before any.
+static LAST_REQUEST_END_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn process_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+}
+
+fn note_request_end() {
+    LAST_REQUEST_END_MS
+        .store(process_ms().max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Releases idle conversations' KV (`PoolMode::trim`) once the server has been idle for the
+/// backend's release window -- the one after which the weights' residency lets go too -- or
+/// as soon as the system reports memory pressure. Once per idle stretch: a trim with nothing
+/// resident gives nothing back, and the next request starts a new stretch.
+///
+/// Only where the backend's committed KV follows the blocks in use does a release give memory
+/// back, so elsewhere there is no trimmer. The idle release hands conversations to the disk
+/// tier, so without one only memory pressure releases.
+///
+/// `--kv-idle-s`, else IMPARO_KV_IDLE_S, sets the window (0: release right after every
+/// request); unset, it is the backend's residency hold.
+fn kv_trimmer(engine: &Mutex<Engine>, kv_idle_s: Option<u64>) {
+    let Some(be) = imparo_model::backend::active() else {
+        return;
+    };
+    if !be.kv_commits_on_demand() {
+        return;
+    }
+    let has_disk = sched::lock_engine(engine).disk.is_some();
+    let window = if has_disk {
+        kv_idle_s
+            .or_else(|| {
+                std::env::var("IMPARO_KV_IDLE_S")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .map(std::time::Duration::from_secs)
+            .or_else(|| be.idle_release_after())
+    } else {
+        None
+    };
+    match window {
+        Some(w) => eprintln!(
+            "[imparo] kv idle release: after {} s without a request, or on memory pressure",
+            w.as_secs()
+        ),
+        None => eprintln!("[imparo] kv idle release: on memory pressure only"),
+    }
+    process_ms();
+    let mut released_after = 0_u64;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let pressure = be.take_memory_pressure();
+        let last = LAST_REQUEST_END_MS.load(std::sync::atomic::Ordering::Relaxed);
+        let idle_for =
+            std::time::Duration::from_millis(process_ms().saturating_sub(last));
+        // Idle means no request running either: a co-batch can decode for longer than the
+        // window without one ending.
+        let due = window
+            .is_some_and(|w| last != 0 && last != released_after && idle_for >= w)
+            && sched::IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        if !pressure && !due {
+            continue;
+        }
+        // This thread never exits: what the trim autoreleases is freed with this scope.
+        let _pool = imparo_model::host::AutoreleaseScope::open();
+        let mut engine = sched::lock_engine(engine);
+        // A request may have run while this waited for the lock: its end starts a new
+        // stretch, and only pressure releases before that one has passed the window.
+        let last_now = LAST_REQUEST_END_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if !pressure && last_now != last {
+            continue;
+        }
+        let Engine {
+            model, pool, slots, ..
+        } = &mut *engine;
+        let Some(pl) = pool.as_mut() else {
+            return;
+        };
+        let t0 = Instant::now();
+        let before = be.kv_committed_bytes();
+        match pl.trim(&mut **model) {
+            Ok(t) => {
+                if imparo_model::log_on() || t.conversations > 0 {
+                    eprintln!(
+                        "[imparo] kv trim ({}): {} conversation(s) released, blocks {} -> {}, \
+committed {:.1} -> {:.1} MiB in {:.1} ms",
+                        if pressure { "memory pressure" } else { "idle" },
+                        t.conversations,
+                        t.blocks_before,
+                        t.blocks_after,
+                        before as f64 / f64::from(1u32 << 20),
+                        be.kv_committed_bytes() as f64 / f64::from(1u32 << 20),
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
+            Err(e) => eprintln!("[imparo] kv trim: {e}"),
+        }
+        // A slot no conversation occupies gives its buffers back; its next request makes them
+        // again. The selected slot keeps its own: a lone client's next turn runs there.
+        let gpu_before = be.allocated_bytes();
+        let mut released = 0;
+        for s in 0..*slots {
+            if s == pl.selected_slot() || pl.occupant(s).is_some() {
+                continue;
+            }
+            match model.release_slot(u32::try_from(s).unwrap_or(u32::MAX)) {
+                Ok(true) => {
+                    // Its rings went with its buffers: no conversation resumes from them.
+                    pl.slot_released(s);
+                    released += 1;
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("[imparo] slot {s} release: {e}"),
+            }
+        }
+        if imparo_model::log_on() || released > 0 {
+            eprintln!(
+                "[imparo] slot release ({}): {released} slot(s) gave their buffers back, \
+device {:.1} -> {:.1} MiB",
+                if pressure { "memory pressure" } else { "idle" },
+                gpu_before as f64 / f64::from(1u32 << 20),
+                be.allocated_bytes() as f64 / f64::from(1u32 << 20)
+            );
+        }
+        released_after = last_now;
+    }
 }
 
 /// The compiled chat template, set once at startup (None = use the built-in renderer).
@@ -792,6 +1061,14 @@ fn last_subsequence(hay: &[u32], needle: &[u32]) -> Option<usize> {
         .find(|&i| hay[i..i + needle.len()] == *needle)
 }
 
+/// Where the FIRST turn opener starts: the end of the system prompt and tool list.
+fn first_subsequence(hay: &[u32], needle: &[u32]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()] == *needle)
+}
+
 fn conversation_label(conversation: &str, hashes: &[imparo_kv::UnitHash]) -> String {
     if conversation != "default" {
         return conversation.to_string();
@@ -857,7 +1134,16 @@ fn render_chat_prompt(
 fn serve_one(
     mut stream: TcpStream,
     engine: &Arc<Mutex<Engine>>,
+    jobs: &std::sync::mpsc::Sender<Job>,
+    submitted: &std::sync::atomic::AtomicUsize,
 ) -> std::io::Result<()> {
+    // NAGLE OFF. A streamed reply is one small SSE frame per token, and Nagle holds a small
+    // write until the previous one is ACKed -- so frames leave in clumps and the CLIENT sees
+    // inter-token gaps the server never had. That is invisible to our own `timings` (which
+    // measure the decode loop) and lands squarely in a client-side tok/s, which is the number
+    // an engine comparison is read on. Costs nothing: the frames are written once each and
+    // there is nothing to coalesce that we want coalesced.
+    let _ = stream.set_nodelay(true);
     let Some(req) = http::read_request(&mut stream)? else {
         return Ok(());
     };
@@ -871,7 +1157,25 @@ fn serve_one(
                 "data": [{"id": "imparo", "object": "model", "owned_by": "imparo"}]
             }),
         ),
-        ("POST", "/v1/chat/completions") => chat_completions(&mut stream, &req, engine),
+        ("POST", "/v1/chat/completions") => {
+            // The engine loop runs it; this thread sends what the loop writes until the
+            // loop is done with the request and drops its end of the channel.
+            let (tx, rx) = std::sync::mpsc::channel();
+            submitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let job = Job {
+                req,
+                out: http::Outbox::new(tx),
+            };
+            if jobs.send(job).is_err() {
+                submitted.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return http::json(
+                    &mut stream,
+                    503,
+                    &json!({"error": "engine stopped"}),
+                );
+            }
+            http::pump(&mut stream, &rx)
+        }
         ("POST", "/kv/conversations/erase") => {
             erase_conversations(&mut stream, &req, engine)
         }
@@ -890,9 +1194,7 @@ fn kv_disk_barrier(
     stream: &mut TcpStream,
     engine: &Arc<Mutex<Engine>>,
 ) -> std::io::Result<()> {
-    let engine = engine
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let engine = sched::lock_engine(engine);
     let Some(dq) = engine.disk.as_ref() else {
         return http::json(stream, 200, &json!({"durable": true, "disk": false}));
     };
@@ -935,9 +1237,20 @@ fn erase_conversations(
             &json!({"error": "ids: non-empty array required"}),
         );
     }
-    let mut engine = engine
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut engine = sched::lock_engine(engine);
+    // A conversation a request is decoding cannot go from under it; the client erases it
+    // once its response is in.
+    let running: Vec<&String> = ids
+        .iter()
+        .filter(|i| engine.pool.as_ref().is_some_and(|pl| pl.is_running(i)))
+        .collect();
+    if !running.is_empty() {
+        return http::json(
+            stream,
+            409,
+            &json!({"error": "a request is running for these conversations", "ids": running}),
+        );
+    }
     if ids.iter().any(|i| *i == engine.resident_conv) {
         engine.resident.clear();
         engine.resident_conv.clear();
@@ -1035,21 +1348,463 @@ fn parse_raw_input_ids(
         .map(Some)
 }
 
+/// What reads the cache as a prefill left it, before a token is generated: the service
+/// witness (IMPARO_SERVICE_STATE_DUMP_DIR) and the digest (IMPARO_KV_DIGEST=1), so two
+/// conversations with the same prompt can be compared over the whole prompt. Then the
+/// prefill's time goes to the profile log, apart from decode's: their shapes differ, and
+/// averaging them would hide whichever one is stalling.
+fn prefill_probes(
+    model: &dyn imparo_model::Model,
+    pool: Option<&imparo_kv::pool::PoolMode>,
+    label: Option<&str>,
+    ids: &[u32],
+    logits: &[f32],
+    prefill_ms: f64,
+) -> std::io::Result<Option<PathBuf>> {
+    let service_witness = dump_service_prefill_witness(model, logits)?;
+    if let Some(folder) = &service_witness {
+        std::fs::write(folder.join("input-ids.json"), serde_json::to_vec(ids)?)?;
+    }
+    if let (Some(pl), Some(label)) = (pool, label) {
+        pl.digest(model, label, ids.len());
+    }
+    imparo_model::host::prof_log("prefill", prefill_ms);
+    Ok(service_witness)
+}
+
+/// A chat request the engine loop serves: the request and where its response goes.
+struct Job {
+    req: http::Request,
+    out: http::Outbox,
+}
+
+/// What became of a job the engine loop ran.
+enum Outcome {
+    /// Its response went out whole, or it failed; nothing of it is left running.
+    Done,
+    /// It decodes on as a row of the co-batch.
+    Row(Box<sched::Row>),
+    /// Rows were running when it was admitted: its prompt is prefilled a chunk per loop
+    /// iteration, between their decode steps, and it joins them after its first token.
+    Prefill(Box<sched::Prefilling>),
+    /// The pool cannot hold it beside the rows running (docs/continuous-batching.md,
+    /// section 4). Nothing of it ran; it waits at the head of the line.
+    Wait(Job),
+}
+
+fn done(sent: std::io::Result<()>) -> std::io::Result<Outcome> {
+    sent.map(|()| Outcome::Done)
+}
+
+/// A request's fixed facts from its prefill on: what its finish reads.
+struct Turn {
+    out: http::Outbox,
+    seed: bool,
+    prompt_tokens: usize,
+    /// The reused prefix: where the prefill started.
+    start_pos: usize,
+    /// The client's conversation id, `default` for none.
+    conversation: String,
+    /// What the conversation's state is stored under; None without the pool.
+    label: Option<String>,
+    /// The prompt's tokens.
+    ids: Vec<u32>,
+    starts_in_reasoning: bool,
+    pool_branches: Vec<PoolBranch>,
+}
+
+/// A branch point: its position, the prompt's unit hashes, the label, and whether it was
+/// captured while the prefill passed it (eager) or is recorded at the turn's end.
+type PoolBranch = (usize, Vec<imparo_kv::UnitHash>, String, bool);
+
+/// A prompt's prefill: its segments -- to each eager branch point, where it pauses to
+/// checkpoint the state, then to the prompt's end -- run a chunk at a time. A request that
+/// starts with nothing running runs it to its end in one go; one admitted beside running rows
+/// runs a chunk per loop iteration, between their decode steps (docs/continuous-batching.md,
+/// section 3). Both make the same calls, so the cache a request leaves does not depend on
+/// which way it was prefilled.
+struct PromptPrefill {
+    /// The pauses, ascending: a branch point, the prompt's unit hashes, the label its
+    /// checkpoint is stored under.
+    pauses: Vec<(usize, Vec<imparo_kv::UnitHash>, String)>,
+    /// The prompt anchor: the grid point the next turn resumes from.
+    anchor: Option<usize>,
+    /// Whether the last segment keeps the recurrent state aside at `anchor` (a model with
+    /// recurrent state); a model without it checkpoints the anchor's KV units alone.
+    arm: bool,
+    /// Where the running segment starts, and its forward once a chunk of it has run.
+    at: usize,
+    running: Option<imparo_model::Prefill>,
+    /// Pauses passed.
+    passed: usize,
+}
+
+impl PromptPrefill {
+    /// The prefill of a `len`-token prompt from `from`: the eager branch points at or above
+    /// `from` and below the end pause it. `anchor` is kept when it lies at or above the last
+    /// pause: only the last segment keeps a recurrent state aside.
+    fn new(
+        branches: &[PoolBranch],
+        from: usize,
+        len: usize,
+        anchor: Option<usize>,
+        arm: bool,
+    ) -> Self {
+        let pauses: Vec<_> = branches
+            .iter()
+            .filter(|(branch, .., eager)| *eager && *branch >= from && *branch < len)
+            .map(|(branch, hashes, label, _)| (*branch, hashes.clone(), label.clone()))
+            .collect();
+        let anchor =
+            anchor.filter(|at| *at >= pauses.last().map_or(from, |(b, ..)| *b));
+        Self {
+            pauses,
+            anchor,
+            arm,
+            at: from,
+            running: None,
+            passed: 0,
+        }
+    }
+
+    /// After the last chunk: the prompt anchor, captured on the way, noted as the next
+    /// turn's resume point (see `chat_completions`).
+    fn note_anchor(
+        &self,
+        model: &dyn imparo_model::Model,
+        pool: Option<&mut imparo_kv::pool::PoolMode>,
+        root: &imparo_kv::ConfigRoot,
+        label: Option<&str>,
+        ids: &[u32],
+    ) {
+        let (Some(anchor), Some(pl), Some(label)) = (self.anchor, pool, label) else {
+            return;
+        };
+        let hashes = imparo_kv::unit_ids(root, ids);
+        if let Some(at) = pl.note_prompt_checkpoint(model, label, &hashes, ids, anchor) {
+            if imparo_model::log_on() {
+                eprintln!("[imparo] prompt replay anchor={at} prompt={}", ids.len());
+            }
+        }
+    }
+
+    /// Runs the prompt's next chunk, and checkpoints each pause the prefill reaches. True
+    /// once every token has run. The request's slot must be the selected one.
+    fn step(
+        &mut self,
+        model: &mut dyn imparo_model::Model,
+        mut pool: Option<&mut imparo_kv::pool::PoolMode>,
+        ids: &[u32],
+        logits: &mut Vec<f32>,
+        mut observer: Option<&mut imparo_model::PrefillChunkObserver<'_>>,
+    ) -> std::io::Result<bool> {
+        let mut ran = false;
+        loop {
+            let end = self.pauses.get(self.passed).map_or(ids.len(), |(b, ..)| *b);
+            if end > self.at {
+                if ran {
+                    return Ok(false);
+                }
+                let tokens = &ids[self.at..end];
+                let forward = match &mut self.running {
+                    Some(forward) => forward,
+                    running => {
+                        let armed = if end == ids.len() && self.arm { self.anchor } else { None };
+                        running.insert(
+                            model
+                                .prefill_begin(tokens.len(), self.at, armed)
+                                .map_err(std::io::Error::other)?,
+                        )
+                    }
+                };
+                model
+                    .prefill_chunk(forward, tokens, logits, observer.as_deref_mut())
+                    .map_err(std::io::Error::other)?;
+                ran = true;
+                if !forward.done() {
+                    return Ok(false);
+                }
+                if let Some(forward) = self.running.take() {
+                    model.prefill_end(forward).map_err(std::io::Error::other)?;
+                }
+            }
+            self.at = end;
+            let Some((branch, hashes, label)) = self.pauses.get(self.passed) else {
+                return Ok(true);
+            };
+            // A RESIDENT record: its tokens are compared by `matching_ckpts` against the
+            // stretch above the last 256-TILE, so that is the grid they are cut on. The
+            // manifest's tail is a different measurement -- above the last EXTENT -- and
+            // `commit_to_disk` derives it there rather than inheriting this one.
+            let units = branch / imparo_kv::grid_tokens();
+            if let (Some(tip), Some(pl)) =
+                (hashes.get(units.wrapping_sub(1)), pool.as_mut())
+            {
+                let tokens = ids[units * imparo_kv::grid_tokens()..*branch].to_vec();
+                let prev = pl.prev_ckpt_at(label, hashes, ids, branch - 1);
+                pl.note_ckpt(&*model, label, *tip, prev, *branch, tokens);
+            }
+            self.passed += 1;
+        }
+    }
+}
+
+/// A reply as it is generated: its tokens, their text, and what of the text has been sent.
+///
+/// STREAMING FEEDS THE NEW BYTES, NOT THE WHOLE ANSWER (the shape oMLX's output parser
+/// uses). Splitting and parsing all of `emitted` every token is O(n) per token and so
+/// O(n^2) over a response. Instead each stage asks its codec how many TRAILING bytes are
+/// still undecided; everything before that is settled forever, classified once, and never
+/// looked at again.
+///
+/// ```text
+///   raw ─[unsettled_in_raw]→ split_channels ─→ reasoning ──────────────────→ delta
+///                                           └→ visible ─[unsettled_in_visible]→ parse → delta
+/// ```
+///
+/// TWO CUTS, NOT ONE, because they are different questions. Asking "is a call open?" about
+/// RAW text answers it for the reasoning channel too, where a `<tool_call>` the model wrote
+/// in its thinking is prose and will never close -- and holding it holds everything after
+/// it, including the visible answer, to the end of generation.
+#[allow(clippy::struct_excessive_bools)] // independent facts about one reply, not one state
+struct Reply {
+    id: String,
+    streaming: bool,
+    max_tokens: usize,
+    chat: &'static dyn ChatCodec,
+    /// The end-of-sequence and end-of-turn tokens: either ends the reply unsent.
+    stops: Vec<u32>,
+    generated: Vec<u32>,
+    /// The generated text's bytes, appended per token: decoding the WHOLE prefix each step
+    /// was quadratic in generation length (review #116, D7).
+    gen_bytes: Vec<u8>,
+    emitted: String,
+    fed_raw: usize,
+    inside: bool,
+    fed_vis: usize,
+    vis_split: String,
+    reasoning_out: String,
+    visible_out: String,
+    sent_reasoning: usize,
+    sent_visible: usize,
+    /// The token's SSE frames, serialised here and written once (task #202).
+    frames: Vec<u8>,
+    /// The turn can end inside the TEXT, not only at an end token -- see
+    /// `ChatCodec::turn_ends_at`. Set when it has, so the reply stops after this token's
+    /// bytes have been truncated and streamed.
+    turn_ended: bool,
+    /// IMPARO_PROF=1, read once: the clock reads themselves are the probe's cost.
+    probe: bool,
+    t_detok: f64,
+    t_send: f64,
+}
+
+impl Reply {
+    /// A reply before its first token. `inside`: the prompt leaves the reasoning channel
+    /// open.
+    fn new(
+        id: String,
+        streaming: bool,
+        max_tokens: usize,
+        chat: &'static dyn ChatCodec,
+        stops: Vec<u32>,
+        inside: bool,
+        probe: bool,
+    ) -> Self {
+        Self {
+            id,
+            streaming,
+            max_tokens,
+            chat,
+            stops,
+            generated: Vec::new(),
+            gen_bytes: Vec::new(),
+            emitted: String::new(),
+            fed_raw: 0,
+            inside,
+            fed_vis: 0,
+            vis_split: String::new(),
+            reasoning_out: String::new(),
+            visible_out: String::new(),
+            sent_reasoning: 0,
+            sent_visible: 0,
+            frames: Vec::with_capacity(512),
+            turn_ended: false,
+            probe,
+            t_detok: 0.0,
+            t_send: 0.0,
+        }
+    }
+
+    /// Hands `next` to the reply. A stop token ends it unsent; any other token is appended,
+    /// and when streaming, its settled text goes out in one write. Returns whether the reply
+    /// has ended: a stop token, a turn handed over inside the text, or `max_tokens` tokens.
+    fn take<W: std::io::Write + ?Sized>(
+        &mut self,
+        next: u32,
+        tok: &Tokenizer,
+        stream: &mut W,
+    ) -> std::io::Result<bool> {
+        if self.stops.contains(&next) {
+            return Ok(true);
+        }
+        let chat = self.chat;
+        self.generated.push(next);
+        let t_d = self.probe.then(Instant::now);
+        tok.decode_bytes_into(
+            &self.generated[self.generated.len() - 1..],
+            &mut self.gen_bytes,
+        );
+        let piece =
+            String::from_utf8_lossy(&self.gen_bytes[..settled_len(&self.gen_bytes)])
+                .into_owned();
+        if let Some(t) = t_d {
+            self.t_detok += t.elapsed().as_secs_f64() * 1e3;
+        }
+        let t_e = self.probe.then(Instant::now);
+        if piece.len() > self.emitted.len() {
+            self.emitted = piece;
+            // WHERE THE MODEL HANDS THE TURN OVER, THE TURN IS OVER. gemma4 finishes a tool
+            // call by writing `<|tool_response>`, the opener of the block a tool RESULT
+            // fills; run past it and the model writes the tool's answer itself. Truncating
+            // HERE rather than after the loop is what makes the stream right too: a delta
+            // already sent cannot be taken back over SSE.
+            //
+            // Searched from `fed_raw`, not from 0: the cut below holds any suffix that could
+            // still grow into a marker, so a COMPLETE handover marker can only lie in the
+            // bytes it has not settled yet. A `find` over the whole answer every token is
+            // the same O(n^2) the split and the parse were just cured of.
+            if let Some(at) = chat.turn_ends_at(&self.emitted[self.fed_raw..]) {
+                // The UNTRUNCATED bytes, under the same gate as the dump below: after the
+                // truncation nothing else in the process holds what the model actually
+                // wrote, and that is exactly what a reader of this probe came for.
+                if std::env::var("IMPARO_DUMP_GEN").is_ok_and(|v| v == "1") {
+                    eprintln!("[gen-raw-begin]{}[gen-raw-end]", self.emitted);
+                    let abs = self.fed_raw + at;
+                    eprintln!(
+                        "[imparo] turn ends at byte {abs}; the rest is the caller's"
+                    );
+                }
+                self.emitted.truncate(self.fed_raw + at);
+                self.turn_ended = true;
+            }
+            // THE RAW CUT RUNS IN BOTH MODES, because both need `fed_raw`: streaming
+            // classifies and sends what it settles, and the turn-end search above uses it as
+            // the floor that keeps itself off the whole answer. Non-streaming only advances.
+            let raw_tail = &self.emitted[self.fed_raw..];
+            let settled = &raw_tail[..raw_tail.len() - chat.unsettled_in_raw(raw_tail)];
+            if !settled.is_empty() {
+                if self.streaming {
+                    // Stage 1: reasoning never streams as `content`.
+                    let (r, v) = chat.split_channels(settled, self.inside);
+                    self.reasoning_out.push_str(&r);
+                    self.vis_split.push_str(&v);
+                    self.inside = chat.channel_state_after(settled, self.inside);
+                }
+                self.fed_raw += settled.len();
+            }
+            if self.streaming {
+                // Stage 2: a tool call is not visible text either. Streaming used to skip
+                // this, so a client received the whole call as `content` deltas AND again as
+                // `tool_calls`, while the same request non-streaming returned `content: ""`.
+                // The calls are dropped here and read from the final parse; only the TEXT
+                // between them is streamed.
+                let vis_tail = &self.vis_split[self.fed_vis..];
+                let ready =
+                    &vis_tail[..vis_tail.len() - chat.unsettled_in_visible(vis_tail)];
+                if !ready.is_empty() {
+                    self.visible_out.push_str(&chat.parse_tool_calls(ready).0);
+                    self.fed_vis += ready.len();
+                }
+                // Everything accumulated above is settled, so a delta is simply the part
+                // not yet sent. Nothing is held back HERE any more -- both cuts happened
+                // upstream, each on the text its own question is about.
+                // ONE WRITE PER TOKEN: both deltas are framed into `frames` and go out
+                // together (task #202); the buffer is reused across the response.
+                let (r, v) = (&self.reasoning_out, &self.visible_out);
+                if r.len() > self.sent_reasoning {
+                    http::sse_frame(
+                        &mut self.frames,
+                        &json!({
+                "id": self.id, "object": "chat.completion.chunk", "model": "imparo",
+                "choices": [{"index": 0,
+                             "delta": {"reasoning_content": &r[self.sent_reasoning..]},
+                             "finish_reason": null}]}),
+                    )?;
+                    self.sent_reasoning = r.len();
+                }
+                if v.len() > self.sent_visible {
+                    http::sse_frame(
+                        &mut self.frames,
+                        &json!({
+                "id": self.id, "object": "chat.completion.chunk", "model": "imparo",
+                "choices": [{"index": 0, "delta": {"content": &v[self.sent_visible..]},
+                             "finish_reason": null}]}),
+                    )?;
+                    self.sent_visible = v.len();
+                }
+                http::sse_send(stream, &mut self.frames)?;
+            }
+        }
+        if let Some(t) = t_e {
+            self.t_send += t.elapsed().as_secs_f64() * 1e3;
+        }
+        // The last token needs no forward: its logits would never be read. Computing them
+        // anyway spent a full decode step per request.
+        Ok(self.turn_ended || self.generated.len() >= self.max_tokens)
+    }
+}
+
+/// What a request's generation left: its reply, and the counts and timings its finish
+/// reports.
+struct Generation {
+    prefill_ms: f64,
+    service_witness: Option<PathBuf>,
+    reply: Reply,
+    /// Counts forwards, not tokens. The first token is free -- it comes from the prefill
+    /// logits -- so N tokens cost N-1 decode steps, and llama.cpp reports its decode rate
+    /// over exactly that (n_gen - 1). Dividing N tokens by N-1 forwards would report a rate
+    /// 1/(N-1) too high against it.
+    decode_steps: usize,
+    t_decode: Instant,
+    decode_ms: f64,
+    t_sample: f64,
+    pipelined: bool,
+    queued: bool,
+    /// What the drafter did, when one was attached.
+    drafted: Option<Drafting>,
+    /// The request stopped decoding alone to join the co-batch: the token its first
+    /// co-batched step starts from, and whether the reply has it already.
+    handover: Option<(u32, bool)>,
+}
+
+/// A request's decode with the drafter attached: its verify rounds, its one-token steps with
+/// no draft verified, and the draft tokens the rounds verified and accepted.
+struct Drafting {
+    rounds: usize,
+    plain: usize,
+    tally: imparo_model::speculative::DraftTally,
+}
+
 fn chat_completions(
-    stream: &mut TcpStream,
-    req: &http::Request,
-    engine: &Arc<Mutex<Engine>>,
-) -> std::io::Result<()> {
+    job: Job,
+    engine: &mut Engine,
+    sched: &sched::Sched<'_>,
+) -> std::io::Result<Outcome> {
+    let Job { req, mut out } = job;
+    let stream = &mut out;
     let body: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
-        Err(e) => return http::json(stream, 400, &json!({"error": e.to_string()})),
+        Err(e) => {
+            return done(http::json(stream, 400, &json!({"error": e.to_string()})));
+        }
     };
     let raw_ids = match parse_raw_input_ids(
         &body,
         std::env::var("IMPARO_DEV_RAW_TOKENS").is_ok_and(|value| value == "1"),
     ) {
         Ok(ids) => ids,
-        Err(error) => return http::json(stream, 400, &json!({"error": error})),
+        Err(error) => return done(http::json(stream, 400, &json!({"error": error}))),
     };
     let messages = body
         .get("messages")
@@ -1071,18 +1826,23 @@ fn chat_completions(
     // refuses (measured: "agrees for 4 of its 5 units, so nothing is adoptable").
     let seed = body.get("seed").and_then(Value::as_bool).unwrap_or(false);
     if seed && raw_ids.is_some() {
-        return http::json(
+        return done(http::json(
             stream,
             400,
             &json!({"error": "seed cannot be combined with input_ids"}),
-        );
+        ));
     }
-    let max_tokens = if seed {
-        0
+    // The client's cap on the reply, under either OpenAI spelling. None: no cap -- the reply
+    // runs to a stop token or to the end of the context, as llama.cpp's does. The request
+    // reserves nothing for it up front, so no cap costs nothing (docs/memory-tiers-and-fit.md
+    // section 12.4).
+    let requested_max = if seed {
+        Some(0)
     } else {
         body.get("max_tokens")
+            .or_else(|| body.get("max_completion_tokens"))
             .and_then(Value::as_u64)
-            .unwrap_or(128) as usize
+            .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
     };
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let kwargs = template_kwargs(&body);
@@ -1105,19 +1865,15 @@ fn chat_completions(
     // continuation. It matters only for a keyless client, where the label is derived from
     // content and a continuation is allowed to drop the manifest it stood on; with a
     // conversation id the identity is explicit and nothing is ever dropped implicitly.
-    let new_conversation = req
+    let mut new_conversation = req
         .header("x-new-conversation")
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"));
     // Jinja template when one is loaded, this architecture's codec as the fallback.
     // The template sees the REAL bos spelling and `render_chat_prompt` then strips one
     // prefix when the tokenizer adds its own -- exactly one owner. It used to render
     // with bos empty, which is the same answer only while every tokenizer adds BOS.
-    let (adds_bos, bos_text, chat) = {
-        let e = engine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (e.tok.add_bos, e.bos_text.clone(), e.chat)
-    };
+    let (adds_bos, bos_text, chat) =
+        (engine.tok.add_bos, engine.bos_text.clone(), engine.chat);
     let prompt = if raw_ids.is_some() {
         String::new()
     } else {
@@ -1144,9 +1900,6 @@ fn chat_completions(
     if std::env::var("IMPARO_DUMP_PROMPT").is_ok_and(|v| v == "1") {
         eprintln!("[prompt-dump-begin]{prompt}[prompt-dump-end]");
     }
-    let mut engine = engine
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let t_tok = Instant::now();
     let mut ids = raw_ids.unwrap_or_else(|| engine.tok.encode(&prompt, true));
     if seed {
@@ -1175,7 +1928,10 @@ fn chat_completions(
             );
             e.tok.encode(&p, true)
         };
-        let (a, b) = (probe("alpha probe", &engine), probe("beta probe", &engine));
+        let (a, b) = (
+            probe("alpha probe", &*engine),
+            probe("beta probe", &*engine),
+        );
         let n = a
             .iter()
             .zip(&b)
@@ -1200,14 +1956,15 @@ fn chat_completions(
         );
     }
     let prompt_tokens = ids.len();
-    if prompt_tokens + max_tokens > engine.ctx {
-        return http::json(
+    let max_tokens = requested_max.unwrap_or(engine.ctx.saturating_sub(prompt_tokens));
+    if prompt_tokens.saturating_add(max_tokens) > engine.ctx {
+        return done(http::json(
             stream,
             400,
             &json!({
             "error": format!("prompt {prompt_tokens} + max_tokens {max_tokens} exceeds ctx {}",
                              engine.ctx)}),
-        );
+        ));
     }
 
     // KV continuation: when the request strictly extends the resident tokens, resume
@@ -1239,12 +1996,15 @@ fn chat_completions(
     }
     // POOL MODE: residency, sharing, disk -- one entry point (docs/unified-kv-pool.md).
     let mut pool_pos: Option<usize> = None;
-    type PoolBranch = (usize, Vec<imparo_kv::UnitHash>, String, bool);
-    let mut pool_branch: Option<PoolBranch> = None;
+    // Ascending: the system prompt's end when this prefill passes it, then the last user message.
+    let mut pool_branches: Vec<PoolBranch> = Vec::new();
     // What the state is actually stored under, for the stats line. Without it the log
     // shows the raw header -- `conv=default` for every keyless request -- while the
     // effective label is content-derived and different for each.
     let mut effective_label: Option<String> = None;
+    // Rows one decode step may write past the committed position; set with the pool's
+    // reservation, read by the decode loop's `grow_room`.
+    let mut lookahead = 0_usize;
     if !reuse_off && engine.pool.is_some() {
         let prof = std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1");
         let t_hash = Instant::now();
@@ -1312,9 +2072,52 @@ fn chat_completions(
         // first unit has nothing to hang on: hence the >= 256 floor.
         let branch_pos = imparo_model::kv::resume_point(branch_pos, ids.len());
         let branch_pos = if branch_pos >= 256 { branch_pos } else { 0 };
+        // THE SYSTEM PROMPT'S END: where the FIRST user message starts. Every conversation with
+        // this system prompt and tool list shares everything below it, while the branch point
+        // above is shared only by conversations that also share this one's history. A first
+        // request that carries several messages passes both and seals both. The last user
+        // message stays a branch point too: each turn's is the root the pool keeps one
+        // checkpoint per turn by, so moving it would drop the older turns.
+        let system_end = (!branch_off && engine.first_scan_trusted)
+            .then(|| first_subsequence(&ids, &engine.user_open))
+            .flatten()
+            .map(|at| imparo_model::kv::resume_point(at, ids.len()))
+            .filter(|&at| at >= 256 && at < branch_pos);
         let ms_branch = t_branch.elapsed().as_secs_f64() * 1e3;
         let t_label = Instant::now();
-        let upper = ids.len() + max_tokens + 1;
+        // THE RESERVATION: every cache slot this request's forwards write. A plain decode
+        // writes up to the reply's last token. A speculative round also lays its verify tree
+        // over the slots after its start -- one slot per node, whatever the node's depth, up to
+        // ROW_LAYOUT_MAX_ROWS -- so a tree near the end of the reply reaches past the reply. A
+        // page the pool did not reserve still has an entry in the device's table (the identity
+        // value, or an older table's), and a row written there lands on a block another page
+        // owns: measured, a 56-row tree at 847 wrote positions 896..902 over this
+        // conversation's own page at 832. The slots stop at the capacity; a round too close to
+        // it drafts a chain instead (`DsparkProvider::tree_proposal`).
+        // THE REQUEST RESERVES ITS PROMPT, NOT ITS BUDGET: decode grows the conversation's
+        // blocks as it reaches them (`grow_room` in the decode loop). `lookahead` is the most
+        // rows one step writes past the committed position -- a tree round's verify rows, and
+        // the pipelined decode's queued step -- so the room is always there before the step
+        // that writes it. The slots stop at the capacity; a round too close to it drafts a
+        // chain instead (`DsparkProvider::tree_proposal`).
+        let capacity = engine.model.kv_runtime().capacity;
+        #[cfg(feature = "speculative")]
+        let verify_slots = if engine.draft_spec.is_some()
+            && !sched.others()
+            && draft_pairing::request_enabled(&body)
+            && temperature == 0.0
+        {
+            imparo_backend::ROW_LAYOUT_MAX_ROWS
+        } else {
+            0
+        };
+        #[cfg(not(feature = "speculative"))]
+        let verify_slots = 0;
+        lookahead = verify_slots + 2;
+        let upper = (ids.len() + lookahead).min(capacity);
+        // Where the reply can reach: what decides whether a branch point's state must be
+        // captured now, before decode runs the rings past it.
+        let reply_end = (ids.len() + max_tokens + verify_slots).min(capacity);
         // A keyless client is identified by what its prompt CONTINUES: if a resident
         // conversation's tokens are a prefix of this prompt, this is that conversation
         // and it keeps its name. Only when nothing matches does it get a fresh
@@ -1336,6 +2139,18 @@ fn chat_completions(
         }
         let label =
             continued.unwrap_or_else(|| conversation_label(&conversation, &hashes));
+        // A keyless label a running request holds -- two prompts that agree up to their
+        // last whole unit get the same one -- names a conversation of its own here: a label
+        // is addressing only, so a fresh one can cost reuse, never a token. It borrows what
+        // it restores from and supersedes nothing.
+        let label = if conversation == "default"
+            && engine.pool.as_ref().is_some_and(|pl| pl.is_running(&label))
+        {
+            new_conversation = true;
+            sched::fresh_label(&label)
+        } else {
+            label
+        };
         let ms_label = t_label.elapsed().as_secs_f64() * 1e3;
         effective_label = Some(label.clone());
         let t_begin = Instant::now();
@@ -1344,9 +2159,70 @@ fn chat_completions(
             store,
             disk,
             pool,
+            slots,
             ..
         } = &mut *engine;
         if let Some(pl) = pool.as_mut() {
+            // With co-batching the request decodes in a slot of its own: the one its
+            // conversation occupies, else the selected one when it is free, else an empty one.
+            if *slots > 1 {
+                let Some(s) = sched::choose_slot(pl, &label, *slots) else {
+                    return done(http::json(
+                        stream,
+                        503,
+                        &json!({"error": "every slot is running a request"}),
+                    ));
+                };
+                // A slot's first request makes its device buffers, and the tier gives up the
+                // pages they take first. When running conversations hold those pages the
+                // request waits at the head of the line; with nothing running it is refused
+                // like a full house, as when the buffers cannot be made.
+                match pl.charge_slot(s, &label) {
+                    Ok(true) => {}
+                    Ok(false) if sched.running > 0 => {
+                        if imparo_model::log_on() {
+                            eprintln!(
+                                "[imparo] cobatch wait: conv={label} slot={s} needs room for \
+the slot's own state"
+                            );
+                        }
+                        return Ok(Outcome::Wait(Job { req, out }));
+                    }
+                    Ok(false) => {
+                        return done(http::json(
+                            stream,
+                            503,
+                            &json!({"error": "no room for another slot's state"}),
+                        ));
+                    }
+                    Err(e) => {
+                        return done(http::json(stream, 503, &json!({"error": e})));
+                    }
+                }
+                if let Err(e) =
+                    model.select_slot(u32::try_from(s).map_err(std::io::Error::other)?)
+                {
+                    return done(http::json(stream, 503, &json!({"error": e})));
+                }
+                pl.select_slot(s);
+                // ADMISSION BY FIT (docs/continuous-batching.md, section 4): beside running rows,
+                // the pages this request takes and one more per running row must be pages the
+                // pool can obtain. Otherwise nothing of it runs and it waits at the head of the
+                // line; with nothing running there is no check.
+                if sched.running > 0 {
+                    let need = upper.div_ceil(imparo_kv::grid_tokens()) + sched.running;
+                    let obtainable = pl.obtainable_units();
+                    if obtainable < need {
+                        if imparo_model::log_on() {
+                            eprintln!(
+                                "[imparo] cobatch wait: conv={label} needs {need} pages, \
+{obtainable} obtainable"
+                            );
+                        }
+                        return Ok(Outcome::Wait(Job { req, out }));
+                    }
+                }
+            }
             match pl.begin(
                 &mut **model,
                 store.as_ref(),
@@ -1384,8 +2260,14 @@ fn chat_completions(
             // EAGER when the device cannot still produce a valid checkpoint for the
             // branch later. A recurrent model reports zero slack, so it is always
             // eager: its conv state is overwritten by the next token.
-            let eager = upper.saturating_sub(branch_pos) > model.kv_checkpoint_slack();
-            pool_branch = Some((branch_pos, hashes, label, eager));
+            let eager =
+                |at: usize| reply_end.saturating_sub(at) > model.kv_checkpoint_slack();
+            // The system prompt's end only when this prefill passes it: a request restored
+            // past it stands on the checkpoint the request that first prefilled it sealed.
+            if let Some(at) = system_end.filter(|&at| at >= pool_pos.unwrap_or(0)) {
+                pool_branches.push((at, hashes.clone(), label.clone(), eager(at)));
+            }
+            pool_branches.push((branch_pos, hashes, label, eager(branch_pos)));
         }
     }
 
@@ -1481,103 +2363,132 @@ fn chat_completions(
     // A cold prefill overwrites the cache; the resident record is stale from this
     // point until the request completes, and a mid-flight failure leaves it empty.
     engine.resident.clear();
-    let mut prefill_from = start_pos;
-    if let Some((branch, bhashes, blabel, true)) = &pool_branch {
-        let branch = *branch;
-        if imparo_model::log_on() {
+    let prefill_from = start_pos;
+    // THE BRANCH PAUSES: an eager branch point -- where a user message starts -- is
+    // checkpointed from the live state, so the prefill stops there first and then goes on.
+    // A pause is part of the prefill below, not a forward run ahead of it: rows forwarded
+    // ahead of the prefill never reach a drafter's history, and such a request could not draft.
+    //
+    // `>=`, not `>` (`PromptPrefill::new`). A conversation continuing ITSELF resumes exactly at
+    // its new user message -- both are the same 64-grid point -- so `>` meant a model that is
+    // always eager (recurrent: zero slack) recorded a branch on its FIRST turn and never again.
+    // There is nothing to forward in that case, but there is something to checkpoint: the
+    // cache is at `filled == prefill_from == branch` right now, which is exactly the state the
+    // branch names. Below it, the recurrent half would already have advanced past the
+    // boundary, so that case still records nothing.
+    if imparo_model::log_on() {
+        for (branch, ..) in pool_branches.iter().filter(|(.., eager)| *eager) {
             eprintln!(
                 "[imparo] kv branch eager at {branch}: prefill_from={prefill_from} len={}",
                 ids.len()
             );
         }
-        // `>=`, not `>`. A conversation continuing ITSELF resumes exactly at its new
-        // user message -- both are the same 64-grid point -- so `>` meant a model that
-        // is always eager (recurrent: zero slack) recorded a branch on its FIRST turn
-        // and never again. There is nothing to forward in that case, but there is
-        // something to checkpoint: the cache is at `filled == prefill_from == branch`
-        // right now, which is exactly the state the branch names. Below it, the
-        // recurrent half would already have advanced past the boundary, so that case
-        // still records nothing.
-        if branch >= prefill_from && branch < ids.len() {
-            // Pause the prefill at the branch point -- where the last user message
-            // starts -- and checkpoint the windowed state: this is what lets a
-            // sub-agent adopt the shared prefix WITH valid windows.
-            if branch > prefill_from {
-                if let Err(e) = engine.model.forward_into(
-                    &ids[prefill_from..branch],
-                    prefill_from,
-                    &mut logits,
-                ) {
-                    return http::json(stream, 500, &json!({"error": e}));
-                }
-            }
-            // A RESIDENT record: its tokens are compared by `matching_ckpts` against
-            // the stretch above the last 256-TILE, so that is the grid they are cut
-            // on. The manifest's tail is a different measurement -- above the last
-            // EXTENT -- and `commit_to_disk` derives it there rather than inheriting
-            // this one.
-            let units = branch / imparo_kv::grid_tokens();
-            if let Some(tip) = bhashes.get(units.wrapping_sub(1)) {
-                let tip = *tip;
-                let tokens = ids[units * imparo_kv::grid_tokens()..branch].to_vec();
-                let Engine { model, pool, .. } = &mut *engine;
-                if let Some(pl) = pool.as_mut() {
-                    let prev = pl.prev_ckpt_at(blabel, bhashes, &ids, branch - 1);
-                    pl.note_ckpt(&**model, blabel, tip, prev, branch, tokens);
-                }
-            }
-            prefill_from = branch;
-        }
     }
-    let prompt_anchor_lab =
-        std::env::var("IMPARO_KV_PROMPT_ANCHOR_LAB").as_deref() == Ok("1");
-    // Request a boundary the NEXT replay can use, not merely the latest grid
-    // crossed. For513 tokens the service needs448;512 leaves an invalid one-token
-    // tail. The model captures it inside its existing batch without another cut.
-    let checkpoint = (prompt_anchor_lab && engine.model.plan().recurrent_elems() > 0)
-        .then(|| imparo_model::kv::resume_point(ids.len(), ids.len()))
-        .filter(|at| *at >= prefill_from);
-    struct Generation {
-        prefill_ms: f64,
-        service_witness: Option<PathBuf>,
-        generated: Vec<u32>,
-        decode_steps: usize,
-        decode_ms: f64,
-        t_sample: f64,
-        t_detok: f64,
-        t_send: f64,
-        probe: bool,
-        emitted: String,
-        sent_reasoning: usize,
-        sent_visible: usize,
-        frames: Vec<u8>,
-        pipelined: bool,
-        queued: bool,
-    }
-    #[cfg(feature = "cuda-speculative")]
+    // THE PROMPT ANCHOR: a boundary the NEXT turn can resume from. The next turn's prompt is
+    // this prompt, the client's copy of this turn's reply, and a new message. The client's copy
+    // need not be the stream this request generates -- a reasoning model's history drops its
+    // thinking -- so the next prompt is only sure to agree with this one up to THIS PROMPT's
+    // end: the anchor is that prompt's last usable grid boundary. For 513 tokens it is 448:
+    // 512 would leave a one-token tail. EVERY model keeps one. A recurrent state cannot be
+    // rewound, so a model with one keeps the state at the anchor aside before decode moves
+    // past it -- captured inside its existing batch, without another cut; it lies at or above
+    // the last pause, so only the last segment arms it. An attention-only model's KV below the
+    // anchor is never rewritten, so its anchor is the KV units alone, noted after the prefill.
+    let mut prompt = PromptPrefill::new(
+        &pool_branches,
+        prefill_from,
+        ids.len(),
+        Some(imparo_model::kv::resume_point(ids.len(), ids.len())),
+        engine.model.plan().recurrent_elems() > 0,
+    );
+    #[cfg(feature = "speculative")]
     let cache_draft =
         std::env::var("IMPARO_LAB_DRAFT_CACHE_RESUME").as_deref() != Ok("0");
-    #[cfg(feature = "cuda-speculative")]
-    let draft_spec = engine
-        .draft_spec
-        .as_ref()
-        .filter(|spec| {
-            draft_pairing::request_enabled(&body)
-                && temperature == 0.0
-                && ((prefill_from == 0 && start_pos == 0)
-                    || (cache_draft
-                        && !new_conversation
-                        && engine.resident_conv == conversation
-                        && prefill_from == start_pos
-                        && spec.can_resume(&ids, prefill_from)))
-                && spec.can_start(
-                    ids.len(),
-                    max_tokens,
-                    engine.model.kv_runtime().capacity,
-                )
-                && !pool_branch.as_ref().is_some_and(|(_, _, _, eager)| *eager)
-        })
-        .map(Arc::clone);
+    // A paired server that serves a request without its drafter says which check declined it: a
+    // silent decline is indistinguishable from a slow drafter in every measurement downstream.
+    #[cfg(feature = "speculative")]
+    let draft_spec = engine.draft_spec.as_ref().and_then(|spec| {
+        let declined = if sched.others() {
+            Some("other requests are running or waiting")
+        } else if !draft_pairing::request_enabled(&body) {
+            Some("the request turned drafting off")
+        } else if temperature != 0.0 {
+            Some("the request samples")
+        } else if prefill_from != 0
+            && !(cache_draft
+                && spec.can_draft_from(
+                    &ids,
+                    prefill_from,
+                    !new_conversation && engine.resident_conv == conversation,
+                ))
+        {
+            Some("the drafter's history cannot serve the reused prefix")
+        } else if !spec.can_start(
+            ids.len(),
+            max_tokens,
+            engine.model.kv_runtime().capacity,
+        ) {
+            Some("the start check (block, cell room, output budget or capacity)")
+        } else {
+            None
+        };
+        match declined {
+            None => Some(Arc::clone(spec)),
+            Some(why) => {
+                eprintln!(
+                    "[imparo] draft declined: {why} (prompt={} reused={prefill_from})",
+                    ids.len()
+                );
+                None
+            }
+        }
+    });
+    // BESIDE RUNNING ROWS the prompt is prefilled a chunk per loop iteration, between their
+    // decode steps, and the request joins them after its first token (docs/continuous-batching.md,
+    // section 3). From here it holds its slot and its pages, so it counts as running: pinned.
+    if sched.running > 0 {
+        if let (Some(pl), Some(label)) =
+            (engine.pool.as_mut(), effective_label.as_deref())
+        {
+            pl.pin(label);
+        }
+        let slot = engine
+            .pool
+            .as_ref()
+            .map_or(0, imparo_kv::pool::PoolMode::selected_slot);
+        let stops = [engine.tok.eos, engine.tok.eot]
+            .into_iter()
+            .flatten()
+            .collect();
+        let probe = std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1");
+        return Ok(Outcome::Prefill(Box::new(sched::Prefilling {
+            reply: Reply::new(
+                id,
+                streaming,
+                max_tokens,
+                chat,
+                stops,
+                starts_in_reasoning,
+                probe,
+            ),
+            turn: Turn {
+                out,
+                seed,
+                prompt_tokens,
+                start_pos,
+                conversation,
+                label: effective_label,
+                ids,
+                starts_in_reasoning,
+                pool_branches,
+            },
+            prompt,
+            slot,
+            logits,
+            t_prefill,
+            temperature,
+        })));
+    }
     let mut outstanding_pipeline = false;
     let generation_result = {
         let Engine {
@@ -1585,8 +2496,15 @@ fn chat_completions(
             tok,
             pool,
             root,
+            store,
+            disk,
             ..
         } = &mut *engine;
+        // Positions the conversation's blocks cover; decode grows them as it reaches them.
+        let mut room = match (pool.as_ref(), effective_label.as_deref()) {
+            (Some(pl), Some(label)) => pl.room(label),
+            _ => usize::MAX,
+        };
         let mut generate = |model: &mut dyn imparo_model::Model,
                             mut draft: Option<
             &mut dyn imparo_model::speculative::DraftProvider,
@@ -1597,110 +2515,76 @@ fn chat_completions(
                     .map_err(std::io::Error::other)?;
                 p.set_capture(true).map_err(std::io::Error::other)?;
             }
-            #[cfg(feature = "cuda-speculative")]
-            if let Some(p) = draft.as_deref_mut() {
-                let mut committed = prefill_from;
-                let mut chunks = 0;
-                model
-                    .forward_prefill_observed(
-                        &ids[prefill_from..],
-                        prefill_from,
-                        &mut logits,
-                        checkpoint,
-                        &mut |at, chunk| {
-                            if at != committed {
-                                return Err(
-                                    "noncontiguous draft Prefill history".into()
-                                );
-                            }
-                            p.commit(at, chunk)?;
-                            committed = at + chunk.len();
-                            chunks += 1;
-                            Ok(())
-                        },
-                    )
-                    .map_err(std::io::Error::other)?;
+            // The prefill, all of it here, a chunk at a time. A drafter observes every chunk,
+            // so its history stays contiguous across a pause.
+            #[cfg(feature = "speculative")]
+            let (mut committed, mut chunks) = (prefill_from, 0_usize);
+            {
+                #[cfg(feature = "speculative")]
+                let drafting = draft.is_some();
+                #[cfg(feature = "speculative")]
+                let mut observe = |pos: usize, chunk: &[u32]| -> Result<(), String> {
+                    let Some(p) = draft.as_deref_mut() else {
+                        return Ok(());
+                    };
+                    if pos != committed {
+                        return Err("noncontiguous draft Prefill history".into());
+                    }
+                    p.commit(pos, chunk)?;
+                    committed = pos + chunk.len();
+                    chunks += 1;
+                    Ok(())
+                };
+                #[cfg(feature = "speculative")]
+                let mut observer: Option<
+                    &mut imparo_model::PrefillChunkObserver<'_>,
+                > = if drafting { Some(&mut observe) } else { None };
+                #[cfg(not(feature = "speculative"))]
+                let mut observer: Option<
+                    &mut imparo_model::PrefillChunkObserver<'_>,
+                > = None;
+                while !prompt.step(
+                    model,
+                    pool.as_mut(),
+                    &ids,
+                    &mut logits,
+                    observer.as_deref_mut(),
+                )? {}
+            }
+            #[cfg(feature = "speculative")]
+            if draft.is_some() {
                 if committed != ids.len() {
                     return Err(std::io::Error::other(
                         "incomplete draft prompt history",
                     ));
                 }
                 eprintln!("[imparo] draft prompt_history={committed} chunks={chunks}");
-            } else {
-                model
-                    .forward_into_with_checkpoint(
-                        &ids[prefill_from..],
-                        prefill_from,
-                        &mut logits,
-                        checkpoint,
-                    )
-                    .map_err(std::io::Error::other)?;
             }
-            #[cfg(not(feature = "cuda-speculative"))]
-            model
-                .forward_into_with_checkpoint(
-                    &ids[prefill_from..],
-                    prefill_from,
-                    &mut logits,
-                    checkpoint,
-                )
-                .map_err(std::io::Error::other)?;
-            // Laboratory state-retention candidate. Capture before decode advances the
-            // recurrent note past the original prompt; include the cost in prefill time.
-            if prompt_anchor_lab {
-                let hashes = imparo_kv::unit_ids(root, &ids);
-                if let (Some(pl), Some(label)) =
-                    (pool.as_mut(), effective_label.as_deref())
-                {
-                    if let Some(at) =
-                        pl.note_prompt_checkpoint(&*model, label, &hashes, &ids)
-                    {
-                        if imparo_model::log_on() {
-                            eprintln!(
-                                "[imparo] prompt replay anchor={at} prompt={prompt_tokens}"
-                            );
-                        }
-                    }
-                }
-            }
+            // The prompt anchor, captured before decode advances the recurrent note past the
+            // prompt; its cost counts as prefill time.
+            prompt.note_anchor(
+                &*model,
+                pool.as_mut(),
+                root,
+                effective_label.as_deref(),
+                &ids,
+            );
             let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
-            let service_witness = dump_service_prefill_witness(&*model, &logits)?;
-            if let Some(folder) = &service_witness {
-                std::fs::write(
-                    folder.join("input-ids.json"),
-                    serde_json::to_vec(&ids)?,
-                )?;
-            }
-            // IMPARO_KV_DIGEST=1: the cache as the prefill left it, BEFORE a single token is
-            // generated -- so two conversations with the same prompt can be compared over the
-            // whole prompt, not just the part they share.
-            {
-                if let (Some(pl), Some(l)) = (pool.as_ref(), effective_label.as_deref())
-                {
-                    pl.digest(&*model, l, prompt_tokens);
-                }
-            }
-            // Read the submission profile at the prefill boundary so prefill and decode are
-            // attributed separately -- they have completely different shapes and averaging them
-            // would hide whichever one is stalling.
-            imparo_model::host::prof_log("prefill", prefill_ms);
+            let service_witness = prefill_probes(
+                &*model,
+                pool.as_ref(),
+                effective_label.as_deref(),
+                &ids,
+                &logits,
+                prefill_ms,
+            )?;
 
-            let end_sequence_token = tok.eos;
-            let end_turn_token = tok.eot;
-            let mut generated: Vec<u32> = Vec::new();
-            let mut emitted = String::new();
-            // The generated text's bytes, appended per token: decoding the WHOLE prefix each step
-            // was quadratic in generation length (review #116, D7).
-            let mut gen_bytes: Vec<u8> = Vec::new();
             let t_decode = Instant::now();
-            // Counts forwards, not tokens. The first token is free -- it comes from the prefill
-            // logits -- so N tokens cost N-1 decode steps, and llama.cpp reports its decode rate
-            // over exactly that (n_gen - 1). Dividing N tokens by N-1 forwards would report a rate
-            // 1/(N-1) too high against it.
             let mut decode_steps = 0_usize;
             // Between two forwards the GPU is idle. `gpu_busy` sits ~0.7 ms/token under wall, so
             // whatever runs here is on the critical path just as much as a kernel is.
-            let (mut t_sample, mut t_detok, mut t_send) = (0.0_f64, 0.0_f64, 0.0_f64);
+            let mut t_sample = 0.0_f64;
+            let mut t_forward = 0.0_f64;
             // Read once, outside the loop: the clock reads themselves are the probe's cost, so
             // gating only the print would leave six of them per token in the measured build.
             let probe = std::env::var("IMPARO_PROF").is_ok_and(|v| v == "1");
@@ -1708,37 +2592,19 @@ fn chat_completions(
             // back from `forward_next`, which runs the same greedy pick on the GPU and returns
             // only the index -- the vocab-size logits never cross to the host during decode.
             let t_s = probe.then(Instant::now);
-            let (mut sent_reasoning, mut sent_visible) = (0usize, 0usize);
-            // The token's SSE frames, serialised here and written once (task #202).
-            let mut frames: Vec<u8> = Vec::with_capacity(512);
-            // STREAMING FEEDS THE NEW BYTES, NOT THE WHOLE ANSWER (the shape oMLX's output parser
-            // uses). Splitting and parsing all of `emitted` every token is O(n) per token and so
-            // O(n^2) over a response. Instead each stage asks its codec how many TRAILING bytes are
-            // still undecided; everything before that is settled forever, classified once, and never
-            // looked at again.
-            //
-            //   raw ─[unsettled_in_raw]→ split_channels ─→ reasoning ──────────────────→ delta
-            //                                           └→ visible ─[unsettled_in_visible]→ parse → delta
-            //
-            // TWO CUTS, NOT ONE, because they are different questions. Asking "is a call open?" about
-            // RAW text answers it for the reasoning channel too, where a `<tool_call>` the model wrote
-            // in its thinking is prose and will never close -- and holding it holds everything after
-            // it, including the visible answer, to the end of generation.
-            let (mut fed_raw, mut inside) = (0usize, starts_in_reasoning);
-            let (mut fed_vis, mut vis_split) = (0usize, String::new());
-            let (mut reasoning_out, mut visible_out) = (String::new(), String::new());
-            // The turn can end inside the TEXT, not only at an end token -- see
-            // `ChatCodec::turn_ends_at`. Set when it has, so the loop stops after this token's
-            // bytes have been truncated and streamed.
-            let mut turn_ended = false;
+            let mut reply = Reply::new(
+                id.clone(),
+                streaming,
+                max_tokens,
+                chat,
+                [tok.eos, tok.eot].into_iter().flatten().collect(),
+                starts_in_reasoning,
+                probe,
+            );
             let mut next = sample(&logits, temperature);
             if let Some(t) = t_s {
                 t_sample += t.elapsed().as_secs_f64() * 1e3;
             }
-            let stops: Vec<u32> = [end_sequence_token, end_turn_token]
-                .into_iter()
-                .flatten()
-                .collect();
             let mut cursor = if let Some(provider) = draft.as_deref_mut() {
                 Some(
                     imparo_model::speculative::GreedyCursor::new(
@@ -1747,7 +2613,7 @@ fn chat_completions(
                         prompt_tokens,
                         next,
                         max_tokens,
-                        &stops,
+                        &reply.stops,
                     )
                     .map_err(std::io::Error::other)?,
                 )
@@ -1757,9 +2623,12 @@ fn chat_completions(
             // PIPELINED DECODE (docs/decode-turnaround.md): the step that consumes `next` is
             // queued before `next` is emitted, and the step after it is queued before this one's
             // pick is read, so the GPU never waits for the host between tokens. The host learns
-            // each token one step late; on a stop the one step still queued is discarded.
-            let pipelined =
-                cursor.is_none() && model.decode_pipelined() && max_tokens > 1;
+            // each token one step late; on a stop the one step still queued is discarded. Not for
+            // a request that joins the co-batch after its first token.
+            let pipelined = cursor.is_none()
+                && model.decode_pipelined()
+                && max_tokens > 1
+                && !sched.others();
             let mut queued = false;
             if pipelined {
                 match model.queue_step(Some(next), prompt_tokens) {
@@ -1770,7 +2639,30 @@ fn chat_completions(
                     Err(e) => return Err(std::io::Error::other(e)),
                 }
             }
+            // Set when another request is running or waiting and this one reaches a point a
+            // plain decode step can carry on from: it leaves to decode in the co-batch.
+            let mut handover: Option<(u32, bool)> = None;
             for step in 0..max_tokens {
+                // Room for what this step writes, before it writes it: the pool hands out the
+                // next chunk of blocks and the storage is committed (prepared ahead, so no
+                // wait). Nothing was reserved for the reply up front.
+                let rt = model.kv_runtime();
+                let reach = (rt.filled + lookahead).min(rt.capacity);
+                if reach > room {
+                    if let (Some(pl), Some(label)) =
+                        (pool.as_mut(), effective_label.as_deref())
+                    {
+                        room = pl
+                            .grow_room(
+                                model,
+                                label,
+                                reach,
+                                store.as_ref(),
+                                disk.as_ref(),
+                            )
+                            .map_err(std::io::Error::other)?;
+                    }
+                }
                 if let (Some(c), Some(provider)) =
                     (cursor.as_mut(), draft.as_deref_mut())
                 {
@@ -1784,123 +2676,25 @@ fn chat_completions(
                     }
                     decode_steps = c.consumed;
                 }
-                if Some(next) == end_sequence_token || Some(next) == end_turn_token {
+                if reply.take(next, tok, stream)? {
                     break;
                 }
-                generated.push(next);
-                let t_d = probe.then(Instant::now);
-                tok.decode_bytes_into(
-                    &generated[generated.len() - 1..],
-                    &mut gen_bytes,
-                );
-                let piece =
-                    String::from_utf8_lossy(&gen_bytes[..settled_len(&gen_bytes)])
-                        .into_owned();
-                if let Some(t) = t_d {
-                    t_detok += t.elapsed().as_secs_f64() * 1e3;
-                }
-                let t_e = probe.then(Instant::now);
-                if piece.len() > emitted.len() {
-                    emitted = piece;
-                    // WHERE THE MODEL HANDS THE TURN OVER, THE TURN IS OVER. gemma4 finishes a tool
-                    // call by writing `<|tool_response>`, the opener of the block a tool RESULT
-                    // fills; run past it and the model writes the tool's answer itself. Truncating
-                    // HERE rather than after the loop is what makes the stream right too: a delta
-                    // already sent cannot be taken back over SSE.
-                    //
-                    // Searched from `fed_raw`, not from 0: the cut below holds any suffix that could
-                    // still grow into a marker, so a COMPLETE handover marker can only lie in the
-                    // bytes it has not settled yet. A `find` over the whole answer every token is
-                    // the same O(n^2) the split and the parse were just cured of.
-                    if let Some(at) = chat.turn_ends_at(&emitted[fed_raw..]) {
-                        // The UNTRUNCATED bytes, under the same gate as the dump below: after the
-                        // truncation nothing else in the process holds what the model actually
-                        // wrote, and that is exactly what a reader of this probe came for.
-                        if std::env::var("IMPARO_DUMP_GEN").is_ok_and(|v| v == "1") {
-                            eprintln!("[gen-raw-begin]{emitted}[gen-raw-end]");
-                            let abs = fed_raw + at;
-                            eprintln!(
-                                "[imparo] turn ends at byte {abs}; the rest is the caller's"
-                            );
-                        }
-                        emitted.truncate(fed_raw + at);
-                        turn_ended = true;
+                if let Some(c) = &cursor {
+                    // Between two rounds the token just handed out is the next round's
+                    // anchor, which the cache does not hold yet: a plain step can take it.
+                    if c.between_rounds() && sched.others() {
+                        handover = Some((next, true));
+                        break;
                     }
-                    // THE RAW CUT RUNS IN BOTH MODES, because both need `fed_raw`: streaming
-                    // classifies and sends what it settles, and the turn-end search above uses it as
-                    // the floor that keeps itself off the whole answer. Non-streaming only advances.
-                    let raw_tail = &emitted[fed_raw..];
-                    let settled =
-                        &raw_tail[..raw_tail.len() - chat.unsettled_in_raw(raw_tail)];
-                    if !settled.is_empty() {
-                        if streaming {
-                            // Stage 1: reasoning never streams as `content`.
-                            let (r, v) = chat.split_channels(settled, inside);
-                            reasoning_out.push_str(&r);
-                            vis_split.push_str(&v);
-                            inside = chat.channel_state_after(settled, inside);
-                        }
-                        fed_raw += settled.len();
-                    }
-                    if streaming {
-                        // Stage 2: a tool call is not visible text either. Streaming used to skip
-                        // this, so a client received the whole call as `content` deltas AND again as
-                        // `tool_calls`, while the same request non-streaming returned `content: ""`.
-                        // The calls are dropped here and read from the final parse; only the TEXT
-                        // between them is streamed.
-                        let vis_tail = &vis_split[fed_vis..];
-                        let ready = &vis_tail
-                            [..vis_tail.len() - chat.unsettled_in_visible(vis_tail)];
-                        if !ready.is_empty() {
-                            visible_out.push_str(&chat.parse_tool_calls(ready).0);
-                            fed_vis += ready.len();
-                        }
-                        // Everything accumulated above is settled, so a delta is simply the part
-                        // not yet sent. Nothing is held back HERE any more -- both cuts happened
-                        // upstream, each on the text its own question is about.
-                        // ONE WRITE PER TOKEN: both deltas are framed into `frames` and go out
-                        // together (task #202); the buffer is reused across the response.
-                        let (r, v) = (&reasoning_out, &visible_out);
-                        if r.len() > sent_reasoning {
-                            http::sse_frame(
-                                &mut frames,
-                                &json!({
-                        "id": id, "object": "chat.completion.chunk", "model": "imparo",
-                        "choices": [{"index": 0,
-                                     "delta": {"reasoning_content": &r[sent_reasoning..]},
-                                     "finish_reason": null}]}),
-                            )?;
-                            sent_reasoning = r.len();
-                        }
-                        if v.len() > sent_visible {
-                            http::sse_frame(
-                                &mut frames,
-                                &json!({
-                        "id": id, "object": "chat.completion.chunk", "model": "imparo",
-                        "choices": [{"index": 0, "delta": {"content": &v[sent_visible..]},
-                                     "finish_reason": null}]}),
-                            )?;
-                            sent_visible = v.len();
-                        }
-                        http::sse_send(stream, &mut frames)?;
-                    }
-                }
-                if let Some(t) = t_e {
-                    t_send += t.elapsed().as_secs_f64() * 1e3;
-                }
-                // The last token needs no forward: its logits would never be read. Computing them
-                // anyway spent a full decode step per request.
-                if turn_ended || generated.len() >= max_tokens {
-                    break;
-                }
-                if cursor.is_some() {
                     continue;
                 }
                 let pos = prompt_tokens + step;
+                let hand = sched.others();
                 if pipelined {
                     // The step at `pos` is already queued. Its pick is token step+1; the step
-                    // after it produces token step+2, wanted only if that token can be emitted.
-                    let want_more = step + 2 < max_tokens;
+                    // after it produces token step+2, wanted only if that token can be emitted
+                    // and this request goes on alone.
+                    let want_more = !hand && step + 2 < max_tokens;
                     if want_more && model.queue_step(None, pos + 1).is_err() {
                         break;
                     }
@@ -1913,15 +2707,39 @@ fn chat_completions(
                     }
                     queued = want_more;
                     outstanding_pipeline = queued;
+                } else if hand {
+                    handover = Some((next, true));
+                    break;
                 } else {
-                    match model.forward_next(next, pos) {
+                    // THE FORWARD, TIMED APART FROM THE LOOP AROUND IT. decode_ms brackets
+                    // the whole loop, so it cannot say whether a gap to another engine is
+                    // the engine or the serving loop -- and on this model that is exactly
+                    // the open question.
+                    let t_fwd = std::time::Instant::now();
+                    let r = model.forward_next(next, pos);
+                    t_forward += t_fwd.elapsed().as_secs_f64() * 1e3;
+                    match r {
                         Ok(id) => next = id,
                         Err(_) => break,
                     }
                 }
                 decode_steps += 1;
+                if hand {
+                    // Nothing is queued past the step just waited for; its pick is the
+                    // co-batch's first input and the reply does not have it yet.
+                    handover = Some((next, false));
+                    break;
+                }
             }
             let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
+            if decode_steps > 0 && std::env::var("IMPARO_DECODE_SPLIT").is_ok() {
+                eprintln!(
+                    "[imparo] decode split: steps={decode_steps} total={:.3} ms/token                      forward={:.3} loop={:.3}",
+                    decode_ms / decode_steps as f64,
+                    t_forward / decode_steps as f64,
+                    (decode_ms - t_forward) / decode_steps as f64
+                );
+            }
             if let Some(c) = &cursor {
                 if c.consumed != decode_steps
                     || model.kv_runtime().filled != prompt_tokens + decode_steps
@@ -1935,7 +2753,7 @@ fn chat_completions(
                     c.verified_blocks,
                     c.draft_calls,
                     c.sequential_steps,
-                    generated.len(),
+                    reply.generated.len(),
                     c.consumed,
                     model.kv_runtime().filled
                 );
@@ -1946,22 +2764,22 @@ fn chat_completions(
             Ok(Generation {
                 prefill_ms,
                 service_witness,
-                generated,
+                reply,
                 decode_steps,
+                t_decode,
                 decode_ms,
                 t_sample,
-                t_detok,
-                t_send,
-                probe,
-                emitted,
-                sent_reasoning,
-                sent_visible,
-                frames,
                 pipelined,
                 queued,
+                drafted: cursor.as_ref().map(|c| Drafting {
+                    rounds: c.verified_blocks,
+                    plain: c.sequential_steps,
+                    tally: c.drafted,
+                }),
+                handover,
             })
         };
-        #[cfg(feature = "cuda-speculative")]
+        #[cfg(feature = "speculative")]
         {
             if let Some(spec) = draft_spec.as_deref() {
                 let mut output = None;
@@ -2014,55 +2832,180 @@ fn chat_completions(
                 generate(&mut **target, None)
             }
         }
-        #[cfg(not(feature = "cuda-speculative"))]
+        #[cfg(not(feature = "speculative"))]
         {
             generate(&mut **target, None)
         }
     };
+    let generation = match generation_result {
+        Ok(generation) => generation,
+        Err(e) => {
+            return done(abandon(
+                engine,
+                effective_label.as_deref(),
+                outstanding_pipeline,
+                streaming,
+                stream,
+                e,
+            ));
+        }
+    };
+    let turn = Turn {
+        out,
+        seed,
+        prompt_tokens,
+        start_pos,
+        conversation,
+        label: effective_label,
+        ids,
+        starts_in_reasoning,
+        pool_branches,
+    };
+    if let Some((next, taken)) = generation.handover {
+        return Ok(Outcome::Row(Box::new(sched::Row::join(
+            engine, turn, generation, next, taken,
+        ))));
+    }
+    finish(engine, turn, generation, sched.running == 0)?;
+    Ok(Outcome::Done)
+}
+
+/// A request prefilled beside running rows (`sched::Prefilling`), once its last chunk has run:
+/// the prompt anchor noted and the probes run. Returns the prefill's milliseconds and the
+/// service witness's folder. The request's slot is the selected one.
+fn prefill_ended(
+    engine: &mut Engine,
+    p: &sched::Prefilling,
+) -> std::io::Result<(f64, Option<PathBuf>)> {
+    let Engine {
+        model, pool, root, ..
+    } = &mut *engine;
+    p.prompt.note_anchor(
+        &**model,
+        pool.as_mut(),
+        root,
+        p.turn.label.as_deref(),
+        &p.turn.ids,
+    );
+    let prefill_ms = p.t_prefill.elapsed().as_secs_f64() * 1e3;
+    let witness = prefill_probes(
+        &**model,
+        pool.as_ref(),
+        p.turn.label.as_deref(),
+        &p.turn.ids,
+        &p.logits,
+        prefill_ms,
+    )?;
+    Ok((prefill_ms, witness))
+}
+
+/// ... and then its first token, picked from the prefill's logits: it becomes a row whose
+/// reply does not have that token yet.
+fn first_row(
+    engine: &mut Engine,
+    p: sched::Prefilling,
+    prefill_ms: f64,
+    service_witness: Option<PathBuf>,
+) -> sched::Row {
+    let next = sample(&p.logits, p.temperature);
+    let generation = Generation {
+        prefill_ms,
+        service_witness,
+        reply: p.reply,
+        decode_steps: 0,
+        t_decode: Instant::now(),
+        decode_ms: 0.0,
+        t_sample: 0.0,
+        pipelined: false,
+        queued: false,
+        drafted: None,
+        handover: None,
+    };
+    sched::Row::join(engine, p.turn, generation, next, false)
+}
+
+/// A request that failed part way: its conversation is forgotten rather than stored half
+/// made, and a client still waiting for a response is told. The request's slot is the
+/// selected one.
+fn abandon(
+    engine: &mut Engine,
+    label: Option<&str>,
+    outstanding_pipeline: bool,
+    streaming: bool,
+    stream: &mut http::Outbox,
+    e: std::io::Error,
+) -> std::io::Result<()> {
+    // A verified block may be ahead of delivery. Abandon the transient
+    // claim; never pretend changing filled rolls recurrent state back.
+    if outstanding_pipeline {
+        engine.model.discard_step().map_err(std::io::Error::other)?;
+    }
+    let filled = engine.model.kv_runtime().filled;
+    engine.resident.clear();
+    engine.resident_conv.clear();
+    engine.model.kv_set_filled(0);
+    if let (Some(pool), Some(label)) = (engine.pool.as_mut(), label) {
+        pool.forget(&[label.to_owned()])
+            .map_err(std::io::Error::other)?;
+    }
+    eprintln!(
+        "[imparo] generation abandoned committed={filled} resident=0 filled=0: {e}"
+    );
+    // SSE headers are already sent. Do not write a second HTTP response.
+    if streaming {
+        return Err(e);
+    }
+    http::json(stream, 500, &json!({"error": e.to_string()}))
+}
+
+/// A request's end: its response, the pipelined step it left queued, and its turn written
+/// through. The request's slot is the selected one. `quiet`: nothing else is running, so
+/// handing free memory back to the system delays no one.
+fn finish(
+    engine: &mut Engine,
+    turn: Turn,
+    generation: Generation,
+    quiet: bool,
+) -> std::io::Result<()> {
+    let Turn {
+        mut out,
+        seed,
+        prompt_tokens,
+        start_pos,
+        conversation,
+        label: effective_label,
+        ids,
+        starts_in_reasoning,
+        pool_branches,
+    } = turn;
     let Generation {
         prefill_ms,
         service_witness,
-        generated,
+        reply,
         decode_steps,
         decode_ms,
         t_sample,
-        t_detok,
-        t_send,
-        probe,
+        pipelined,
+        queued,
+        drafted,
+        ..
+    } = generation;
+    let Reply {
+        id,
+        streaming,
+        max_tokens,
+        chat,
+        generated,
         emitted,
         sent_reasoning,
         sent_visible,
         mut frames,
-        pipelined,
-        queued,
-    } = match generation_result {
-        Ok(result) => result,
-        Err(e) => {
-            // A verified block may be ahead of delivery. Abandon the transient
-            // claim; never pretend changing filled rolls recurrent state back.
-            if outstanding_pipeline {
-                engine.model.discard_step().map_err(std::io::Error::other)?;
-            }
-            let filled = engine.model.kv_runtime().filled;
-            engine.resident.clear();
-            engine.resident_conv.clear();
-            engine.model.kv_set_filled(0);
-            if let (Some(pool), Some(label)) =
-                (engine.pool.as_mut(), effective_label.as_deref())
-            {
-                pool.forget(&[label.to_owned()])
-                    .map_err(std::io::Error::other)?;
-            }
-            eprintln!(
-                "[imparo] generation abandoned committed={filled} resident=0 filled=0: {e}"
-            );
-            // SSE headers are already sent. Do not write a second HTTP response.
-            if streaming {
-                return Err(e);
-            }
-            return http::json(stream, 500, &json!({"error":e.to_string()}));
-        }
-    };
+        probe,
+        t_detok,
+        t_send,
+        ..
+    } = reply;
+    let stream = &mut out;
     // The cache now holds the prompt plus every token that went through a forward:
     // decode_steps of the generated tokens (the last generated token is never
     // forwarded — its logits would be unread — so it is not resident).
@@ -2121,7 +3064,7 @@ fn chat_completions(
     // server's own numbers on theirs -- two different rulers, which charged us for decode
     // time the fork was not charged for and understated our prefill by a third.
     let processed = prompt_tokens - start_pos;
-    let timings = json!({
+    let mut timings = json!({
         "prompt_n": processed,
         "prompt_ms": prefill_ms,
         "prompt_per_second": processed as f64 / (prefill_ms / 1e3).max(1e-9),
@@ -2129,6 +3072,25 @@ fn chat_completions(
         "predicted_ms": decode_ms,
         "predicted_per_second": decode_steps as f64 / (decode_ms / 1e3).max(1e-9),
     });
+    // THIS REQUEST'S DRAFTING, present whenever the drafter was attached: the draft tokens the
+    // target verified past each round's anchor and the ones it accepted (llama.cpp calls them
+    // draft_n and draft_n_accepted), the verify rounds, the one-token steps that verified no draft,
+    // and the two counts by the source that proposed each token. The decode commits
+    // draft_accepted + draft_rounds + plain_rounds tokens to the cache: each round its accepted
+    // drafts and its anchor, each plain step one token.
+    if let Some(d) = drafted {
+        let counts = |t: imparo_model::speculative::Tally| json!({"verified": t.verified, "accepted": t.accepted});
+        let total = d.tally.total();
+        timings["draft_verified"] = json!(total.verified);
+        timings["draft_accepted"] = json!(total.accepted);
+        timings["draft_rounds"] = json!(d.rounds);
+        timings["plain_rounds"] = json!(d.plain);
+        timings["draft_sources"] = json!({
+            "drafter": counts(d.tally.drafter),
+            "ngram": counts(d.tally.ngram),
+            "agreed": counts(d.tally.agreed),
+        });
+    }
     // cached_tokens = the reused prefix, same field llama-server reports. What lets
     // a speed harness (dev_harness/bracket.py) reject cache-contaminated legs on
     // THIS engine instead of only on the reference.
@@ -2187,7 +3149,8 @@ fn chat_completions(
                     &mut frames,
                     &json!({
                     "id": id, "object": "chat.completion.chunk", "model": "imparo",
-                    "choices": [{"index": 0, "delta": {"tool_calls": tool_calls},
+                    "choices": [{"index": 0,
+                                 "delta": {"tool_calls": streamed_tool_calls(&tool_calls)},
                                  "finish_reason": null}]}),
                 )?;
             }
@@ -2211,6 +3174,11 @@ fn chat_completions(
             )
         }
     })();
+    // Optional local quality witness from tokens already held on the CPU.
+    // Emit only after the response is sent; no GPU state dump in timed requests.
+    if std::env::var("IMPARO_LAB_GENERATED_TOKEN_IDS").is_ok_and(|v| v == "1") {
+        eprintln!("[generated-token-ids] {}", json!(&generated));
+    }
     let t_tail = std::time::Instant::now();
     if pipelined && queued {
         // The step queued behind the last confirmed one ran for a token that will not be
@@ -2221,7 +3189,7 @@ fn chat_completions(
     }
     let tail_discard_ms = t_tail.elapsed().as_secs_f64() * 1e3;
     if discard_partial_draft {
-        #[cfg(feature = "cuda-speculative")]
+        #[cfg(feature = "speculative")]
         engine
             .model
             .clear_draft_cache()
@@ -2272,7 +3240,9 @@ fn chat_completions(
             ..
         } = &mut *engine;
         if let Some(pl) = pool.as_mut() {
-            if let Some((branch, bhashes, blabel, false)) = &pool_branch {
+            for (branch, bhashes, blabel, _) in
+                pool_branches.iter().filter(|(.., eager)| !eager)
+            {
                 // deferred branch point: record now that the forward SUCCEEDED
                 let units = branch / imparo_kv::grid_tokens();
                 if imparo_model::log_on() {
@@ -2369,18 +3339,20 @@ fn chat_completions(
         );
     }
     imparo_model::host::prof_log("decode ", decode_ms);
-    // A request boundary is the one place where returning free pages costs nothing: the
-    // next request will fault back in only what it actually uses.
-    imparo_model::host::release_free_memory();
-    // Sample after a request has run: the startup samples are taken before any GPU buffer
-    // exists, so they miss the KV pool and the activation buffers entirely -- and those
-    // are exactly what the prefill batch size trades against speed.
-    // Hand back the request's transients: the decoded strings, the JSON, the token vecs.
-    // The allocator keeps them in its arena for reuse, and `phys_footprint` charges for
-    // them either way, so a server that has served N requests carries N requests' worth of
-    // arena unless it asks. After `decode_ms` is taken, so it costs no measured time.
-    imparo_model::host::release_free_memory();
-    imparo_model::host::log_footprint("after request");
+    if quiet {
+        // A request boundary is the one place where returning free pages costs nothing: the
+        // next request will fault back in only what it actually uses. Not while other
+        // requests run: the loop would hold their next step for it.
+        // Hand back the request's transients: the decoded strings, the JSON, the token vecs.
+        // The allocator keeps them in its arena for reuse, and `phys_footprint` charges for
+        // them either way, so a server that has served N requests carries N requests' worth
+        // of arena unless it asks. After `decode_ms` is taken, so it costs no measured time.
+        imparo_model::host::release_free_memory();
+        // Sample after a request has run: the startup samples are taken before any GPU
+        // buffer exists, so they miss the KV pool and the activation buffers entirely -- and
+        // those are exactly what the prefill batch size trades against speed.
+        imparo_model::host::log_footprint("after request");
+    }
 
     sent
 }
@@ -2393,6 +3365,45 @@ fn chat_completions(
 /// on the GPU inside `forward_next`, which applies the same rule.
 fn sample(logits: &[f32], _temperature: f64) -> u32 {
     imparo_model::ops::argmax_f32(logits)
+}
+
+/// The response's tool calls as stream deltas: each carries its `index`, because a client
+/// joins streamed call deltas by index. Sent without one, three `get_weather` calls came
+/// back to the client as one call named `get_weatherget_weatherget_weather` whose
+/// arguments were not JSON, and the history it sent next did not render.
+fn streamed_tool_calls(calls: &[Value]) -> Vec<Value> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(i, call)| {
+            let mut call = call.clone();
+            call["index"] = json!(i);
+            call
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod streamed_tool_call_tests {
+    use super::streamed_tool_calls;
+    use serde_json::json;
+
+    #[test]
+    fn every_streamed_call_carries_its_index() {
+        let calls = [
+            json!({"id": "call_get_weather_0", "type": "function",
+                   "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"}}),
+            json!({"id": "call_get_weather_1", "type": "function",
+                   "function": {"name": "get_weather", "arguments": "{\"city\":\"Bergen\"}"}}),
+        ];
+        let streamed = streamed_tool_calls(&calls);
+        assert_eq!(streamed.len(), 2);
+        for (i, (s, c)) in streamed.iter().zip(&calls).enumerate() {
+            assert_eq!(s["index"], json!(i));
+            assert_eq!(s["function"], c["function"]);
+            assert_eq!(s["id"], c["id"]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2554,5 +3565,28 @@ mod pool_eligibility_tests {
             parse_raw_input_ids(&json!({"input_ids": [u64::from(u32::MAX) + 1]}), true)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_opener_scan_tests {
+    use super::{first_subsequence, last_subsequence};
+
+    /// The two branch points of one prompt: the system prompt's end is the FIRST opener, the
+    /// last user message the LAST; with one user message they are the same position.
+    #[test]
+    fn first_and_last_opener_are_the_system_end_and_the_last_user_message() {
+        let open = [7, 8];
+        // system 1..4 | user (7 8) 5 | assistant 6 | user (7 8) 9
+        let ids = [1, 2, 3, 4, 7, 8, 5, 6, 7, 8, 9];
+        assert_eq!(first_subsequence(&ids, &open), Some(4));
+        assert_eq!(last_subsequence(&ids, &open), Some(8));
+        let one = [1, 2, 3, 7, 8, 5];
+        assert_eq!(
+            first_subsequence(&one, &open),
+            last_subsequence(&one, &open)
+        );
+        assert_eq!(first_subsequence(&one, &[]), None);
+        assert_eq!(first_subsequence(&[7], &open), None);
     }
 }

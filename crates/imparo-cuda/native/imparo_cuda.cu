@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "q8_quant_contract.cuh"
+#include "lfm_retained_policy.cuh"
 #if defined(IMPARO_CUDA_SPECULATIVE)
 #include "sm80/d64_fa2/dispatch.cuh"
 #endif
@@ -51,6 +52,9 @@ extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);
 #if defined(IMPARO_CUDA_ENABLE_CUBLAS_LAB)
 #include <cublas_v2.h>
 #endif
+#if defined(IMPARO_CUDA_ENABLE_PTQ_CUBLAS)
+#include "ptq1_bounded_gemm.cuh"
+#endif
 #include <mma.h>
 #include <algorithm>
 #include <chrono>
@@ -67,6 +71,11 @@ extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);
 
 #include "sm80/mma_f16.cuh"
 #include "host_memory.cuh"
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+#include "sm86/w4a16_marlin/marlin_frozen.cuh"
+#include "sm86/w4a16_marlin/permutation.cuh"
+#include "sm86/w4a16_marlin/unpack_tiled.cuh"
+#endif
 #include "device_ready_tasks.cuh"
 #include "host_profile.cuh"
 #include "kv_memory.cuh"
@@ -136,14 +145,26 @@ static_assert(offsetof(ImparoCudaHostProfileWire, pinned_d2h_bytes_per_second) =
         }                                                                          \
     } while (0)
 
+struct TreeReplayState;
+#if defined(IMPARO_CUDA_SPECULATIVE)
+extern "C" int imparo_cuda_tree_graph_abort();
+#endif
+
+#if defined(IMPARO_CUDA_SPECULATIVE)
+// Decode Graph admission shares the page-table helpers defined below.
+static const uint32_t * kv_device_page_table(uint32_t layer);
+static bool kv_page_table_requires_mapping(uint32_t layer);
+#endif
+
 namespace {
 
 // ---- state (the .mm's globals, CUDA edition) --------------------------------------
 // Capacity, not a second copy of BufId::COUNT. Rust checks this through
 // imparo_cuda_buf_count at init; headroom lets model-private slots grow without
 // changing the native ABI on every appended BufId.
-constexpr int B_COUNT = 31;
+constexpr int B_COUNT = 40;
 constexpr int MAX_LAYERS = 128;
+static uint64_t w4_ffn_device_bytes();
 
 struct WeightSpanWire {
     uint64_t offset;
@@ -192,7 +213,7 @@ struct CublasF16WeightSpan {
 };
 #endif
 
-enum class NativeGraphUpdate : uint8_t { Default, Scalars, ValidGridY, ValidTiles16GridY, SpanGroups32GridY };
+enum class NativeGraphUpdate : uint8_t { Default, Scalars, ValidGridY, ValidTiles16GridY, SpanGroups32GridY, Fa2ParamsV1, Fa2MergeV1 };
 
 struct DynamicGraphNode {
     cudaGraphNode_t node = nullptr;
@@ -208,6 +229,12 @@ struct DynamicGraphNode {
     };
     std::vector<ProgramArgumentStorage> program_arguments;
     std::vector<uint32_t> program_update_sources;
+#if defined(IMPARO_CUDA_SPECULATIVE)
+    // Aligned owned copies, including all capture-static merge arguments.
+    std::vector<uint64_t> fa2_arguments;
+    imparo_d64_fa2_port::DecodeReplayFa2Binding fa2_binding;
+    void *fa2_scratch=nullptr;uint64_t fa2_scratch_bytes=0;
+#endif
     uint32_t start_index = UINT32_MAX;
     uint32_t valid_index = UINT32_MAX;
     uint32_t ring = 0;
@@ -266,7 +293,21 @@ uint64_t grouped_ffn_device_bytes();
 // Mutable buffers and graph state belong to one request. Graph arguments and
 // host upload sources stay at stable addresses for that execution's lifetime.
 #include "tree_context.cuh"
+struct WeightTransferSlice { uint64_t offset, bytes; };
+struct WeightTransferState {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t ready[2] = {nullptr,nullptr}, consumed[2] = {nullptr,nullptr};
+    std::vector<WeightTransferSlice> plan, observed;
+    size_t queued[2] = {SIZE_MAX,SIZE_MAX};
+    size_t cursor = 0;
+    int previous_slot = -1;
+    bool started = false, blocked = false, reported = false;
+};
 struct ExecutionState {
+    WeightTransferState weight_transfer;
+    std::shared_ptr<TreeReplayState> tree_replay;
+    bool tree_capture_active = false;
+    bool tree_capture_allocation_blocked = false;
     TreeContext tree;
     uint32_t graph_leases = 0;
 #if defined(IMPARO_CUDA_EXECUTION_OWNER_LAB)
@@ -320,8 +361,14 @@ struct ExecutionState {
     uint32_t q8_src = UINT32_MAX;
     uint32_t q8_n_in = 0, q8_n_tok = 0, q8_src_row = 0, q8_layout = UINT32_MAX;
     uint64_t q8_src_epoch = 0;
+    // Immutable per owner after first model preparation: 0=Legacy, 1=BatchInvariantQ8V1.
+    uint32_t q8_numerical_policy = 0;
+    uint32_t q8_cache_numerical_policy = UINT32_MAX;
     uint64_t graph_capture_generation = 0;
     uint64_t q8_owner_capture_generation = 0;
+#if defined(IMPARO_CUDA_ENABLE_PTQ_CUBLAS)
+    imparo_cuda_ptq1_gemm::State ptq_gemm; // bounded, owned scratch; never a full-model expansion
+#endif
     void * attention_scratch = nullptr; // bounded, reusable per-SM prefill workspace
     uint64_t attention_scratch_bytes = 0;
     void * attention_q_cache = nullptr; // post-head f16 Q, consumed by tiled attention
@@ -407,6 +454,9 @@ struct ExecutionState {
     uint32_t prefill_graph_canonical_start = 0;
     uint32_t prefill_graph_canonical_tokens = 0;
     bool prefill_graph_argmax = false;
+    // An executable may only read the weight representation it captured.
+    // Kept per execution owner so inactive owners invalidate on their next use.
+    bool prefill_graph_w4_packed = false;
     uint32_t prefill_warm_forwards = 0;
     // Dev-only same-process numerical mask sweep index. It is read only when
     // the explicit sweep environment is present and never affects production.
@@ -473,6 +523,10 @@ struct State {
     std::vector<WeightSpanWire> streamed_weights;
     std::vector<ResidentWeightSegment> resident_segments;
     uint64_t weight_cache_limit = 0;
+    uint32_t weight_transfer_policy = 0;
+    bool weight_transfer_frozen = false, weight_pins_ready = false;
+    // One model per native process, matching the retained GGUF mapping lifetime.
+    std::vector<WeightTransferSlice> weight_pins;
     const void * q8_l2_window_base = nullptr;
     uint64_t q8_l2_window_bytes = 0;
     uint64_t packed_q4_bytes = 0;
@@ -482,6 +536,8 @@ struct State {
     uint64_t ffn_packed_q4_slab_used = 0;
     bool ffn_packed_q4_slab_attempted = false;
     uint64_t runtime_reserve_bytes = 0;
+    uint64_t placement_reserve_bytes = 0;
+    bool has_placement_reserve = false;
     uint64_t ffn_sidecar_model_layer_bytes = 0;
     bool packed_q4_budget_initialized = false;
     bool ffn_sidecar_model_ready = false;
@@ -549,12 +605,35 @@ struct State {
     // above currently hard-code their geometry -- wiring each launch to its slot
     // is part of the CUDA port (marked per knob in knobs.rs).
     uint32_t knobs[64] = {};
+    // Whole-model numerical policy: no fictitious native timing slot/proof bit.
+    uint32_t ptq_prefill_tensorcore = 0;
+    bool ptq_prefill_tensorcore_frozen = false;
+    uint32_t ptq_prefill_tensorcore_trace_mask = 0;
+    // Fixed workflow policy, not another native timing dimension.
+    uint32_t lfm_retained_policy = 0;
+    uint32_t lfm_retained_domain = 0;
+    const void *lfm_retained_weights_identity = nullptr;
+    uint32_t e4b_retained_policy = 0;
+    uint32_t e4b_retained_domain = 0; // exact admitted context capacities, never text contents
+    bool e4b_retained_policy_frozen = false;
+    const void *e4b_retained_weights_identity = nullptr;
 };
 State g;
+static bool e4b_retained_decode_policy_enabled() {
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    return g.e4b_retained_policy == 1 && g.sm_version == 86 && g.sm_count == 30;
+#else
+    return false;
+#endif
+}
 ExecutionState default_execution;
 ExecutionState * active_execution = &default_execution;
 inline ExecutionState & execution() { return *active_execution; }
+inline bool batch_invariant_q8_v1_active() {
+    return execution().q8_numerical_policy == 1;
+}
 inline bool verification_m1_quant_policy() {
+    if (batch_invariant_q8_v1_active()) return false;
 #if defined(IMPARO_CUDA_EXECUTION_OWNER_LAB)
     return execution().verification_m1_quant_active;
 #else
@@ -993,6 +1072,7 @@ bool destroy_decode_graph_checked() {
     return destroy_decode_graph_checked(execution());
 }
 
+static bool release_weight_transfer(WeightTransferState &);
 #include "execution_owners.cuh"
 
 void destroy_decode_graph() {
@@ -1009,6 +1089,7 @@ void destroy_single_decode_graph() {
 void invalidate_q8_cache() {
     execution().q8_src = UINT32_MAX;
     execution().q8_layout = UINT32_MAX;
+    execution().q8_cache_numerical_policy = UINT32_MAX;
     execution().q8_owner_capture_generation = 0;
 }
 
@@ -1037,7 +1118,8 @@ bool q8_cache_matches(uint32_t src, uint32_t n_in, uint32_t n_tok,
     }
     return src < B_COUNT && execution().q8_src == src && execution().q8_src_epoch == execution().buf_epoch[src]
         && execution().q8_n_in == n_in && execution().q8_n_tok == n_tok
-        && execution().q8_src_row == src_row && execution().q8_layout == layout;
+        && execution().q8_src_row == src_row && execution().q8_layout == layout
+        && execution().q8_cache_numerical_policy == execution().q8_numerical_policy;
 }
 
 void own_q8_cache(uint32_t src, uint32_t n_in, uint32_t n_tok,
@@ -1048,6 +1130,7 @@ void own_q8_cache(uint32_t src, uint32_t n_in, uint32_t n_tok,
     execution().q8_n_tok = n_tok;
     execution().q8_src_row = src_row;
     execution().q8_layout = layout;
+    execution().q8_cache_numerical_policy = execution().q8_numerical_policy;
     execution().q8_owner_capture_generation =
         execution().graph_capturing && (execution().forward_decode || execution().verification_capture_active) && !execution().prefill_capture_active
         ? execution().graph_capture_generation
@@ -1077,6 +1160,7 @@ uint64_t env_mib(const char * name, uint64_t fallback) {
 }
 
 uint64_t attention_workspace_budget(uint32_t head_dim) {
+    if (head_dim==64 && imparo_lfm_retained::domain()==3) return 96ull<<20;
     uint64_t mib = tuner_knob(head_dim == 256 ? 13 : 14);
     if (!mib) {
         mib = g.sm_version == 86 ? (head_dim == 256 ? 20u : 16u) : 32u;
@@ -1092,7 +1176,7 @@ uint64_t attention_workspace_budget(uint32_t head_dim) {
 
 uint64_t tracked_bytes() {
     uint64_t total = g.weights_resident ? g.weights_device_bytes : 0;
-    total += g.packed_q4_bytes + execution_owners_device_bytes();
+    total += g.packed_q4_bytes + execution_owners_device_bytes() + w4_ffn_device_bytes();
 #if defined(IMPARO_CUDA_EXECUTION_OWNER_LAB)
     total += grouped_ffn_device_bytes();
 #endif
@@ -1116,7 +1200,7 @@ void release_prefill_transients_for_decode() {
     if (!execution().attention_q_cache) return;
     const char * mtp_m1_graph = std::getenv("IMPARO_LAB_MTP_M1_GRAPH");
     const char * verify_graph = std::getenv("IMPARO_LAB_VERIFY_GRAPH_UPDATE");
-    if (((mtp_m1_graph && std::strcmp(mtp_m1_graph, "1") == 0)
+    if ((e4b_retained_decode_policy_enabled() || (mtp_m1_graph && std::strcmp(mtp_m1_graph, "1") == 0)
             || (verify_graph && (std::strcmp(verify_graph, "1") == 0 || std::strcmp(verify_graph, "2") == 0 || std::strcmp(verify_graph, "3") == 0)))
             && !execution().attention_q_cache_from_prefill) return;
     static const bool profile =
@@ -1314,7 +1398,15 @@ static inline void trace_d256_attention_route(
         segment_bound);
 }
 
+// Freeze allocation without changing the numerical capture guards.
+bool tree_capture_reject_growth() {
+    if (!execution().tree_capture_active) return false;
+    execution().tree_capture_allocation_blocked = true;
+    set_pending(CUDA_RC_INVALID, "tree capture requires stable storage");
+    return true;
+}
 int alloc_raw(void ** out, uint64_t bytes, const char * what) {
+    if (tree_capture_reject_growth()) return CUDA_RC_INVALID;
     if (!bytes) { *out = nullptr; return 0; }
     cudaError_t err = cudaMalloc(out, size_t(bytes));
     if (err == cudaSuccess) return 0;
@@ -1328,9 +1420,13 @@ int alloc_raw(void ** out, uint64_t bytes, const char * what) {
     return err == cudaErrorMemoryAllocation ? CUDA_RC_OOM : CUDA_RC_ERROR;
 }
 
+static int weight_transfer_barrier(bool invalidate = true);
 int ensure_weight_cache(uint64_t bytes) {
+    const int transfer_rc = weight_transfer_barrier();
+    if (transfer_rc) return transfer_rc;
     if (bytes <= execution().weight_cache_bytes) return 0;
     if (!g.weights_host || bytes > g.weight_cache_limit) return CUDA_RC_INVALID;
+    if (tree_capture_reject_growth()) return CUDA_RC_INVALID;
     if (execution().graph_capturing) return CUDA_RC_INVALID;
     destroy_decode_graph();
     if (execution().weight_cache) {
@@ -1407,6 +1503,7 @@ int ensure_q8_scratch(uint64_t bytes) {
         configure_q8_l2_window_lab();
         return 0;
     }
+    if (tree_capture_reject_growth()) return CUDA_RC_INVALID;
     if (execution().graph_capturing) return CUDA_RC_INVALID;
     destroy_decode_graph();
     void * next = nullptr;
@@ -1703,6 +1800,7 @@ int alloc_raw_with_packed_q4_reclaim(
 
 bool ensure_device_task_scratch(uint64_t bytes) {
     if (bytes <= execution().device_task_scratch_bytes) return true;
+    if (tree_capture_reject_growth()) return false;
     if (execution().graph_capturing || execution().prefill_capture_active) return false;
     void * next = nullptr;
     if (alloc_raw(&next, bytes, "device ready tasks")) {
@@ -1717,6 +1815,7 @@ bool ensure_device_task_scratch(uint64_t bytes) {
 
 bool ensure_q8_scratch_next(uint64_t bytes) {
     if (bytes <= execution().q8_scratch_next_bytes) return true;
+    if (tree_capture_reject_growth()) return false;
     if (execution().graph_capturing) return false;
     destroy_decode_graph();
     if (execution().q8_scratch_next) {
@@ -1889,6 +1988,7 @@ uint32_t batch_mmvq_rows_per_cta() {
 // and fall back to the common kernel if even one tile cannot be staged.
 bool ensure_attention_scratch(uint64_t bytes) {
     if (bytes <= execution().attention_scratch_bytes) return true;
+    if (tree_capture_reject_growth()) return false;
     if (execution().graph_capturing) {
         execution().graph_capture_compatible = false;
         return false;
@@ -1917,6 +2017,7 @@ bool ensure_attention_q_cache(uint64_t bytes, bool from_prefill = false) {
         execution().attention_q_cache_from_prefill |= from_prefill;
         return true;
     }
+    if (tree_capture_reject_growth()) return false;
     if (execution().graph_capturing) return false;
     void * next = nullptr;
     if (cudaMalloc(&next, bytes) != cudaSuccess) {
@@ -2009,6 +2110,7 @@ bool trace_cuda_graph() {
 
 // This selector changes submission only; the current native Q8 math stays selected.
 bool parallel_qk_graph_lab_enabled() {
+    if (imparo_lfm_retained::enabled()) return true;
     return std::getenv("IMPARO_LAB_D64_PARALLEL_QK_GRAPH") != nullptr
         && std::getenv("IMPARO_LAB_D64_PARALLEL_QK") != nullptr
         && std::getenv("IMPARO_LAB_D64_DIRECT_MMA") != nullptr
@@ -2024,7 +2126,7 @@ bool decode_graph_candidate() {
                     || std::getenv("IMPARO_CUDA_ATTN_D64_VEC_Q8") != nullptr)
                   && std::getenv("IMPARO_CUDA_NO_ATTN_D64_VEC_Q8") == nullptr)
                 || parallel_qk_graph_lab_enabled()));
-    return !g.tuner_mode && execution().decode_prepared && execution().decode_argmax && decode_graph_enabled()
+    return !g.weight_transfer_policy && !g.tuner_mode && execution().decode_prepared && execution().decode_argmax && decode_graph_enabled()
         && decode_pinned_input_enabled() && async_host_control_enabled()
         && g.weights_resident && graph_kv
         && g.sm_version >= 80;
@@ -2057,6 +2159,10 @@ int rope_frequency_buffer(const float * host, uint64_t bytes,
                           const float ** device) {
     *device = nullptr;
     if (!host) return 0;
+    if (execution().tree_capture_active && (!async_host_control_enabled()
+            || execution().rope_freqs_host != host || execution().rope_freqs_host_bytes != bytes)) {
+        tree_capture_reject_growth(); return CUDA_RC_INVALID;
+    }
     if (bytes > execution().rope_freqs_bytes) {
         if (execution().graph_capturing) return CUDA_RC_INVALID;
         destroy_decode_graph();
@@ -2159,7 +2265,169 @@ const uint32_t * host_u32_values(uint32_t id, uint32_t count,
     return fallback.data();
 }
 
+// Experimental single-resident Marlin FFN transaction. State is model-owned;
+// all conversions and executions use the backend's existing serialized stream.
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+struct W4FfnSpan {
+    uint64_t gate_off, up_off, down_off;
+    uint8_t *joined;
+    uint8_t *down;
+    uint32_t k, n, gap;
+};
+struct W4FfnRuntime {
+    std::vector<W4FfnSpan> spans;
+    void *scratch = nullptr;
+    uint64_t scratch_bytes = 0;
+    const void *weights_identity = nullptr;
+    imparo_w4a16_marlin::Kernel kernel{};
+    uint8_t loaded_module_sha256[32] = {};
+    uint32_t policy = 0; // 0=off, 1=phase roundtrip, 2=domain1 packed Prefill reuse
+    bool policy_frozen = false;
+    bool packed = false;
+    bool poisoned = false;
+    bool dispatch_reported[4] = {};
+};
+static W4FfnRuntime w4_ffn;
+static uint64_t w4_ffn_device_bytes() { return w4_ffn.scratch_bytes; }
+static bool w4_ffn_lab_requested() {
+    static const char *flag = std::getenv("IMPARO_LAB_E4B_W4A16_FFN");
+    return flag && std::strcmp(flag,"1")==0;
+}
+static uint32_t w4_ffn_policy_value() {
+    if (w4_ffn.policy_frozen) return w4_ffn.policy;
+    if (w4_ffn.policy == 1 || w4_ffn.policy == 2) return w4_ffn.policy;
+    return w4_ffn_lab_requested() ? 1u : 0u;
+}
+static bool w4_ffn_enabled() {
+    const uint32_t policy = w4_ffn_policy_value();
+    return (policy == 1 || policy == 2) && g.sm_version==86
+        && g.sm_count==30 && !g.tuner_mode && !g.tuner_lab;
+}
+static bool w4_ffn_packed_prefill_requested() {
+    // Mode 2 retains packed weights only in the admitted short model domain.
+    // Middle/long owners and the standalone FFN checker keep the established
+    // canonical/packed phase roundtrip, without changing the selected identity.
+    return w4_ffn_policy_value() == 2 && w4_ffn_enabled()
+        && e4b_retained_decode_policy_enabled() && g.e4b_retained_domain == 1;
+}
+static bool w4_ffn_has_packed_weights() { return w4_ffn.packed; }
+static const uint8_t *w4_ffn_relocated(uint64_t off,uint64_t bytes) {
+    if (!w4_ffn.packed || w4_ffn.poisoned) return nullptr;
+    for (const auto &s:w4_ffn.spans) {
+        const uint64_t one=uint64_t(s.k)*s.n/32*18;
+        const uint64_t gap_off=s.gate_off+one;
+        if (off>=gap_off && off-gap_off<=s.gap
+                && bytes<=s.gap-(off-gap_off))
+            return s.joined+2*one+(off-gap_off);
+    }
+    return nullptr;
+}
+static bool w4_ffn_blocks_canonical(uint64_t off,uint64_t bytes) {
+    if (!w4_ffn.packed) return false;
+    for (const auto &s:w4_ffn.spans) {
+        const uint64_t one=uint64_t(s.k)*s.n/32*18;
+        for (uint64_t base:{s.gate_off,s.up_off,s.down_off})
+            if (off>=base && off-base<one && bytes) return true;
+    }
+    return false;
+}
+static cudaError_t w4_ffn_convert_phase(const void *input, void *output,
+        int k, int n, size_t gap, bool packed, cudaStream_t stream) {
+    // Keep the phase owner and its single scratch/copy-back transaction intact.
+    // Packing is unchanged; tiled unpack returns the identical canonical bytes.
+    return packed
+        ? imparo_w4a16_marlin::convert(input, output, k, n, gap, true, stream)
+        : imparo_w4a16_marlin::unpack_tiled(input, output, k, n, gap, stream);
+}
+static int w4_ffn_prepare_phase(bool packed) {
+    if (!w4_ffn.policy_frozen) {
+        w4_ffn.policy=w4_ffn_policy_value();
+        w4_ffn.policy_frozen=true;
+    }
+    if (!w4_ffn_enabled()) return 0;
+    if (w4_ffn.spans.empty()) return CUDA_RC_INVALID;
+    if (w4_ffn.poisoned || w4_ffn.weights_identity!=g.weights) return CUDA_RC_INVALID;
+    if (packed==w4_ffn.packed) return 0;
+    if (execution().graph_capturing || execution().prefill_capture_active
+            || execution().tree_capture_active) return CUDA_RC_INVALID;
+    const auto begin=std::chrono::steady_clock::now();
+    // Rust loads the authenticated embedded (or identical lab) image before this
+    // phase. Never bypass its identity check by opening an external path here.
+    if (!w4_ffn.kernel.function) return CUDA_RC_INVALID;
+    uint64_t largest=0;
+    for (const auto &s:w4_ffn.spans)
+        largest=std::max(largest,uint64_t(s.k)*s.n/32*36+s.gap);
+    if (!w4_ffn.scratch) {
+        const int rc=alloc_raw(&w4_ffn.scratch,largest,"single-resident W4 FFN conversion");
+        if (rc) return rc;
+        w4_ffn.scratch_bytes=largest;
+    }
+    if (w4_ffn.scratch_bytes<largest) return CUDA_RC_INVALID;
+    for (const auto &s:w4_ffn.spans) {
+        const uint64_t one=uint64_t(s.k)*s.n/32*18;
+        if (w4_ffn_convert_phase(s.joined,
+                static_cast<uint8_t *>(w4_ffn.scratch),s.k,2*s.n,s.gap,packed,g.stream)!=cudaSuccess
+                || cudaMemcpyAsync(s.joined,w4_ffn.scratch,size_t(2*one+s.gap),
+                    cudaMemcpyDeviceToDevice,g.stream)!=cudaSuccess
+                || w4_ffn_convert_phase(s.down,
+                    static_cast<uint8_t *>(w4_ffn.scratch),s.n,s.k,0,packed,g.stream)!=cudaSuccess
+                || cudaMemcpyAsync(s.down,w4_ffn.scratch,size_t(one),
+                    cudaMemcpyDeviceToDevice,g.stream)!=cudaSuccess) {
+            w4_ffn.poisoned=true; return CUDA_RC_ERROR;
+        }
+    }
+    if (cudaStreamSynchronize(g.stream)!=cudaSuccess) {
+        w4_ffn.poisoned=true; return CUDA_RC_ERROR;
+    }
+    w4_ffn.packed=packed;
+    if (!packed) std::fprintf(stderr,
+        "[w4a16-unpack] tile_k=256 tile_n=64 threads=256 shared=18432 layers=%zu\n",
+        w4_ffn.spans.size());
+    if (packed && cudaMemsetAsync(w4_ffn.scratch,0,128,g.stream)!=cudaSuccess) {
+        w4_ffn.poisoned=true; return CUDA_RC_ERROR;
+    }
+    const double ms=std::chrono::duration<double,std::milli>(
+        std::chrono::steady_clock::now()-begin).count();
+    std::fprintf(stderr,"[w4a16-phase] packed=%u layers=%zu scratch=%llu weight_shadow=0 elapsed_ms=%.6f\n",
+        unsigned(packed),w4_ffn.spans.size(),static_cast<unsigned long long>(largest),ms);
+    return 0;
+}
+#else
+static uint64_t w4_ffn_device_bytes() { return 0; }
+static bool w4_ffn_enabled() { return false; }
+static bool w4_ffn_packed_prefill_requested() { return false; }
+static bool w4_ffn_has_packed_weights() { return false; }
+static const uint8_t *w4_ffn_relocated(uint64_t,uint64_t) { return nullptr; }
+static bool w4_ffn_blocks_canonical(uint64_t,uint64_t) { return false; }
+static int w4_ffn_prepare_phase(bool) { return 0; }
+#endif
+// As with Program Pack, identify Driver kernels before Runtime parameter reads.
+// Both Graph scanners share this check; the immutable W4 FFN has no position args.
+static bool w4_ffn_static_graph_node(cudaGraphNode_t node, bool *matched) {
+    *matched=false;
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    if (!w4_ffn_enabled() || !w4_ffn.kernel.function) return true;
+    CUDA_KERNEL_NODE_PARAMS p={};
+    if (w4_ffn.kernel.driver.graph_params(reinterpret_cast<CUgraphNode>(node),&p)!=CUDA_SUCCESS)
+        return false;
+    if (p.func!=w4_ffn.kernel.function) return true;
+    *matched=true;
+    if (!w4_ffn.packed || w4_ffn.poisoned || !p.kernelParams || p.extra
+            || p.gridDimX!=30 || p.gridDimY!=1 || p.gridDimZ!=1
+            || p.blockDimX!=256 || p.blockDimY!=1 || p.blockDimZ!=1
+            || p.sharedMemBytes!=unsigned(w4_ffn.kernel.max_shared_memory)) return false;
+    for(unsigned i=0;i<20;++i) if(!p.kernelParams[i]) return false;
+    const int m=*static_cast<const int*>(p.kernelParams[11]);
+    const int n=*static_cast<const int*>(p.kernelParams[12]);
+    const int k=*static_cast<const int*>(p.kernelParams[13]);
+    return m==3 && ((k==2560 && n==20480)||(k==10240 && n==2560));
+#else
+    return true;
+#endif
+}
 const uint8_t * resident_weight_range(uint64_t off, uint64_t bytes) {
+    if (const auto *moved=w4_ffn_relocated(off,bytes)) return moved;
+    if (w4_ffn_blocks_canonical(off,bytes)) return nullptr;
     if (!g.weights_resident || !g.weights || off > g.weights_len
         || bytes > g.weights_len - off) return nullptr;
     for (const ResidentWeightSegment & segment : g.resident_segments) {
@@ -2173,7 +2441,11 @@ const uint8_t * resident_weight_range(uint64_t off, uint64_t bytes) {
     return nullptr;
 }
 
+#include "weight_transfer.cuh"
+
 int weight_slice(uint64_t off, uint64_t bytes, const uint8_t ** out) {
+    if (out) { if (const auto *moved=w4_ffn_relocated(off,bytes)) { *out=moved; return 0; } }
+    if (w4_ffn_blocks_canonical(off,bytes)) return CUDA_RC_INVALID;
     if (!out || off > g.weights_len || bytes > g.weights_len - off) return CUDA_RC_INVALID;
     if (g.weights_resident) {
         for (const ResidentWeightSegment & segment : g.resident_segments) {
@@ -2185,6 +2457,10 @@ int weight_slice(uint64_t off, uint64_t bytes, const uint8_t ** out) {
                 return 0;
             }
         }
+    }
+    if (tree_capture_reject_growth()) return CUDA_RC_INVALID;
+    if (g.weight_transfer_policy && execution().forward_decode) {
+        return weight_transfer_slice(off,bytes,out);
     }
     int rc = ensure_weight_cache(bytes);
     if (rc) return rc;
@@ -2255,6 +2531,40 @@ struct QuantizedWeightPrepackWire {
 };
 static_assert(sizeof(QuantizedWeightPrepackWire) == 24,
     "quantized-weight prepack ABI drift");
+static int w4_ffn_register(const QuantizedWeightPrepackWire *specs,uint32_t count) {
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    if (!w4_ffn_enabled() || !w4_ffn.spans.empty()) return 0;
+    if (!g.weights_resident || !specs || !count) return CUDA_RC_INVALID;
+    std::vector<W4FfnSpan> spans;
+    // Existing Gemma producer registers Gate, Up, Down together. Check all
+    // offsets and residency before registering or ever rewriting any bytes.
+    for (uint32_t i=0;i+2<count;++i) {
+        const auto &a=specs[i], &b=specs[i+1], &d=specs[i+2];
+        if (a.kind!=1 || b.kind!=1 || d.kind!=1
+                || a.n_in!=2560 || a.n_out!=10240
+                || b.n_in!=a.n_in || b.n_out!=a.n_out
+                || d.n_in!=a.n_out || d.n_out!=a.n_in) continue;
+        const uint64_t one=uint64_t(a.n_in)*a.n_out/32*18;
+        const uint32_t gap=a.n_in*sizeof(float);
+        if (b.offset!=a.offset+one+gap || d.offset+one>a.offset)
+            return CUDA_RC_INVALID;
+        const auto *joined=resident_weight_range(a.offset,2*one+gap);
+        const auto *down=resident_weight_range(d.offset,one);
+        if (!joined || !down || (uintptr_t(joined)&15) || (uintptr_t(down)&15))
+            return CUDA_RC_INVALID;
+        spans.push_back({a.offset,b.offset,d.offset,const_cast<uint8_t*>(joined),
+            const_cast<uint8_t*>(down),a.n_in,a.n_out,gap});
+        i+=2;
+    }
+    if (spans.empty()) return CUDA_RC_INVALID; // selected policy must prove its complete model domain
+    if (spans.size()!=42) return CUDA_RC_INVALID;
+    w4_ffn.spans=std::move(spans); w4_ffn.weights_identity=g.weights;
+    w4_ffn.policy=w4_ffn_policy_value(); w4_ffn.policy_frozen=true;
+    std::fprintf(stderr,"[w4a16-policy] value=%u layers=%zu frozen=1\n",
+        w4_ffn.policy,w4_ffn.spans.size());
+#endif
+    return 0;
+}
 
 // Admission-only conversion from Q8_0 TileMajor to canonical row-major Q4_0.
 // The cache is a Decode numerical candidate; model bytes and Prefill stay Q8.
@@ -2431,6 +2741,26 @@ __global__ void k_q8_to_q5_shadow(
 
 extern "C" int imparo_cuda_prepare_quantized_weight_cache(
         const QuantizedWeightPrepackWire * specs, uint32_t count) {
+    if (e4b_retained_decode_policy_enabled()) {
+        if (!g.weights_resident || !specs || !count || !g.e4b_retained_domain) return CUDA_RC_INVALID;
+        if (g.e4b_retained_policy_frozen && g.e4b_retained_weights_identity != g.weights)
+            return CUDA_RC_INVALID;
+        uint32_t layers = 0;
+        for (uint32_t i = 0; i + 2 < count; ++i) {
+            const auto &a=specs[i], &b=specs[i+1], &d=specs[i+2];
+            if (a.kind==1 && b.kind==1 && d.kind==1
+                    && a.n_in==2560 && a.n_out==10240
+                    && b.n_in==2560 && b.n_out==10240
+                    && d.n_in==10240 && d.n_out==2560) { ++layers; i+=2; }
+        }
+        if (layers != 42) return CUDA_RC_INVALID;
+        const bool first = !g.e4b_retained_policy_frozen;
+        g.e4b_retained_weights_identity = g.weights;
+        g.e4b_retained_policy_frozen = true;
+        if (first) std::fprintf(stderr,"[e4b-retained-policy] value=1 version=1 layers=42 sm=86 sms=30 frozen=1\n");
+    }
+    const int w4_rc=w4_ffn_register(specs,count);
+    if(w4_rc) return w4_rc;
     const char * decode_q4_shadow_mode =
         std::getenv("IMPARO_LAB_LFM2_Q8_TM_DOWN_Q4_SHADOW");
     const uint64_t tuned_ffn_q5_mask = tuner_knob(53);
@@ -3179,6 +3509,33 @@ __global__ void k_gemm_q4_q8_1_mma(const uint8_t * w, const BlockQ8_1 * x, float
 }
 
 #include "sm80/mmq_q4_q8_1.cuh"
+// Bind only complete FFN matrices owned by the frozen single-resident W4 policy.
+// Ordinary weight_slice must continue rejecting these offsets while packed.
+static bool w4_ffn_packed_prefill_view(uint64_t off, uint32_t n_in,
+        uint32_t n_out, imparo_sm80_mmq::PackedWeightView *view) {
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    if (!w4_ffn_packed_prefill_requested() || !w4_ffn.packed
+            || w4_ffn.poisoned || w4_ffn.weights_identity != g.weights)
+        return false;
+    for (const auto &s : w4_ffn.spans) {
+        if ((off == s.gate_off || off == s.up_off)
+                && n_in == s.k && n_out == s.n) {
+            *view = {reinterpret_cast<const uint32_t *>(s.joined),
+                reinterpret_cast<const __half *>(s.joined + uint64_t(s.k)*s.n),
+                2*s.n, off == s.up_off ? s.n : 0u};
+            return true;
+        }
+        if (off == s.down_off && n_in == s.n && n_out == s.k) {
+            *view = {reinterpret_cast<const uint32_t *>(s.down),
+                reinterpret_cast<const __half *>(s.down + uint64_t(s.n)*s.k/2),
+                s.k, 0u};
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
 #include "sm86/mmq_q4_q8_aligned_prepack.cuh"
 #include "sm86/mmvq_q4_aligned_prepack.cuh"
 #include "sm86/mmq_q4_q8_dp4a.cuh"
@@ -4966,6 +5323,7 @@ __global__ void k_attention_batch32_f16(const float * q, const __half * kc,
 #if defined(IMPARO_CUDA_SPECULATIVE)
 #include "sm86/attention_decode_mma_d512_pipeline_q4.cuh"
 #include "sm86/attention_decode_mma_d512_m3_shared_q4.cuh"
+#include "sm86/attention_decode_mma_d512_m3_register_q4.cuh"
 #endif
 #include "sm80/attention_decode_vec_d64_q4.cuh"
 #include "sm80/attention_decode_vec_d64_q8.cuh"
@@ -5192,7 +5550,7 @@ __global__ void k_ple_norm_gather_combine(
     float * proj, const float * norm_w, const uint8_t * table,
     const uint32_t * tokens, uint32_t ple_width, uint32_t n_layers,
     float input_scale, float eps, float emb_scale, float comb_scale,
-    uint32_t n_tok) {
+    uint32_t n_tok, uint32_t source_width) {
     const uint32_t layer = blockIdx.x;
     const uint32_t token = blockIdx.y;
     if (layer >= n_layers || token >= n_tok) return;
@@ -5216,8 +5574,7 @@ __global__ void k_ple_norm_gather_combine(
     extern __shared__ float shared[];
     sum = block_sum<BlockSize>(sum, shared);
     const float scale = rsqrtf(sum / ple_width + eps);
-    const uint64_t full_width = uint64_t(ple_width) * n_layers;
-    const uint64_t table_row_bytes = full_width / 32 * 18;
+    const uint64_t table_row_bytes = uint64_t(source_width) / 32 * 18;
     const uint8_t * selected = table + uint64_t(tokens[token]) * table_row_bytes;
     const uint32_t col_end = SingleValue ? min(ple_width, BlockSize) : ple_width;
     for (uint32_t col = threadIdx.x; col < col_end; col += BlockSize) {
@@ -5332,6 +5689,126 @@ bool add_dynamic_graph_node(
     return true;
 }
 
+
+#if defined(IMPARO_CUDA_SPECULATIVE)
+static uint64_t decode_fa2_buffer_capacity(const void*p){
+ const auto a=reinterpret_cast<uintptr_t>(p);if(!a)return 0;
+ for(unsigned i=0;i<B_COUNT;++i){const auto base=reinterpret_cast<uintptr_t>(execution().bufs[i]);
+  if(base&&a>=base&&uint64_t(a-base)<execution().sizes[i])return execution().sizes[i]-uint64_t(a-base);}
+ return 0;
+}
+static bool decode_fa2_grid(const dim3&d,unsigned x,unsigned y,unsigned z){return d.x==x&&d.y==y&&d.z==z;}
+static unsigned decode_fa2_chunks(unsigned start,unsigned span){return unsigned((uint64_t(start)+1+span-1)/span);}
+static bool add_decode_fa2_node(cudaGraphNode_t node,const cudaKernelNodeParams&p,
+ const imparo_d64_fa2_port::DecodeReplayFa2Kernels&fa,bool merge){
+ auto&e=execution();if(!p.kernelParams||p.extra)return false;
+ DynamicGraphNode d;d.node=node;d.params=p;
+ d.native_update=merge?NativeGraphUpdate::Fa2MergeV1:NativeGraphUpdate::Fa2ParamsV1;
+ d.fa2_scratch=e.attention_scratch;d.fa2_scratch_bytes=e.attention_scratch_bytes;
+ if(!d.fa2_scratch)return false;
+ if(!merge){
+  if(!p.kernelParams[0]||!fa.params_bytes||fa.params_bytes>4096
+   ||p.sharedMemBytes!=fa.shared_bytes||!decode_fa2_grid(p.blockDim,32,4,1))return false;
+  d.fa2_arguments.resize(size_t((fa.params_bytes+7)/8));d.args.resize(1);
+  std::memcpy(d.fa2_arguments.data(),p.kernelParams[0],size_t(fa.params_bytes));
+  if(!imparo_d64_fa2_port::decode_replay_fa2_params(d.fa2_arguments.data(),e.decode_start_pos,
+   d.fa2_scratch,d.fa2_scratch_bytes,d.fa2_binding,true))return false;
+  const auto original=d.fa2_arguments;
+  if(!imparo_d64_fa2_port::decode_replay_fa2_params(d.fa2_arguments.data(),e.decode_start_pos,
+   d.fa2_scratch,d.fa2_scratch_bytes,d.fa2_binding,false)||original!=d.fa2_arguments)return false;
+  if(!decode_fa2_grid(p.gridDim,1,decode_fa2_chunks(e.decode_start_pos,d.fa2_binding.fixed_span),8))return false;
+  const uint64_t rows=std::min(decode_fa2_buffer_capacity(d.fa2_binding.k),
+   decode_fa2_buffer_capacity(d.fa2_binding.v))/(512*sizeof(__half));
+  const uint64_t scratch_chunks=(d.fa2_scratch_bytes-8192)/(4096+32*sizeof(float));
+  const uint64_t capacity=std::min(rows,scratch_chunks*uint64_t(d.fa2_binding.fixed_span));
+  if(capacity<=e.decode_start_pos)return false;
+  const auto maximum=uint32_t(std::min<uint64_t>(capacity-1,UINT32_MAX-1ull));
+  e.graph_max_start=std::min(e.graph_max_start,maximum);
+  e.decode_graph_max_start=std::min(e.decode_graph_max_start,maximum);
+  d.args[0]=d.fa2_arguments.data();
+ }else{
+  if(p.sharedMemBytes||!decode_fa2_grid(p.gridDim,1,1,1)||!decode_fa2_grid(p.blockDim,8,32,1))return false;
+  d.fa2_arguments.resize(8);d.args.resize(8);
+  for(unsigned i=0;i<8;++i){if(!p.kernelParams[i])return false;
+   std::memcpy(&d.fa2_arguments[i],p.kernelParams[i],(i<3||i==7)?sizeof(void*):sizeof(uint32_t));
+   d.args[i]=&d.fa2_arguments[i];}
+  auto u=[&](unsigned i){uint32_t v;std::memcpy(&v,&d.fa2_arguments[i],sizeof(v));return v;};
+  auto ptr=[&](unsigned i){void*v;std::memcpy(&v,&d.fa2_arguments[i],sizeof(v));return v;};
+  const unsigned span=u(6);if(span<256||span%128||u(3)!=1||u(5)!=e.decode_start_pos
+   ||u(4)!=decode_fa2_chunks(e.decode_start_pos,span)||ptr(7))return false;
+  auto*base=static_cast<uint8_t*>(d.fa2_scratch);
+  auto*tmp=reinterpret_cast<__half*>(base+8192);
+  if(8192+uint64_t(u(4))*(4096+32*sizeof(float))>d.fa2_scratch_bytes
+   ||ptr(0)!=tmp||ptr(1)!=reinterpret_cast<float*>(tmp+uint64_t(u(4))*2048)
+   ||ptr(2)!=base+4096)return false;
+  d.fa2_binding.fixed_span=span;
+ }
+ e.decode_graph_nodes.push_back(std::move(d));
+ auto&owned=e.decode_graph_nodes.back();owned.params.kernelParams=owned.args.data();return true;
+}
+static bool validate_decode_fa2_adapter(const cudaKernelNodeParams&p,bool prepare){
+ if(!p.kernelParams||p.extra||p.sharedMemBytes||!decode_fa2_grid(p.gridDim,8,1,1)
+  ||!decode_fa2_grid(p.blockDim,256,1,1))return false;
+ for(unsigned i=0;i<(prepare?4u:3u);++i)if(!p.kernelParams[i])return false;
+ auto*base=static_cast<uint8_t*>(execution().attention_scratch);
+ const void*input=*static_cast<const void*const*>(p.kernelParams[0]);
+ void*output=*static_cast<void*const*>(p.kernelParams[1]);
+ if(!base||*static_cast<const uint32_t*>(p.kernelParams[2])!=2048)return false;
+ if(prepare){const float scale=*static_cast<const float*>(p.kernelParams[3]);
+  return output==base&&std::isfinite(scale)&&scale>0.f&&decode_fa2_buffer_capacity(input)>=8192;}
+ return input==base+4096&&decode_fa2_buffer_capacity(output)>=8192;
+}
+static bool add_decode_fa2_dequant(cudaGraphNode_t node,const cudaKernelNodeParams&p,bool fallback){
+ auto&e=execution();const unsigned argc=fallback?7:6;
+ if(!p.kernelParams||p.extra)return false;
+ for(unsigned i=0;i<argc;++i)if(!p.kernelParams[i])return false;
+ const void*src=*static_cast<const void*const*>(p.kernelParams[0]);
+ const void*dst=*static_cast<const void*const*>(p.kernelParams[1]);
+ const unsigned slots=*static_cast<const uint32_t*>(p.kernelParams[3]);
+ const void*pages=*static_cast<const void*const*>(p.kernelParams[fallback?6:5]);
+ if(*static_cast<const uint32_t*>(p.kernelParams[2])!=512||slots!=uint64_t(e.decode_start_pos)+1
+  ||*static_cast<const uint32_t*>(p.kernelParams[fallback?5:4])
+  ||(fallback&&*static_cast<const uint32_t*>(p.kernelParams[4])!=8)
+  ||p.sharedMemBytes||!decode_fa2_grid(p.gridDim,fallback?1:2,slots,1)
+  ||!decode_fa2_grid(p.blockDim,fallback?64:256,1,1)
+  ||decode_fa2_buffer_capacity(dst)<uint64_t(slots)*1024)return false;
+ uint64_t capacity=0;
+ for(unsigned l=0;l<MAX_LAYERS;++l)if(src==e.kv_k[l]||src==e.kv_v[l]){
+  if(!src||pages!=kv_device_page_table(l)||kv_page_table_requires_mapping(l))return false;
+  capacity=e.kv_bytes[l]/544;break;}
+ if(capacity<=e.decode_start_pos)return false;
+ const auto maximum=uint32_t(std::min<uint64_t>(capacity-1,UINT32_MAX-1ull));
+ e.graph_max_start=std::min(e.graph_max_start,maximum);
+ e.decode_graph_max_start=std::min(e.decode_graph_max_start,maximum);
+ return add_dynamic_graph_node(node,p,argc,UINT32_MAX,3,fallback?5:4,NativeGraphUpdate::ValidGridY);
+}
+static int update_decode_fa2_graph_node(DynamicGraphNode&d,unsigned start){
+ auto&e=execution();const unsigned span=d.fa2_binding.fixed_span;
+ if(!batch_invariant_q8_v1_active()||start==UINT32_MAX||span<256
+  ||e.attention_scratch!=d.fa2_scratch||e.attention_scratch_bytes!=d.fa2_scratch_bytes)return CUDA_RC_INVALID;
+ const unsigned chunks=decode_fa2_chunks(start,span);
+ if(8192+uint64_t(chunks)*(4096+32*sizeof(float))>d.fa2_scratch_bytes)return CUDA_RC_INVALID;
+ if(d.native_update==NativeGraphUpdate::Fa2ParamsV1){
+  if(d.args.size()!=1||d.fa2_arguments.empty()
+   ||decode_fa2_buffer_capacity(d.fa2_binding.k)<(uint64_t(start)+1)*1024
+   ||decode_fa2_buffer_capacity(d.fa2_binding.v)<(uint64_t(start)+1)*1024
+   ||!imparo_d64_fa2_port::decode_replay_fa2_params(d.fa2_arguments.data(),start,
+    d.fa2_scratch,d.fa2_scratch_bytes,d.fa2_binding,false))return CUDA_RC_INVALID;
+  d.args[0]=d.fa2_arguments.data();d.params.gridDim.y=chunks;
+ }else{
+  if(d.args.size()!=8||d.fa2_arguments.size()!=8)return CUDA_RC_INVALID;
+  auto*tmp=reinterpret_cast<__half*>(static_cast<uint8_t*>(d.fa2_scratch)+8192);
+  void*ls=reinterpret_cast<float*>(tmp+uint64_t(chunks)*2048);
+  std::memcpy(&d.fa2_arguments[1],&ls,sizeof(ls));
+  std::memcpy(&d.fa2_arguments[4],&chunks,sizeof(chunks));
+  std::memcpy(&d.fa2_arguments[5],&start,sizeof(start));
+  for(unsigned i=0;i<8;++i)d.args[i]=&d.fa2_arguments[i];
+ }
+ d.params.kernelParams=d.args.data();d.params.extra=nullptr;
+ return cudaGraphExecKernelNodeSetParams(e.decode_graph_exec,d.node,&d.params)==cudaSuccess?0:CUDA_RC_ERROR;
+}
+#endif
+
 constexpr uint32_t kKvStoreGraphArgCount = 8;
 constexpr uint32_t kKvStoreGraphStartArg = 3;
 constexpr uint32_t kKvStoreGraphPageTableArg = 7;
@@ -5377,6 +5854,13 @@ bool configure_decode_graph_nodes() noexcept try {
         return false;
     }
     execution().decode_graph_nodes.clear();
+#if defined(IMPARO_CUDA_SPECULATIVE)
+    const bool fa2_v1=batch_invariant_q8_v1_active();
+    const auto fa=fa2_v1?imparo_d64_fa2_port::decode_replay_fa2_kernels()
+        :imparo_d64_fa2_port::DecodeReplayFa2Kernels{};
+    uint32_t fa2_count=0,merge_count=0,prepare_count=0,output_count=0,dequant_count=0;
+    std::vector<uint32_t>fa2_spans,merge_spans;
+#endif
     for (cudaGraphNode_t node : nodes) {
         cudaGraphNodeType type = cudaGraphNodeTypeEmpty;
         if (cudaGraphNodeGetType(node, &type) != cudaSuccess) return false;
@@ -5386,8 +5870,33 @@ bool configure_decode_graph_nodes() noexcept try {
         bool program_matched = false;
         if (!add_program_dynamic_graph_node(node, &program_matched)) return false;
         if (program_matched) continue;
+        bool w4_matched=false;
+        if (!w4_ffn_static_graph_node(node,&w4_matched)) return false;
+        if (w4_matched) continue;
         cudaKernelNodeParams params = {};
         if (cudaGraphKernelNodeGetParams(node, &params) != cudaSuccess) return false;
+#if defined(IMPARO_CUDA_SPECULATIVE)
+        if(fa2_v1){
+            if(graph_kernel_is(params.func,fa.causal)||graph_kernel_is(params.func,fa.merge)){
+                const bool merge=graph_kernel_is(params.func,fa.merge);
+                if(!add_decode_fa2_node(node,params,fa,merge))return false;
+                const auto span=execution().decode_graph_nodes.back().fa2_binding.fixed_span;
+                if(merge){++merge_count;merge_spans.push_back(span);}
+                else{++fa2_count;fa2_spans.push_back(span);}
+                continue;
+            }
+            if(graph_kernel_is(params.func,fa.prepare_q)||graph_kernel_is(params.func,fa.output)){
+                const bool prepare=graph_kernel_is(params.func,fa.prepare_q);
+                if(!validate_decode_fa2_adapter(params,prepare))return false;
+                if(prepare)++prepare_count;else ++output_count;continue;
+            }
+            const bool fallback=graph_kernel_is(params.func,(void*)k_kv_dequant);
+            if(fallback||graph_kernel_is(params.func,(void*)imparo_sm80_kv::dequant_parallel<8>)){
+                if(!add_decode_fa2_dequant(node,params,fallback))return false;
+                ++dequant_count;continue;
+            }
+        }
+#endif
         if (parallel_qk_graph_lab_enabled()) {
             if (graph_kernel_is(params.func,
                     (void *)imparo_sm80_kv::dequant_parallel<8>)) {
@@ -5409,7 +5918,11 @@ bool configure_decode_graph_nodes() noexcept try {
             }
         }
         const bool head =
-            graph_kernel_is(params.func, (void *)k_head_norm_rope_hadamard<256, true>)
+            graph_kernel_is(params.func, (void *)k_head_norm_rope_hadamard<64, true>)
+            || graph_kernel_is(params.func, (void *)k_head_norm_rope_hadamard<64, false>)
+            || graph_kernel_is(params.func, (void *)k_head_norm_rope_hadamard<128, true>)
+            || graph_kernel_is(params.func, (void *)k_head_norm_rope_hadamard<128, false>)
+            || graph_kernel_is(params.func, (void *)k_head_norm_rope_hadamard<256, true>)
             || graph_kernel_is(params.func, (void *)k_head_norm_rope_hadamard<256, false>)
             || graph_kernel_is(params.func, (void *)k_head_norm_rope_hadamard<1024, true>)
             || graph_kernel_is(params.func, (void *)k_head_norm_rope_hadamard<1024, false>);
@@ -5608,6 +6121,13 @@ bool configure_decode_graph_nodes() noexcept try {
         }
         if (values) continue;
     }
+#if defined(IMPARO_CUDA_SPECULATIVE)
+    if(fa2_v1){
+        std::sort(fa2_spans.begin(),fa2_spans.end());std::sort(merge_spans.begin(),merge_spans.end());
+        if(!fa2_count||merge_count!=fa2_count||prepare_count!=fa2_count||output_count!=fa2_count
+            ||dequant_count!=2*fa2_count||fa2_spans!=merge_spans)return false;
+    }
+#endif
     return execution().decode_graph_nodes.size() == execution().graph_expected_dynamic_nodes;
 } catch (...) {
     // Graph discovery owns temporary vectors and Program argument copies. Any
@@ -5628,30 +6148,44 @@ static bool configure_verification_graph(cudaGraph_t graph) noexcept try {
     std::vector<cudaGraphNode_t> nodes(count);
     if (cudaGraphGetNodes(graph, nodes.data(), &count) != cudaSuccess) return false;
     uint32_t attention_nodes = 0;
+    uint32_t d512_shared_nodes = 0, d512_register_nodes = 0;
+    uint32_t short_pv_shared_nodes = 0, short_pv_register_nodes = 0;
     for (auto node : nodes) {
         cudaGraphNodeType type;
         if (cudaGraphNodeGetType(node, &type) != cudaSuccess) return false;
         if (type != cudaGraphNodeTypeKernel) continue;
+        bool w4_matched=false;
+        if (!w4_ffn_static_graph_node(node,&w4_matched)) return false;
+        if (w4_matched) continue;
         cudaKernelNodeParams p = {};
         if (cudaGraphKernelNodeGetParams(node, &p) != cudaSuccess || !p.kernelParams) return false;
         uint32_t argc=0, si=UINT32_MAX, vi=UINT32_MAX, ri=UINT32_MAX;
-        bool d512 = false, small_queries = false, common_queries = false, dequant = false;
+        bool d512 = false, d256_vector = false, d256_shared = false, small_queries = false, common_queries = false, dequant = false;
         uint32_t common_ring=0;
         uint32_t span_index = UINT32_MAX, workspace_index = UINT32_MAX, parts_index = UINT32_MAX;
         const auto is = [&](void * f) { return graph_kernel_is(p.func, f); };
-        if (is((void *)k_head_norm_rope_hadamard<256,true>)
+        if (is((void *)k_head_norm_rope_hadamard<64,true>)
+                || is((void *)k_head_norm_rope_hadamard<64,false>)
+                || is((void *)k_head_norm_rope_hadamard<128,true>)
+                || is((void *)k_head_norm_rope_hadamard<128,false>)
+                || is((void *)k_head_norm_rope_hadamard<256,true>)
                 || is((void *)k_head_norm_rope_hadamard<256,false>)
                 || is((void *)k_head_norm_rope_hadamard<1024,true>)
                 || is((void *)k_head_norm_rope_hadamard<1024,false>)) { argc=13; si=6; }
         else if (is((void *)k_rope)) { argc=9; si=6; }
         else if (is((void *)k_kv_store_q4)) { argc=8; si=3; }
 #if defined(IMPARO_CUDA_SPECULATIVE)
-        else if (is((void *)imparo_sm80_d256_vec::partial_q4_gqa4_m3)) { argc=11; si=7; ri=8; ++attention_nodes; }
+        else if (is((void *)imparo_sm80_d256_vec::partial_q4_gqa4_m3)) { argc=11; si=7; ri=8; d256_shared=true; ++attention_nodes; }
 #endif
         else if (is((void *)imparo_sm80_d256_vec::partial_q4_gqa4)
-                || is((void *)imparo_sm80_d256_vec::partial_q4)) { argc=12; si=7; ri=8; ++attention_nodes; }
+                || is((void *)imparo_sm80_d256_vec::partial_q4)) { argc=12; si=7; ri=8; d256_vector=true; ++attention_nodes; }
 #if defined(IMPARO_CUDA_SPECULATIVE)
-        else if (is((void *)imparo_sm86_d512_m3_shared::partial)) { argc=14; si=7; vi=10; ri=9; d512=true; ++attention_nodes; }
+        else if (is((void *)imparo_sm86_d512_m3_shared::partial)
+                || is((void *)imparo_sm86_d512_register_fragments::partial)) {
+            argc=14; si=7; vi=10; ri=9; d512=true; ++attention_nodes;
+            if (is((void *)imparo_sm86_d512_register_fragments::partial)) ++d512_register_nodes;
+            else ++d512_shared_nodes;
+        }
         else if (is((void *)imparo_sm86_d512_pipeline::partial_q4)
                 || is((void *)imparo_sm86_d512_pipeline::partial_q4_pair)
                 || is((void *)imparo_sm80_d512_pair::partial_q4_pair)
@@ -5665,8 +6199,17 @@ static bool configure_verification_graph(cudaGraph_t graph) noexcept try {
         } else if (is((void *)imparo_sm80_d512_small::values_combine<256,1,1,4,false>)
                 || is((void *)imparo_sm80_d512_small::values_combine<256,1,2,4,false>)
                 || is((void *)imparo_sm80_d512_small::values_combine<512,2,1,4,false>)
-                || is((void *)imparo_sm80_d512_small::values_combine<512,2,2,4,false>)) {
+                || is((void *)imparo_sm80_d512_small::values_combine<512,2,2,4,false>)
+#if defined(IMPARO_CUDA_SPECULATIVE)
+                || is((void *)imparo_sm80_d512_small::values_combine<512,2,1,4,false,false,true>)
+#endif
+                ) {
             if (*static_cast<const uint32_t*>(p.kernelParams[7])!=3) return false;
+#if defined(IMPARO_CUDA_SPECULATIVE)
+            if (is((void *)imparo_sm80_d512_small::values_combine<512,2,1,4,false,false,true>)) ++short_pv_register_nodes;
+#endif
+            if (is((void *)imparo_sm80_d512_small::values_combine<512,2,1,4,false>)
+                || is((void *)imparo_sm80_d512_small::values_combine<512,2,2,4,false>)) ++short_pv_shared_nodes;
             argc=13; vi=9; ri=8; span_index=10; workspace_index=1; parts_index=11; common_queries=true;
         } else if (is((void *)imparo_sm80_d512_small::softmax_parts)) {
             // The captured stream edge identifies this exact score producer.
@@ -5710,7 +6253,25 @@ static bool configure_verification_graph(cudaGraph_t graph) noexcept try {
         }
         if (ri != UINT32_MAX) d.ring=u32(ri);
         else if(common_queries)d.ring=common_ring;
-        if (d.ring && e.batch_geometry_start < d.ring && !small_queries && !common_queries && !dequant) return false;
+        if (d256_vector) {
+            uint32_t upper = 0;
+            if (*static_cast<const void * const *>(p.kernelParams[11]) != nullptr
+                || !imparo_sm80_d256_vec_plan::verification_bucket_max(
+                    e.batch_geometry_start, d.start_delta, d.ring,
+                    u32(9), p.gridDim.y, &upper)) return false;
+            e.verification_max_start = std::min(e.verification_max_start, upper);
+        }
+        if (d256_shared) {
+            uint32_t upper = 0;
+            if (d.start_delta != 0 || u32(4) != 8 || u32(5) != 2 || u32(6) != 512
+                || d.ring != 1023 || p.gridDim.x != 8 || p.gridDim.z != 1
+                || p.blockDim.x != 32 || p.blockDim.y != 4 || p.blockDim.z != 1
+                || !imparo_sm80_d256_vec_plan::shared_verification_bucket_max(
+                    e.batch_geometry_start, d.ring, u32(9), p.gridDim.y, &upper)) return false;
+            e.verification_max_start = std::min(e.verification_max_start, upper);
+        }
+        if (d.ring && e.batch_geometry_start < d.ring
+            && !d256_vector && !d256_shared && !small_queries && !common_queries && !dequant) return false;
         if (vi != UINT32_MAX) {
             if (small_queries || common_queries || dequant) {
                 d.valid_delta=(dequant || common_queries) ? 3u : 1u;
@@ -5755,7 +6316,7 @@ static bool configure_verification_graph(cudaGraph_t graph) noexcept try {
             // unsaturated ring changes only exact row pitches and the score grid.
             // Keep the original partition seams, kernels and cross-group fallback.
             const uint32_t groups = (span + 31u) / 32u;
-            if (growing_span && std::strcmp(growing_span,"1")==0
+            if ((e4b_retained_decode_policy_enabled() ? g.e4b_retained_domain==1 : (growing_span && std::strcmp(growing_span,"1")==0))
                     && d.ring && e.batch_geometry_start < d.ring
                     && parts < groups && d.ring >= queries) {
                 upper = d.ring - queries;
@@ -5790,8 +6351,16 @@ static bool configure_verification_graph(cudaGraph_t graph) noexcept try {
         }
         e.verification_nodes.push_back(std::move(d));
     }
-    return attention_nodes > 0 && e.verification_nodes.size()==e.graph_expected_dynamic_nodes
+    const bool reusable = attention_nodes > 0
+        && e.verification_nodes.size()==e.graph_expected_dynamic_nodes
         && e.verification_min_start <= e.verification_max_start;
+    if (trace_cuda_graph() && (d512_shared_nodes || d512_register_nodes))
+        std::fprintf(stderr, "[verify-graph-d512] shared=%u register_fragments=%u reusable=%u\n",
+            d512_shared_nodes,d512_register_nodes,unsigned(reusable));
+    if (trace_cuda_graph() && (short_pv_shared_nodes || short_pv_register_nodes))
+        std::fprintf(stderr, "[verify-graph-short-pv] shared=%u register_fragments=%u reusable=%u\n",
+            short_pv_shared_nodes,short_pv_register_nodes,unsigned(reusable));
+    return reusable;
 } catch (...) { return false; }
 
 static int replay_verification_graph(uint32_t start) {
@@ -5825,6 +6394,12 @@ static int replay_verification_graph(uint32_t start) {
 int update_decode_graph_nodes(uint32_t start_pos) {
     const bool device_control = decode_device_control_enabled();
     for (DynamicGraphNode & dynamic : execution().decode_graph_nodes) {
+#if defined(IMPARO_CUDA_SPECULATIVE)
+        if(dynamic.native_update==NativeGraphUpdate::Fa2ParamsV1
+            ||dynamic.native_update==NativeGraphUpdate::Fa2MergeV1){
+            const int rc=update_decode_fa2_graph_node(dynamic,start_pos);if(rc)return rc;continue;
+        }
+#endif
         if (!dynamic.program_arguments.empty()) {
             if (dynamic.program_arguments.size() != dynamic.args.size()
                 || dynamic.program_update_sources.size() != dynamic.args.size()) {
@@ -5967,6 +6542,23 @@ int upload_staged_decode_inputs() {
 // Every function returns 0 on success where a result is meaningful. The .def export
 // list for the Windows DLL build lives next to this file.
 
+extern "C" int imparo_cuda_prepare_projection_phase(uint32_t decode_or_verify) {
+    if (g.e4b_retained_policy == 1
+            && (!e4b_retained_decode_policy_enabled()
+                || !g.e4b_retained_policy_frozen || !g.e4b_retained_domain
+                || g.e4b_retained_weights_identity != g.weights
+                || g.kv_type_k != 2 || g.kv_type_v != 2
+                || g.tuner_mode || g.tuner_lab)) {
+        set_pending(CUDA_RC_INVALID,"retained E4B policy model/KV/owner mismatch");
+        return CUDA_RC_INVALID;
+    }
+    g.e4b_retained_policy_frozen = true;
+    // Preserve the existing cold Prefill. Only reuse a packed representation
+    // that ordinary Decode/verification has already prepared for this owner.
+    return w4_ffn_prepare_phase(decode_or_verify != 0
+        || (w4_ffn_packed_prefill_requested() && w4_ffn_has_packed_weights()));
+}
+
 extern "C" uint32_t imparo_cuda_abi_version(void) { return IMPARO_CUDA_BACKEND_ABI; }
 
 extern "C" int imparo_cuda_runtime_identity(ImparoCudaRuntimeIdentityWire * out,
@@ -6006,6 +6598,17 @@ extern "C" int imparo_cuda_runtime_identity(ImparoCudaRuntimeIdentityWire * out,
     return 0;
 }
 
+// Source-build-only bridge: not exported by the dynamic release ABI. The common
+// planner owns this reserve; legacy callers without a placement retain their default.
+extern "C" int imparo_cuda_set_placement_reserve(uint64_t bytes) {
+    if (g.weights_host || !execution_owners.empty() || execution().graph_capturing) {
+        return CUDA_RC_INVALID;
+    }
+    g.placement_reserve_bytes = bytes;
+    g.has_placement_reserve = true;
+    return 0;
+}
+
 extern "C" int imparo_cuda_init(const void * weights_host, uint64_t len,
                                   const WeightSpanWire * streamed,
                                   uint32_t streamed_count) {
@@ -6042,8 +6645,11 @@ extern "C" int imparo_cuda_init(const void * weights_host, uint64_t len,
     const uint64_t resident_bytes = len - streamed_bytes;
     size_t free = 0, total = 0;
     CUDA_OK(cudaMemGetInfo(&free, &total));
-    const uint64_t reserve = env_mib(
-        "IMPARO_CUDA_RESERVE_MIB", std::max<uint64_t>(512ull << 20, uint64_t(total) / 8));
+    const uint64_t reserve = g.has_placement_reserve
+        ? std::max(g.placement_reserve_bytes,
+            env_mib("IMPARO_CUDA_RESERVE_MIB", g.placement_reserve_bytes))
+        : env_mib("IMPARO_CUDA_RESERVE_MIB",
+            std::max<uint64_t>(512ull << 20, uint64_t(total) / 8));
     g.runtime_reserve_bytes = reserve;
 
     // Fast path: only claim residency if activations/KV retain an explicit reserve.
@@ -6124,6 +6730,8 @@ extern "C" int imparo_cuda_init(const void * weights_host, uint64_t len,
 
 extern "C" int imparo_cuda_memory_info(uint64_t * free_out, uint64_t * total_out,
                                         uint64_t * allocated_out) {
+    const int runtime_rc = ensure_cuda_runtime();
+    if (runtime_rc) return runtime_rc;
     size_t free = 0, total = 0;
     cudaError_t err = cudaMemGetInfo(&free, &total);
     if (err != cudaSuccess) return CUDA_RC_ERROR;
@@ -6267,6 +6875,7 @@ extern "C" uint32_t imparo_cuda_device_tag(uint8_t * dst, uint32_t len) {
 }
 
 static void begin_forward(bool decode) {
+    weight_transfer_begin(decode);
 #if defined(IMPARO_CUDA_SPECULATIVE)
     execution().projection_reference_active = false;
 #endif
@@ -6449,9 +7058,10 @@ static int prefill_body_capture_or_replay(
         && execution().batch_geometry_valid
         && execution().prefill_graph_canonical_start == execution().batch_canonical_start
         && execution().prefill_graph_canonical_tokens == execution().batch_canonical_tokens
-        && execution().prefill_graph_argmax == (argmax != 0);
+        && execution().prefill_graph_argmax == (argmax != 0)
+        && execution().prefill_graph_w4_packed == w4_ffn_has_packed_weights();
     if (!descriptor_ok) {
-        destroy_prefill_graph();
+        if (!destroy_prefill_graph_checked()) return -CUDA_RC_ERROR;
         execution().prefill_graph_blocked = true;
         return 0;
     }
@@ -6511,14 +7121,16 @@ extern "C" int imparo_cuda_prefill_prepare(
         && execution().batch_geometry_valid
         && execution().prefill_graph_canonical_start == execution().batch_canonical_start
         && execution().prefill_graph_canonical_tokens == execution().batch_canonical_tokens
-        && execution().prefill_graph_argmax == (argmax != 0);
+        && execution().prefill_graph_argmax == (argmax != 0)
+        && execution().prefill_graph_w4_packed == w4_ffn_has_packed_weights();
     if (!same_key) {
-        destroy_prefill_graph();
+        if (!destroy_prefill_graph_checked()) return -CUDA_RC_ERROR;
         execution().prefill_graph_tokens = count;
         execution().prefill_graph_start = start_pos;
         execution().prefill_graph_canonical_start = execution().batch_canonical_start;
         execution().prefill_graph_canonical_tokens = execution().batch_canonical_tokens;
         execution().prefill_graph_argmax = argmax != 0;
+        execution().prefill_graph_w4_packed = w4_ffn_has_packed_weights();
         execution().prefill_warm_forwards = 0;
         execution().prefill_graph_blocked = false;
         execution().prefill_token_buf = UINT32_MAX;
@@ -6643,9 +7255,11 @@ extern "C" int imparo_cuda_verification_body_begin(uint32_t rows, uint32_t start
 #if defined(IMPARO_CUDA_SPECULATIVE)
     const char * flag = std::getenv("IMPARO_LAB_VERIFY_GRAPH_UPDATE");
     auto & e = execution();
-    const bool short_reuse = flag && std::strcmp(flag, "3") == 0;
-    const bool reuse = short_reuse || (flag && std::strcmp(flag, "2") == 0);
-    if (!flag || (!reuse && std::strcmp(flag, "1") != 0) || rows != 3 || g.sm_version != 86
+    const bool retained = e4b_retained_decode_policy_enabled();
+    // All three retained profiles used mode 3; only common/growing-span differ.
+    const bool short_reuse = retained || (flag && std::strcmp(flag, "3") == 0);
+    const bool reuse = retained || short_reuse || (flag && std::strcmp(flag, "2") == 0);
+    if ((!retained && (!flag || (!reuse && std::strcmp(flag, "1") != 0))) || rows != 3 || g.sm_version != 86
             || g.kv_type_k != 2 || g.kv_type_v != 2 || !g.weights_resident
             || g.tuner_mode || g.tuner_lab || !e.forward_open || e.forward_decode
             || e.graph_capturing || e.prefill_prepared || e.pending_error
@@ -6680,6 +7294,12 @@ extern "C" int imparo_cuda_verification_body_begin(uint32_t rows, uint32_t start
 }
 extern "C" void imparo_cuda_flush(void) { /* async stream: kernels already queued */ }
 extern "C" int imparo_cuda_end(void) {
+#if defined(IMPARO_CUDA_SPECULATIVE)
+    if (execution().tree_capture_active) {
+        imparo_cuda_tree_graph_abort();
+        set_pending(CUDA_RC_INVALID, "unfinished tree capture");
+    }
+#endif
     const bool profile = std::getenv("IMPARO_CUDA_PROFILE_FORWARD") != nullptr;
     bool discard_captured_graph = false;
     if (execution().graph_capturing) {
@@ -6843,6 +7463,7 @@ extern "C" int imparo_cuda_end(void) {
             }
         }
     }
+    if (weight_transfer_finish()) set_pending(CUDA_RC_ERROR,"weight transfer finish");
     cudaError_t launch = cudaGetLastError();
     if (execution().forward_timing_armed
         && cudaEventRecord(execution().forward_stop, g.stream) != cudaSuccess) {
@@ -7143,10 +7764,21 @@ extern "C" double imparo_cuda_probe(
     return host_us / n;
 }
 
+// Opt-in physical capacity retention within the existing execution owner.
+// Logical shapes, arena placements and Graph invalidation remain independent.
+static bool retain_activation_capacity() {
+    if (imparo_lfm_retained::enabled()) return imparo_lfm_retained::domain()==1;
+    static const bool enabled = [] {
+        const char * value = std::getenv("IMPARO_LAB_RETAIN_ACTIVATION_CAPACITY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 extern "C" int imparo_cuda_alloc(uint32_t id, uint64_t bytes) {
     if (id >= B_COUNT) return 1;
     if (execution().bufs[id] && !execution().in_arena[id] && execution().sizes[id] >= bytes
-        && bytes * 2 >= execution().sizes[id]) return 0;   // the .mm's shrink hysteresis
+        && (retain_activation_capacity() || bytes * 2 >= execution().sizes[id])) return 0;
     destroy_decode_graph();
     if (execution().bufs[id] && !execution().in_arena[id]) cudaFree(execution().bufs[id]);
     execution().bufs[id] = nullptr; execution().sizes[id] = 0; execution().in_arena[id] = false;
@@ -7164,6 +7796,10 @@ extern "C" int imparo_cuda_arena(uint64_t bytes) {
     for (int i = 0; i < B_COUNT; ++i) if (execution().in_arena[i]) {
         execution().bufs[i] = nullptr; execution().in_arena[i] = false; mark_buf_written(i);
     }
+    // All old arena views were cleared above, including aliases skipped by the
+    // narrower layout. Retain storage only after preserving that invalidation.
+    if (retain_activation_capacity() && execution().arena
+        && bytes <= execution().arena_size) return 0;
     if (execution().arena) cudaFree(execution().arena);
     execution().arena = nullptr; execution().arena_size = 0;
     int rc = alloc_raw_with_packed_q4_reclaim(
@@ -7517,6 +8153,38 @@ extern "C" void imparo_cuda_write_u32(uint32_t id, uint64_t off, const uint32_t 
     }
     mark_buf_written(id);
 }
+#if defined(IMPARO_CUDA_SPECULATIVE)
+// Fixed correctness probes use the active owner and stream, but must observe
+// transfer failures directly. Ordinary dispatch/readback remains unchanged.
+extern "C" int imparo_cuda_gate_transfer_f32(uint32_t id, uint64_t off,
+                                             float * host, uint64_t n,
+                                             uint32_t upload) {
+    auto & e = execution();
+    if (id >= B_COUNT || upload > 1 || !g.stream || e.graph_capturing
+            || e.tree_capture_active || e.pending_error) return CUDA_RC_INVALID;
+    const uint64_t capacity = e.sizes[id] / sizeof(float);
+    if (off > capacity || n > capacity - off || (!host && n)
+            || (!e.bufs[id] && n)) return CUDA_RC_INVALID;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(g.stream, &capture) != cudaSuccess)
+        return CUDA_RC_ERROR;
+    if (capture != cudaStreamCaptureStatusNone) return CUDA_RC_INVALID;
+    if (!n) return 0;
+    float * device = static_cast<float *>(e.bufs[id]) + off;
+    const cudaError_t copied = upload
+        ? cudaMemcpyAsync(device, host, size_t(n * sizeof(float)),
+                          cudaMemcpyHostToDevice, g.stream)
+        : cudaMemcpyAsync(host, device, size_t(n * sizeof(float)),
+                          cudaMemcpyDeviceToHost, g.stream);
+    // Keep the borrowed host storage alive until all submitted stream work ends,
+    // including when a copy call itself fails.
+    const cudaError_t synced = cudaStreamSynchronize(g.stream);
+    if (copied != cudaSuccess || synced != cudaSuccess) return CUDA_RC_ERROR;
+    if (upload) mark_buf_written(id);
+    return 0;
+}
+#endif
+
 extern "C" void imparo_cuda_read(uint32_t id, uint64_t off, float * dst, uint64_t n) {
     cudaMemcpyAsync(dst, static_cast<const float *>(execution().bufs[id]) + off, n * 4,
                     cudaMemcpyDeviceToHost, g.stream);
@@ -7827,7 +8495,241 @@ extern "C" void imparo_cuda_set_epilogue(uint32_t on) {
     }
     execution().epilogue = on;
 }
+// Workflow policy has no native timing slot. The existing model owner freezes
+// it before execution; changing only M1 or only verification is never permitted.
+extern "C" int imparo_cuda_set_weight_transfer_policy(uint32_t value) {
+    if (value > 1 || (value != g.weight_transfer_policy && g.weight_transfer_frozen)) {
+        set_pending(CUDA_RC_INVALID,"weight transfer policy change after execution");
+        return CUDA_RC_INVALID;
+    }
+    if (value != g.weight_transfer_policy) {
+        if (!destroy_all_execution_graphs_checked()) return CUDA_RC_ERROR;
+        invalidate_all_execution_choices();
+        ++g.choice_epoch; if (!g.choice_epoch) ++g.choice_epoch;
+        g.weight_transfer_policy=value;
+    }
+    return 0;
+}
+extern "C" uint32_t imparo_cuda_weight_transfer_policy() { return g.weight_transfer_policy; }
+extern "C" int imparo_cuda_set_ptq_prefill_tensorcore(uint32_t value) {
+#if !defined(IMPARO_CUDA_ENABLE_PTQ_CUBLAS)
+    if (value == 3) {
+        set_pending(CUDA_RC_INVALID,"bounded PTQ GEMM provider absent from this build");
+        return CUDA_RC_INVALID;
+    }
+#endif
+    if (value > 3 || (value && g.sm_version < 80)
+        || (value >= 2 && g.sm_version != 86)) {
+        set_pending(CUDA_RC_INVALID,"unsupported PTQ prefill numerical policy");
+        return CUDA_RC_INVALID;
+    }
+    if (value != g.ptq_prefill_tensorcore) {
+        // KV/recurrent state was produced under one numerical policy. Changing
+        // it in place would create a mixed-history model, even with no Graph.
+        if (g.ptq_prefill_tensorcore_frozen) {
+            set_pending(CUDA_RC_INVALID,"PTQ policy change after model execution");
+            return CUDA_RC_INVALID;
+        }
+        if (!destroy_all_execution_graphs_checked()) {
+            set_pending(CUDA_RC_ERROR,"owner graphs before PTQ policy change");
+            return CUDA_RC_ERROR;
+        }
+        invalidate_all_execution_choices();
+        ++g.choice_epoch;
+        if (!g.choice_epoch) ++g.choice_epoch;
+        invalidate_q8_cache();
+        g.ptq_prefill_tensorcore = value;
+        g.ptq_prefill_tensorcore_trace_mask = 0;
+    }
+    return 0;
+}
+extern "C" uint32_t imparo_cuda_ptq_prefill_tensorcore() {
+    return g.ptq_prefill_tensorcore;
+}
+extern "C" int imparo_cuda_set_e4b_ffn_w4a16(uint32_t value) {
+    if (value > 2) {
+        set_pending(CUDA_RC_INVALID,"unsupported E4B FFN numerical policy");
+        return CUDA_RC_INVALID;
+    }
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    const uint32_t selected = value ? value : (w4_ffn_lab_requested() ? 1u : 0u);
+    if (w4_ffn.policy_frozen) {
+        if (selected==w4_ffn.policy) return 0;
+        set_pending(CUDA_RC_INVALID,"E4B FFN policy change after owner preparation");
+        return CUDA_RC_INVALID;
+    }
+    if (value!=0 && (g.sm_version!=86 || g.sm_count!=30)) {
+        set_pending(CUDA_RC_INVALID,"unsupported E4B W4A16 device");
+        return CUDA_RC_INVALID;
+    }
+    if (selected!=w4_ffn_policy_value()) {
+        if (!destroy_all_execution_graphs_checked()) {
+            set_pending(CUDA_RC_ERROR,"owner graphs before FFN policy change");
+            return CUDA_RC_ERROR;
+        }
+        invalidate_all_execution_choices();
+        ++g.choice_epoch;
+        if (!g.choice_epoch) ++g.choice_epoch;
+        invalidate_q8_cache();
+    }
+    w4_ffn.policy=value;
+    return 0;
+#else
+    if (value==0) return 0;
+    set_pending(CUDA_RC_INVALID,"E4B W4A16 provider not built");
+    return CUDA_RC_INVALID;
+#endif
+}
+extern "C" uint32_t imparo_cuda_e4b_ffn_w4a16() {
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    if (g.sm_version!=86 || g.sm_count!=30) return 0;
+    return w4_ffn_policy_value();
+#else
+    return 0;
+#endif
+}
+
+extern "C" int imparo_cuda_set_lfm_retained_policy(uint32_t value) {
+    if (value>1) return CUDA_RC_INVALID;
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    if (g.lfm_retained_domain && value!=g.lfm_retained_policy) {
+        set_pending(CUDA_RC_INVALID,"retained LFM policy is model-owner frozen");
+        return CUDA_RC_INVALID;
+    }
+    if (value && (g.sm_version!=86 || g.sm_count!=30 || g.e4b_retained_policy)) return CUDA_RC_INVALID;
+    if (value!=g.lfm_retained_policy) {
+        if (!destroy_all_execution_graphs_checked()) return CUDA_RC_ERROR;
+        invalidate_all_execution_choices(); invalidate_q8_cache();
+        if (!++g.choice_epoch) ++g.choice_epoch;
+    }
+    g.lfm_retained_policy=value;
+    return 0;
+#else
+    return value==0 ? 0 : CUDA_RC_INVALID;
+#endif
+}
+extern "C" uint32_t imparo_cuda_lfm_retained_policy() { return g.lfm_retained_policy; }
+extern "C" uint32_t imparo_cuda_lfm_retained_domain() {
+    return g.lfm_retained_policy==1 ? g.lfm_retained_domain : 0;
+}
+extern "C" int imparo_cuda_prepare_lfm_retained_policy(
+        uint32_t capacity,uint32_t batch,uint32_t hidden,uint32_t mid,
+        uint32_t layers,uint32_t heads,uint32_t kv_heads,uint32_t down_kind) {
+    if (!g.lfm_retained_policy) return 0;
+    const uint32_t domain=capacity==1024?1u:capacity==6656?2u:capacity==16896?3u:0u;
+    if (!domain || g.sm_version!=86 || g.sm_count!=30 || g.e4b_retained_policy
+        || !g.weights || !g.weights_resident || g.tuner_mode || g.tuner_lab
+        || hidden!=2048 || mid!=10752 || layers!=30 || heads!=32 || kv_heads!=8
+        || g.kv_type_k!=8 || g.kv_type_v!=8 || batch!=(domain==1?512u:1920u)
+        || down_kind!=(domain==1?3u:2u)
+        || (g.lfm_retained_domain && g.lfm_retained_domain!=domain)
+        || (g.lfm_retained_weights_identity && g.lfm_retained_weights_identity!=g.weights)) {
+        set_pending(CUDA_RC_INVALID,"retained LFM model/domain/layout mismatch");
+        return CUDA_RC_INVALID;
+    }
+    constexpr uint32_t slots[]={60,63,56,28,42,50,51,52,37};
+    constexpr uint32_t values[]={3,2,3,1,2,1,1,1,2};
+    for (unsigned i=0;i<sizeof(slots)/sizeof(slots[0]);++i) {
+        if (tuner_knob(slots[i])!=values[i]) {
+            set_pending(CUDA_RC_INVALID,"retained LFM registered knob mismatch");
+            return CUDA_RC_INVALID;
+        }
+    }
+    g.lfm_retained_domain=domain;
+    g.lfm_retained_weights_identity=g.weights;
+    std::fprintf(stderr,"[lfm-retained-domain] version=1 capacity=%u batch=%u domain=%u down=%u frozen=1\n",capacity,batch,domain,down_kind);
+    return 0;
+}
+
+extern "C" int imparo_cuda_set_e4b_retained_decode_policy(uint32_t value) {
+    if (value && g.lfm_retained_policy) return CUDA_RC_INVALID;
+    if (value > 1) return CUDA_RC_INVALID;
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    if (g.e4b_retained_policy_frozen || g.e4b_retained_domain != 0) {
+        if (value == g.e4b_retained_policy) return 0;
+        set_pending(CUDA_RC_INVALID,"retained E4B policy change after owner preparation");
+        return CUDA_RC_INVALID;
+    }
+    if (value == 1 && (g.sm_version != 86 || g.sm_count != 30)) return CUDA_RC_INVALID;
+    if (value != g.e4b_retained_policy) {
+        if (!destroy_all_execution_graphs_checked()) return CUDA_RC_ERROR;
+        invalidate_all_execution_choices();
+        ++g.choice_epoch;
+        if (!g.choice_epoch) ++g.choice_epoch;
+        invalidate_q8_cache();
+    }
+    g.e4b_retained_policy = value;
+    return 0;
+#else
+    return value == 0 ? 0 : CUDA_RC_INVALID;
+#endif
+}
+extern "C" uint32_t imparo_cuda_e4b_retained_decode_policy() {
+    return e4b_retained_decode_policy_enabled() ? 1u : 0u;
+}
+extern "C" uint32_t imparo_cuda_e4b_retained_decode_domain() {
+    return e4b_retained_decode_policy_enabled() ? g.e4b_retained_domain : 0u;
+}
+extern "C" int imparo_cuda_prepare_e4b_retained_decode_policy(
+        uint32_t capacity, uint32_t hidden, uint32_t mid,
+        uint32_t layers, uint32_t heads, uint32_t kv_heads) {
+    if (!g.e4b_retained_policy) return 0;
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    if (w4_ffn_policy_value() == 2 && tuner_knob(33) != 3) {
+        set_pending(CUDA_RC_INVALID,"packed E4B Prefill policy requires D512 mode 3");
+        return CUDA_RC_INVALID;
+    }
+#endif
+    if (!e4b_retained_decode_policy_enabled() || !g.weights || !g.weights_resident
+            || hidden!=2560 || mid!=10240 || layers!=42 || heads!=8 || kv_heads!=2
+            || g.kv_type_k!=2 || g.kv_type_v!=2 || g.tuner_mode || g.tuner_lab)
+        return CUDA_RC_INVALID;
+    // Only these complete retained execution domains have on/off and lifecycle
+    // evidence. Unknown capacities fail closed rather than inventing a threshold.
+    const uint32_t domain = capacity==1024 ? 1u : capacity==6656 ? 2u : capacity==16896 ? 3u : 0u;
+    if (!domain || (g.e4b_retained_domain && g.e4b_retained_domain!=domain)
+            || (g.e4b_retained_weights_identity && g.e4b_retained_weights_identity!=g.weights))
+        return CUDA_RC_INVALID;
+    g.e4b_retained_domain=domain;
+    g.e4b_retained_weights_identity=g.weights;
+    std::fprintf(stderr,"[e4b-retained-domain] version=1 capacity=%u domain=%u\n",capacity,domain);
+    return 0;
+}
+
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+// The synchronous Rust bridge owns and authenticates this exact immutable slice.
+// Module lifetime stays with the existing W4 owner, after its referencing Graphs.
+extern "C" int imparo_cuda_load_e4b_ffn_w4a16(
+        const uint8_t *image, uint64_t bytes, const uint8_t *digest) {
+    if (!image || !digest || bytes!=imparo_w4a16_marlin::kCubinBytes
+            || !w4_ffn_enabled() || w4_ffn.poisoned
+            || w4_ffn.spans.size()!=42 || w4_ffn.weights_identity!=g.weights)
+        return CUDA_RC_INVALID;
+    if (w4_ffn.kernel.function)
+        return std::memcmp(digest,w4_ffn.loaded_module_sha256,32)==0 ? 0 : CUDA_RC_INVALID;
+    if (execution().graph_capturing || execution().prefill_capture_active
+            || execution().tree_capture_active) return CUDA_RC_INVALID;
+    int device=0;
+    if (cudaGetDevice(&device)!=cudaSuccess) return CUDA_RC_ERROR;
+    const CUresult rc=imparo_w4a16_marlin::initialize_image(
+        image,std::size_t(bytes),device,&w4_ffn.kernel);
+    if (rc!=CUDA_SUCCESS) return CUDA_RC_ERROR;
+    // Publish only after Driver load, function resolution and resource setup pass.
+    std::memcpy(w4_ffn.loaded_module_sha256,digest,32);
+    return 0;
+}
+extern "C" int imparo_cuda_e4b_ffn_w4a16_module_identity(uint8_t *out,uint32_t bytes) {
+    if (!out || bytes!=32 || !w4_ffn.kernel.function || !w4_ffn.kernel.module
+            || w4_ffn.poisoned) return CUDA_RC_INVALID;
+    std::memcpy(out,w4_ffn.loaded_module_sha256,32);
+    return 0;
+}
+#endif
+
 extern "C" void imparo_cuda_set_knob(uint32_t idx, uint32_t v) {
+    if (idx<64 && g.lfm_retained_domain && g.knobs[idx]!=v) {
+        set_pending(CUDA_RC_INVALID,"retained LFM knob change after preparation"); return;
+    }
     if (idx < 64) {
         if (g.knobs[idx] != v) {
             if (!destroy_all_execution_graphs_checked()) {
@@ -7879,9 +8781,25 @@ static bool short_prefill_replay_lab(uint32_t n_tok, uint32_t bit) {
         && execution().batch_canonical_tokens > 8;
 }
 
+// The opt-in target contract reuses the retained M9 arithmetic for actual 1..16
+// rows. A rejected numerical route must not fall back to another family.
+static bool batch_invariant_q8_rows(uint32_t rows) {
+    return batch_invariant_q8_v1_active() && rows >= 1 && rows <= 16;
+}
+static uint32_t reject_batch_invariant_q8(const char * reason) {
+    if (!execution().pending_error) set_pending(CUDA_RC_INVALID, reason);
+    return 1;
+}
+
+#include "bonsai_bridge.cuh"
+
 static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
                                     uint32_t n_out, uint32_t src, uint32_t dst,
                                     uint32_t n_tok, uint32_t src_row, uint32_t canonical_out) {
+    if (wkind == 39 || wkind == 40) {
+        if (canonical_out) { set_pending(CUDA_RC_INVALID,"Bonsai canonical output unsupported"); return; }
+        bonsai_matmat(wkind,w_off,n_in,n_out,src,dst,n_tok,src_row); return;
+    }
     if (src >= B_COUNT || dst >= B_COUNT || !execution().bufs[src] || !execution().bufs[dst]
         || !n_in || !n_out || !n_tok
         || (wkind != 0 && wkind != 1 && wkind != 2 && wkind != 3)) {
@@ -7899,6 +8817,67 @@ static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
         || n_tok != 512 || execution().epilogue || src_row || n_out % 128
         || canonical_out % 128)) {
         set_pending(CUDA_RC_INVALID, "projection prefix family"); return;
+    }
+    if ((wkind == 2 || wkind == 3) && batch_invariant_q8_rows(n_tok)) {
+        const uint32_t epilogue = execution().epilogue;
+        const bool sidecar = epilogue == 4;
+        const bool fused_silu = wkind == 3 && (epilogue == 2 || sidecar)
+            && tuner_knob(42) != 0 && tuner_knob(43) != 0;
+        if (g.sm_version != 86 || n_in % 256 || n_out % 64
+                || (epilogue && !fused_silu) || (fused_silu && n_out % 128)
+                || uint64_t(src_row) + n_tok > execution().sizes[src] / sizeof(float) / n_in
+                || uint64_t(n_tok) > execution().sizes[dst] / sizeof(float) / n_out
+                || std::getenv("IMPARO_CUDA_Q8_F32") != nullptr) {
+            reject_batch_invariant_q8("batch-invariant Q8 projection shape/policy"); return;
+        }
+        const uint8_t * weights = resident_weight_range(
+            w_off, uint64_t(n_in / 32) * 34 * n_out);
+        if (!weights) {
+            reject_batch_invariant_q8("batch-invariant Q8 projection resident weights"); return;
+        }
+        const uint64_t input_bytes = uint64_t(n_tok) * (n_in / 128) * sizeof(BlockQ8_1Mmq);
+        const int rc = ensure_q8_scratch(input_bytes);
+        if (rc) { set_pending(rc, "batch-invariant Q8 projection scratch"); return; }
+        if (sidecar && !ensure_q8_scratch_next(
+                uint64_t(n_tok) * (n_out / 128) * sizeof(BlockQ8_1Mmq))) {
+            reject_batch_invariant_q8("batch-invariant Q8 projection sidecar"); return;
+        }
+        const bool hit = q8_cache_matches(src,n_in,n_tok,src_row,Q8_LAYOUT_MMQ_D4);
+        if (!hit) {
+            k_quantize_q8_1_mmq<<<dim3(n_tok,(n_in+511)/512),128,0,g.stream>>>(
+                x,static_cast<BlockQ8_1Mmq *>(execution().q8_scratch),
+                n_in,n_tok,src_row,true,false);
+            own_q8_cache(src,n_in,n_tok,src_row,Q8_LAYOUT_MMQ_D4);
+        }
+        trace_q8_cache(hit,src,n_in,n_tok,src_row,Q8_LAYOUT_MMQ_D4);
+        namespace Q8 = imparo_sm80_q8_mmq;
+        const auto * input = static_cast<const BlockQ8_1Mmq *>(execution().q8_scratch);
+        auto * output_q8 = sidecar
+            ? static_cast<BlockQ8_1Mmq *>(execution().q8_scratch_next) : nullptr;
+        Q8::LaunchResult result;
+        if (sidecar) {
+            result = Q8::launch_aligned_whole_k<true,4>(weights,input,y,output_q8,
+                n_in,n_out,n_tok,n_out,0,g.stream,nullptr,true);
+        } else if (fused_silu) {
+            result = Q8::launch_aligned_whole_k<true,2>(weights,input,y,nullptr,
+                n_in,n_out,n_tok,n_out,0,g.stream,nullptr,true);
+        } else if (wkind == 3) {
+            result = Q8::launch_aligned_whole_k<true,0,false,4,4,16,64,true>(
+                weights,input,y,nullptr,n_in,n_out,n_tok,n_out,0,g.stream,nullptr,true);
+        } else {
+            result = Q8::launch_aligned_whole_k<false,0,false,4,4,16,64,true>(
+                weights,input,y,nullptr,n_in,n_out,n_tok,n_out,0,g.stream,nullptr,true);
+        }
+        if (result != Q8::LaunchResult::Launched) {
+            set_pending(result == Q8::LaunchResult::Error ? CUDA_RC_ERROR : CUDA_RC_INVALID,
+                "batch-invariant Q8 projection did not dispatch"); return;
+        }
+        mark_buf_written(dst);
+        if (sidecar) {
+            publish_q8_scratch_next();
+            own_q8_cache(dst,n_out,n_tok,0,Q8_LAYOUT_MMQ_D4);
+        }
+        return;
     }
     const bool q8_tm_silu_requested = wkind == 3
         && (execution().epilogue == 2 || execution().epilogue == 4)
@@ -7931,12 +8910,16 @@ static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
     const uint64_t tensor_bytes = row_bytes * n_out;
     // `weights_resident` means the hot subset was uploaded, not that this particular
     // tensor is resident. Streamed tensors remain bounded by the page cache.
-    const bool tensor_resident = resident_weight_range(w_off, tensor_bytes) != nullptr;
+    imparo_sm80_mmq::PackedWeightView packed_prefill_view{};
+    const bool packed_prefill = wkind == 1
+        && w4_ffn_packed_prefill_view(w_off, n_in, n_out, &packed_prefill_view);
+    const bool tensor_resident = packed_prefill
+        || resident_weight_range(w_off, tensor_bytes) != nullptr;
     if (q8_tm_silu_requested && !tensor_resident) {
         set_pending(CUDA_RC_INVALID, "Q8_0_TM SiLU epilogue requires resident weights");
         return;
     }
-    const uint64_t slice_limit = tensor_resident ? tensor_bytes : g.weight_cache_limit;
+    const uint64_t slice_limit = tensor_resident ? tensor_bytes : weight_transfer_slice_limit();
     if (row_bytes > slice_limit) {
         set_pending(CUDA_RC_OOM, "one weight row exceeds paged cache limit");
         return;
@@ -8056,6 +9039,10 @@ static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
         && (n_tok > imparo_sm80_mmvq::kMaxTokens || kv_large_all)
         && n_in % 128 == 0
         && !batch_dp4a && !kv_mma16 && !kv_fixed8 && !kv_virtual512 && !mmvq_batched;
+    if (packed_prefill && (!large_mmq_candidate || src_row != 0)) {
+        set_pending(CUDA_RC_INVALID, "packed FFN prefill requires original MMQ route");
+        return;
+    }
     const uint32_t projection_logical_tiles =
         (n_out / imparo_sm80_mmq::kRows)
         * ((n_tok + imparo_sm80_mmq::kTokens - 1)
@@ -8445,7 +9432,14 @@ static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
     for (uint32_t row_base = 0; row_base < n_out; row_base += rows_per_slice) {
         const uint32_t rows = std::min(rows_per_slice, n_out - row_base);
         const uint8_t * raw = nullptr;
-        int rc = wkind == 3
+        int rc = 0;
+        if (packed_prefill) {
+            if (row_base != 0 || rows != n_out) {
+                set_pending(CUDA_RC_INVALID, "packed FFN prefill cannot page canonical rows");
+                return;
+            }
+            raw = reinterpret_cast<const uint8_t *>(packed_prefill_view.words);
+        } else rc = wkind == 3
             ? q8_tm_weight_slice(
                 w_off, n_in, n_out, row_base, rows, &raw)
             : weight_slice(w_off + uint64_t(row_base) * row_bytes,
@@ -8459,7 +9453,7 @@ static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
         } else if (q8_weight) {
             if (q8_mmvq && projection_q8) {
                 if (wkind == 3) {
-                    if (n_in>n_out && std::getenv("IMPARO_LAB_Q8_DOWN_TM_ASYNC") != nullptr)
+                    if (n_in>n_out && imparo_lfm_retained::short_only(std::getenv("IMPARO_LAB_Q8_DOWN_TM_ASYNC") != nullptr))
                         imparo_sm80_q8_mmvq::launch_layout<true>(raw,projection_q8,y,
                             n_in,rows,n_tok,n_out,row_base,g.stream);
                     else imparo_sm80_q8_mmvq::launch_tile_major(
@@ -8467,7 +9461,7 @@ static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
                         n_out, row_base, g.stream);
                 } else {
                     imparo_sm80_q8_mmvq::launch(raw, projection_q8, y, n_in,
-                        rows, n_tok, n_out, row_base, g.stream);
+                        rows, n_tok, n_out, row_base, g.stream, e4b_retained_decode_policy_enabled() || imparo_lfm_retained::enabled());
                 }
             } else if (q8_mmq && projection_q8_mmq) {
                 imparo_sm80_mmq::LaunchInfo launch_info;
@@ -8683,10 +9677,10 @@ static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
 #if defined(IMPARO_CUDA_SPECULATIVE)
                     if (g.sm_version == 86 && batch_warps == 4 && rows % 2 == 0
                             && (tuner_knob(22) == 0 || batch_rows == 2)
-                            && [] { static const bool enabled = [] {
+                            && (e4b_retained_decode_policy_enabled() || [] { static const bool enabled = [] {
                                 const char *value = std::getenv("IMPARO_LAB_Q4_FULL_TILE_ROWS");
                                 return value && value[0] == '1';
-                            }(); return enabled; }()) {
+                            }(); return enabled; }())) {
                         imparo_sm80_mmvq::q4_q8_1_full_tiles<3, 4, 2>
                             <<<rows / 2, dim3(32, 4), 0, g.stream>>>(
                                 raw, projection_q8, y, n_in, rows,
@@ -8990,7 +9984,19 @@ static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
                     == imparo_sm86_mmq_gate_up_pipe::LaunchResult::Launched
                 || down_pipe_result
                     == imparo_sm86_mmq_down_pipe::LaunchResult::Launched
-                || imparo_sm80_mmq::launch(
+                || (packed_prefill
+                    ? imparo_sm80_mmq::launch_packed(
+                    packed_prefill_view, projection_q8_mmq, y, n_in, rows, large_tokens, execution().epilogue,
+                    n_out, row_base, uint32_t(g.sm_count), stream_k_numeric,
+                    execution().batch_geometry_start, virtual_mmq,
+                    tuner_knob(25), canonical_full_mmq,
+                    virtual_no_seam_mmq && g.sm_version == 86 ? 1u : 0u,
+                    virtual_direct_seam_mmq && g.sm_version == 86 ? 1u : 0u,
+                    virtual_async_activation_mmq && g.sm_version == 86 ? 1u : 0u,
+                    exact128_token64_mmq,
+                    full_tile_variant, full_tile_min_efficiency,
+                    mmq_workspace, epilogue_q8, g.stream, &launch_info, canonical_out)
+                    : imparo_sm80_mmq::launch(
                     raw, projection_q8_mmq, y, n_in, rows, large_tokens, execution().epilogue,
                     n_out, row_base, uint32_t(g.sm_count), stream_k_numeric,
                     execution().batch_geometry_start, virtual_mmq,
@@ -9000,7 +10006,18 @@ static void matmat_impl(uint32_t wkind, uint64_t w_off, uint32_t n_in,
                     virtual_async_activation_mmq && g.sm_version == 86 ? 1u : 0u,
                     exact128_token64_mmq,
                     full_tile_variant, full_tile_min_efficiency,
-                    mmq_workspace, epilogue_q8, g.stream, &launch_info, canonical_out);
+                    mmq_workspace, epilogue_q8, g.stream, &launch_info, canonical_out));
+            if (packed_prefill && large_mmq) {
+                static bool reported_full = false, reported_tail = false;
+                bool &reported = n_tok >= 128 ? reported_full : reported_tail;
+                if (!reported) {
+                    std::fprintf(stderr, "[w4a16-packed-prefill] tokens=%u route=%s tile=%ux%u physical=%u fused_q8=%u weight_shadow=0\n",
+                        n_tok, imparo_sm80_mmq::launch_route_name(launch_info.route),
+                        launch_info.tile_rows, launch_info.tile_tokens,
+                        launch_info.physical_blocks, unsigned(launch_info.fused_q8));
+                    reported = true;
+                }
+            }
             if (g.tuner_lab && tuned_exact128_token64(n_tok)
                     && launch_info.route
                         == imparo_sm80_mmq::LaunchRoute::Exact128Token64SingleSeamLab
@@ -9765,7 +10782,8 @@ extern "C" void imparo_cuda_matmat_gated(
         }
     }
 
-    const bool shadow_decode_requested = fused_epilogue == 2
+    const bool shadow_decode_requested = !batch_invariant_q8_rows(n_tok)
+        && fused_epilogue == 2
         && gate_kind == 3 && up_kind == 3 && n_tok == 1
         && g.sm_version == 86 && execution().epilogue == 0
         && src < B_COUNT && dst < B_COUNT && tmp < B_COUNT
@@ -9814,7 +10832,8 @@ extern "C" void imparo_cuda_matmat_gated(
         }
     }
 
-    const bool q8_tm_decode_requested = fused_epilogue == 2
+    const bool q8_tm_decode_requested = !batch_invariant_q8_rows(n_tok)
+        && fused_epilogue == 2
         && gate_kind == 3 && up_kind == 3 && n_tok == 1
         && tuner_knob(50) != 0
         && std::getenv("IMPARO_CUDA_NO_Q8_TM_GATED_MMVQ") == nullptr;
@@ -9933,9 +10952,11 @@ extern "C" void imparo_cuda_matmat_gated(
     const bool canonical_pair_tuned = tuner_knob(60) >= 1 && tuner_knob(60) <= 4;
     if ((canonical_pair_tuned || (canonical_pair_env && std::strcmp(canonical_pair_env, "1") == 0))
             && fused_epilogue == 2 && gate_kind == 2 && up_kind == 2
-            && g.sm_version == 86 && execution().epilogue == 0 && n_tok > 8
+            && g.sm_version == 86 && execution().epilogue == 0
+            && (n_tok > 8 || batch_invariant_q8_rows(n_tok))
             && n_in != 0 && n_in % 256 == 0 && n_out != 0 && n_out % 128 == 0
-            && !execution().graph_capturing && !execution().prefill_capture_active
+            && (batch_invariant_q8_rows(n_tok)
+                || (!execution().graph_capturing && !execution().prefill_capture_active))
             && src < B_COUNT && dst < B_COUNT && src != dst
             && execution().bufs[src] && execution().bufs[dst]
             && uint64_t(n_tok) * n_in <= execution().sizes[src] / sizeof(float)
@@ -9957,7 +10978,7 @@ extern "C" void imparo_cuda_matmat_gated(
             trace_q8_cache(hit,src,n_in,n_tok,0,Q8_LAYOUT_MMQ_D4);
             const auto result = canonical_q8_pair_lab::launch(gate,up,
                 static_cast<const BlockQ8_1Mmq *>(execution().q8_scratch),
-                static_cast<float *>(execution().bufs[dst]),n_in,n_out,n_tok,g.stream);
+                static_cast<float *>(execution().bufs[dst]),n_in,n_out,n_tok,g.stream,batch_invariant_q8_rows(n_tok));
             if (result == canonical_q8_pair_lab::Pair::LaunchResult::Error) {
                 set_pending(CUDA_RC_ERROR,"canonical Gate/Up launch"); return;
             }
@@ -9968,7 +10989,7 @@ extern "C" void imparo_cuda_matmat_gated(
         }
     }
 
-    if (g.tuner_mode && canonical_pair_tuned) {
+    if ((g.tuner_mode || batch_invariant_q8_rows(n_tok)) && canonical_pair_tuned) {
         set_pending(CUDA_RC_INVALID, "canonical Gate/Up candidate did not dispatch");
         return;
     }
@@ -9979,7 +11000,7 @@ extern "C" void imparo_cuda_matmat_gated(
     const bool q8_tm_silu = fused_epilogue == 2
         && gate_kind == 3 && up_kind == 3
         && tuner_knob(43) != 0 && tuner_knob(42) != 0
-        && g.sm_version == 86 && n_tok > 8
+        && g.sm_version == 86 && (n_tok > 8 || batch_invariant_q8_rows(n_tok))
         && n_in % 256 == 0
         && n_out % imparo_sm80_mmq::kRows == 0
         && q8_tm_row_bytes != 0
@@ -10030,23 +11051,24 @@ static uint32_t try_q8_canonical_silu_private_down(
         uint32_t n_in, uint32_t n_mid, uint32_t n_out,
         uint32_t src, uint32_t gated_tmp, uint32_t dst,
         uint32_t n_tok) {
+    const bool invariant = batch_invariant_q8_rows(n_tok);
     const uint32_t canonical_mode = tuner_knob(60);
     // Laboratory mixed layout: file-converted Gate/Up, unchanged canonical Down.
     // Same-size resident weights; no shadow allocation or per-request repacking.
     const bool mixed_tm = canonical_mode == 3 && !g.tuner_mode
         && gate_kind == 3 && up_kind == 3
         && (down_kind == 2 || (down_kind == 3
-            && std::getenv("IMPARO_LAB_Q8_DOWN_TM_ASYNC") != nullptr))
-        && std::getenv("IMPARO_LAB_Q8_TM_GATE_UP_CANONICAL_DOWN") != nullptr;
+            && imparo_lfm_retained::short_only(std::getenv("IMPARO_LAB_Q8_DOWN_TM_ASYNC") != nullptr)))
+        && imparo_lfm_retained::common(std::getenv("IMPARO_LAB_Q8_TM_GATE_UP_CANONICAL_DOWN") != nullptr);
     const bool down_tm=mixed_tm && down_kind==3;
     if (!mixed_tm && ((canonical_mode != 2 && canonical_mode != 3 && canonical_mode != 4)
             || gate_kind != 2 || up_kind != 2 || down_kind != 2))
         return 0;
-    const bool eligible = n_tok > 8 && execution().epilogue == 0
+    const bool eligible = (n_tok > 8 || invariant) && execution().epilogue == 0
         && g.sm_version == 86 && g.weights_resident
         && execution().batch_geometry_valid && execution().batch_geometry_tokens == n_tok
-        && execution().batch_geometry_phase == 0
-        && !execution().graph_capturing && !execution().prefill_capture_active
+        && (execution().batch_geometry_phase == 0 || invariant)
+        && (invariant || (!execution().graph_capturing && !execution().prefill_capture_active))
         && std::getenv("IMPARO_GPU_PROBE") == nullptr
         && src < B_COUNT && gated_tmp < B_COUNT && dst < B_COUNT
         && src != gated_tmp && src != dst && gated_tmp != dst
@@ -10056,7 +11078,8 @@ static uint32_t try_q8_canonical_silu_private_down(
         && uint64_t(n_tok) * n_in <= execution().sizes[src] / sizeof(float)
         && uint64_t(n_tok) * n_mid <= execution().sizes[gated_tmp] / sizeof(float)
         && uint64_t(n_tok) * n_out <= execution().sizes[dst] / sizeof(float);
-    if (!eligible || execution().pending_error) return 0;
+    if (!eligible || execution().pending_error)
+        return invariant ? reject_batch_invariant_q8("batch-invariant Q8 FFN eligibility") : 0;
     const uint32_t canonical_load_lanes = tuner_knob(63);
     const bool cooperative_load_lanes2 = canonical_load_lanes == 2;
     const bool cooperative_load_lanes4 = canonical_load_lanes == 4;
@@ -10071,15 +11094,15 @@ static uint32_t try_q8_canonical_silu_private_down(
     if (g.tuner_mode
         && (((g.proof_expected_knob_mask & (uint64_t(1) << 61)) && (!large_down || small_down))
             || ((g.proof_expected_knob_mask & (uint64_t(1) << 62)) && !small_down)))
-        return 0;
+        return invariant ? reject_batch_invariant_q8("batch-invariant Q8 FFN preflight") : 0;
     const uint8_t *gate = resident_weight_range(gate_off, uint64_t(n_in/32)*34*n_mid);
     const uint8_t *up = resident_weight_range(up_off, uint64_t(n_in/32)*34*n_mid);
     if (!gate || !up || !resident_weight_range(down_off, uint64_t(n_mid/32)*34*n_out))
-        return 0;
+        return invariant ? reject_batch_invariant_q8("batch-invariant Q8 FFN preflight") : 0;
     if (ensure_q8_scratch(uint64_t(n_tok)*(n_in/128)*sizeof(BlockQ8_1Mmq))
             || !ensure_q8_scratch_next(uint64_t(n_tok)*(n_mid/128)*sizeof(BlockQ8_1Mmq))) {
         (void)cudaGetLastError();
-        return 0;
+        return invariant ? reject_batch_invariant_q8("batch-invariant Q8 FFN preflight") : 0;
     }
     namespace TM = imparo_sm86_q8_tm_gate_up_row_pair_lab;
     namespace Sidecar = canonical_q8_sidecar_lab;
@@ -10087,7 +11110,8 @@ static uint32_t try_q8_canonical_silu_private_down(
     namespace Pair = canonical_q8_pair_lab;
     static int configured_device = -1;
     int device = -1;
-    if (cudaGetDevice(&device) != cudaSuccess) return 0;
+    if (cudaGetDevice(&device) != cudaSuccess)
+        return invariant ? reject_batch_invariant_q8("batch-invariant Q8 FFN device") : 0;
     if (configured_device != device) {
         const cudaError_t regular = cudaFuncSetAttribute(Sidecar::fused<true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Pair::kSharedBytes);
@@ -10107,10 +11131,19 @@ static uint32_t try_q8_canonical_silu_private_down(
                 || split2 != cudaSuccess || split4 != cudaSuccess || split8 != cudaSuccess
                 || tm_pair != cudaSuccess) {
             (void)cudaGetLastError();
-            return 0;
+            return invariant ? reject_batch_invariant_q8("batch-invariant Q8 FFN preflight") : 0;
         }
         configured_device = device;
     }
+#if defined(IMPARO_CUDA_SPECULATIVE)
+    const char * contract_k3 = std::getenv("IMPARO_LAB_Q8_M9_K3");
+    const bool invariant_k3 = invariant && down_w16 && n_mid > n_out
+        && n_mid % 768 == 0 && imparo_lfm_retained::common(contract_k3 && std::strcmp(contract_k3,"1") == 0);
+    if (invariant_k3 && !ensure_attention_scratch(
+            uint64_t(3) * n_tok * n_out * sizeof(float))) {
+        return reject_batch_invariant_q8("batch-invariant K3 scratch preflight");
+    }
+#endif
     const bool hit = q8_cache_matches(src,n_in,n_tok,0,Q8_LAYOUT_MMQ_D4);
     if (!hit) {
         k_quantize_q8_1_mmq<<<dim3(n_tok,(n_in+511)/512),128,0,g.stream>>>(
@@ -10132,7 +11165,7 @@ static uint32_t try_q8_canonical_silu_private_down(
             if (TM::launch_selected(gate, up,
                     static_cast<const BlockQ8_1Mmq *>(execution().q8_scratch),
                     static_cast<BlockQ8_1Mmq *>(execution().q8_scratch_next),
-                    n_in, n_mid, n_tok, g.stream, verification_m1_quant_policy()) != cudaSuccess) {
+                    n_in, n_mid, n_tok, g.stream, verification_m1_quant_policy(), invariant) != cudaSuccess) {
                 set_pending(CUDA_RC_ERROR, "tilemajor Q8 sidecar launch");
                 return 1;
             }
@@ -10190,14 +11223,14 @@ static uint32_t try_q8_canonical_silu_private_down(
             const char *v = std::getenv("IMPARO_LAB_Q8_M9_K3");
             return v && std::strcmp(v,"1") == 0;
         }();
-        if (parallel_k_requested && down_w16 && (n_tok == 9 || execution().tree.nodes == n_tok) && n_mid > n_out
-                && n_mid % 768 == 0 && !execution().graph_capturing) {
+        if (imparo_lfm_retained::common(parallel_k_requested) && down_w16 && (invariant || n_tok == 9 || execution().tree.nodes == n_tok) && n_mid > n_out
+                && n_mid % 768 == 0 && (invariant || !execution().graph_capturing)) {
             const uint64_t bytes = uint64_t(3) * n_tok * n_out * sizeof(float);
             if (ensure_attention_scratch(bytes)) {
                 result = down_tm ? Down::launch_m9_parallel_k3<true>(weights,input,output,
-                    static_cast<float *>(execution().attention_scratch),n_mid,n_out,n_tok,g.stream)
+                    static_cast<float *>(execution().attention_scratch),n_mid,n_out,n_tok,g.stream,invariant)
                     : Down::launch_m9_parallel_k3(weights,input,output,
-                    static_cast<float *>(execution().attention_scratch),n_mid,n_out,n_tok,g.stream);
+                    static_cast<float *>(execution().attention_scratch),n_mid,n_out,n_tok,g.stream,invariant);
                 static const bool trace = std::getenv("IMPARO_Q8_M9_K3_TRACE") != nullptr;
                 static bool traced = false;
                 if (trace && !traced && result == Down::LaunchResult::Launched) {
@@ -10207,40 +11240,44 @@ static uint32_t try_q8_canonical_silu_private_down(
                 }
             }
         }
+        if (invariant_k3 && result != Down::LaunchResult::Launched) {
+            return reject_batch_invariant_q8("batch-invariant K3 did not dispatch");
+        }
 #endif
         if (result == Down::LaunchResult::NotSupported && down_tm) {
             // Keep the original narrow-row ownership/ordered reduction for verify;
             // only the full Prefill tile uses the already validated async reader.
-            if (n_tok==9 || n_tok==16)
+            if (invariant || n_tok==9 || n_tok==16)
                 result=Down::launch_aligned_whole_k<true,0,false,16,2,128,128,true>(
-                    weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream);
+                    weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream,nullptr,invariant);
             else
                 result=Down::launch_aligned_whole_k<true,0,true,16,1,128,128,false>(
-                    weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream);
+                    weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream,nullptr,invariant);
             static bool traced_full=false;
             if(!traced_full && n_tok>=128 && result==Down::LaunchResult::Launched) {
                 std::fprintf(stderr,"[q8-down-tm-async] rows=%u in=%u out=%u W16 original-Q32-order\n",n_tok,n_mid,n_out);
                 traced_full=true;
             }
             if(result==Down::LaunchResult::NotSupported) {
+                if (invariant) return reject_batch_invariant_q8("batch-invariant TM Down did not dispatch");
                 imparo_cuda_matmat(down_kind,down_off,n_mid,n_out,gated_tmp,dst,n_tok,0);
                 return 1;
             }
         }
         if (result == Down::LaunchResult::NotSupported) result = down_w16
             ? Down::launch_aligned_whole_k<false,0,false,16,2,128,128,true>(
-                weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream)
+                weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream,nullptr,invariant)
             : small_down
             ? Down::launch_aligned_whole_k<false,0,false,8,4,64,64,true>(
-                weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream)
+                weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream,nullptr,invariant)
             : Down::launch_aligned_whole_k<false,0,false,8,4,128,128,true>(
-                weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream);
+                weights,input,output,nullptr,n_mid,n_out,n_tok,n_out,0,g.stream,nullptr,invariant);
         if (result == Down::LaunchResult::Launched) {
             mark_buf_written(dst);
             mark_tuner_dispatch(3,(uint64_t(down_w16 ? 23 : small_down ? 19 : 18)<<32)|n_mid);
             return 1;
         }
-        if (result == Down::LaunchResult::Error || g.tuner_mode) {
+        if (result == Down::LaunchResult::Error || g.tuner_mode || invariant) {
             set_pending(CUDA_RC_ERROR,"canonical Down candidate did not dispatch");
             return 1;
         }
@@ -10258,17 +11295,18 @@ static uint32_t try_q8_tm_silu_private_down(
         uint32_t n_in, uint32_t n_mid, uint32_t n_out,
         uint32_t src, uint32_t gated_tmp, uint32_t dst,
         uint32_t n_tok) {
+    const bool invariant = batch_invariant_q8_rows(n_tok);
     const uint32_t min_tokens = tuner_knob(45);
-    const bool requested = min_tokens != 0 && n_tok >= min_tokens
+    const bool requested = min_tokens != 0 && (n_tok >= min_tokens || invariant)
         && gate_kind == 3 && up_kind == 3 && down_kind == 3
         && tuner_knob(42) != 0 && tuner_knob(43) != 0;
     if (!requested) return 0;
 
-    const bool eligible = n_tok > 8 && execution().epilogue == 0
+    const bool eligible = (n_tok > 8 || invariant) && execution().epilogue == 0
         && g.sm_version == 86 && g.weights_resident
         && execution().batch_geometry_valid && execution().batch_geometry_tokens == n_tok
-        && execution().batch_geometry_phase == 0
-        && !execution().graph_capturing && !execution().prefill_capture_active
+        && (execution().batch_geometry_phase == 0 || invariant)
+        && (invariant || (!execution().graph_capturing && !execution().prefill_capture_active))
         && std::getenv("IMPARO_GPU_PROBE") == nullptr
         && src < B_COUNT && gated_tmp < B_COUNT && dst < B_COUNT
         && src != gated_tmp && src != dst && gated_tmp != dst
@@ -10278,7 +11316,8 @@ static uint32_t try_q8_tm_silu_private_down(
         && uint64_t(n_tok) * n_in <= execution().sizes[src] / sizeof(float)
         && uint64_t(n_tok) * n_mid <= execution().sizes[gated_tmp] / sizeof(float)
         && uint64_t(n_tok) * n_out <= execution().sizes[dst] / sizeof(float);
-    if (!eligible || execution().pending_error) return 0;
+    if (!eligible || execution().pending_error)
+        return invariant ? reject_batch_invariant_q8("batch-invariant TM FFN eligibility") : 0;
 
     const auto resident_tm = [](uint64_t offset, uint32_t width,
                                 uint32_t rows) -> const uint8_t * {
@@ -10290,21 +11329,23 @@ static uint32_t try_q8_tm_silu_private_down(
     const uint8_t * gate_weights = resident_tm(gate_off, n_in, n_mid);
     const uint8_t * up_weights = resident_tm(up_off, n_in, n_mid);
     if (!gate_weights || !up_weights
-            || !resident_tm(down_off, n_mid, n_out)) return 0;
+            || !resident_tm(down_off, n_mid, n_out))
+        return invariant ? reject_batch_invariant_q8("batch-invariant TM FFN weights") : 0;
 
     const uint64_t input_records = uint64_t(n_tok) * (n_in / 128);
     const uint64_t sidecar_records = uint64_t(n_tok) * (n_mid / 128);
     if (input_records > UINT64_MAX / sizeof(BlockQ8_1Mmq)
-            || sidecar_records > UINT64_MAX / sizeof(BlockQ8_1Mmq)) return 0;
+            || sidecar_records > UINT64_MAX / sizeof(BlockQ8_1Mmq))
+        return invariant ? reject_batch_invariant_q8("batch-invariant TM FFN size") : 0;
     if (ensure_q8_scratch(input_records * sizeof(BlockQ8_1Mmq))
             || !ensure_q8_scratch_next(
                 sidecar_records * sizeof(BlockQ8_1Mmq))) {
         (void)cudaGetLastError();
-        return 0;
+        return invariant ? reject_batch_invariant_q8("batch-invariant TM FFN scratch") : 0;
     }
     const uint32_t pair_min_tokens = tuner_knob(48);
     const bool pair_requested = pair_min_tokens != 0
-        && n_tok >= pair_min_tokens
+        && (n_tok >= pair_min_tokens || invariant)
         && std::getenv("IMPARO_CUDA_NO_Q8_TM_GATE_UP_ROW_PAIR") == nullptr;
     if (pair_requested) {
         const bool q8_hit = q8_cache_matches(
@@ -10329,13 +11370,15 @@ static uint32_t try_q8_tm_silu_private_down(
             n_in, n_mid, n_tok, uint32_t(g.sm_version),
             uint32_t(g.q8_mmq_limits.max_grid_x),
             uint32_t(g.q8_mmq_limits.max_grid_y), g.stream,
-            verification_m1_quant_policy());
+            verification_m1_quant_policy(), invariant);
         pair_launched = result == Pair::LaunchResult::Launched;
         pair_error = result == Pair::LaunchResult::Error;
         if (pair_error) {
             set_pending(CUDA_RC_ERROR, "Q8_0_TM Gate/Up row-pair launch");
             return 1;
         }
+        if (invariant && !pair_launched)
+            return reject_batch_invariant_q8("batch-invariant TM pair did not dispatch");
         if (pair_launched) {
             mark_buf_written(gated_tmp);
             publish_q8_scratch_next();
@@ -10369,6 +11412,85 @@ static uint32_t try_q8_tm_silu_private_down(
 // that no public buffer was written, so the workflow may issue its established
 // gate/up/down sequence.  Once the first public-output launch is enqueued, CUDA
 // errors are forward-fatal and this routine returns success for end() to report.
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+__global__ void w4_ffn_half_input(const float *x,__half *y,uint32_t active) {
+    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<3u*2560u) y[i]=__float2half_rn(i<active*2560u?x[i]:0.0f);
+}
+__global__ void w4_ffn_gelu_half(const __half *gu,__half *mid) {
+    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=3u*10240u) return;
+    const uint32_t row=i/10240u,col=i%10240u;
+    const float a=__half2float(gu[row*20480u+col]);
+    const float b=__half2float(gu[row*20480u+10240u+col]);
+    const float cube=__fmul_rn(__fmul_rn(0.044715f,a),a);
+    const float arg=__fmul_rn(__fmul_rn(0.7978845608028654f,a),__fadd_rn(1.0f,cube));
+    const float gelu=__fmul_rn(__fmul_rn(0.5f,a),__fadd_rn(1.0f,tanhf(arg)));
+    mid[i]=__float2half_rn(__fmul_rn(gelu,b));
+}
+__global__ void w4_ffn_float_output(const __half *x,float *y,uint32_t count) {
+    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<count) y[i]=__half2float(x[i]);
+}
+#endif
+static uint32_t try_w4_ffn(uint32_t gate_kind,uint64_t gate_off,
+        uint32_t up_kind,uint64_t up_off,uint32_t down_kind,uint64_t down_off,
+        uint32_t n_in,uint32_t n_mid,uint32_t n_out,uint32_t src,uint32_t dst,
+        uint32_t n_tok) {
+#if defined(IMPARO_CUDA_SPECULATIVE) && defined(_WIN32)
+    if (!w4_ffn_enabled() || gate_kind!=1 || up_kind!=1 || down_kind!=1
+            || n_in!=2560 || n_mid!=10240 || n_out!=2560
+            || n_tok<1 || n_tok>3) return 0;
+    const W4FfnSpan *span=nullptr;
+    for (const auto &s:w4_ffn.spans)
+        if(s.gate_off==gate_off && s.up_off==up_off && s.down_off==down_off) {span=&s;break;}
+    if(!span) return 0;
+    if (!w4_ffn.packed || w4_ffn.poisoned || !w4_ffn.scratch
+            || w4_ffn.weights_identity!=g.weights || !w4_ffn.kernel.function
+            || src>=B_COUNT || dst>=B_COUNT || src==dst
+            || !execution().bufs[src] || !execution().bufs[dst]
+            || uint64_t(n_tok)*n_in*sizeof(float)>execution().sizes[src]
+            || uint64_t(n_tok)*n_out*sizeof(float)>execution().sizes[dst]) {
+        set_pending(CUDA_RC_INVALID,"selected W4 FFN contract not ready"); return 1;
+    }
+    auto *base=static_cast<uint8_t*>(w4_ffn.scratch);
+    auto *locks=reinterpret_cast<int*>(base);
+    auto *reduce=base+128;
+    auto *a=reinterpret_cast<__half*>(reduce+imparo_w4a16_marlin::kReduceBytes);
+    auto *gu=a+3*2560;
+    auto *mid=gu+3*20480;
+    auto *out=mid+3*10240;
+    if(reinterpret_cast<uint8_t*>(out+3*2560)>base+w4_ffn.scratch_bytes) {
+        set_pending(CUDA_RC_INVALID,"W4 FFN scratch capacity"); return 1;
+    }
+    w4_ffn_half_input<<<30,256,0,g.stream>>>(
+        static_cast<const float*>(execution().bufs[src]),a,n_tok);
+    const uint64_t gu_payload=uint64_t(n_in)*(2*n_mid)/2;
+    const uint64_t down_payload=uint64_t(n_mid)*n_out/2;
+    CUresult rc=imparo_w4a16_marlin::launch(w4_ffn.kernel,a,span->joined,
+        span->joined+gu_payload,gu,reduce,locks,n_in,2*n_mid,g.stream);
+    if(rc==CUDA_SUCCESS) {
+        w4_ffn_gelu_half<<<120,256,0,g.stream>>>(gu,mid);
+        rc=imparo_w4a16_marlin::launch(w4_ffn.kernel,mid,span->down,
+            span->down+down_payload,out,reduce,locks,n_mid,n_out,g.stream);
+    }
+    if(rc!=CUDA_SUCCESS || cudaGetLastError()!=cudaSuccess) {
+        w4_ffn.poisoned=true;
+        set_pending(CUDA_RC_ERROR,"W4 FFN frozen Marlin launch failed"); return 1;
+    }
+    w4_ffn_float_output<<<(n_tok*n_out+255)/256,256,0,g.stream>>>(out,
+        static_cast<float*>(execution().bufs[dst]),n_tok*n_out);
+    mark_buf_written(dst);
+    if(!w4_ffn.dispatch_reported[n_tok]) {
+        std::fprintf(stderr,"[w4a16-ffn] logical=%u physical=3 layers=%zu grid=30 block=256 shared=%d weight_shadow=0\n",
+            n_tok,w4_ffn.spans.size(),w4_ffn.kernel.max_shared_memory);
+        w4_ffn.dispatch_reported[n_tok]=true;
+    }
+    return 1;
+#else
+    return 0;
+#endif
+}
 extern "C" uint32_t imparo_cuda_ffn_gated_down(
         uint32_t gate_kind, uint64_t gate_off,
         uint32_t up_kind, uint64_t up_off,
@@ -10376,6 +11498,8 @@ extern "C" uint32_t imparo_cuda_ffn_gated_down(
         uint32_t n_in, uint32_t n_mid, uint32_t n_out,
         uint32_t src, uint32_t gated_tmp, uint32_t dst,
         uint32_t n_tok) {
+    if (try_w4_ffn(gate_kind,gate_off,up_kind,up_off,down_kind,down_off,
+            n_in,n_mid,n_out,src,dst,n_tok)) return 1;
     if (try_q8_canonical_silu_private_down(
             gate_kind, gate_off, up_kind, up_off, down_kind, down_off,
             n_in, n_mid, n_out, src, gated_tmp, dst, n_tok)) {
@@ -11464,6 +12588,40 @@ extern "C" void imparo_cuda_rms_norm(uint32_t buf, uint32_t src, uint64_t w_off,
 extern "C" void imparo_cuda_rms_norm_project(
         uint32_t buf, uint32_t src, uint64_t w_off, uint32_t width,
         float eps, uint32_t n_row, uint32_t row_stride, uint32_t base_off) {
+    if (batch_invariant_q8_rows(n_row)) {
+        if (buf >= B_COUNT || src >= B_COUNT || !execution().bufs[buf]
+                || !execution().bufs[src] || !width || width % 128
+                || row_stride != width || (base_off && n_row != 1)
+                || g.sm_version != 86
+                || uint64_t(base_off) + uint64_t(n_row) * width > execution().sizes[src] / sizeof(float)
+                || uint64_t(n_row) * width > execution().sizes[buf] / sizeof(float)) {
+            reject_batch_invariant_q8("batch-invariant RMS shape"); return;
+        }
+        const uint8_t * raw = nullptr;
+        int rc = weight_slice(w_off,uint64_t(width)*sizeof(float),&raw);
+        if (rc) { set_pending(rc,"batch-invariant RMS weights"); return; }
+        rc = ensure_q8_scratch(uint64_t(n_row)*(width/128)*sizeof(BlockQ8_1Mmq));
+        if (rc) { set_pending(rc,"batch-invariant RMS scratch"); return; }
+        const uint32_t requested = tuner_knob(8);
+        const uint32_t threads = (requested == 256 || requested == 1024)
+            ? requested : (width < 1024 ? 256 : 1024);
+        const float * input = static_cast<const float *>(execution().bufs[src]) + base_off;
+        auto * output = static_cast<float *>(execution().bufs[buf]);
+        auto * q8 = static_cast<BlockQ8_1Mmq *>(execution().q8_scratch);
+        if (threads == 1024) {
+            k_rms_norm_q8_1_mmq<1024,true,false><<<n_row,1024,32*sizeof(float),g.stream>>>(
+                input,output,reinterpret_cast<const float *>(raw),q8,width,n_row,eps,false);
+        } else {
+            k_rms_norm_q8_1_mmq<256,true,false><<<n_row,256,32*sizeof(float),g.stream>>>(
+                input,output,reinterpret_cast<const float *>(raw),q8,width,n_row,eps,false);
+        }
+        if (cudaPeekAtLastError() != cudaSuccess) {
+            set_pending(CUDA_RC_ERROR,"batch-invariant RMS launch"); return;
+        }
+        mark_buf_written(buf);
+        own_q8_cache(buf,width,n_row,0,Q8_LAYOUT_MMQ_D4);
+        return;
+    }
     const bool projection_shape = buf < B_COUNT && src < B_COUNT
         && execution().bufs[buf] && execution().bufs[src] && width && width % 32 == 0
         && n_row > 0 && row_stride == width && (base_off == 0 || n_row == 1)
@@ -11765,11 +12923,13 @@ extern "C" void imparo_cuda_rms_norm_add(uint32_t dst, uint32_t src, uint64_t w_
 extern "C" void imparo_cuda_rms_norm_add_project(
         uint32_t buf, uint64_t w_off, uint32_t width, float eps,
         uint32_t n_row, uint32_t add_buf) {
+    const bool invariant = batch_invariant_q8_rows(n_row);
     const bool direct = buf < B_COUNT && add_buf < B_COUNT
         && execution().bufs[buf] && execution().bufs[add_buf] && buf != add_buf
-        && width && width % 128 == 0 && n_row > 8 && g.sm_version >= 80
+        && width && width % 128 == 0 && (n_row > 8 || invariant) && g.sm_version >= 80
         && std::getenv("IMPARO_CUDA_NO_RMS_ADD_Q8") == nullptr;
     if (!direct) {
+        if (invariant) { reject_batch_invariant_q8("batch-invariant RMS-add shape"); return; }
         imparo_cuda_rms_norm_add(
             buf, buf, w_off, width, eps, n_row, add_buf, 1.0f);
         return;
@@ -11811,22 +12971,23 @@ extern "C" void imparo_cuda_rms_norm_add_project(
 extern "C" uint32_t imparo_cuda_add_rms_norm_project(
         uint32_t dst, uint32_t resid, uint32_t other, uint64_t w_off,
         uint32_t width, float eps, uint32_t n_row) {
+    const bool invariant = batch_invariant_q8_rows(n_row);
     if (g.sm_version < 80 || dst >= B_COUNT || resid >= B_COUNT
             || other >= B_COUNT || !execution().bufs[dst] || !execution().bufs[resid]
             || !execution().bufs[other] || dst == resid || dst == other
-            || resid == other || !width || width % 128 != 0 || n_row <= 8
-            || execution().graph_capturing || execution().prefill_capture_active) {
-        return 0;
+            || resid == other || !width || width % 128 != 0 || (n_row <= 8 && !invariant)
+            || (!invariant && (execution().graph_capturing || execution().prefill_capture_active))) {
+        return invariant ? reject_batch_invariant_q8("batch-invariant Add-RMS preflight/launch") : 0;
     }
     const uint8_t * raw = nullptr;
     int rc = weight_slice(w_off, uint64_t(width) * sizeof(float), &raw);
-    if (rc) return 0;
+    if (rc) return invariant ? reject_batch_invariant_q8("batch-invariant Add-RMS weights") : 0;
     const uint64_t q8_bytes = uint64_t(n_row) * (width / 32)
         * sizeof(BlockQ8_1Mmq);
     rc = ensure_q8_scratch(q8_bytes);
     if (rc) {
         cudaGetLastError();
-        return 0;
+        return invariant ? reject_batch_invariant_q8("batch-invariant Add-RMS preflight/launch") : 0;
     }
     OpEventScope profile("add_rms_norm_q8_d4", width, n_row);
     const uint32_t requested = tuner_knob(8);
@@ -11879,7 +13040,7 @@ extern "C" uint32_t imparo_cuda_add_rms_norm_project(
     }
     if (cudaPeekAtLastError() != cudaSuccess) {
         cudaGetLastError();
-        return 0;
+        return invariant ? reject_batch_invariant_q8("batch-invariant Add-RMS preflight/launch") : 0;
     }
     mark_buf_written(resid);
     mark_buf_written(dst);
@@ -12013,7 +13174,7 @@ extern "C" void imparo_cuda_head_norm_rope_hadamard(
     const uint32_t requested = tuner_knob(8);
     uint32_t threads = (requested == 256 || requested == 1024)
         ? requested : (head_dim < 1024 ? 256 : 1024);
-    if (n_tok > 8) {
+    if (n_tok > 8 || (batch_invariant_q8_v1_active() && n_tok<=16)) {
         const uint32_t candidate = tuner_knob(59);
         if (candidate == 64 || candidate == 128 || candidate == 256) {
             threads = candidate;
@@ -12280,7 +13441,8 @@ extern "C" void imparo_cuda_kv_dequant(uint32_t layer, uint32_t width, uint32_t 
         k_kv_dequant<<<grid, 64, 0, g.stream>>>(
             src, dst, width, slots, kt, ring, page_table);
     }
-    if (execution().verification_capture_active) ++execution().graph_expected_dynamic_nodes;
+    if (execution().verification_capture_active || (execution().graph_capturing && batch_invariant_q8_v1_active()))
+        ++execution().graph_expected_dynamic_nodes;
     mark_buf_written(scratch_buf);
     key.install(layer, width, slots, ring, scratch_buf, kt);
 }
@@ -12305,15 +13467,59 @@ __global__ void gather_out(const float*x,float*y){unsigned i=blockIdx.x*blockDim
 // Shared SM80 small-query scheduler for D64/D256/D512 attention families.
 // The per-SM residency is a property of the pinned FA shapes; partition count is
 // derived from the actual GPU topology and capped by available 32-key groups.
+struct D256M1Schedule {
+    imparo_sm80_d256_vec_plan::Geometry geometry;
+    bool q4;
+};
+static D256M1Schedule plan_attention_d256_m1(
+        uint32_t head_dim, uint32_t n_heads, uint32_t n_kv, uint32_t kv_width,
+        uint32_t start_pos, uint32_t window, uint32_t n_tok, uint32_t ring) {
+    const bool specialized_decode = tuner_knob(36) != 0;
+    imparo_sm80_d256_vec_plan::Geometry d256_vec_geometry;
+    const bool d256_vec_plan = imparo_sm80_d256_vec_plan::geometry(
+        start_pos, n_tok, ring, &d256_vec_geometry);
+    const bool d256_vec_q4 = specialized_decode && g.sm_version == 86
+        && head_dim == imparo_sm80_d256_vec::kHeadDim
+        && n_tok == 1
+        && n_heads / n_kv == imparo_sm80_d256_vec::kGqaHeads
+        && window == imparo_sm80_d256_vec::kWindowSpan
+        && d256_vec_plan
+        // P3 joins the retained policy after its original eight-step gate passes.
+        // Other early buckets remain diagnostic; preserve the historical P4 route.
+        && (d256_vec_geometry.schedule_span
+                == imparo_sm80_d256_vec::kMaxPhysicalSpan
+            || (e4b_retained_decode_policy_enabled()
+                && d256_vec_geometry.schedule_span == 768)
+            || std::getenv("IMPARO_CUDA_ATTN_D256_VEC_EARLY"))
+        && start_pos + n_tok >= imparo_sm80_d256_vec::kWindowSpan
+        && kv_width == n_kv * imparo_sm80_d256_vec::kHeadDim
+        && g.kv_type_k == 2 && g.kv_type_v == 2
+        && tuner_knob(30)
+        && std::getenv("IMPARO_CUDA_NO_ATTN_D256_VEC") == nullptr;
+    return {d256_vec_geometry, d256_vec_q4};
+}
+
 static bool common_short_verify(uint32_t head_dim,uint32_t n_heads,uint32_t n_kv,
         uint32_t start,uint32_t window,uint32_t n_tok,uint32_t ring,const uint32_t*pages) {
 #if defined(IMPARO_CUDA_SPECULATIVE)
     const char*flag=std::getenv("IMPARO_LAB_VERIFY_COMMON_PARTITION");
-    return flag && std::strcmp(flag,"1")==0 && g.sm_version==86 && n_tok==3
+    const bool eligible = (e4b_retained_decode_policy_enabled() ? g.e4b_retained_domain==1 : (flag && std::strcmp(flag,"1")==0)) && g.sm_version==86 && n_tok==3
         && n_heads==8 && n_kv==2 && start>=512 && start<1021 && start/32==(start+2)/32
         && !pages && !execution().forward_decode && !execution().prefill_capture_active
         && (!execution().graph_capturing || execution().verification_capture_active) && !decode_control_arg()
         && ((head_dim==256 && window==512 && ring==1023) || (head_dim==512 && !window && !ring));
+    if (!eligible) return false;
+    // A grouped half-cache schedule must not override a vector schedule already
+    // selected for ordinary M1. Reuse the same planner for every causal row; the
+    // existing per-row verifier below preserves its arithmetic and Graph symbols.
+    if (e4b_retained_decode_policy_enabled() && head_dim == 256) {
+        for (uint32_t row = 0; row < n_tok; ++row) {
+            if (plan_attention_d256_m1(head_dim, n_heads, n_kv,
+                    n_kv * head_dim, start + row, window, 1, ring).q4)
+                return false;
+        }
+    }
+    return true;
 #else
     return false;
 #endif
@@ -12413,7 +13619,7 @@ static bool launch_attention_small(
 #if defined(IMPARO_CUDA_SPECULATIVE)
     if constexpr (CacheType == 2 && GqaHeads == 2 && !QueryGrid) {
         static const bool fused_assistant=[](){const char*v=std::getenv("IMPARO_LAB_MTP_FUSED_D512");return v&&std::strcmp(v,"1")==0;}();
-        if(fused_assistant && g.sm_version==86 && head_dim==512 && n_heads==4 && n_kv==2
+        if((e4b_retained_decode_policy_enabled() ? g.e4b_retained_domain>=2 : fused_assistant) && g.sm_version==86 && head_dim==512 && n_heads==4 && n_kv==2
                 && kv_width==1024 && n_tok==1 && !window && !ring && !page_table
                 && start_pos>=4096 && qk_scale==1.f && !decode_control_arg()) {
             const unsigned blocks=2*unsigned(g.sm_count);
@@ -12775,14 +13981,46 @@ static bool launch_attention_small(
                         static bool pv_seen=false;
                         if (!pv_seen) { std::fprintf(stderr,"[mtp-pv-f32] provider=small heads=4 tiles=1 start=%u\n",start_pos); pv_seen=true; }
                     } else {
-                    imparo_sm80_d512_small::values_combine<512, CacheType, 1, GqaHeads, QueryGrid>
-                        <<<value_grid, 64, 0, g.stream>>>(
-                            vc, workspace,
-                            static_cast<float *>(execution().bufs[out_buf])
-                                + uint64_t(out_token_offset) * n_heads * head_dim,
-                            base,
-                            n_heads, n_kv, kv_width, n_tok, ring, valid_span,
-                            kv_span, stream_parts, decode_control_arg());
+                    bool register_pv = false;
+#if defined(IMPARO_CUDA_SPECULATIVE)
+                    if constexpr (CacheType == 2 && GqaHeads == 4 && !QueryGrid) {
+                        // Keep the existing common partition, tuner-selected tiles,
+                        // workspace owner and Graph update ABI. Only the PV operand
+                        // staging changes for the qualified short geometry.
+                        const bool eligible = common_verify && kv_width == 1024
+                            && kv_span == 768 && stream_parts == 8 && qk_scale == 1.f;
+                        const char * flag = std::getenv("IMPARO_LAB_SHORT_PV_REGISTER_FRAGMENTS");
+                        register_pv = eligible && flag && std::strcmp(flag,"1") == 0;
+                        if (register_pv) {
+                            imparo_sm80_d512_small::values_combine<512,2,1,4,false,false,true>
+                                <<<value_grid, 64, 0, g.stream>>>(
+                                    vc, workspace,
+                                    static_cast<float *>(execution().bufs[out_buf])
+                                        + uint64_t(out_token_offset) * n_heads * head_dim,
+                                    base,
+                                    n_heads, n_kv, kv_width, n_tok, ring, valid_span,
+                                    kv_span, stream_parts, decode_control_arg());
+                        }
+                        if (eligible && trace_cuda_graph()) {
+                            static bool seen = false;
+                            if (!seen) {
+                                std::fprintf(stderr,"[short-pv-fragments] register_fragments=%u start=%u valid=%u span=%u parts=%u\n",
+                                    unsigned(register_pv),start_pos,valid_span,kv_span,stream_parts);
+                                seen = true;
+                            }
+                        }
+                    }
+#endif
+                    if (!register_pv) {
+                        imparo_sm80_d512_small::values_combine<512, CacheType, 1, GqaHeads, QueryGrid>
+                            <<<value_grid, 64, 0, g.stream>>>(
+                                vc, workspace,
+                                static_cast<float *>(execution().bufs[out_buf])
+                                    + uint64_t(out_token_offset) * n_heads * head_dim,
+                                base,
+                                n_heads, n_kv, kv_width, n_tok, ring, valid_span,
+                                kv_span, stream_parts, decode_control_arg());
+                    }
                     }
                 }
                 }
@@ -12886,7 +14124,8 @@ static bool launch_attention_d64_wide(
 // Shared by pre-admission and the actual tree dispatch; capacity is physical KV rows.
 static unsigned d64_fixed_partition_span(unsigned start,unsigned nt,unsigned nk,unsigned capacity){
     const char*flag=std::getenv("IMPARO_LAB_D64_FIXED_PARTITION");
-    if(!flag||std::strcmp(flag,"1")||!capacity||!nk||nt>16||start<4096)return 0;
+    if(!capacity||!nk||nt>16)return 0;
+    if(!batch_invariant_q8_v1_active()&&(!flag||std::strcmp(flag,"1")||start<4096))return 0;
     const unsigned chunks=std::max(1u,2u*unsigned(g.sm_count)/nk);
     return unsigned(std::max(uint64_t(256),(uint64_t(capacity)+chunks*128-1)/(chunks*128)*128));
 }
@@ -12898,13 +14137,14 @@ struct TreeAttentionPlan{
 static cudaError_t tree_attention_plan(const TreeContext&t,unsigned fixed_span,TreeAttentionPlan&p){
     p=TreeAttentionPlan{};
     const char*flag=std::getenv("IMPARO_LAB_TREE_TAIL_REPAIR");
-    p.repair=flag&&std::strcmp(flag,"1")==0;
+    p.repair=batch_invariant_q8_v1_active()||(flag&&std::strcmp(flag,"1")==0);
     if(t.nodes!=16||t.start>UINT_MAX-16)return cudaErrorInvalidValue;
     uint64_t extra=0;
     if(p.repair){
         for(unsigned i=0;i<16;++i){if(t.depths[i]>8)return cudaErrorInvalidValue;if(i)p.leaf_mask&=~(1u<<t.parents[i]);}
         unsigned leaves=0;for(unsigned m=p.leaf_mask;m;m&=m-1)++leaves;
-        auto e=imparo_d64_fa2_port::tree_tail_plan(t.start,fixed_span,leaves,&p.chunks,&p.begin,&p.tail,&extra);
+        auto plan=batch_invariant_q8_v1_active()?imparo_d64_fa2_port::tree_tail_plan_v1:imparo_d64_fa2_port::tree_tail_plan;
+        auto e=plan(t.start,fixed_span,leaves,&p.chunks,&p.begin,&p.tail,&extra);
         if(e!=cudaSuccess)return e;
     }
     p.ordinary_bytes=imparo_d64_fa2_port::workspace_bytes(16,32,t.start+16,true);
@@ -12944,7 +14184,9 @@ static bool launch_attention_d64_ordered_qk(
         auto*base=static_cast<uint8_t*>(execution().attention_scratch);
         auto*mask=static_cast<uint8_t*>(execution().device_task_scratch)+t.mask_offset;
         if(repair){
-            auto err=imparo_d64_fa2_port::launch_tree_tail(q,kc,vc,out,reinterpret_cast<__half*>(base),reinterpret_cast<__half*>(base+qbytes),reinterpret_cast<__half*>(base+2*qbytes),base+ordinary_bytes,mask,static_cast<const int*>(execution().device_task_scratch),start,fixed_span,chunks,begin,tail,leaf_mask,scale,g.stream);
+            auto tail_launch=batch_invariant_q8_v1_active()?imparo_d64_fa2_port::launch_tree_tail_v1:
+                imparo_d64_fa2_port::tree_tail_shared_kv_enabled()?imparo_d64_fa2_port::launch_tree_tail_mapped:imparo_d64_fa2_port::launch_tree_tail;
+            auto err=tail_launch(q,kc,vc,out,reinterpret_cast<__half*>(base),reinterpret_cast<__half*>(base+qbytes),reinterpret_cast<__half*>(base+2*qbytes),base+ordinary_bytes,mask,static_cast<const int*>(execution().device_task_scratch),start,fixed_span,chunks,begin,tail,leaf_mask,scale,g.stream);
             if(err!=cudaSuccess)set_pending(CUDA_RC_ERROR,"tree tail repair dispatch");
             static bool seen=false;if(!seen){std::fprintf(stderr,"[tree-tail-repair] ordinary chunks=%u begin=%u tail=%u scratch=%llu\n",chunks,begin,tail,(unsigned long long)bytes);seen=true;}
             return true;
@@ -12960,6 +14202,27 @@ static bool launch_attention_d64_ordered_qk(
         if(err!=cudaSuccess)set_pending(CUDA_RC_ERROR,"tree attention dispatch");
         return true;
     }
+
+    if(batch_invariant_q8_v1_active() && nt<=16){
+        if(!fixed_span||nh!=32||nk!=8||kw!=512||window||ring||pages||!causal
+            ||valid!=uint64_t(start)+nt||valid>kv_capacity||!std::isfinite(scale)||scale<=0.f){
+            set_pending(CUDA_RC_INVALID,"batch-invariant D64 attention contract");return true;
+        }
+        // Reserve for real small target batches through owner capacity once, before
+        // capture. Actual launches only cover ceil(valid/span), never capacity work.
+        const uint64_t bytes=imparo_d64_fa2_port::workspace_bytes(16,32,kv_capacity,true);
+        if(bytes>attention_workspace_budget(64)||!ensure_attention_scratch(bytes)){
+            set_pending(CUDA_RC_ERROR,"batch-invariant D64 attention scratch");return true;
+        }
+        auto*base=static_cast<uint8_t*>(execution().attention_scratch);
+        const uint64_t qbytes=uint64_t(nt)*32*64*sizeof(__half);
+        auto err=imparo_d64_fa2_port::launch_batch_invariant_v1(q,kc,vc,out,
+            reinterpret_cast<__half*>(base),reinterpret_cast<__half*>(base+qbytes),
+            reinterpret_cast<__half*>(base+2*qbytes),nt,valid,scale,fixed_span,g.stream);
+        if(err!=cudaSuccess)set_pending(CUDA_RC_ERROR,"batch-invariant D64 FA2 dispatch");
+        if(execution().graph_capturing)execution().graph_expected_dynamic_nodes+=2;
+        return true;
+    }
 #endif
     const char *flag=std::getenv("IMPARO_LAB_D64_ORDERED_QK");
 #if defined(IMPARO_CUDA_SPECULATIVE)
@@ -12972,8 +14235,14 @@ static bool launch_attention_d64_ordered_qk(
             && fa2_flag && std::strcmp(fa2_flag, "1") == 0));
     // Opt-in larger prefill chunk inherits the same FA2 provider and scratch contract.
     const char *wide_prefill_flag = std::getenv("IMPARO_LAB_D64_FA2_PREFILL_1024");
-    const bool wide_prefill = nt == 1024 && wide_prefill_flag
-        && std::strcmp(wide_prefill_flag, "1") == 0;
+    // Keep the existing provider for the opt-in 1920-row chunk and its 384-row
+    // remainder at 6144 tokens; other batch settings retain their old routing.
+    const char *prefill_batch_flag = std::getenv("IMPARO_BATCH");
+    const bool wave_prefill = imparo_lfm_retained::wide_only(prefill_batch_flag
+        && std::strcmp(prefill_batch_flag, "1920") == 0)
+        && (nt == 1920 || nt == 384);
+    const bool wide_prefill = (nt == 1024 || wave_prefill) && imparo_lfm_retained::wide_only(wide_prefill_flag
+        && std::strcmp(wide_prefill_flag, "1") == 0);
     const bool fa2_prefill = (nt == 512 || wide_prefill) && causal
         && (tuned_fa2 || (prefill_flag && std::strcmp(prefill_flag, "1") == 0));
     if ((fa2_decode || fa2_prefill) && tuner_knob(37) != 0 && g.sm_version == 86
@@ -13001,7 +14270,7 @@ static bool launch_attention_d64_ordered_qk(
                 set_pending(CUDA_RC_ERROR, "D64 FA2 dispatch exception");
             }
             static unsigned fa2_seen = 0;
-            const unsigned bit = fa2_prefill ? 4u : (causal ? 1u : 2u);
+            const unsigned bit = fa2_prefill ? (nt == 1920 ? 8u : nt == 384 ? 16u : 4u) : (causal ? 1u : 2u);
             if (std::getenv("IMPARO_CUDA_ATTN_D64_MMA_TRACE") && !(fa2_seen & bit)) {
                 fa2_seen |= bit;
                 std::fprintf(stderr, "[d64-fa2] causal=%u tokens=%u scratch=%llu\n",
@@ -13020,7 +14289,7 @@ static bool launch_attention_d64_ordered_qk(
     imparo_sm80_d64_ordered_qk::whole_k_tile<false,1><<<dim3(nk,updates),128,0,g.stream>>>(
         q,kc,vc,out,nh,nk,kw,start,window,nt,ring,scale,valid,updates,pages,scores,causal,kv_end);
     const char *querywarp_flag = std::getenv("IMPARO_LAB_D64_PV_QUERYWARP");
-    const bool querywarp = querywarp_flag && std::strcmp(querywarp_flag, "1") == 0;
+    const bool querywarp = imparo_lfm_retained::common(querywarp_flag && std::strcmp(querywarp_flag, "1") == 0);
     if (querywarp) {
         const uint32_t query_ctas = ((nt + 3) / 4) * nk;
         imparo_sm80_d64_ordered_qk::whole_k_tile<false,2,true><<<query_ctas,32,0,g.stream>>>(
@@ -13315,38 +14584,6 @@ static void shadow_gqa2_attention_once(
 }
 
 // Share the original M1 vector numerical policy with per-row target verification.
-struct D256M1Schedule {
-    imparo_sm80_d256_vec_plan::Geometry geometry;
-    bool q4;
-};
-static D256M1Schedule plan_attention_d256_m1(
-        uint32_t head_dim, uint32_t n_heads, uint32_t n_kv, uint32_t kv_width,
-        uint32_t start_pos, uint32_t window, uint32_t n_tok, uint32_t ring) {
-    const bool specialized_decode = tuner_knob(36) != 0;
-    imparo_sm80_d256_vec_plan::Geometry d256_vec_geometry;
-    const bool d256_vec_plan = imparo_sm80_d256_vec_plan::geometry(
-        start_pos, n_tok, ring, &d256_vec_geometry);
-    const bool d256_vec_q4 = specialized_decode && g.sm_version == 86
-        && head_dim == imparo_sm80_d256_vec::kHeadDim
-        && n_tok == 1
-        && n_heads / n_kv == imparo_sm80_d256_vec::kGqaHeads
-        && window == imparo_sm80_d256_vec::kWindowSpan
-        && d256_vec_plan
-        // P2/P3 geometry now has an exact ownership/Graph contract, but the
-        // vector kernel's arithmetic is not yet certified against pinned llama.
-        // Keep the historical P4 production floor; the early buckets remain an
-        // explicit diagnostic until their strict eight-step gate passes.
-        && (d256_vec_geometry.schedule_span
-                == imparo_sm80_d256_vec::kMaxPhysicalSpan
-            || std::getenv("IMPARO_CUDA_ATTN_D256_VEC_EARLY"))
-        && start_pos + n_tok >= imparo_sm80_d256_vec::kWindowSpan
-        && kv_width == n_kv * imparo_sm80_d256_vec::kHeadDim
-        && g.kv_type_k == 2 && g.kv_type_v == 2
-        && tuner_knob(30)
-        && std::getenv("IMPARO_CUDA_NO_ATTN_D256_VEC") == nullptr;
-    return {d256_vec_geometry, d256_vec_q4};
-}
-
 // Original kernels, reduction order and Graph symbols; row offsets are host pointers only.
 static bool launch_attention_d256_m1(
         const D256M1Schedule & schedule, uint32_t kv_layer,
@@ -13858,7 +15095,8 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
     // Q4 route must not produce a half mirror that it never reads. Fallbacks below
     // request the same bounded materialization/key invalidation as the backend.
     const char * defer_flag = std::getenv("IMPARO_LAB_DEFER_KV_MATERIALIZATION");
-    const bool defer_kv = defer_flag && std::strcmp(defer_flag, "1") == 0;
+    const bool defer_kv = e4b_retained_decode_policy_enabled()
+        || (defer_flag && std::strcmp(defer_flag, "1") == 0);
     bool kv_materialized = false;
     auto materialize_kv = [&]() -> bool {
         if (!defer_kv || n_tok <= 1 || kv_materialized) return !execution().pending_error;
@@ -13876,6 +15114,32 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
     const bool page_mapping = ring == 0
         && kv_page_table_requires_mapping(kv_layer);
     const uint32_t * page_table = page_mapping ? stable_page_table : nullptr;
+
+#if defined(IMPARO_CUDA_SPECULATIVE)
+    if(batch_invariant_q8_v1_active() && n_tok<=16){
+        if(g.sm_version!=86||head_dim!=64||n_heads!=32||n_kv!=8||kv_width!=512
+            ||window||ring||page_table||g.kv_type_k!=8||g.kv_type_v!=8
+            ||kdq_buf>=B_COUNT||vdq_buf>=B_COUNT||!execution().bufs[kdq_buf]||!execution().bufs[vdq_buf]){
+            set_pending(CUDA_RC_INVALID,"batch-invariant target attention shape");return;
+        }
+        const uint32_t valid=start_pos+n_tok;
+        // These owner mirrors use the same Q8-to-half producer in all phases.
+        imparo_cuda_kv_dequant(kv_layer,kv_width,valid,0,kdq_buf,0);
+        imparo_cuda_kv_dequant(kv_layer,kv_width,valid,1,vdq_buf,0);
+        if(execution().pending_error)return;
+        const uint64_t capacity64=execution().kv_bytes[kv_layer]/(uint64_t(kv_width/32)*34);
+        if(capacity64>UINT32_MAX||capacity64<valid){
+            set_pending(CUDA_RC_INVALID,"batch-invariant target KV capacity");return;
+        }
+        if(!launch_attention_d64_ordered_qk(static_cast<const float*>(execution().bufs[q_buf]),
+            static_cast<const __half*>(execution().bufs[kdq_buf]),static_cast<const __half*>(execution().bufs[vdq_buf]),
+            static_cast<float*>(execution().bufs[out_buf]),n_heads,n_kv,kv_width,start_pos,0,n_tok,0,
+            applied_q_scale,valid,(valid+127)/128,nullptr,true,valid,uint32_t(capacity64))){
+            set_pending(CUDA_RC_INVALID,"batch-invariant target attention unavailable");return;
+        }
+        mark_buf_written(out_buf);return;
+    }
+#endif
     // Prefill dequantizes quantized cache rows into bounded half scratch in the
     // common workflow. Consume that scratch here so all KV types share the exact
     // SM80 FA scheduler.
@@ -14155,7 +15419,7 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
         && window == 0 && ring == 0
         && g.kv_type_k == 2 && g.kv_type_v == 2
         && std::getenv("IMPARO_CUDA_NO_Q4_ATTN_DIRECT") == nullptr
-        && (common_short || std::getenv("IMPARO_CUDA_NO_Q4_VERIFY_GROUPED") == nullptr);
+        && (common_short || (!e4b_retained_decode_policy_enabled() && std::getenv("IMPARO_CUDA_NO_Q4_VERIFY_GROUPED") == nullptr));
     if (grouped_q4_verify
         && launch_attention_small_chain<2>(
             execution().kv_k[kv_layer], execution().kv_v[kv_layer], head_dim,
@@ -14174,7 +15438,7 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
         && g.kv_type_k == 2 && g.kv_type_v == 2
         && kdq_buf < B_COUNT && vdq_buf < B_COUNT
         && execution().bufs[kdq_buf] && execution().bufs[vdq_buf]
-        && (common_short || std::getenv("IMPARO_CUDA_NO_Q4_VERIFY_GROUPED") == nullptr)
+        && (common_short || (!e4b_retained_decode_policy_enabled() && std::getenv("IMPARO_CUDA_NO_Q4_VERIFY_GROUPED") == nullptr))
         && std::getenv("IMPARO_CUDA_NO_Q4_ATTN_DIRECT") == nullptr;
     if (grouped_q4_verify_sliding
         && materialize_kv()
@@ -14203,7 +15467,7 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
             return;
         }
         const char * d256_verify_lab=std::getenv("IMPARO_CUDA_Q4_VERIFY_D256_VEC");
-        if (d256_verify_lab && std::strcmp(d256_verify_lab,"1")==0
+        if ((e4b_retained_decode_policy_enabled() || (d256_verify_lab && std::strcmp(d256_verify_lab,"1")==0))
             && head_dim==256 && n_heads==n_kv*imparo_sm80_d256_vec::kGqaHeads
             && !page_table && !execution().forward_decode && (!execution().graph_capturing || execution().verification_capture_active)
             && !execution().prefill_capture_active && !decode_control_arg()
@@ -14224,17 +15488,26 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
             // Leave all-small/opt-out batches on the existing query-parallel path.
             if (vec_rows && capacity_ok) {
 #if defined(IMPARO_CUDA_SPECULATIVE)
-                // Mode2 shares KV across exactly three saturated-ring queries.
-                // All other shapes retain each original M1 planner/fallback below.
-                if (g.sm_version == 86 && tuner_knob(30) == 2 && n_tok == 3
+                // Reuse shared M3 work for the admitted saturated-ring path and
+                // short P3 geometry. Every row retains its original M1 partition.
+                const bool short_p3 = e4b_retained_decode_policy_enabled()
+                    && g.e4b_retained_domain == 1
+                    && plans[0].geometry.schedule_span == 768;
+                uint32_t shared_upper = 0;
+                if (g.sm_version == 86
+                    && (e4b_retained_decode_policy_enabled()
+                        ? (g.e4b_retained_domain >= 2 || short_p3) : tuner_knob(30) == 2)
+                    && n_tok == 3
                     && n_heads == 8 && n_kv == 2 && vec_rows == 3
-                    && window == 512 && ring == 1023 && start_pos >= ring
+                    && window == 512 && ring == 1023 && (start_pos >= ring || short_p3)
                     && start_pos <= UINT32_MAX - 2
                     && !std::getenv("IMPARO_CUDA_NO_ATTN_D256_GQA4")
                     && !std::getenv("IMPARO_CUDA_ATTN_D256_GQA4_COMPARE")
-                    && plans[0].geometry.schedule_span == 1024
-                    && plans[1].geometry.schedule_span == 1024
-                    && plans[2].geometry.schedule_span == 1024) {
+                    && plans[1].geometry.schedule_span == plans[0].geometry.schedule_span
+                    && plans[2].geometry.schedule_span == plans[0].geometry.schedule_span
+                    && imparo_sm80_d256_vec_plan::shared_verification_bucket_max(
+                        start_pos, ring, plans[0].geometry.schedule_span,
+                        plans[0].geometry.partials, &shared_upper)) {
                     const uint64_t child_floats = uint64_t(n_heads)
                         * imparo_sm80_d256_vec::kMaxPartials
                         * imparo_sm80_d256_vec::kWarps
@@ -14242,23 +15515,42 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
                     if (ensure_attention_scratch(3 * child_floats * sizeof(float))) {
                         auto * children = static_cast<float *>(execution().attention_scratch);
                         imparo_sm80_d256_vec::partial_q4_gqa4_m3
-                            <<<dim3(n_kv * 4, 4), dim3(32, 4), 0, g.stream>>>(
+                            <<<dim3(n_kv * 4, plans[0].geometry.partials), dim3(32, 4), 0, g.stream>>>(
                                 static_cast<const float *>(execution().bufs[q_buf]),
                                 static_cast<const uint8_t *>(execution().kv_k[kv_layer]),
                                 static_cast<const uint8_t *>(execution().kv_v[kv_layer]),
-                                children, n_heads, n_kv, kv_width, start_pos, ring, 1024, qk_scale);
+                                children, n_heads, n_kv, kv_width, start_pos, ring,
+                                plans[0].geometry.schedule_span, qk_scale);
                         if (execution().graph_capturing) ++execution().graph_expected_dynamic_nodes;
-                        for (uint32_t row = 0; row < 3; ++row) {
-                            imparo_sm80_d256_vec::combine_q4_gqa4_final
-                                <<<n_heads, 256, 0, g.stream>>>(
-                                    children + row * child_floats,
-                                    static_cast<float *>(execution().bufs[out_buf]) + uint64_t(row) * n_heads * head_dim,
-                                    n_heads, 4);
+                        // Mode2 selects the admitted parallel combine for this shape.
+                        // The formal policy fixes the admitted topology. Legacy mode
+                        // retains its static diagnostic choice through capture/replay.
+                        static const bool lab_parallel_combine = [] {
+                            const char * value = std::getenv("IMPARO_LAB_D256_PARALLEL_COMBINE");
+                            return !value || std::strcmp(value, "1") == 0;
+                        }();
+                        const bool parallel_combine = e4b_retained_decode_policy_enabled()
+                            || lab_parallel_combine;
+                        if (parallel_combine) {
+                            imparo_sm80_d256_vec::combine_q4_gqa4_final_parallel
+                                <<<dim3(n_heads, n_tok), 256, 0, g.stream>>>(
+                                    children, static_cast<float *>(execution().bufs[out_buf]),
+                                    n_heads, plans[0].geometry.partials);
+                        } else {
+                            for (uint32_t row = 0; row < 3; ++row) {
+                                imparo_sm80_d256_vec::combine_q4_gqa4_final
+                                    <<<n_heads, 256, 0, g.stream>>>(
+                                        children + row * child_floats,
+                                        static_cast<float *>(execution().bufs[out_buf]) + uint64_t(row) * n_heads * head_dim,
+                                        n_heads, plans[0].geometry.partials);
+                            }
                         }
                         static bool traced = false;
-                        if (!traced && std::getenv("IMPARO_DEVICE_GREEDY_VERIFY_TRACE")) {
-                            std::fprintf(stderr, "[imparo] q4-verify-d256-m3-shared rows=3 start=%u scratch_bytes=%llu\n",
-                                start_pos, (unsigned long long)(3 * child_floats * sizeof(float)));
+                        if (!traced && (e4b_retained_decode_policy_enabled()
+                            || std::getenv("IMPARO_DEVICE_GREEDY_VERIFY_TRACE"))) {
+                            std::fprintf(stderr, "[imparo] q4-verify-d256-m3-shared rows=3 start=%u scratch_bytes=%llu parallel_combine=%u retained_domain=%u mode=2\n",
+                                start_pos, (unsigned long long)(3 * child_floats * sizeof(float)), unsigned(parallel_combine),
+                                e4b_retained_decode_policy_enabled() ? g.e4b_retained_domain : 0u);
                             traced = true;
                         }
                         mark_buf_written(out_buf); return;
@@ -14297,7 +15589,7 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
             }
         }
         const char * d512_verify_lab=std::getenv("IMPARO_CUDA_Q4_VERIFY_D512_MMA");
-        if (d512_verify_lab && std::strcmp(d512_verify_lab,"1")==0
+        if ((e4b_retained_decode_policy_enabled() || (d512_verify_lab && std::strcmp(d512_verify_lab,"1")==0))
             && head_dim==512 && n_heads==n_kv*imparo_sm80_d512_decode::kGqaHeads
             && direct_cache && window==0 && ring==0
             && !execution().forward_decode && (!execution().graph_capturing || execution().verification_capture_active)
@@ -14319,7 +15611,7 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
                 const char * pair_lab=std::getenv("IMPARO_CUDA_Q4_VERIFY_D512_PAIR");
                 // Both pair rows must retain their independently admitted M1 policy.
                 // Cross-bucket, staged-F16, paged and non-three-row cases stay unchanged.
-                if (pair_lab && std::strcmp(pair_lab,"1")==0 && n_tok==3
+                if ((e4b_retained_decode_policy_enabled() || (pair_lab && std::strcmp(pair_lab,"1")==0)) && n_tok==3
                     && !page_table && window==0 && ring==0 && mma_rows==3
                     && plans[0].schedule_span==plans[1].schedule_span
                     && execution().bufs[q_buf] && execution().bufs[out_buf]
@@ -14345,7 +15637,7 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
                             n_heads,n_kv,third_groups,third_blocks)) {
 #if defined(IMPARO_CUDA_SPECULATIVE)
                         const char * share_flag=std::getenv("IMPARO_LAB_D512_M3_SHARED_DEPACK");
-                        if (share_flag && std::strcmp(share_flag,"1")==0
+                        if ((e4b_retained_decode_policy_enabled() ? g.e4b_retained_domain>=2 : (share_flag && std::strcmp(share_flag,"1")==0))
                             && g.sm_version==86 && n_heads==8 && n_kv==2 && start_pos>=4096
                             && pair_groups==third_groups && pair_blocks==third_blocks
                             && plans[2].valid_span==start_pos+3
@@ -14363,11 +15655,22 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
                             const uint64_t qp=allq/2;
                             imparo_sm80_prefill::cache_scaled_q<<<(qp+255)/256,256,0,g.stream>>>(
                                 static_cast<const float *>(execution().bufs[q_buf]),reinterpret_cast<__half2 *>(qq),qp,qk_scale);
+                            const char * register_flag=std::getenv("IMPARO_LAB_D512_REGISTER_FRAGMENTS");
+                            const bool register_fragments=e4b_retained_decode_policy_enabled()
+                                ? g.e4b_retained_domain==3 : (register_flag && std::strcmp(register_flag,"1")==0);
+                            if (register_fragments) {
+                            imparo_sm86_d512_register_fragments::partial<<<pair_blocks,128,0,g.stream>>>(
+                                qq,static_cast<const uint8_t *>(execution().kv_k[kv_layer]),
+                                static_cast<const uint8_t *>(execution().kv_v[kv_layer]),ww,
+                                n_heads,n_kv,kv_width,start_pos,window,ring,plans[2].valid_span,
+                                pair_groups,pair_blocks,ws);
+                            } else {
                             imparo_sm86_d512_m3_shared::partial<<<pair_blocks,128,0,g.stream>>>(
                                 qq,static_cast<const uint8_t *>(execution().kv_k[kv_layer]),
                                 static_cast<const uint8_t *>(execution().kv_v[kv_layer]),ww,
                                 n_heads,n_kv,kv_width,start_pos,window,ring,plans[2].valid_span,
                                 pair_groups,pair_blocks,ws);
+                            }
                             if(execution().graph_capturing) ++execution().graph_expected_dynamic_nodes;
                             imparo_sm80_d512_pair::combine_pair<<<dim3(n_kv,8),256,0,g.stream>>>(
                                 ww,static_cast<float *>(execution().bufs[out_buf]),n_heads,n_kv,pair_groups,pair_blocks);
@@ -14376,8 +15679,8 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
                                 n_heads,n_kv,third_groups,third_blocks);
                             static bool traced=false;
                             if(!traced && std::getenv("IMPARO_DEVICE_GREEDY_VERIFY_TRACE")) {
-                                std::fprintf(stderr,"[d512-m3-shared-depack] start=%u groups=%u blocks=%u scratch=%llu\n",
-                                    start_pos,pair_groups,pair_blocks,(unsigned long long)(2*workspace_bytes));
+                                std::fprintf(stderr,"[d512-m3-shared-depack] start=%u groups=%u blocks=%u scratch=%llu register_fragments=%u\n",
+                                    start_pos,pair_groups,pair_blocks,(unsigned long long)(2*workspace_bytes),unsigned(register_fragments));
                                 traced=true;
                             }
                             mark_buf_written(out_buf);return;
@@ -14466,8 +15769,9 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
         }
         if (!direct_cache && !materialize_kv()) return;
         const char * query_parallel = std::getenv("IMPARO_CUDA_Q4_VERIFY_QUERY_PARALLEL");
-        if (std::getenv("IMPARO_CUDA_NO_Q4_VERIFY_GROUPED")
-            && query_parallel && std::strcmp(query_parallel, "1") == 0) {
+        if (e4b_retained_decode_policy_enabled()
+                || (std::getenv("IMPARO_CUDA_NO_Q4_VERIFY_GROUPED")
+                    && query_parallel && std::strcmp(query_parallel, "1") == 0)) {
             const bool parallel = direct_cache
                 ? launch_attention_small<2, 4, true>(
                     verify_k, verify_v, head_dim, n_heads, n_kv, kv_width,
@@ -14642,9 +15946,47 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
     const uint32_t requested = tuner_knob(7);
     const uint32_t threads = (requested == 64 || requested == 128 || requested == 256)
         ? requested : 128;
+    // Mode 2 extends the existing specialization policy only to the qualified
+    // GQA6 M1/F16 shape. Modes 0/1 and every older specialization are unchanged.
+    // Reuse the existing scores -> softmax -> values transaction and workspace.
+    const bool gqa6_small_shape = tuner_knob(36) == 2 && g.sm_version == 86
+        && head_dim == 256 && n_heads == 24 && n_kv == 4 && kv_width == 1024
+        && n_tok == 1 && window == 0 && ring == 0 && !page_table
+        && g.kv_type_k == 1 && g.kv_type_v == 1 && ktype == 1 && vtype == 1
+        && (tuner_knob(16) == 0 || tuner_knob(16) == 2)
+        && (tuner_knob(17) == 0 || tuner_knob(17) == 1)
+        && (tuner_knob(18) == 0 || tuner_knob(18) == 8)
+        && !std::getenv("IMPARO_CUDA_NO_ATTN_SMALL")
+        && !std::getenv("IMPARO_CUDA_ATTN_F32")
+        && !std::getenv("IMPARO_CUDA_ATTN_D256_FULL32")
+        && !std::getenv("IMPARO_CUDA_ATTN_SOFTMAX_WARPS")
+        && !std::getenv("IMPARO_CUDA_ATTN_VALUE_TILES")
+        && !std::getenv("IMPARO_CUDA_ATTN_STREAM_PART_CAP")
+        && !std::getenv("IMPARO_CUDA_ATTN_D256_STREAM_PART_CAP");
+    if (gqa6_small_shape) {
+        // The existing Graph updater has no GQA6 symbols. Do not capture a
+        // launch whose changing start/valid-span parameters it cannot update.
+        if (execution().graph_capturing || execution().prefill_capture_active
+            || execution().verification_capture_active) {
+            execution().graph_capture_compatible = false;
+            execution().decode_graph_shape_blocked = true;
+        } else if (launch_attention_small<1, 6>(
+            kc, vc, head_dim, n_heads, n_kv, kv_width, start_pos, qk_scale,
+            window, n_tok, ring, q_buf, out_buf, page_table)) {
+            static bool traced_gqa6 = false;
+            if (!traced_gqa6) {
+                std::fprintf(stderr,
+                    "[imparo] gqa6-small actual route mode=2 layer=%u start=%u rows=1 head_dim=256 heads=24 kv_heads=4 f16 parts_cap=8\n",
+                    kv_layer, start_pos);
+                traced_gqa6 = true;
+            }
+            mark_buf_written(out_buf);
+            return;
+        }
+    }
     const char * gqa2_d512_lab=std::getenv("IMPARO_CUDA_GQA2_D512_SMALL");
-    const bool gqa2_d512_small_shape = gqa2_d512_lab
-        && std::strcmp(gqa2_d512_lab,"1")==0
+    const bool gqa2_d512_small_shape = (e4b_retained_decode_policy_enabled()
+        || (gqa2_d512_lab && std::strcmp(gqa2_d512_lab,"1")==0))
         && head_dim==512 && n_heads==4 && n_kv==2 && kv_width==1024
         && n_tok==1 && window==0 && ring==0 && qk_scale==1.0f
         && ktype==2 && vtype==2 && !page_table
@@ -14790,6 +16132,79 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
         && g.sm_version == 86
         && (tuned_exact128_staged_f32_attention(n_tok)
             || std::getenv("IMPARO_CUDA_ATTN_D256_STAGED_F32_VALUES_LAB") != nullptr);
+    // Existing D256 FA arithmetic, specialized only for the admitted GQA6
+    // geometry. Mode 2 keeps its 48 active columns in the physical 64-column
+    // tile and uses one complete key segment with an F32 numerator. The old
+    // GQA4 selector and its Stream-K/fixup contract remain separate.
+    const bool gqa6_prefill_fa = tuner_knob(29) == 2 && g.sm_version == 86
+        && head_dim == 256 && n_heads == 24 && n_kv == 4 && kv_width == 1024
+        && n_tok >= 9 && n_tok <= 128 && window == 0 && ring == 0 && !page_table
+        && g.kv_type_k == 1 && g.kv_type_v == 1 && ktype == 1 && vtype == 1
+        && std::getenv("IMPARO_CUDA_ATTN_F32") == nullptr
+        && std::getenv("IMPARO_CUDA_NO_ATTN_D256_TILED") == nullptr
+        && std::getenv("IMPARO_CUDA_NO_ATTN_D256_FUSED") == nullptr;
+    if (gqa6_prefill_fa) {
+        if (execution().graph_capturing || execution().prefill_capture_active
+            || execution().verification_capture_active) {
+            execution().graph_capture_compatible = false;
+            execution().decode_graph_shape_blocked = true;
+        } else {
+            constexpr uint32_t queries = 8, columns = 64;
+            const uint32_t query_tiles = (n_tok + queries - 1) / queries;
+            const uint32_t blocks = query_tiles * n_kv;
+            const uint32_t valid = start_pos + n_tok;
+            const uint32_t groups = ((valid + 255u) / 256u) * 8u;
+            const uint64_t stride = uint64_t(columns) * head_dim + 2 * columns;
+            const uint64_t bytes_per_block = stride * sizeof(float);
+            const uint64_t elements = uint64_t(n_tok) * n_heads * head_dim;
+            const bool q_hit = qk_scale == 1.0f
+                && execution().attention_q_src == q_buf
+                && execution().attention_q_epoch == execution().buf_epoch[q_buf]
+                && execution().attention_q_head_dim == head_dim
+                && execution().attention_q_heads == n_heads
+                && execution().attention_q_tokens == n_tok;
+            const uint64_t offset = q_hit ? 0
+                : (elements * sizeof(__half) + 255u) & ~uint64_t(255u);
+            const uint64_t cap = std::max<uint64_t>(bytes_per_block,
+                attention_workspace_budget(head_dim));
+            uint32_t chunk = uint32_t(std::min<uint64_t>(blocks, cap / bytes_per_block));
+            chunk = std::max(1u, chunk);
+            while (!ensure_attention_scratch(offset + uint64_t(chunk) * bytes_per_block)
+                   && chunk > 1) chunk = (chunk + 1) / 2;
+            if (execution().attention_scratch && execution().attention_scratch_bytes
+                >= offset + uint64_t(chunk) * bytes_per_block) {
+                __half * q_cache = q_hit
+                    ? static_cast<__half *>(execution().attention_q_cache)
+                    : static_cast<__half *>(execution().attention_scratch);
+                float * workspace = reinterpret_cast<float *>(
+                    static_cast<uint8_t *>(execution().attention_scratch) + offset);
+                if (!q_hit) {
+                    const uint64_t pairs = elements / 2;
+                    imparo_sm80_prefill::cache_scaled_q
+                        <<<(pairs + 255) / 256, 256, 0, g.stream>>>(
+                            static_cast<const float *>(execution().bufs[q_buf]),
+                            reinterpret_cast<__half2 *>(q_cache), pairs, qk_scale);
+                }
+                for (uint32_t base = 0; base < blocks; base += chunk) {
+                    const uint32_t count = std::min(chunk, blocks - base);
+                    imparo_sm80_fa_d256::flash<false, true, 6>
+                        <<<count, 128, 0, g.stream>>>(q_cache,
+                            static_cast<const __half *>(kc), static_cast<const __half *>(vc),
+                            workspace, static_cast<float *>(execution().bufs[out_buf]), base,
+                            query_tiles, n_heads, n_kv, kv_width, start_pos, 0, n_tok, 0,
+                            valid, groups, blocks, 0, 1, queries, stride, nullptr);
+                }
+                static bool reported_gqa6_prefill = false;
+                if (!reported_gqa6_prefill) {
+                    std::fprintf(stderr, "[imparo] gqa6-prefill actual route mode=2 layer=%u start=%u rows=%u heads=24 kv_heads=4 d=256 columns=48/64 numerator=f32 segments=1\n",
+                        kv_layer, start_pos, n_tok);
+                    reported_gqa6_prefill = true;
+                }
+                mark_buf_written(out_buf);
+                return;
+            }
+        }
+    }
     const bool tiled_d256 = head_dim == 256
         && n_tok >= imparo_sm80_d512_small::kQueryTokens
         // Quarantined after the onto-v2 n=128 gate: this route changed the layer-0
@@ -14960,7 +16375,11 @@ extern "C" void imparo_cuda_attention(uint32_t kv_layer, uint32_t head_dim,
             && std::getenv("IMPARO_CUDA_NO_ATTN_D256_FUSED") == nullptr;
         const bool fused_d512_stable = head_dim == 512
             && g.sm_version == 86 && stable_cell_d512 && ring == 0
-            && canonical_parts > 0 && virtual_stream_blocks == 0
+            // The fused kernel also implements the existing virtual Stream-K
+            // contract. Keep the same tuner-owned seams and bound its two slots.
+            && ((canonical_parts > 0 && virtual_stream_blocks == 0)
+                || (stable_virtual_stream_d512 && virtual_stream_blocks > 0))
+            && segment_slots > 0
             && segment_slots <= imparo_sm80_prefill::kCanonicalD512Parts;
         const bool fused_d512_physical = head_dim == 512
             && !stable_cell_d512;
@@ -15776,6 +17195,33 @@ extern "C" void imparo_cuda_copy_range(uint32_t dst, uint32_t dst_off, uint32_t 
         static_cast<const float *>(execution().bufs[src]) + src_off, n);
     mark_buf_written(dst);
 }
+#include "copy_strided.cuh"
+extern "C" void imparo_cuda_copy_strided(uint32_t dst, uint32_t src, uint32_t width,
+                                        uint32_t src_off, uint32_t src_stride,
+                                        uint32_t n_row) {
+    imparo_cuda_copy_strided_detail::Layout layout;
+    if (!imparo_cuda_copy_strided_detail::make_layout(width, src_off, src_stride, n_row, &layout)) {
+        set_pending(CUDA_RC_INVALID, "strided copy shape overflow"); return;
+    }
+    if (!layout.rows) return;
+    uint8_t * d = nullptr, * s = nullptr;
+    if (!buffer_slice(dst, 0, layout.dst_bytes, &d)
+            || !buffer_slice(src, 0, layout.src_bytes, &s)) {
+        set_pending(CUDA_RC_INVALID, "strided copy buffer range"); return;
+    }
+    OpEventScope profile("copy_strided", width, n_row);
+    const auto rc = imparo_cuda_copy_strided_detail::launch(
+        reinterpret_cast<float *>(d), reinterpret_cast<const float *>(s), layout, g.stream,
+        [](float * row_dst, const float * row_src, uint32_t n, cudaStream_t stream) {
+            // Same kernel/order as copy_range for aliasing or short source strides.
+            k_copy<<<uint32_t((uint64_t(n) + 255) / 256), 256, 0, stream>>>(row_dst, row_src, n);
+            return cudaPeekAtLastError();
+        });
+    if (rc != cudaSuccess) {
+        set_pending(CUDA_RC_ERROR, "strided copy launch"); return;
+    }
+    mark_buf_written(dst);
+}
 extern "C" void imparo_cuda_mul_strided(uint32_t a, uint32_t b, uint32_t n,
                                         uint32_t b_off, uint32_t b_stride,
                                         uint32_t a_stride, uint32_t n_tok) {
@@ -15894,6 +17340,8 @@ extern "C" void imparo_cuda_row(uint32_t wkind, uint64_t w_off, uint32_t width,
                                  uint32_t index, float scale, uint32_t dst,
                                  uint32_t dst_off) {
     OpEventScope profile("row", width, 0);
+    if(wkind==39){bonsai_row(w_off,width,index,scale,dst,dst_off);return;}
+
     if ((wkind != 1 && wkind != 2) || dst >= B_COUNT || !execution().bufs[dst]
         || !width || width % 32 || uint64_t(dst_off) + width > execution().sizes[dst] / 4) {
         set_pending(CUDA_RC_INVALID, "embedding row arguments");
@@ -15948,6 +17396,8 @@ extern "C" void imparo_cuda_rows(uint32_t wkind, uint64_t w_off, uint32_t width,
                                   uint32_t table_rows, uint32_t tokens_buf,
                                   float scale, uint32_t dst, uint32_t n_tok) {
     OpEventScope profile("rows", width, n_tok);
+    if(wkind==39){bonsai_rows(w_off,width,table_rows,tokens_buf,scale,dst,n_tok);return;}
+
     if ((wkind != 1 && wkind != 2) || tokens_buf >= B_COUNT || dst >= B_COUNT
         || !execution().bufs[tokens_buf] || !execution().bufs[dst] || !width || width % 32
         || !table_rows || !n_tok || uint64_t(n_tok) > execution().sizes[tokens_buf] / 4
@@ -16130,15 +17580,22 @@ extern "C" void imparo_cuda_ple_gather_combine(
         width, width, emb_scale, comb_scale, n_tok);
 }
 
-extern "C" void imparo_cuda_ple_norm_gather_combine(
+extern "C" void imparo_cuda_ple_norm_gather_combine_prefix(
     uint32_t proj, uint32_t tokens_buf, uint64_t norm_w_offset,
     uint64_t table_offset, uint32_t ple_width, uint32_t n_layers,
+    uint32_t source_width,
     float input_scale, float eps, float emb_scale, float comb_scale,
     uint32_t n_tok) {
     OpEventScope profile("ple_norm_gather", ple_width, n_tok);
+    const uint64_t output_width = uint64_t(ple_width) * n_layers;
     if (proj >= B_COUNT || tokens_buf >= B_COUNT || !execution().bufs[proj]
         || !execution().bufs[tokens_buf] || !ple_width || !n_layers
-        || ple_width % 32) {
+        || ple_width % 32 || !n_tok || output_width > UINT32_MAX
+        || source_width < output_width || source_width % 32
+        || output_width * n_tok > UINT32_MAX
+        || execution().sizes[proj] < output_width * n_tok * sizeof(float)
+        || execution().sizes[tokens_buf] < uint64_t(n_tok) * sizeof(uint32_t)
+        || (source_width != output_width && execution().forward_decode)) {
         set_pending(CUDA_RC_INVALID, "PLE norm-gather arguments");
         return;
     }
@@ -16148,15 +17605,10 @@ extern "C" void imparo_cuda_ple_norm_gather_combine(
     constexpr uint32_t shared_bytes = 32 * sizeof(float);
     const uint32_t width = ple_width * n_layers;
     const uint64_t table_row_bytes = uint64_t(width / 32) * 18;
+    const uint64_t source_row_bytes = uint64_t(source_width / 32) * 18;
     if (const uint8_t * table = resident_weight_at(table_offset)) {
-        if (execution().forward_decode && decode_graph_candidate()) {
-            execution().decode_graph_shape_blocked = true;
-        }
-        // Resident norm/table pointers and the exact-key token buffer are stable
-        // throughout Prefill replay. Decode still needs its separately staged row
-        // descriptors and therefore keeps the conservative rejection.
-        if (execution().graph_capturing && !execution().prefill_capture_active)
-            execution().graph_capture_compatible = false;
+        // Token indices and resident table pointers retain the existing owner
+        // lifetime. Replay reads Tokens again; it does not freeze a host row.
         if (!norm_raw) {
             int rc = weight_slice(norm_w_offset, norm_bytes, &norm_raw);
             if (rc) { set_pending(rc, "PLE norm weight upload"); return; }
@@ -16167,14 +17619,14 @@ extern "C" void imparo_cuda_ple_norm_gather_combine(
                     static_cast<float *>(execution().bufs[proj]),
                     reinterpret_cast<const float *>(norm_raw), table,
                     static_cast<const uint32_t *>(execution().bufs[tokens_buf]), ple_width,
-                    n_layers, input_scale, eps, emb_scale, comb_scale, n_tok);
+                    n_layers, input_scale, eps, emb_scale, comb_scale, n_tok, source_width);
         } else {
             k_ple_norm_gather_combine<threads, false>
                 <<<dim3(n_layers, n_tok), threads, shared_bytes, g.stream>>>(
                     static_cast<float *>(execution().bufs[proj]),
                     reinterpret_cast<const float *>(norm_raw), table,
                     static_cast<const uint32_t *>(execution().bufs[tokens_buf]), ple_width,
-                    n_layers, input_scale, eps, emb_scale, comb_scale, n_tok);
+                    n_layers, input_scale, eps, emb_scale, comb_scale, n_tok, source_width);
         }
     } else {
         std::vector<uint32_t> fallback_tokens;
@@ -16213,7 +17665,7 @@ extern "C" void imparo_cuda_ple_norm_gather_combine(
         }
         for (uint32_t token = 0; token < n_tok; ++token) {
             const uint64_t row_off = table_offset
-                + uint64_t(tokens[token]) * table_row_bytes;
+                + uint64_t(tokens[token]) * source_row_bytes;
             if (row_off < table_offset || row_off > g.weights_len
                 || table_row_bytes > g.weights_len - row_off) {
                 set_pending(CUDA_RC_INVALID, "PLE norm row range");
@@ -16252,6 +17704,17 @@ extern "C" void imparo_cuda_ple_norm_gather_combine(
     mark_buf_written(proj);
 }
 
+// Full-width ABI retained for existing callers.
+extern "C" void imparo_cuda_ple_norm_gather_combine(
+    uint32_t proj, uint32_t tokens_buf, uint64_t norm_w_offset,
+    uint64_t table_offset, uint32_t ple_width, uint32_t n_layers,
+    float input_scale, float eps, float emb_scale, float comb_scale,
+    uint32_t n_tok) {
+    imparo_cuda_ple_norm_gather_combine_prefix(proj, tokens_buf, norm_w_offset,
+        table_offset, ple_width, n_layers, ple_width * n_layers,
+        input_scale, eps, emb_scale, comb_scale, n_tok);
+}
+
 // Data-only CUDA Driver module bridge. Kept in a separate source file for review,
 // included here so existing source and per-SM DLL builds remain one translation unit.
 #include "program_pack.cu"
@@ -16270,4 +17733,5 @@ extern "C" void imparo_cuda_ple_norm_gather_combine(
 
 #if defined(IMPARO_CUDA_SPECULATIVE)
 #include "tree_owner_api.cuh"
+#include "tree_replay_owner.cuh"
 #endif

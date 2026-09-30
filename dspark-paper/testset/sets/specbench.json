@@ -1,0 +1,329 @@
+{
+ "set": "specbench",
+ "source_max_tokens": 1024,
+ "provenance": {
+  "source": "hemingkx/Spec-Bench",
+  "revision": "fd2c1cd7d2201ef71db4c5f4e455008f017967bf",
+  "url": "https://raw.githubusercontent.com/hemingkx/Spec-Bench/fd2c1cd7d2201ef71db4c5f4e455008f017967bf/data/spec_bench/question.jsonl",
+  "skipped_over_cap": 0,
+  "builder": "dspark-paper/testset/build.py",
+  "params": {
+   "rounds_per_kind": 2,
+   "single_kind": 8,
+   "max_chars": 4000
+  },
+  "built": "2026-09-27T16:17:34+0800"
+ },
+ "conversations": [
+  {
+   "name": "sb-coding-1",
+   "kind": "coding",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "121",
+   "chars": 157,
+   "sha256": "d4d5bbc6e1b5bc66",
+   "turns": [
+    {
+     "kind": "coding",
+     "type": "first",
+     "text": "Develop a Python program that reads all the text files under a directory and returns top-5 words with the most number of occurrences."
+    },
+    {
+     "kind": "coding",
+     "type": "continued",
+     "text": "Can you parallelize it?"
+    }
+   ]
+  },
+  {
+   "name": "sb-extraction-1",
+   "kind": "extraction",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "131",
+   "chars": 770,
+   "sha256": "943352f589559dff",
+   "turns": [
+    {
+     "kind": "extraction",
+     "type": "first",
+     "text": "Evaluate the following movie reviews on a scale of 1 to 5, with 1 being very negative, 3 being neutral, and 5 being very positive:\n1. This movie released on Nov. 18, 2019, was phenomenal. The cinematography, the acting, the plot - everything was top-notch.\n2. Never before have I been so disappointed with a movie. The plot was predictable and the characters were one-dimensional. In my opinion, this movie is the worst one to have been released in 2022.\n3. The movie was okay. There were some parts I  enjoyed, but there were also parts that felt lackluster. This is a movie that was released in Feb 2018 and seems to be quite ordinary.\nReturn the answer as a JSON array of integers."
+    },
+    {
+     "kind": "extraction",
+     "type": "continued",
+     "text": "Update your previous reply by including the release date as part of the JSON content."
+    }
+   ]
+  },
+  {
+   "name": "sb-humanities-1",
+   "kind": "humanities",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "151",
+   "chars": 218,
+   "sha256": "bdb89b4685794f00",
+   "turns": [
+    {
+     "kind": "humanities",
+     "type": "first",
+     "text": "Provide insights into the correlation between economic indicators such as GDP, inflation, and unemployment rates. Explain how fiscal and monetary policies affect those indicators."
+    },
+    {
+     "kind": "humanities",
+     "type": "continued",
+     "text": "Now, explain them again like I'm five."
+    }
+   ]
+  },
+  {
+   "name": "sb-math-1",
+   "kind": "math",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "111",
+   "chars": 158,
+   "sha256": "61c078710124b1e7",
+   "turns": [
+    {
+     "kind": "math",
+     "type": "first",
+     "text": "The vertices of a triangle are at points (0, 0), (-1, 1), and (3, 3). What is the area of the triangle?"
+    },
+    {
+     "kind": "math",
+     "type": "continued",
+     "text": "What's area of the circle circumscribing the triangle?"
+    }
+   ]
+  },
+  {
+   "name": "sb-math_reasoning-1",
+   "kind": "math_reasoning",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "401",
+   "chars": 200,
+   "sha256": "adda018a8588695c",
+   "turns": [
+    {
+     "kind": "math_reasoning",
+     "type": "first",
+     "text": "Jen decides to travel to 3 different countries.  He has to pay $400 for the supplies he needs, in total.  The tickets for travel cost, in total, 50% more than the supplies.  How much does travel cost?"
+    }
+   ]
+  },
+  {
+   "name": "sb-math_reasoning-2",
+   "kind": "math_reasoning",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "402",
+   "chars": 216,
+   "sha256": "7810cb6f7d1e2ec7",
+   "turns": [
+    {
+     "kind": "math_reasoning",
+     "type": "first",
+     "text": "Hallie had dance practice for 1 hour on Tuesdays and 2 hours on Thursdays.  On Saturdays, she had dance practice that lasted twice as long as Tuesday's night class.  How many hours a week did she have dance practice?"
+    }
+   ]
+  },
+  {
+   "name": "sb-qa-1",
+   "kind": "qa",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "321",
+   "chars": 36,
+   "sha256": "28342f18eec5a305",
+   "turns": [
+    {
+     "kind": "qa",
+     "type": "first",
+     "text": "Who played anna in once upon a time?"
+    }
+   ]
+  },
+  {
+   "name": "sb-qa-2",
+   "kind": "qa",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "322",
+   "chars": 46,
+   "sha256": "ac5fd0f910a4a36d",
+   "turns": [
+    {
+     "kind": "qa",
+     "type": "first",
+     "text": "Where was the 2015 rugby union world cup held?"
+    }
+   ]
+  },
+  {
+   "name": "sb-rag-1",
+   "kind": "rag",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "481",
+   "chars": 3381,
+   "sha256": "f390bf1012163192",
+   "turns": [
+    {
+     "kind": "rag",
+     "type": "first",
+     "text": "Some researchers state that forests do not only provide benefits, but can in certain cases also incur costs to humans. Forests may impose an economic burden, diminish the enjoyment of natural areas, reduce the food producing capacity of grazing land and cultivated land, reduce biodiversity reduce available water for humans and wildlife, harbour dangerous or destructive wildlife, and act as reservoirs of human and livestock disease. The management of forests is often referred to as forestry. Forest management has changed considerably over the last few centuries, with rapid changes from the 1980s onwards culminating in a practice now referred to\nForestry Forestry is the science and craft of creating, managing, using, conserving, and repairing forests, woodlands, and associated resources for human and environmental benefits. Forestry is practiced in plantations and natural stands. The science of forestry has elements that belong to the biological, physical, social, political and managerial sciences. Modern forestry generally embraces a broad range of concerns, in what is known as multiple-use management, including the provision of timber, fuel wood, wildlife habitat, natural water quality management, recreation, landscape and community protection, employment, aesthetically appealing landscapes, biodiversity management, watershed management, erosion control, and preserving forests as \"sinks\" for atmospheric\nForest A forest is a large area dominated by trees. Hundreds of more precise definitions of forest are used throughout the world, incorporating factors such as tree density, tree height, land use, legal standing and ecological function. According to the widely used Food and Agriculture Organization definition, forests covered (15 million square miles) or approximately 30 percent of the world's land area in 2006. Forests are the dominant terrestrial ecosystem of Earth, and are distributed around the globe. Forests account for 75% of the gross primary production of the Earth's biosphere, and contain 80% of the Earth's plant biomass. Net\nincluding harvesting forest resources, can negatively affect forest ecosystems. Although \"forest\" is a term of common parlance, there is no universally recognised precise definition, with more than 800 definitions of forest used around the world. Although a forest is usually defined by the presence of trees, under many definitions an area completely lacking trees may still be considered a forest if it grew trees in the past, will grow trees in the future, or was legally designated as a forest regardless of vegetation type. There are three broad categories of forest definitions in use: administrative, land use, and land cover.\nForest Peoples Programme Forest Peoples Programme (FPP) advocates an alternative vision of how forests should be managed and controlled, based on respect for the rights of the peoples who know them best. FPP works with forest peoples in South America, Africa, and Asia, to help them secure their rights, build up their own organisations and negotiate with governments and companies as to how economic development and conservation are best achieved on their lands. Forests cover 31% of total land area of the planet. Of that, 12% are designated for the conservation of biological diversity and nearly all are inhabited. Many\nDescribe the various uses of forests to human beings?"
+    }
+   ]
+  },
+  {
+   "name": "sb-rag-2",
+   "kind": "rag",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "482",
+   "chars": 2661,
+   "sha256": "57f149c0b2e3af3a",
+   "turns": [
+    {
+     "kind": "rag",
+     "type": "first",
+     "text": "Got My Mind Set on You \"Got My Mind Set on You\" (also written as \"(Got My Mind) Set on You\") is a song written and composed by Rudy Clark and originally recorded by James Ray in 1962, under the title \"I've Got My Mind Set on You\". An edited version of the song was released later in the year as a single on the Dynamic Sound label. In 1987, George Harrison released a cover version of the song as a single, and released it on his album \"Cloud Nine,\" which he had recorded on his own Dark Horse Records\nlabel. Of Harrison's three number-one singles in the US, it was both the only song not written or composed by Harrison himself and the only one without religious overtones. It also was not only the last US No. 1 hit by Harrison, but also from any of the ex-Beatles (as of 2018) in the US. When the song hit No. 1, it broke a three-way tie among Harrison, John Lennon, and Ringo Starr, all of whom had two No. 1 hit singles as solo artists (discounting Paul McCartney's work with Wings). It also happened to be the No. 1 single\nsignificant airplay, and was nominated for three MTV VMAs. Harrison's version of the song was parodied by \"Weird Al\" Yankovic on his 1988 album \"Even Worse,\" as \"(This Song's Just) Six Words Long\" poking fun at the repetitive nature of the lyrics. Shakin' Stevens recorded the song for his 2006 album \"Now Listen\". Irish singer Lee Matthews covered it in his 2015 album \"It's a Great Day to Be Alive\". Got My Mind Set on You \"Got My Mind Set on You\" (also written as \"(Got My Mind) Set on You\") is a song written and composed by Rudy Clark\nthe Cupcakes 1963, Jerry Lee Lewis 1965, Carl Hall 1966, Sleepy LaBeef 1970, Price Mitchell & Jerri Kelly 1974, Carol Channing & Webb Pierce 1977, and by Dale Sellers. The song was also the title track on albums of the same title by Jean Shephard 1961 and William Galison and Madeleine Peyroux 2004. Got You on My Mind (song) \"Got You on My Mind\" is a song written by Howard Biggs and Joe Thomas. The lyrics commence: \"Got you on my mind feeling kinda sad and low / Wonderin' where you are / wonderin' why you had to go /\nYou Got My Mind Messed Up You Got My Mind Messed Up is a 1967 album by James Carr. Although Carr is not as well known as his contemporaries such as Otis Redding or Aretha Franklin, \"You Got My Mind Messed Up\" has been cited as one of the top soul music albums of all time. Allmusic gave it 5 stars from two different reviewers. On the 2002 re-release Mojo magazine stated \"This is undoubtedly one of the greatest soul albums of all time.\" . After Carr's death in 2001, Kent Records re-released the album with another dozen bonus tracks.\nWho sings got my mind set on you?"
+    }
+   ]
+  },
+  {
+   "name": "sb-reasoning-1",
+   "kind": "reasoning",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "101",
+   "chars": 278,
+   "sha256": "256d282f5d01668d",
+   "turns": [
+    {
+     "kind": "reasoning",
+     "type": "first",
+     "text": "Imagine you are participating in a race with a group of people. If you have just overtaken the second person, what's your current position? Where is the person you just overtook?"
+    },
+    {
+     "kind": "reasoning",
+     "type": "continued",
+     "text": "If the \"second person\" is changed to \"last person\" in the above question, what would the answer be?"
+    }
+   ]
+  },
+  {
+   "name": "sb-roleplay-1",
+   "kind": "roleplay",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "91",
+   "chars": 183,
+   "sha256": "0ba91bac84b9bad4",
+   "turns": [
+    {
+     "kind": "roleplay",
+     "type": "first",
+     "text": "Pretend yourself to be Elon Musk in all the following conversations. Speak like Elon Musk as much as possible. Why do we need to go to Mars?"
+    },
+    {
+     "kind": "roleplay",
+     "type": "continued",
+     "text": "How do you like dancing? Can you teach me?"
+    }
+   ]
+  },
+  {
+   "name": "sb-stem-1",
+   "kind": "stem",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "141",
+   "chars": 186,
+   "sha256": "26b0b289307f1f26",
+   "turns": [
+    {
+     "kind": "stem",
+     "type": "first",
+     "text": "In the field of quantum physics, what is superposition, and how does it relate to the phenomenon of quantum entanglement?"
+    },
+    {
+     "kind": "stem",
+     "type": "continued",
+     "text": "What assumptions have you made in your response? Are they valid?"
+    }
+   ]
+  },
+  {
+   "name": "sb-summarization-1",
+   "kind": "summarization",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "241",
+   "chars": 3259,
+   "sha256": "6a0fb44e7d07da34",
+   "turns": [
+    {
+     "kind": "summarization",
+     "type": "first",
+     "text": "Summarize: Hillary Clinton’s security detail arrived at a suburban Des Moines, Iowa fruit processing company on Tuesday with an added vehicle – a second Scooby. After her signature oversize black Chevy conversion van dropped her off at Capitol Fruit Company in Norwalk, Iowa, a visually identical GMC van drove up to the building with a nearly identical Secret Service escort vehicle. Both armored vehicles have raised roofs, deep-tinted windows and New York license plates. But while the original van – the one nicknamed 'Scooby' after the Scooby-Doo cartoon show – sports a mustard-yellow New York tag, the second has blue and white plates of a different design. Scroll down for video. WHY BUY ONE WHEN YOU CAN HAVE TWO AT TWICE THE PRICE? The first picture of both of Hillary Clinton's Scooby mobiles. One is a GMC and the other is a Chevrolet, but they are mechanically identical. CONVOY: Scooby-one and Scooby-two took up positions in Hillary's motorcade on a freeway near Des Moines. BACK SEAT DRIVER? Hillary Clinton climbs into the so-called Scooby van after a campaign stop at Capital City Fruit in Norwalk, Iowa. Clinton (right), a Democratic presidential hopeful and former secretary of state, posed for selfies with fans after meeting with members of the Iowa State legislature at the State Capital on Wednesday. It’s common for U.S. Secret Service to employ 'decoy' vehicles, identical in design, in order to inject some mystery into VIPs' travel plans, if for no other reason than to confuse and discourage would-be attackers. When President Barack Obama returns to the White House after long trips, his arrival on the Marine One helicopter can be a shell-game exercise when three identical choppers appear on the horizon. Only one, of course, lands on the South Lawn. A Secret Service spokesperson said the agency does not comment on security arrangements for dignitaries. FLASHERS: 'Scooby-two' forced an Iowa motorist to leave the roadway on Wednesday so it could go through a red light and rejoin the caravan. Mrs. Clinton enjoys constant protection at taxpayers' expense because she is part of a former first family, not as a result of her service in the U.S. Senate or the State Department. But at some point during presidential campaigns, front-runner status generally attracts Secret Service as a candidate’s profile is elevated and crowd sizes swell. On Wednesday, the two Scooby vans arrived at Clinton's appointed location separately, but left together in a seven-car motorcade. UNDER GUARD: Two Secret Service agents with Scooby One in Iowa today. MOTORCADE: The Clinton convoy includes both Scooby vans and four black Suburbans, believed to all be Secret Service vehicles. It also included a white minivan on Wednesday. Scooby-Two’s driver brought up the rear, at enough of a distance to allow another car to pull in front of him. When that car stopped at a red light, the GMC van’s blue and red flashing lights came on. The stray car’s driver pulled to one side and Scooby-Two zoomed into the intersection, against the light. DECOYS: The Secret Service frequently deploys duplicates of aircraft and cars it uses to transport VIPs – including Marine One, the president's customized helicopter, which usually travels with two decoys."
+    }
+   ]
+  },
+  {
+   "name": "sb-summarization-2",
+   "kind": "summarization",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "242",
+   "chars": 2909,
+   "sha256": "c4bb6a3f576afaae",
+   "turns": [
+    {
+     "kind": "summarization",
+     "type": "first",
+     "text": "Summarize: After a fire took a family's home of four years leaving them without anything, a Georgia mother of six is making a desperate plea for help. Kalimah Dixon said she was awakened by a neighbor yelling there was a fire early on Monday morning, and was lucky to get her children, aged one to 14, out of the Decatur condo safely. However, all that was left of her rented condo was a pile of rubble, and in her efforts to get her family back on their feet, she is asking for assistance. 'My children are homeless. They have nothing. They lost everything,' Dixon told Channel 2. Scroll down for video. A mother of six said her family has nothing after fire reduced their Georgia condo to a pile of rubble (above Kalimah Dixon with her five of her six children) The Dekalb County mother said the fire happened early on Monday and that she managed to get all of her children safely out (remains of the condo following the fire above) While Dixon was renting the Condo in the last four years, she had quit working to enroll full time in school to complete her degree in business management. But now she is finding it difficult to get a lease for a new permanent home  while being unemployed. As the mother of three sons and three daughters shuffles to give her kids stability, she is currently staying with a friend, far from her children's Decatur schools - where On Tuesday, Georgia students are required to take a standardized test. 'Yes, it starts Tuesday and I don't even know where I'm going to be on Monday,' said Dixon. In the last four years while Dixon rented the condo, she had quit working to enroll full time in school to complete her degree in business management. Now she said she is finding it difficult to get a lease while unemployed (pictured right and left with her children) Dixon said on Monday as the fire broke out before she knew it the whole roof had been engulfed in flames (above aftermath of the fire) Following the fire, the mother of six said: 'My children are homeless. They have nothing. They lost everything' She said in the past few days, the American Red Cross has assisted her as she searched for a place to live, but as she has looked to shelters for help, they turn her away. 'They'll take three of my children but they won't take the other three or my son is too old or they have any space at all,' Dixon told Channel 2. Dixon has since started a GoFundMe page which on Sunday had raised $4,619 in donations. Dixon has started a GoFundMe page which has raised $4,619 in donations so far. On the site she wrote: 'I'm humbly asking for assistance for me and my children we currently suffered a tremendous loss due to a fire early Monday morning. 'On top of losing everything we haven't been able to receive housing assistance rendering us homeless. 'If you could find it in you're hearts to assist it would be greatly appreciated every bit counts even prayers thank you.'"
+    }
+   ]
+  },
+  {
+   "name": "sb-translation-1",
+   "kind": "translation",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "161",
+   "chars": 110,
+   "sha256": "8a87a2dc4ac12a90",
+   "turns": [
+    {
+     "kind": "translation",
+     "type": "first",
+     "text": "Translate German to English: Pfandhäuser boomen in Singapur , da die Krise in der Mittelschicht angekommen ist"
+    }
+   ]
+  },
+  {
+   "name": "sb-translation-2",
+   "kind": "translation",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "162",
+   "chars": 174,
+   "sha256": "d432cbf5f20241b5",
+   "turns": [
+    {
+     "kind": "translation",
+     "type": "first",
+     "text": "Translate German to English: St. Hubertus war der Sage nach ein recht rücksichtsloser Jäger , der durch eine Vision bekehrt und später zum Bischof von Lüttich ernannt wurde ."
+    }
+   ]
+  },
+  {
+   "name": "sb-writing-1",
+   "kind": "writing",
+   "source": "hemingkx/Spec-Bench",
+   "source_id": "81",
+   "chars": 199,
+   "sha256": "24c9fc3e50783759",
+   "turns": [
+    {
+     "kind": "writing",
+     "type": "first",
+     "text": "Compose an engaging travel blog post about a recent trip to Hawaii, highlighting cultural experiences and must-see attractions."
+    },
+    {
+     "kind": "writing",
+     "type": "continued",
+     "text": "Rewrite your previous response. Start every sentence with the letter A."
+    }
+   ]
+  }
+ ]
+}

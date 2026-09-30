@@ -26,6 +26,7 @@ crate::architecture!(Gemma4Arch => Gemma4 {
     batch_host:          workflow_cpu::batch,
     device_batch:        workflow_gpu::batch,
     device_prepare:      workflow_gpu::prepare_device,
+    device_rows:         workflow_gpu::rows,
     buffer_requirements: workflow_gpu::buffer_requirements,
     state_only_output_lab: true,
     device_all_logits: cfg!(feature = "cuda-speculative"),

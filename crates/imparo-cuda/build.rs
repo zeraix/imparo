@@ -170,6 +170,9 @@ fn main() {
     let owner_lab = std::env::var_os("CARGO_FEATURE_CUDA_OWNER_LAB").is_some();
     let speculative =
         owner_lab || std::env::var_os("CARGO_FEATURE_CUDA_SPECULATIVE").is_some();
+    // Bounded PTQ cuBLAS is available only in toolkit-linked source builds.
+    // Official plugin build scripts omit this flag and reject policy 3.
+    args.push("-DIMPARO_CUDA_ENABLE_PTQ_CUBLAS=1".to_string());
     if speculative {
         args.push("-DIMPARO_CUDA_SPECULATIVE=1".to_string());
     } else {

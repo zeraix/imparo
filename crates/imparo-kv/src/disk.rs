@@ -22,9 +22,9 @@
 //! (old manifest, new checkpoint) fails the boundary check in `state_from_links`
 //! and reprocesses -- fail-closed, which is the only acceptable direction.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::identity::UnitHash;
 use crate::{Manifest, PrefixHash, Store};
@@ -49,12 +49,19 @@ enum Job {
     Barrier(Sender<Result<(), String>>),
 }
 
+/// The prefixes of the commits handed to the writer and not yet finished, counted,
+/// with the signal the writer gives as each one finishes.
+type Writing = Arc<(Mutex<HashMap<PrefixHash, usize>>, Condvar)>;
+
 pub struct DiskQueue {
     tx: Sender<Job>,
     /// Units handed to the queue but not yet on disk. Without it, the second turn
     /// re-reads and re-queues a unit the first turn already sent, because the file
     /// it would check for does not exist yet.
     queued: Arc<Mutex<HashSet<UnitHash>>>,
+    /// What a store lookup cannot see yet: a manifest is found by the prefixes it
+    /// commits, and these are the prefixes of commits still on their way to disk.
+    writing: Writing,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -67,6 +74,8 @@ impl DiskQueue {
         let queued: Arc<Mutex<HashSet<UnitHash>>> =
             Arc::new(Mutex::new(HashSet::new()));
         let q = Arc::clone(&queued);
+        let writing: Writing = Arc::default();
+        let w = Arc::clone(&writing);
         let handle = std::thread::spawn(move || {
             // Bytes handed to this thread since the last GC pass, and what that pass
             // measured the store at. Together they say whether a walk could possibly
@@ -81,9 +90,18 @@ impl DiskQueue {
                 match job {
                     Job::Unit(h, bytes) => {
                         written += bytes.len() as u64;
+                        let probe = crate::disk_probe();
                         if let Err(e) = store.put_unit(&h, &bytes) {
                             eprintln!("[imparo] kv unit write: {e}");
                             pending_error.get_or_insert(e);
+                        }
+                        if let (Some(t0), Some(t1)) = (probe, crate::disk_probe()) {
+                            eprintln!(
+                                "[imparo] kv disk probe {t1:.1}: unit {} ({:.1} MiB) on disk, {:.1} ms",
+                                h.hex(),
+                                bytes.len() as f64 / (1u64 << 20) as f64,
+                                t1 - t0
+                            );
                         }
                         q.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -113,6 +131,7 @@ impl DiskQueue {
                     } => {
                         // Blobs first, manifest last: the manifest is the commit line and
                         // must never name a checkpoint that is not yet on disk.
+                        let probe = crate::disk_probe();
                         let mut job_error: Option<String> = None;
                         for (h, bytes) in &blobs {
                             written += bytes.len() as u64;
@@ -150,6 +169,29 @@ impl DiskQueue {
                         } else {
                             false
                         };
+                        if let (Some(t0), Some(t1)) = (probe, crate::disk_probe()) {
+                            eprintln!(
+                                "[imparo] kv disk probe {t1:.1}: {conversation} committed \
+({} checkpoint blob(s)), {:.1} ms",
+                                blobs.len(),
+                                t1 - t0
+                            );
+                        }
+                        {
+                            let (map, done) = &*w;
+                            let mut map = map
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            for p in &at {
+                                if let Some(n) = map.get_mut(p) {
+                                    *n -= 1;
+                                    if *n == 0 {
+                                        map.remove(p);
+                                    }
+                                }
+                            }
+                            done.notify_all();
+                        }
                         let mine = store.manifest_path(&conversation);
                         superseded.retain(|path| *path != mine);
                         // Commit and supersede are one transaction in this worker:
@@ -249,6 +291,7 @@ manifest(s), swept {swept} unit(s)"
         Self {
             tx,
             queued,
+            writing,
             handle: Some(handle),
         }
     }
@@ -285,6 +328,7 @@ manifest(s), swept {swept} unit(s)"
         Self {
             tx,
             queued: Arc::new(Mutex::new(HashSet::new())),
+            writing: Arc::default(),
             handle: None,
         }
     }
@@ -365,6 +409,8 @@ manifest(s), swept {swept} unit(s)"
                 q.insert(*h);
             }
         }
+        self.count_writing(&at, true);
+        let prefixes = at.clone();
         if self
             .tx
             .send(Job::Commit {
@@ -384,6 +430,8 @@ manifest(s), swept {swept} unit(s)"
             for h in hashes {
                 q.remove(&h);
             }
+            drop(q);
+            self.count_writing(&prefixes, false);
             return Err("kv disk writer is not running".to_string());
         }
         match wait {
@@ -392,6 +440,70 @@ manifest(s), swept {swept} unit(s)"
             })?,
             None => Ok(()),
         }
+    }
+
+    fn count_writing(&self, prefixes: &[PrefixHash], add: bool) {
+        let (map, done) = &*self.writing;
+        let mut map = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for p in prefixes {
+            if add {
+                *map.entry(*p).or_insert(0) += 1;
+            } else if let Some(n) = map.get_mut(p) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(p);
+                }
+            }
+        }
+        done.notify_all();
+    }
+
+    /// Whether a commit naming one of `prefixes` is still on its way to disk.
+    #[must_use]
+    pub fn in_flight(&self, prefixes: &[PrefixHash]) -> bool {
+        let map = self
+            .writing
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prefixes.iter().any(|p| map.contains_key(p))
+    }
+
+    /// Waits until no commit naming one of `prefixes` is still on its way to disk, and
+    /// says how long that took, or `None` when there was nothing to wait for.
+    ///
+    /// A lookup that ran first would read the store without those manifests: it would
+    /// restore an older state or none, and prefill again what the writer is about to
+    /// finish. Only commits sharing a prefix are waited for, not the whole queue.
+    pub fn wait_for_commits(
+        &self,
+        prefixes: &[PrefixHash],
+    ) -> Option<std::time::Duration> {
+        let (map, done) = &*self.writing;
+        let mut map = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !prefixes.iter().any(|p| map.contains_key(p)) {
+            return None;
+        }
+        let t0 = std::time::Instant::now();
+        while prefixes.iter().any(|p| map.contains_key(p)) {
+            // A writer that died never finishes them: give up rather than wait forever.
+            if self
+                .handle
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+            {
+                break;
+            }
+            map = done
+                .wait_timeout(map, std::time::Duration::from_millis(100))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        Some(t0.elapsed())
     }
 
     /// Delete manifests by path off the request thread.
@@ -518,6 +630,7 @@ mod tests {
         let queue = DiskQueue {
             tx,
             queued: Arc::clone(&queued),
+            writing: Arc::default(),
             handle: None,
         };
         let hash = UnitHash([9; 16]);
@@ -538,6 +651,7 @@ mod tests {
         let queue = DiskQueue {
             tx,
             queued: Arc::new(Mutex::new(HashSet::new())),
+            writing: Arc::default(),
             handle: None,
         };
         assert!(queue.drain().is_err());
@@ -565,6 +679,60 @@ mod tests {
         queue.drain().expect("replacement barrier");
         assert!(!old.exists());
         assert!(new.exists());
+        drop(queue);
+        drop(store);
+        std::fs::remove_dir_all(&dir).expect("remove scratch store");
+    }
+
+    /// A lookup right after a commit is queued must see that commit. The writer runs
+    /// behind the requests, so `wait_for_commits` holds the lookup until no commit
+    /// sharing its prefixes is in flight -- and does not wait at all for prefixes no
+    /// commit in flight shares.
+    #[test]
+    fn a_lookup_waits_for_the_commit_it_shares() {
+        let dir = scratch("wait-commit");
+        let root = ConfigRoot::new(b"model", (1, 1), b"geometry");
+        let store = Store::open(&dir, &root).expect("open scratch store");
+        let tokens = vec![7_u32; crate::grid_tokens()];
+        let (cuts, at) = Cut::for_stream(&root, &tokens, &[tokens.len()]);
+        let manifest = Manifest {
+            boundary: tokens.len() as u64,
+            cuts,
+            ckpts: Vec::new(),
+            keyless: false,
+        };
+        let queue = DiskQueue::new(store.clone());
+        // A unit ahead of the commit, as a turn's write-through queues them, keeps the
+        // commit in flight a little longer.
+        queue
+            .put_unit(UnitHash([5; 16]), vec![1_u8; 8 << 20])
+            .expect("enqueue unit");
+        queue
+            .commit(
+                "waited",
+                manifest.clone(),
+                Vec::new(),
+                at.clone(),
+                Vec::new(),
+            )
+            .expect("enqueue commit");
+        assert!(
+            queue.wait_for_commits(&[PrefixHash([9; 16])]).is_none(),
+            "no commit in flight shares this prefix"
+        );
+        queue.wait_for_commits(&at);
+        // However the timing fell, the lookup after the wait sees the commit.
+        assert!(
+            store
+                .prefix_matches(&at)
+                .iter()
+                .any(|(_, _, matched)| *matched == 1)
+        );
+        assert!(
+            queue.wait_for_commits(&at).is_none(),
+            "nothing left in flight"
+        );
+        queue.drain().expect("writer barrier");
         drop(queue);
         drop(store);
         std::fs::remove_dir_all(&dir).expect("remove scratch store");

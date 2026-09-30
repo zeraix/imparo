@@ -34,6 +34,29 @@ pub struct FfnTransactionShape {
     pub down: (u64, u32, u32, u32),
 }
 
+/// Rotated projections cannot share offset zero across different input widths.
+/// Reuse the already named FFN matrices; old unrotated timing blobs retain their seat.
+fn wide_projection_offsets(
+    kind: u32,
+    n_embd: u32,
+    n_ff: u32,
+    ffn: Option<FfnTransactionShape>,
+) -> Result<(u64, u64), String> {
+    if kind != 39 {
+        return Ok((0, 0));
+    }
+    let shape = ffn.ok_or("PTQ wide workload needs a named FFN triple")?;
+    if shape.gate.0 == 0
+        || shape.down.0 == 0
+        || shape.gate.0 == shape.down.0
+        || (shape.gate.1, shape.gate.2, shape.gate.3) != (n_embd, n_ff, kind)
+        || (shape.down.1, shape.down.2, shape.down.3) != (n_ff, n_embd, kind)
+    {
+        return Err("PTQ wide workload does not match its registered matrices".into());
+    }
+    Ok((shape.gate.0, shape.down.0))
+}
+
 /// One real per-layer-embedding gate/projection pair and its token-major per-layer
 /// multiplier layout. Together with `FfnTransactionShape` this is the complete
 /// exact-128 transaction; neither half is sufficient evidence for the coupled route.
@@ -119,6 +142,10 @@ pub struct Shapes {
     pub head_dim: u32,
     /// 0 for a dense model; the MoE knobs key off this.
     pub n_experts: u32,
+    /// The experts a token picks (0 for a dense model).
+    pub experts_used: u32,
+    /// Windowed-attention layers.
+    pub windowed_layers: u32,
     /// Head dim of the FULL-attention layers -- the only geometry whose span grows
     /// with the conversation, so the only one a decode-routing boundary can be
     /// measured on. In Gemma4 E4B the majority geometry is the 256-dim WINDOW
@@ -905,6 +932,8 @@ pub fn measure(
     // its compiled default and lost its stored, end-to-end-verified value.
     seats: &[u32],
 ) -> Result<Picks, String> {
+    let (wide_up_offset, wide_down_offset) =
+        wide_projection_offsets(s.wide_kind, s.n_embd, s.n_ff, s.ffn_transaction)?;
     // Phase timing, always on. A tuner that takes minutes must be able to say WHERE,
     // or every diagnosis of it is a guess -- which is how a KV staging loop and a
     // measurement loop got conflated for an entire session.
@@ -931,6 +960,8 @@ pub fn measure(
         head_dim: s.head_dim,
         deep_head_dim: s.deep_head_dim,
         n_experts: s.n_experts,
+        experts_used: s.experts_used,
+        windowed_layers: s.windowed_layers,
         n_layers: s.n_layers,
         layer_dispatches: s.layer_dispatches,
         weight_kinds: s.weight_kinds,
@@ -1155,6 +1186,18 @@ pub fn measure(
     ] {
         b.alloc(id, u64::from(n) * 4)
             .map_err(|rc| format!("alloc {id:?} rc={rc}"))?;
+    }
+    // The half-activation mirror, sized by the rule the models allocate it by. Without it
+    // every GEMM timed here read f32 activations and converted them inside each
+    // threadgroup, and the gated gate/up pair was refused -- a route no model runs.
+    let widest = hidden.max(s.n_head * s.head_dim);
+    for req in imparo_model::gpu_support::half_activation_mirror_requirements(
+        tile as usize,
+        widest as usize,
+        BufId::U,
+    ) {
+        b.alloc(req.id, req.bytes)
+            .map_err(|rc| format!("alloc {:?} rc={rc}", req.id))?;
     }
     if let Some(ple) = s.ple_transaction {
         let ple_width = ple.gate.2;
@@ -1392,7 +1435,15 @@ pub fn measure(
     // model reads the Q4 path's occupancy, not the one every ranked workload is subject to).
     let reference = || {
         time_us(b, 3, 4, &|| {
-            b.matmat(s.wide_kind, 0, n_in, n_out, BufId::Cur, BufId::Logits, tile);
+            b.matmat(
+                s.wide_kind,
+                wide_up_offset,
+                n_in,
+                n_out,
+                BufId::Cur,
+                BufId::Logits,
+                tile,
+            );
         })
     };
 
@@ -1954,7 +2005,7 @@ pub fn measure(
                 // cannot move.
                 b.matmat(
                     s.wide_kind,
-                    0,
+                    wide_up_offset,
                     s.n_embd,
                     s.n_ff,
                     BufId::Cur,
@@ -1963,7 +2014,7 @@ pub fn measure(
                 );
                 b.matmat(
                     s.wide_kind,
-                    0,
+                    wide_down_offset,
                     s.n_ff,
                     s.n_embd,
                     BufId::Cur,
@@ -2164,7 +2215,7 @@ pub fn measure(
                     // that it reads the model's kind here. It did not.
                     b.matmat(
                         s.wide_kind,
-                        0,
+                        wide_up_offset,
                         s.n_embd,
                         out,
                         BufId::Cur,
@@ -2173,7 +2224,7 @@ pub fn measure(
                     );
                     b.matmat(
                         s.wide_kind,
-                        0,
+                        wide_down_offset,
                         s.n_ff,
                         out.min(s.n_embd),
                         BufId::Cur,
@@ -2194,7 +2245,7 @@ pub fn measure(
                     for w in RANK_WIDTHS {
                         b.matmat(
                             s.wide_kind,
-                            0,
+                            wide_up_offset,
                             s.n_embd,
                             out,
                             BufId::Cur,
@@ -2203,7 +2254,7 @@ pub fn measure(
                         );
                         b.matmat(
                             s.wide_kind,
-                            0,
+                            wide_down_offset,
                             s.n_ff,
                             out.min(s.n_embd),
                             BufId::Cur,
@@ -2230,7 +2281,7 @@ pub fn measure(
                 time_us(b, 3, 2, &move || {
                     b.matmat(
                         s.wide_kind,
-                        0,
+                        wide_up_offset,
                         s.n_embd,
                         out,
                         BufId::Cur,
@@ -2239,7 +2290,7 @@ pub fn measure(
                     );
                     b.matmat(
                         s.wide_kind,
-                        0,
+                        wide_down_offset,
                         s.n_ff,
                         out.min(s.n_embd),
                         BufId::Cur,
@@ -2258,7 +2309,7 @@ pub fn measure(
                 time_us(b, 5, 4, &move || {
                     b.matmat(
                         s.wide_kind,
-                        0,
+                        wide_up_offset,
                         s.n_embd,
                         out,
                         BufId::Cur,
@@ -2267,7 +2318,7 @@ pub fn measure(
                     );
                     b.matmat(
                         s.wide_kind,
-                        0,
+                        wide_down_offset,
                         s.n_ff,
                         out.min(s.n_embd),
                         BufId::Cur,
@@ -2399,7 +2450,17 @@ pub fn measure(
         let t = std::time::Instant::now();
         b.reset_tuner_dispatch_proof();
         b.begin();
-        b.matmat(s.wide_kind, 0, 256, 256, BufId::Cur, BufId::Logits, 64);
+        // A rotated matrix keeps its complete K/sign vector, even in the small screen.
+        let screen_k = if s.wide_kind == 39 { s.n_embd } else { 256 };
+        b.matmat(
+            s.wide_kind,
+            wide_up_offset,
+            screen_k,
+            256.min(s.n_ff),
+            BufId::Cur,
+            BufId::Logits,
+            64,
+        );
         b.end().unwrap_or_else(|rc| {
             panic!("tuner screen GPU submission failed with backend code {rc}")
         });
@@ -2477,7 +2538,8 @@ pub fn measure(
                 SweepKind::Crossing { lo, .. }
                 | SweepKind::TokenMinCrossing { lo, .. }
                 | SweepKind::TokenMaxCrossing { lo, .. }
-                | SweepKind::SpanCrossing { lo, .. } => {
+                | SweepKind::SpanCrossing { lo, .. }
+                | SweepKind::RowsCrossing { lo, .. } => {
                     let cur = (r.current)();
                     (r.apply)(lo);
                     Some((r, cur))
@@ -2819,7 +2881,80 @@ pub fn measure(
     // the compiled default stands. (The old min_tok scan recorded that its crossing
     // "never reproduced" -- that was the task-#5 wobble perturbing one side, root-caused
     // since as the engine's arena aliasing and fixed; both sides are honest to time now.)
-    let crossing = |d: &KnobDecl, ladder: &[u32], hi: u32, lo: u32| -> u32 {
+    // `rows`: each rung is a co-batched decode step at n independent rows (`RowsCrossing`),
+    // timed with the backend's fast decode-rows route on, which is where the knob routes.
+    // The step is the majority layer's matmuls as the rows forward issues them -- the
+    // mixer projections, then the FFN as the gated pair where the backend takes one (the
+    // GEMM side) or as gate, up and act_mul (the GEMV side), then down -- plus the lm
+    // head at its per-layer share, as in DecodeMix.
+    let mixer: Vec<(u64, u32, u32, u32)> = mix
+        .iter()
+        .filter(|e| {
+            s.ffn_transaction
+                .is_none_or(|t| ![t.gate.0, t.up.0, t.down.0].contains(&e.0))
+        })
+        .copied()
+        .collect();
+    let rows_layer = |n: u32| {
+        for &(off, i, o, wk) in &mixer {
+            b.matmat(wk, off, i, o, BufId::Cur, BufId::Logits, n);
+        }
+        let Some(t) = s.ffn_transaction else {
+            return;
+        };
+        let (g_off, g_in, g_out, g_kind) = t.gate;
+        let (u_off, _, _, u_kind) = t.up;
+        let (d_off, d_in, d_out, d_kind) = t.down;
+        b.set_activation(s.activation);
+        let fused = b.ffn_gated_down(
+            g_kind,
+            g_off,
+            u_kind,
+            u_off,
+            d_kind,
+            d_off,
+            g_in,
+            g_out,
+            d_out,
+            BufId::Cur,
+            BufId::G,
+            BufId::X,
+            n,
+        );
+        if fused {
+            return;
+        }
+        let pair = b.matmat_gated(
+            g_kind,
+            g_off,
+            u_kind,
+            u_off,
+            g_in,
+            g_out,
+            BufId::Cur,
+            BufId::G,
+            BufId::U,
+            n,
+        );
+        if !pair {
+            b.matmat(g_kind, g_off, g_in, g_out, BufId::Cur, BufId::G, n);
+            b.matmat(u_kind, u_off, g_in, g_out, BufId::Cur, BufId::U, n);
+            b.act_mul(BufId::G, BufId::U, n * g_out);
+        }
+        b.matmat(d_kind, d_off, d_in, d_out, BufId::G, BufId::X, n);
+    };
+    let rows_step_us = |n: u32| {
+        b.set_decode_rows(Some(imparo_backend::RowRoute::Fast));
+        let layer = time_us(b, 3, 8, &|| rows_layer(n));
+        let head = s.lm_head.map_or(0.0, |(off, i, o, wk)| {
+            time_us(b, 3, 8, &move || {
+                b.matmat(wk, off, i, o, BufId::Cur, BufId::Logits, n);
+            }) / f64::from(s.n_layers.max(1))
+        });
+        b.set_decode_rows(None);
+        layer + head
+    };
+    let crossing = |d: &KnobDecl, ladder: &[u32], hi: u32, lo: u32, rows: bool| {
         expect_one(d);
         let default = (d.current)();
         let scan = || {
@@ -2827,6 +2962,9 @@ pub fn measure(
             for (i, &n) in ladder.iter().enumerate() {
                 let one = |boundary: u32| {
                     (d.apply)(boundary);
+                    if rows {
+                        return rows_step_us(n);
+                    }
                     time_us(b, 3, 8, &move || {
                         // THE MODEL'S OWN KIND, for the same reason `NarrowMix` gives:
                         // each quant has its own route family, so a Q8 boundary forced
@@ -2837,7 +2975,7 @@ pub fn measure(
                         // same routing choice was 89 ms against 60 ms.
                         b.matmat(
                             s.wide_kind,
-                            0,
+                            wide_up_offset,
                             s.n_embd,
                             s.n_ff,
                             BufId::Cur,
@@ -3621,7 +3759,12 @@ pub fn measure(
         // Boundaries last, against the shape that just won.
         for d in &rest {
             let v = match d.sweep {
-                SweepKind::Crossing { ladder, hi, lo } => crossing(d, ladder, hi, lo),
+                SweepKind::Crossing { ladder, hi, lo } => {
+                    crossing(d, ladder, hi, lo, false)
+                }
+                SweepKind::RowsCrossing { ladder, hi, lo } => {
+                    crossing(d, ladder, hi, lo, true)
+                }
                 SweepKind::TokenMinCrossing { ladder, hi, lo } => {
                     token_min_crossing(d, ladder, hi, lo, false)
                 }
@@ -3727,7 +3870,12 @@ pub fn measure(
                 value
             }
             SweepKind::Values => sweep(d),
-            SweepKind::Crossing { ladder, hi, lo } => crossing(d, ladder, hi, lo),
+            SweepKind::Crossing { ladder, hi, lo } => {
+                crossing(d, ladder, hi, lo, false)
+            }
+            SweepKind::RowsCrossing { ladder, hi, lo } => {
+                crossing(d, ladder, hi, lo, true)
+            }
             SweepKind::TokenMinCrossing { ladder, hi, lo } => {
                 token_min_crossing(d, ladder, hi, lo, false)
             }
@@ -4029,5 +4177,44 @@ mod tests {
             settle_token_min_scans(&[Some(32), Some(128), Some(512)], &ladder, 0),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod ptq_tuner_tests {
+    use super::{FfnTransactionShape, wide_projection_offsets};
+    fn triple() -> FfnTransactionShape {
+        FfnTransactionShape {
+            gate: (256, 5120, 17408, 39),
+            up: (20_000_000, 5120, 17408, 39),
+            down: (40_000_000, 17408, 5120, 39),
+        }
+    }
+    #[test]
+    fn ptq_wide_workloads_use_distinct_registered_k_addresses() {
+        assert_eq!(
+            wide_projection_offsets(39, 5120, 17408, Some(triple())).unwrap(),
+            (256, 40_000_000)
+        );
+        for kind in [1, 2, 3, 40] {
+            assert_eq!(
+                wide_projection_offsets(kind, 5120, 17408, None).unwrap(),
+                (0, 0)
+            );
+        }
+    }
+    #[test]
+    fn ptq_wide_workloads_fail_closed_without_valid_named_matrices() {
+        assert!(wide_projection_offsets(39, 5120, 17408, None).is_err());
+        for field in 0..4 {
+            let mut t = triple();
+            match field {
+                0 => t.down.0 = t.gate.0,
+                1 => t.gate.0 = 0,
+                2 => t.down.1 = 5120,
+                _ => t.gate.3 = 3,
+            }
+            assert!(wide_projection_offsets(39, 5120, 17408, Some(t)).is_err());
+        }
     }
 }

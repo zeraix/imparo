@@ -1,5 +1,5 @@
 {
   "schema": 1,
-  "backend_abi": 34,
+  "backend_abi": 35,
   "sms": [75, 80, 86, 89, 90, 100, 120]
 }

@@ -14,7 +14,7 @@ uint64_t active_execution_owner_id = 0;
 
 bool execution_boundary_closed() {
     const auto & s = execution();
-    return !s.forward_open && !s.forward_active && !s.graph_capturing
+    return !s.forward_open && !s.forward_active && !s.graph_capturing && !s.tree_capture_active
         && !s.prefill_capture_active && !s.decode_prepared
         && !s.prefill_prepared && !s.pending_error;
 }
@@ -102,6 +102,9 @@ uint64_t execution_device_bytes(const ExecutionState & s) {
     uint64_t total = s.weight_cache_bytes + s.rope_freqs_bytes
         + s.q8_scratch_bytes + s.q8_scratch_next_bytes + s.device_task_scratch_bytes
         + s.attention_scratch_bytes + s.attention_q_cache_bytes + s.arena_size;
+#if defined(IMPARO_CUDA_ENABLE_PTQ_CUBLAS)
+    total += s.ptq_gemm.bytes;
+#endif
     if (s.decode_control_device) total += sizeof(uint32_t);
     for (int i = 0; i < B_COUNT; ++i) {
         if (s.bufs[i] && !s.in_arena[i]) total += s.sizes[i];
@@ -121,6 +124,8 @@ uint64_t execution_owners_device_bytes() {
 }
 
 bool release_execution_storage_checked(ExecutionState & s) {
+    if (s.tree_capture_active) return false;
+    s.tree_replay.reset();
     if (!destroy_decode_graph_checked(s)) return false;
     const auto device = [](void *& p) {
         if (p && cudaFree(p) != cudaSuccess) return false;
@@ -153,6 +158,10 @@ bool release_execution_storage_checked(ExecutionState & s) {
         bytes = 0;
         return true;
     };
+#if defined(IMPARO_CUDA_ENABLE_PTQ_CUBLAS)
+    if (!imparo_cuda_ptq1_gemm::release(s.ptq_gemm)) return false;
+#endif
+    if (!release_weight_transfer(s.weight_transfer)) return false;
     if (!sized(s.weight_cache, s.weight_cache_bytes)
         || !sized(s.rope_freqs, s.rope_freqs_bytes)
         || !sized(s.q8_scratch, s.q8_scratch_bytes)
@@ -191,6 +200,33 @@ int execution_owner_release(uint64_t id) {
 
 #if defined(IMPARO_CUDA_SPECULATIVE)
 // Static execution symbols deliberately absent from imparo_cuda.def.
+// Configure only a fresh, selected target owner; an existing numerical lifetime
+// must be retired instead of switched beneath state, prepared buffers or Graphs.
+extern "C" int imparo_cuda_prepare_batch_invariant_q8_v1() {
+    auto & s = execution();
+    if (!g.runtime_initialized || !g.weights_host || !execution_boundary_closed()
+            || s.graph_leases || g.sm_version != 86
+            || g.kv_type_k != 8 || g.kv_type_v != 8 || !s.kv_layout.layers) {
+        return CUDA_RC_INVALID;
+    }
+    if (s.q8_numerical_policy == 1) return 0; // same-owner preparation is idempotent
+    if (s.q8_numerical_policy != 0 || s.batch_geometry_valid
+            || s.materialized_geometry_valid || s.graph_capture_generation
+            || s.decode_graph || s.decode_graph_exec
+            || s.prefill_graph || s.prefill_graph_exec
+            || s.verification_graph || s.verification_graph_exec || s.tree_replay
+            || s.q8_scratch || s.q8_scratch_next || s.q8_src != UINT32_MAX
+            || s.q8_cache_numerical_policy != UINT32_MAX
+            || s.attention_q_src != UINT32_MAX
+            || s.kdq.layer != UINT32_MAX || s.vdq.layer != UINT32_MAX) {
+        return CUDA_RC_INVALID;
+    }
+    // No live numerical cache or captured executable can cross this transition.
+    // Owner creation remains Legacy, including DSpark's separately created owner.
+    s.q8_numerical_policy = 1;
+    return 0;
+}
+
 extern "C" int imparo_cuda_execution_work_demand_lab(
         uint32_t ffn_layers, uint32_t logits_wanted) {
     auto & s = execution();

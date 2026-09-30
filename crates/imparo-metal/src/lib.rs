@@ -60,6 +60,24 @@ pub fn decode_probe_for_tests(
     n_elems: usize,
     half: bool,
 ) -> Result<Vec<f32>, i32> {
+    decode_probe_mode_for_tests(wfmt, scales, payload, n_elems, u32::from(half))
+}
+
+/// The brick's gate with its other outputs: `mode` bit 0 the half output, bit 1 the run fetch
+/// (`tm_run8`, the eight values a rows-matmul lane holds, each put back at its k), bit 2 the
+/// aligned flag the tile-major kernels pass, bit 3 (with bit 1) the pair fetch (`tm_run8_pair`)
+/// where the format has one.
+///
+/// # Errors
+/// The backend's return code when the device, the pipeline or the dispatch fails.
+#[doc(hidden)]
+pub fn decode_probe_mode_for_tests(
+    wfmt: u32,
+    scales: &[u8],
+    payload: &[u8],
+    n_elems: usize,
+    mode: u32,
+) -> Result<Vec<f32>, i32> {
     // The probe needs the device and the compiled library, which `imparo_metal_init`
     // builds; the process runs one model, so this init is the test's model.
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -78,7 +96,7 @@ pub fn decode_probe_for_tests(
             payload.as_ptr().cast(),
             payload.len() as u64,
             u32::try_from(n_elems).map_err(|_| -1_i32)?,
-            u32::from(half),
+            mode,
             out.as_mut_ptr(),
         )
     };
@@ -103,7 +121,7 @@ unsafe extern "C" {
         payload: *const core::ffi::c_void,
         n_pay_bytes: u64,
         n_elems: u32,
-        as_half: u32,
+        mode: u32,
         out: *mut f32,
     ) -> i32;
     fn imparo_metal_working_set_budget() -> u64;
@@ -120,9 +138,141 @@ unsafe extern "C" {
     fn imparo_metal_kv_types(k: *mut u32, v: *mut u32);
     fn imparo_metal_read_kv(layer: u32, is_v: u32, off: u64, dst: *mut u8, n: u64);
     fn imparo_metal_write_kv(layer: u32, is_v: u32, off: u64, src: *const u8, n: u64);
+    fn imparo_metal_kv_host_span(layer: u32, is_v: u32, off: u64, n: u64) -> *mut u8;
     fn imparo_metal_set_kv_pages(layer: u32, e: *const u32, n: u32);
     fn imparo_metal_set_concurrent(on: u32);
     fn imparo_metal_argmax(src: u32, dst: u32, n: u32);
+    fn imparo_metal_argmax_rows(src: u32, dst: u32, width: u32, rows: u32);
+    fn imparo_metal_top_k_rows_max() -> u32;
+    fn imparo_metal_top_k_rows_len(width: u32, rows: u32, k: u32) -> u64;
+    fn imparo_metal_top_k_rows(
+        src: u32,
+        dst: u32,
+        width: u32,
+        rows: u32,
+        k: u32,
+    ) -> i32;
+    fn imparo_metal_moe_gate(
+        scores: u32,
+        probs: u32,
+        sel: u32,
+        bias_off: u64,
+        n_tok: u32,
+        n_expert: u32,
+        gating: u32,
+    ) -> i32;
+    fn imparo_metal_moe_plan(
+        topk: u32,
+        probs: u32,
+        perm: u32,
+        wgt: u32,
+        seg: u32,
+        inv: u32,
+        n_tok: u32,
+        n_expert: u32,
+        k: u32,
+        normalise: u32,
+        scale: f32,
+    ) -> i32;
+    fn imparo_metal_moe_grouped(
+        wkind: u32,
+        w_off: u64,
+        expert_stride: u64,
+        src: u32,
+        dst: u32,
+        perm: u32,
+        seg: u32,
+        n_in: u32,
+        n_out: u32,
+        n_expert: u32,
+        n_tok: u32,
+        rows: u32,
+        src_work_rows: u32,
+        prefill_chunk: u32,
+    ) -> i32;
+    fn imparo_metal_moe_route(
+        scores: u32,
+        probs: u32,
+        sel: u32,
+        topk: u32,
+        perm: u32,
+        wgt: u32,
+        seg: u32,
+        inv: u32,
+        bias_off: u64,
+        n_tok: u32,
+        n_expert: u32,
+        k: u32,
+        gating: u32,
+        normalise: u32,
+        scale: f32,
+    ) -> i32;
+    fn imparo_metal_moe_grouped_pair(
+        wkind: u32,
+        gate_off: u64,
+        up_off: u64,
+        expert_stride: u64,
+        src: u32,
+        dst: u32,
+        perm: u32,
+        seg: u32,
+        n_in: u32,
+        n_out: u32,
+        n_expert: u32,
+        n_tok: u32,
+        rows: u32,
+        prefill_chunk: u32,
+    ) -> i32;
+    fn imparo_metal_moe_combine(
+        src: u32,
+        wgt: u32,
+        inv: u32,
+        dst: u32,
+        n_embd: u32,
+        k: u32,
+        n_tok: u32,
+    ) -> i32;
+    fn imparo_metal_matmat_resid(
+        wkind: u32,
+        w_off: u64,
+        n_in: u32,
+        n_out: u32,
+        src: u32,
+        resid: u32,
+        n_tok: u32,
+    ) -> i32;
+    fn imparo_metal_rms_norm_resid(
+        dst: u32,
+        resid: u32,
+        w_off: u64,
+        width: u32,
+        eps: f32,
+        n_row: u32,
+    ) -> i32;
+    fn imparo_metal_moe_combine_add_rms_norm(
+        ydown: u32,
+        wgt: u32,
+        inv: u32,
+        k: u32,
+        dst: u32,
+        resid: u32,
+        w_off: u64,
+        width: u32,
+        eps: f32,
+        n_row: u32,
+    ) -> i32;
+    fn imparo_metal_logistic_rows_len(a_width: u32, b_width: u32, rows: u32) -> u64;
+    fn imparo_metal_logistic_rows(
+        a: u32,
+        a_width: u32,
+        b: u32,
+        b_width: u32,
+        w: u32,
+        w_off: u32,
+        dst: u32,
+        dst_off: u32,
+        rows: u32,
+    ) -> i32;
     fn imparo_metal_set_skip_attn(on: u32);
     fn imparo_metal_set_skip_cat(cat: u32);
     fn imparo_metal_set_epilogue(kind: u32);
@@ -177,6 +327,9 @@ unsafe extern "C" {
     fn imparo_metal_read_weight_bytes(off: u64, bytes: u64, out: *mut u8) -> i32;
     fn imparo_metal_set_weight_kind_types(pairs: *const u32, n: u32);
     fn imparo_metal_refused_dispatches() -> u64;
+    fn imparo_metal_route_count_n() -> u32;
+    fn imparo_metal_route_name(i: u32) -> *const std::os::raw::c_char;
+    fn imparo_metal_route_count(i: u32) -> u64;
     fn imparo_metal_rt_route_kinds() -> u64;
     fn imparo_metal_ple_gather_combine_staged(
         proj: u32,
@@ -217,11 +370,17 @@ unsafe extern "C" {
     fn imparo_metal_set_q8_dev_a(on: u32);
     fn imparo_metal_set_q8_clamp_edge(on: u32);
     fn imparo_metal_set_q8_mma_fence(on: u32);
+    fn imparo_metal_set_q8_pad_skip(on: u32);
     fn imparo_metal_set_rt_mma_fence(on: u32);
     fn imparo_metal_set_attn_skip(bits: u32);
+    fn imparo_metal_set_skip_mm_nout(n: u32);
+    fn imparo_metal_set_dup_mm_nout(n: u32);
+    fn imparo_metal_set_dup_attn_combine(on: u32);
+    fn imparo_metal_set_haz_skip(on: u32);
+    fn imparo_metal_set_haz_named(on: u32);
     fn imparo_metal_st_gemm_shape() -> u32;
-    fn imparo_metal_set_st_gemm_large_shape(shape: u32);
-    fn imparo_metal_st_gemm_large_shape() -> u32;
+    fn imparo_metal_set_st_gemm_narrow_max(n: u32);
+    fn imparo_metal_st_gemm_narrow_max() -> u32;
     fn imparo_metal_set_q8_full_tiles(on: u32);
     fn imparo_metal_q8_full_tiles() -> u32;
     fn imparo_metal_set_q8_all(on: u32);
@@ -254,6 +413,90 @@ unsafe extern "C" {
     fn imparo_metal_set_kvq_rt(ty: u32, lo: u32, hi: u32);
     fn imparo_metal_set_nb8_max(n: u32);
     fn imparo_metal_set_gemv_max_tok(n: u32);
+    fn imparo_metal_set_decode_rows(route: u32);
+    fn imparo_metal_set_q8_rows_gemv_max(n: u32);
+    fn imparo_metal_q8_rows_gemv_max() -> u32;
+    fn imparo_metal_set_q8_tm_rows_mma_max(n: u32);
+    fn imparo_metal_q8_tm_rows_mma_max() -> u32;
+    fn imparo_metal_set_q4_rows_mma_max(n: u32);
+    fn imparo_metal_q4_rows_mma_max() -> u32;
+    fn imparo_metal_rows_mma_dispatches() -> u64;
+    fn imparo_metal_set_blk_rows_gemv_max(n: u32);
+    fn imparo_metal_blk_rows_gemv_max() -> u32;
+    fn imparo_metal_blk_rows_gemv_max_for(wkind: u32) -> u32;
+    fn imparo_metal_blk_rows_gemv_max_at(wkind: u32, n_in: u32, n_out: u32) -> u32;
+    fn imparo_metal_set_blk_rows_seat(
+        wkind: u32,
+        n_in: u32,
+        n_out: u32,
+        gemv_max: u32,
+    ) -> bool;
+    fn imparo_metal_clear_blk_rows_seats();
+    fn imparo_metal_blk_rows_seat_count() -> u32;
+    fn imparo_metal_blk_rows_dispatches() -> u64;
+    fn imparo_metal_set_blk_rows_mma_max(n: u32);
+    fn imparo_metal_blk_rows_mma_max() -> u32;
+    fn imparo_metal_set_q4_rows_gemv_max(n: u32);
+    fn imparo_metal_q4_rows_gemv_max() -> u32;
+    fn imparo_metal_set_slots(
+        n: u32,
+        buf_ids: *const u32,
+        n_ids: u32,
+        ring_layers: *const u32,
+        n_rings: u32,
+    ) -> i32;
+    fn imparo_metal_select_slot(slot: u32) -> i32;
+    fn imparo_metal_release_slot(slot: u32) -> i32;
+    fn imparo_metal_kv_store_slot_rows(
+        src: u32,
+        layer: u32,
+        width: u32,
+        slots: *const u32,
+        pos: *const u32,
+        n_rows: u32,
+        is_v: u32,
+        ring: u32,
+    );
+    fn imparo_metal_attention_slot_rows(
+        kv_layer: u32,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv: u32,
+        kv_width: u32,
+        window: u32,
+        scale: f32,
+        slots: *const u32,
+        pos: *const u32,
+        max_scores: *const u32,
+        n_rows: u32,
+        ring: u32,
+    );
+    fn imparo_metal_causal_conv_slot_rows(
+        form: u32,
+        src: u32,
+        w_off: u64,
+        state: u32,
+        slots: *const u32,
+        state_off: *const u32,
+        state_out_off: *const u32,
+        n_rows: u32,
+        out: u32,
+        width: u32,
+        kern: u32,
+    );
+    fn imparo_metal_head_norm_rope_at(
+        buf: u32,
+        w_off: u64,
+        head_dim: u32,
+        eps: f32,
+        n_heads: u32,
+        pos: *const u32,
+        n_rows: u32,
+        n_rot: u32,
+        base: f32,
+        freqs: *const f32,
+        n_freqs: u32,
+    );
     fn imparo_metal_gemv_max_tok_current() -> u32;
     fn imparo_metal_set_nb8_shape(v: u32);
     fn imparo_metal_nb8_max_current() -> u32;
@@ -270,6 +513,8 @@ unsafe extern "C" {
     fn imparo_metal_set_attn_stage(v: u32);
     fn imparo_metal_set_attn_gqa(on: u32);
     fn imparo_metal_set_attn_fd(on: u32);
+    fn imparo_metal_set_verify_attention(tgs: u32, heads: u32);
+    fn imparo_metal_set_verify_split_on(on: u32);
     fn imparo_metal_set_attn_fd_chunk(v: u32);
     fn imparo_metal_attn_fd_chunk() -> u32;
     fn imparo_metal_set_attn_vec_max_keys(v: u32);
@@ -280,6 +525,7 @@ unsafe extern "C" {
     fn imparo_metal_mega_nsg_current() -> u32;
     fn imparo_metal_mega_threads_limit() -> u32;
     fn imparo_metal_gpu_cores() -> u32;
+    fn imparo_metal_moe_token_tile() -> u32;
     fn imparo_metal_set_mega_tgs_large(v: u32);
     fn imparo_metal_mega_tgs_large_current() -> u32;
     fn imparo_metal_mega_admission(family: u32, slot: u32) -> u32;
@@ -294,7 +540,12 @@ unsafe extern "C" {
     fn imparo_metal_set_rt_shape(i: u32) -> i32;
     fn imparo_metal_prof_enable(on: u32);
     fn imparo_metal_prof_barriers() -> u64;
-    fn imparo_metal_prof_cats(secs: *mut f64, calls: *mut u64, n: *mut u32);
+    fn imparo_metal_prof_cats_b(
+        secs: *mut f64,
+        calls: *mut u64,
+        bytes: *mut u64,
+        n: *mut u32,
+    );
     fn imparo_metal_prof_cat_name(i: u32) -> *const std::os::raw::c_char;
     fn imparo_metal_prof_read(
         gpu_s: *mut f64,
@@ -308,6 +559,18 @@ unsafe extern "C" {
     fn imparo_metal_place(id: u32, offset: u64, bytes: u64) -> i32;
     fn imparo_metal_page_round(n: u64) -> u64;
     fn imparo_metal_grow_kv(n_layers: u32, bytes: *const u64) -> i32;
+    fn imparo_metal_alloc_kv_reserved(
+        n_layers: u32,
+        bytes: *const u64,
+        reserve: *const u64,
+    ) -> i32;
+    fn imparo_metal_kv_prefetch(n_layers: u32, bytes: *const u64);
+    fn imparo_metal_kv_adopt(n_layers: u32, need: *const u64);
+    fn imparo_metal_kv_release(n_layers: u32, bytes: *const u64) -> i32;
+    fn imparo_metal_take_memory_pressure() -> u32;
+    fn imparo_metal_idle_release_s() -> u32;
+    fn imparo_metal_kv_committed_bytes() -> u64;
+    fn imparo_metal_max_buffer_bytes() -> u64;
     fn imparo_metal_allocated_bytes() -> u64;
     fn imparo_metal_bw_read(bytes: u64, reps: u32, tgs: u32, tpg: u32) -> f64;
     fn imparo_metal_gemv_probe(
@@ -328,6 +591,7 @@ unsafe extern "C" {
     fn imparo_metal_zero(id: u32, off: u64, n: u64);
     fn imparo_metal_wire_weights(stall_budget_s: f64);
     fn imparo_metal_set_weight_path(path: *const std::os::raw::c_char);
+    fn imparo_metal_slow_segments() -> u32;
     fn imparo_metal_longest_cb_us() -> f64;
     fn imparo_metal_read(id: u32, off: u64, dst: *mut f32, n: u64);
     fn imparo_metal_end_async() -> i32;
@@ -511,6 +775,62 @@ unsafe extern "C" {
         kern: u32,
         n_tok: u32,
     );
+    fn imparo_metal_supports_row_layout(head_dim: u32) -> u32;
+    fn imparo_metal_attention_rows(
+        kv_layer: u32,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv: u32,
+        kv_width: u32,
+        start_pos: u32,
+        key_lo: u32,
+        n_tok: u32,
+        scale: f32,
+        layout: u32,
+        float_q: u32,
+    ) -> u32;
+    fn imparo_metal_head_norm_rope_rows(
+        buf: u32,
+        w_off: u64,
+        head_dim: u32,
+        eps: f32,
+        n_heads: u32,
+        n_tok: u32,
+        n_rot: u32,
+        base: f32,
+        freqs: *const f32,
+        n_freqs: u32,
+        layout: u32,
+    ) -> u32;
+    fn imparo_metal_causal_conv_rows(
+        form: u32,
+        src: u32,
+        w_off: u64,
+        state: u32,
+        state_off: u32,
+        out: u32,
+        width: u32,
+        kern: u32,
+        n_tok: u32,
+        layout: u32,
+    ) -> u32;
+    fn imparo_metal_conv_row_inputs(
+        form: u32,
+        src: u32,
+        inputs: u32,
+        inputs_off: u32,
+        row_elems: u32,
+        width: u32,
+        n_tok: u32,
+    ) -> u32;
+    fn imparo_metal_kv_move_rows(
+        layer: u32,
+        k_stride: u64,
+        v_stride: u64,
+        from: *const u32,
+        to: *const u32,
+        n: u32,
+    ) -> u32;
     fn imparo_metal_delta_net(
         qkv: u32,
         alpha: u32,
@@ -536,6 +856,47 @@ unsafe extern "C" {
         snap_off: u32,
         snap_row: u32,
     ) -> bool;
+    fn imparo_metal_delta_net_slot_rows(
+        qkv: u32,
+        alpha: u32,
+        beta: u32,
+        a_off: u64,
+        dt_off: u64,
+        state: u32,
+        slots: *const u32,
+        state_off: *const u32,
+        state_out_off: *const u32,
+        n_rows: u32,
+        out: u32,
+        k_heads: u32,
+        v_heads: u32,
+        key_dim: u32,
+        value_dim: u32,
+        eps: f32,
+        norm_w_off: u64,
+        gate: u32,
+    ) -> bool;
+    fn imparo_metal_delta_net_tree(
+        qkv: u32,
+        alpha: u32,
+        beta: u32,
+        a_off: u64,
+        dt_off: u64,
+        state: u32,
+        state_off: u32,
+        out: u32,
+        layout: u32,
+        layout_words: u32,
+        keep_lo: u32,
+        keep_hi: u32,
+        k_heads: u32,
+        v_heads: u32,
+        key_dim: u32,
+        value_dim: u32,
+        n_tok: u32,
+        eps: f32,
+    ) -> bool;
+    fn imparo_metal_delta_tree_depth() -> u32;
     fn imparo_metal_set_recurrent_dims(key_dim: u32, value_dim: u32);
     fn imparo_metal_supports_gated_delta() -> u32;
     fn imparo_metal_delta_net_fuses_epilogue() -> u32;
@@ -554,6 +915,14 @@ unsafe extern "C" {
         width: u32,
         src_off: u32,
         src_stride: u32,
+        n_row: u32,
+    );
+    fn imparo_metal_scatter_strided(
+        dst: u32,
+        src: u32,
+        width: u32,
+        dst_off: u32,
+        dst_stride: u32,
         n_row: u32,
     );
     fn imparo_metal_add(a: u32, b: u32, n: u32);
@@ -632,6 +1001,16 @@ pub fn set_rt(on: bool) {
 /// Attention threadgroup count below which the KV range is split across threadgroups.
 pub fn set_attn_min_tgs(n: u32) {
     unsafe { imparo_metal_set_attn_min_tgs(n) }
+}
+/// A verify's row-layout attention: the threadgroups its key split aims for (0 = no split) and
+/// whether the four query heads of a KV head share a threadgroup (0 or 1).
+pub fn set_verify_attention(tgs: u32, heads: u32) {
+    unsafe { imparo_metal_set_verify_attention(tgs, heads) }
+}
+/// False keeps a row-layout attention from splitting its keys, so its arithmetic is the causal
+/// forward's; true restores the configured split.
+pub fn set_verify_split_on(on: bool) {
+    unsafe { imparo_metal_set_verify_split_on(u32::from(on)) }
 }
 /// Register-blocking depth in the attention matrix phases.
 /// Query heads per threadgroup in the stream kernel (1 or 2). GQA row sharing:
@@ -849,6 +1228,217 @@ q8_knob!(
     imparo_metal_q8_decode_rows
 );
 q8_knob!(
+    set_q8_rows_gemv_max,
+    q8_rows_gemv_max,
+    imparo_metal_set_q8_rows_gemv_max,
+    imparo_metal_q8_rows_gemv_max
+);
+q8_knob!(
+    set_q8_tm_rows_mma_max,
+    q8_tm_rows_mma_max,
+    imparo_metal_set_q8_tm_rows_mma_max,
+    imparo_metal_q8_tm_rows_mma_max
+);
+q8_knob!(
+    set_q4_rows_mma_max,
+    q4_rows_mma_max,
+    imparo_metal_set_q4_rows_mma_max,
+    imparo_metal_q4_rows_mma_max
+);
+/// Rows-matmul dispatches this process encoded: proof the route ran, independent of its output.
+#[must_use]
+pub fn rows_mma_dispatches() -> u64 {
+    unsafe { imparo_metal_rows_mma_dispatches() }
+}
+q8_knob!(
+    set_blk_rows_gemv_max,
+    blk_rows_gemv_max,
+    imparo_metal_set_blk_rows_gemv_max,
+    imparo_metal_blk_rows_gemv_max
+);
+/// The crossing one weight kind takes WITHOUT a per-tensor seat: rows up to this many go to the
+/// block formats' decode-rows GEMV, above it the matrix-unit rows kernel. Per format -- 2 for the
+/// ones whose unpack leaves them short of the bandwidth wall, 1 for the rest -- unless
+/// `set_blk_rows_gemv_max` has overridden every format. 0 is a kind with no block rows kernel.
+#[must_use]
+pub fn blk_rows_gemv_max_for(wkind: u32) -> u32 {
+    unsafe { imparo_metal_blk_rows_gemv_max_for(wkind) }
+}
+/// What one TENSOR takes: its seat when the tune file carried one for this (kind, shape), the
+/// format's crossing otherwise. This is what a dispatch actually uses.
+#[must_use]
+pub fn blk_rows_gemv_max_at(wkind: u32, n_in: u32, n_out: u32) -> u32 {
+    unsafe { imparo_metal_blk_rows_gemv_max_at(wkind, n_in, n_out) }
+}
+/// Seat one measured tensor. `gemv_max` is the rows up to which the tuner found the scalar rows
+/// GEMV beat the matrix unit on this (kind, shape). Re-seating a triple replaces it. False when
+/// the table is full or the value is out of range -- that tensor then keeps its format's
+/// crossing, which is the shipped behaviour, so a full table degrades rather than breaks.
+pub fn set_blk_rows_seat(wkind: u32, n_in: u32, n_out: u32, gemv_max: u32) -> bool {
+    unsafe { imparo_metal_set_blk_rows_seat(wkind, n_in, n_out, gemv_max) }
+}
+/// Drop every per-tensor seat, so every tensor goes back to its format's crossing. A test or a
+/// model reload starts from here.
+pub fn clear_blk_rows_seats() {
+    unsafe { imparo_metal_clear_blk_rows_seats() }
+}
+/// How many tensors are seated. A caller that just applied a tune file checks this against the
+/// number of lines it passed, so a silently-dropped seat is visible.
+#[must_use]
+pub fn blk_rows_seat_count() -> u32 {
+    unsafe { imparo_metal_blk_rows_seat_count() }
+}
+
+/// One measured triple: which kernel won at `rows` rows, and by how much.
+#[derive(Debug, Clone, Copy)]
+pub struct BlkRowsMeasurement {
+    pub wkind: u32,
+    pub n_in: u32,
+    pub n_out: u32,
+    /// How many tensors of the model share this (kind, shape) -- so a caller can weight a
+    /// difference by how many dispatches a step actually issues on it.
+    pub tensors: u32,
+    /// Best microseconds per dispatch on each kernel.
+    pub gemv_us: f64,
+    pub mma_us: f64,
+}
+
+impl BlkRowsMeasurement {
+    /// The seat value: `rows` when the scalar rows GEMV won (serve rows up to that on it), 1 when
+    /// the matrix unit did (serve 2 and above on it).
+    #[must_use]
+    pub fn seat(&self, rows: u32) -> u32 {
+        if self.gemv_us < self.mma_us { rows } else { 1 }
+    }
+}
+
+/// TIMES BOTH ROWS KERNELS ON EACH (kind, n_in, n_out) the model carries, which is what makes a
+/// per-tensor seat possible where a per-format one was not.
+///
+/// The objection to seating the crossing at all was that a sweep reads ONE step total, and that
+/// total is 35% a single tensor group, so it picks the matrix unit for everything and flattens
+/// the table. Nothing here reads a total: each triple is timed on its own, twice, and keeps its
+/// own winner.
+///
+/// `tensors` is (wire kind, weight offset, n_in, n_out) for every 2-D weight the model will
+/// project through. Triples repeat across layers; they are grouped, and every tensor of a group
+/// is dispatched in each timed batch so the measurement sees the same weight stream a step does
+/// rather than one tensor re-read from cache.
+///
+/// CLOBBERS buffers X and O, the crossing overrides and the decode-rows route, and CLEARS any
+/// seats already applied -- a stale seat would otherwise steer the very measurement meant to
+/// replace it. Everything it moved is restored before it returns, except the seats, which the
+/// caller re-applies from what this returns.
+pub fn measure_blk_rows_kernels(
+    tensors: &[(u32, u64, u32, u32)],
+    rows: u32,
+) -> Result<Vec<BlkRowsMeasurement>, String> {
+    if rows < 2 {
+        return Err(format!("the rows kernels serve 2 rows and up, not {rows}"));
+    }
+    let mut groups: std::collections::BTreeMap<(u32, u32, u32), Vec<u64>> =
+        std::collections::BTreeMap::new();
+    let (mut max_in, mut max_out) = (0_u64, 0_u64);
+    for &(wkind, off, n_in, n_out) in tensors {
+        // ONLY KINDS THE ROWS KERNELS SERVE. `blk_rows_gemv_max_for` answers 0 for a kind with
+        // no block rows kernel (Q8_0 has its own path, and a float kind has none), and
+        // dispatching one here would be REFUSED -- which the tuner treats as fatal, because a
+        // refused dispatch means some candidate was ranked against work that never ran.
+        if blk_rows_gemv_max_for(wkind) == 0 {
+            continue;
+        }
+        groups.entry((wkind, n_in, n_out)).or_default().push(off);
+        max_in = max_in.max(u64::from(n_in));
+        max_out = max_out.max(u64::from(n_out));
+    }
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    alloc(buf::X, u64::from(rows) * max_in * 4)
+        .map_err(|rc| format!("alloc X rc={rc}"))?;
+    alloc(buf::O, u64::from(rows) * max_out * 4)
+        .map_err(|rc| format!("alloc O rc={rc}"))?;
+    let (gemv0, mma0) = (blk_rows_gemv_max(), blk_rows_mma_max());
+    clear_blk_rows_seats();
+    set_decode_rows(Some(imparo_backend::RowRoute::Fast));
+    // One kernel's best microseconds per dispatch for one group. Repeats until both a minimum
+    // count and a time floor are met, as the bench's probe does: a single batch of a small group
+    // is shorter than the timer's own resolution.
+    let time_group =
+        |offs: &[u64], wkind: u32, n_in: u32, n_out: u32| -> Result<f64, String> {
+            let mut best = f64::INFINITY;
+            let (mut rounds, mut total_us) = (0_usize, 0.0_f64);
+            while rounds < 5 || total_us < 20_000.0 {
+                begin();
+                for &off in offs {
+                    matmat(wkind, off, n_in, n_out, buf::X, buf::O, rows);
+                }
+                end().map_err(|rc| format!("rows probe rc={rc}"))?;
+                let us = last_gpu_us();
+                best = best.min(us / offs.len() as f64);
+                total_us += us;
+                rounds += 1;
+            }
+            Ok(best)
+        };
+    let mut out = Vec::with_capacity(groups.len());
+    let mut err = None;
+    for (&(wkind, n_in, n_out), offs) in &groups {
+        // Force each kernel through the format crossing: at `rows` every format takes the GEMV,
+        // at 1 every format is past its crossing and takes the matrix unit.
+        set_blk_rows_gemv_max(rows);
+        set_blk_rows_mma_max(0);
+        let gemv_us = match time_group(offs, wkind, n_in, n_out) {
+            Ok(v) => v,
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        };
+        set_blk_rows_gemv_max(1);
+        set_blk_rows_mma_max(rows.max(2));
+        let mma_us = match time_group(offs, wkind, n_in, n_out) {
+            Ok(v) => v,
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        };
+        out.push(BlkRowsMeasurement {
+            wkind,
+            n_in,
+            n_out,
+            tensors: u32::try_from(offs.len()).unwrap_or(u32::MAX),
+            gemv_us,
+            mma_us,
+        });
+    }
+    set_blk_rows_gemv_max(gemv0);
+    set_blk_rows_mma_max(mma0);
+    set_decode_rows(None);
+    match err {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
+}
+q8_knob!(
+    set_blk_rows_mma_max,
+    blk_rows_mma_max,
+    imparo_metal_set_blk_rows_mma_max,
+    imparo_metal_blk_rows_mma_max
+);
+/// The block formats' decode-rows GEMV dispatches this process encoded, for the same proof.
+#[must_use]
+pub fn blk_rows_dispatches() -> u64 {
+    unsafe { imparo_metal_blk_rows_dispatches() }
+}
+q8_knob!(
+    set_q4_rows_gemv_max,
+    q4_rows_gemv_max,
+    imparo_metal_set_q4_rows_gemv_max,
+    imparo_metal_q4_rows_gemv_max
+);
+q8_knob!(
     set_q8_batch_sgs,
     q8_batch_sgs,
     imparo_metal_set_q8_batch_sgs,
@@ -867,10 +1457,10 @@ q8_knob!(
     imparo_metal_st_gemm_shape
 );
 q8_knob!(
-    set_st_gemm_large_shape,
-    st_gemm_large_shape,
-    imparo_metal_set_st_gemm_large_shape,
-    imparo_metal_st_gemm_large_shape
+    set_st_gemm_narrow_max,
+    st_gemm_narrow_max,
+    imparo_metal_set_st_gemm_narrow_max,
+    imparo_metal_st_gemm_narrow_max
 );
 q8_knob!(
     set_q8_full_tiles,
@@ -1017,6 +1607,12 @@ pub fn gpu_cores() -> u32 {
     unsafe { imparo_metal_gpu_cores() }
 }
 
+/// The routed prefill GEMM's token tile (0 when that GEMM is off).
+#[must_use]
+pub fn moe_token_tile() -> u32 {
+    unsafe { imparo_metal_moe_token_tile() }
+}
+
 /// MEASURE how many threadgroups of `family`'s plain mega layer pipeline this GPU holds
 /// resident at the seated width, and remember it (task #203). The tuner's discovery step
 /// calls this between regions; 0 = no pipeline for the family, a region is open, or the
@@ -1158,6 +1754,14 @@ pub fn q8_pick_shape(n_tok: u32, n_in: u32) -> u32 {
     unsafe { imparo_metal_q8_pick_shape(n_tok, n_in) }
 }
 
+/// PIN the prefill tile to one shape, over both the stored config and the derived rule.
+/// `IMPARO_ST_GEMM_SHAPE` sets it, and the correctness bench uses it to reach every
+/// compiled shape: seating a shape is not the same as running it, because the engine
+/// derives the token tile per dispatch.
+pub fn set_st_gemm_shape_pin(shape: u32) {
+    unsafe { imparo_metal_set_st_gemm_shape_pin(shape) }
+}
+
 /// The token tile one Q8 GEMM shape uses, read from the table rather than written beside
 /// it. The mirror's padding has to cover the widest of these.
 #[must_use]
@@ -1196,6 +1800,180 @@ pub fn set_nb8_max(n: u32) {
 /// and imparo-metalbench's kernel check.
 pub fn set_gemv_max_tok(n: u32) {
     unsafe { imparo_metal_set_gemv_max_tok(n) }
+}
+/// DECODE ROWS: while `Some`, a projection of 2+ rows is that many independent decode rows (one
+/// co-batched step over several conversations), served on the route: `Exact` gives each of up to 8
+/// rows the decode GEMV's arithmetic, so its bits equal what the row gets alone; `Fast` keeps the
+/// GEMV up to the family's measured row count (`q8_rows_gemv_max`, `q4_rows_gemv_max`), then on
+/// tile-major Q8 takes the rows matmul up to `q8_tm_rows_mma_max`, and the GEMM above that.
+/// `None`: 2+ rows are one prompt's chunk (the GEMM).
+pub fn set_decode_rows(route: Option<imparo_backend::RowRoute>) {
+    let v = match route {
+        None => 0,
+        Some(imparo_backend::RowRoute::Exact) => 1,
+        Some(imparo_backend::RowRoute::Fast) => 2,
+    };
+    unsafe { imparo_metal_set_decode_rows(v) }
+}
+/// Slots `0..n` for co-batched decode (`Backend::set_slots`); `per_conversation` names the
+/// buffers each slot holds its own copy of, `ring_layers` the windowed layers whose rings each
+/// slot holds its own of.
+///
+/// # Errors
+///
+/// Returns the host's nonzero code for a buffer or a layer a slot cannot hold its own of.
+pub fn set_slots(
+    n: u32,
+    per_conversation: &[u32],
+    ring_layers: &[u32],
+) -> Result<(), i32> {
+    let len = u32::try_from(per_conversation.len()).map_err(|_| 5)?;
+    let rings = u32::try_from(ring_layers.len()).map_err(|_| 5)?;
+    let rc = unsafe {
+        imparo_metal_set_slots(
+            n,
+            per_conversation.as_ptr(),
+            len,
+            ring_layers.as_ptr(),
+            rings,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(rc) }
+}
+/// Selects `slot` (`Backend::select_slot`). A slot's buffers are made on its first select.
+///
+/// # Errors
+///
+/// Returns the host's nonzero code for a slot that does not exist or whose buffers could not
+/// be made; the selection is unchanged.
+pub fn select_slot(slot: u32) -> Result<(), i32> {
+    let rc = unsafe { imparo_metal_select_slot(slot) };
+    if rc == 0 { Ok(()) } else { Err(rc) }
+}
+/// Gives back `slot`'s buffers (`Backend::release_slot`): true when they went back, false for
+/// the selected slot, one that does not exist, one holding none, or with work in flight.
+#[must_use]
+pub fn release_slot(slot: u32) -> bool {
+    unsafe { imparo_metal_release_slot(slot) == 0 }
+}
+pub fn kv_store_slot_rows(
+    src: u32,
+    layer: u32,
+    width: u32,
+    slots: &[u32],
+    pos: &[u32],
+    is_v: bool,
+    ring: u32,
+) {
+    assert_eq!(slots.len(), pos.len());
+    let n = u32::try_from(slots.len()).expect("row count fits u32");
+    unsafe {
+        imparo_metal_kv_store_slot_rows(
+            src,
+            layer,
+            width,
+            slots.as_ptr(),
+            pos.as_ptr(),
+            n,
+            u32::from(is_v),
+            ring,
+        );
+    }
+}
+#[allow(clippy::too_many_arguments)]
+pub fn attention_slot_rows(
+    kv_layer: u32,
+    head_dim: u32,
+    n_heads: u32,
+    n_kv: u32,
+    kv_width: u32,
+    window: u32,
+    scale: f32,
+    slots: &[u32],
+    pos: &[u32],
+    max_scores: &[u32],
+    ring: u32,
+) {
+    assert!(slots.len() == pos.len() && pos.len() == max_scores.len());
+    let n = u32::try_from(slots.len()).expect("row count fits u32");
+    unsafe {
+        imparo_metal_attention_slot_rows(
+            kv_layer,
+            head_dim,
+            n_heads,
+            n_kv,
+            kv_width,
+            window,
+            scale,
+            slots.as_ptr(),
+            pos.as_ptr(),
+            max_scores.as_ptr(),
+            n,
+            ring,
+        );
+    }
+}
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv_slot_rows(
+    form: u32,
+    src: u32,
+    w_off: u64,
+    state: u32,
+    slots: &[u32],
+    state_off: &[u32],
+    state_out_off: &[u32],
+    out: u32,
+    width: u32,
+    kern: u32,
+) {
+    assert!(slots.len() == state_off.len() && state_off.len() == state_out_off.len());
+    let n = u32::try_from(slots.len()).expect("row count fits u32");
+    unsafe {
+        imparo_metal_causal_conv_slot_rows(
+            form,
+            src,
+            w_off,
+            state,
+            slots.as_ptr(),
+            state_off.as_ptr(),
+            state_out_off.as_ptr(),
+            n,
+            out,
+            width,
+            kern,
+        );
+    }
+}
+/// Per-head norm and rope of rows at unrelated positions: row r at `pos[r]`, each by the
+/// one-row call.
+#[allow(clippy::too_many_arguments)]
+pub fn head_norm_rope_at(
+    buf: u32,
+    w_off: u64,
+    head_dim: u32,
+    eps: f32,
+    n_heads: u32,
+    pos: &[u32],
+    n_rot: u32,
+    base: f32,
+    freqs: Option<&[f32]>,
+) {
+    let n = u32::try_from(pos.len()).expect("row count fits u32");
+    unsafe {
+        imparo_metal_head_norm_rope_at(
+            buf,
+            w_off,
+            head_dim,
+            eps,
+            n_heads,
+            pos.as_ptr(),
+            n,
+            n_rot,
+            base,
+            freqs.map_or(std::ptr::null(), <[f32]>::as_ptr),
+            freqs.map_or(0, |f| u32::try_from(f.len()).unwrap_or(0)),
+        );
+    }
 }
 /// Single-knob flush setters, so the registry's one-value apply hook fits the
 /// two-value engine call (the other side keeps its current value).
@@ -1271,7 +2049,11 @@ pub fn prof_enable(on: bool) {
     unsafe { imparo_metal_prof_enable(u32::from(on)) }
 }
 
-/// Per-kernel-category GPU time since the last read, as (name, SECONDS, calls).
+/// Per-kernel-category GPU time since the last read, as (name, SECONDS, calls, WEIGHT BYTES).
+///
+/// The bytes let a caller print a bandwidth. A category that declares no bytes reports 0:
+/// the dispatch sites that know their weight span pass it, the rest do not, and 0 means
+/// "not declared" rather than "read nothing".
 ///
 /// Seconds, not ticks. The backend converts each region's counter ticks with the tick
 /// period that region measured, because the period is only known once a region samples the
@@ -1284,19 +2066,30 @@ pub fn prof_enable(on: bool) {
 /// Concurrent categories each report their own full duration, so the column can sum to
 /// more than the wall it ran in. That is overlap, not error -- and it is why a category's
 /// figure is comparable with a skip-and-diff only when nothing overlaps it.
-pub fn prof_categories() -> Vec<(String, f64, u64)> {
-    let (mut secs, mut calls, mut n) = ([0.0f64; 32], [0u64; 32], 0u32);
+pub fn prof_categories_bytes() -> Vec<(String, f64, u64, u64)> {
+    let (mut secs, mut calls, mut bytes, mut n) =
+        ([0.0f64; 32], [0u64; 32], [0u64; 32], 0u32);
     unsafe {
-        imparo_metal_prof_cats(secs.as_mut_ptr(), calls.as_mut_ptr(), &raw mut n);
+        imparo_metal_prof_cats_b(
+            secs.as_mut_ptr(),
+            calls.as_mut_ptr(),
+            bytes.as_mut_ptr(),
+            &raw mut n,
+        );
     };
     (0..n.min(32) as usize)
         .map(|i| {
             let name = unsafe {
                 std::ffi::CStr::from_ptr(imparo_metal_prof_cat_name(i as u32))
             };
-            (name.to_string_lossy().into_owned(), secs[i], calls[i])
+            (
+                name.to_string_lossy().into_owned(),
+                secs[i],
+                calls[i],
+                bytes[i],
+            )
         })
-        .filter(|(_, t, calls)| *t > 0.0 || *calls > 0)
+        .filter(|(_, t, calls, _)| *t > 0.0 || *calls > 0)
         .collect()
 }
 
@@ -1305,7 +2098,7 @@ pub fn prof_categories() -> Vec<(String, f64, u64)> {
 /// `imparo_metal_prof_cat_name` returns an empty string past the last category, which is
 /// how the count comes back without calling `prof_cats` (that one RESETS the counters).
 fn profiler_categories() -> Vec<String> {
-    // 32 is the ceiling `prof_categories` already sizes its buffers to; the loop stops at
+    // 32 is the ceiling `prof_categories_bytes` already sizes its buffers to; the loop stops at
     // the first empty name long before it, and a table that outgrew 32 would break that
     // function first.
     (0..32)
@@ -1376,6 +2169,7 @@ pub fn set_placement(segs: &[imparo_backend::WeightSegment], budget: u64) {
                 imparo_backend::WeightTier::Fast => (0, 0),
                 imparo_backend::WeightTier::Slow { layer } => (1, layer),
                 imparo_backend::WeightTier::HostStaged => (2, 0),
+                imparo_backend::WeightTier::Unread => (3, 0),
             };
             WSegWire {
                 off: s.offset,
@@ -1419,15 +2213,14 @@ pub unsafe fn init_tuned(base: *const u8, len: u64) -> Result<(), i32> {
     // Measured facts about the machine, before the tuned choices and before the library
     // compiles: every derived shape is computed from these.
     apply_device_profile();
-    let skip_cfg = std::env::var("IMPARO_NO_HOSTCONFIG").is_ok_and(|v| v == "1");
-    if let Some(batch) = if skip_cfg {
-        None
-    } else {
-        apply_host_config(len)
-    } {
-        if std::env::var("IMPARO_BATCH").is_err() {
-            unsafe { std::env::set_var("IMPARO_BATCH", batch.to_string()) };
-        }
+    // The config's `batch` line is not applied here: the chunk sizes the KV and activation
+    // reserves, which placement computes before this init runs, so the model layer reads it
+    // first (`stored_prefill_batch`).
+    if !std::env::var("IMPARO_NO_HOSTCONFIG").is_ok_and(|v| v == "1") {
+        // The model's own bytes when the caller set them: a paired drafter is mapped
+        // past the model's end, and the tune file belongs to the model.
+        let model_bytes = MODEL_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = apply_host_config(if model_bytes == 0 { len } else { model_bytes });
     }
     if let Ok(v) = std::env::var("IMPARO_SGS") {
         if let Ok(n) = v.parse::<u32>() {
@@ -1648,13 +2441,6 @@ pub unsafe fn init_tuned(base: *const u8, len: u64) -> Result<(), i32> {
     // The edge-predicate-free entry point, A/B'd end to end. llama.cpp decides this per
     // dispatch from the shape (`bc_out = ne0 % 64 || ne1 % 32`); here it is one tuned
     // global, so an override is the only way to ask what it is worth.
-    // The SECOND tile of the pair. Setting it to a different shape turns on the padding
-    // rule in `q8_matmat`; leaving it equal to the first is the single-shape path.
-    if let Ok(v) = std::env::var("IMPARO_ST_GEMM_LARGE_SHAPE") {
-        if let Ok(i) = v.parse::<u32>() {
-            set_st_gemm_large_shape(i);
-        }
-    }
     if let Ok(v) = std::env::var("IMPARO_Q8_FULL_TILES") {
         set_q8_full_tiles(u32::from(v != "0"));
     }
@@ -1680,8 +2466,40 @@ pub unsafe fn init_tuned(base: *const u8, len: u64) -> Result<(), i32> {
             unsafe { imparo_metal_set_attn_skip(bits) };
         }
     }
+    // Drop the decode matmuls of one output width, to decompose matmat_decode by shape.
+    if let Ok(v) = std::env::var("IMPARO_SKIP_MM_NOUT") {
+        if let Ok(n) = v.parse::<u32>() {
+            unsafe { imparo_metal_set_skip_mm_nout(n) };
+        }
+    }
+    // Encode one decode-matmul width TWICE: prices it additively, which skipping does not.
+    if let Ok(v) = std::env::var("IMPARO_DUP_MM_NOUT") {
+        if let Ok(n) = v.parse::<u32>() {
+            unsafe { imparo_metal_set_dup_mm_nout(n) };
+        }
+    }
+    // Encode the flash-decoding attention combine twice: prices it additively.
+    if let Ok(v) = std::env::var("IMPARO_DUP_ATTN_COMBINE") {
+        unsafe { imparo_metal_set_dup_attn_combine(u32::from(v != "0")) };
+    }
+    // Drop the hazard barriers: WRONG ANSWERS, timing only. Prices the dispatch chain's
+    // serialisation, which no other instrument in the tree can see.
+    // IMPARO_HAZ_NAMED=0 restores the whole-buffer-scope barrier (both are correct).
+    if let Ok(v) = std::env::var("IMPARO_HAZ_NAMED") {
+        unsafe { imparo_metal_set_haz_named(u32::from(v != "0")) };
+    }
+    if let Ok(v) = std::env::var("IMPARO_HAZ_SKIP") {
+        if let Ok(n) = v.parse::<u32>() {
+            unsafe { imparo_metal_set_haz_skip(n) };
+        }
+    }
     if let Ok(v) = std::env::var("IMPARO_Q8_MMA_FENCE") {
         unsafe { imparo_metal_set_q8_mma_fence(u32::from(v != "0")) };
+    }
+    // 1 compiles the Q8 GEMM that skips the token tiles past the last live row; default
+    // (unset) multiplies every padded row, beside the edge clamp (see g_q8_pad_skip).
+    if let Ok(v) = std::env::var("IMPARO_Q8_PAD_SKIP") {
+        unsafe { imparo_metal_set_q8_pad_skip(u32::from(v != "0")) };
     }
     if let Ok(v) = std::env::var("IMPARO_RT_MMA_FENCE") {
         unsafe { imparo_metal_set_rt_mma_fence(u32::from(v != "0")) };
@@ -1786,6 +2604,13 @@ pub unsafe fn init_tuned(base: *const u8, len: u64) -> Result<(), i32> {
     // IMPARO_ATTN_FD=0 refuses the flash-decoding route (hd <= 128, f16, GQA) for A/Bs.
     if let Ok(v) = std::env::var("IMPARO_ATTN_FD") {
         unsafe { imparo_metal_set_attn_fd(u32::from(v != "0")) };
+    }
+    // A verify's row-layout attention: IMPARO_VERIFY_TGS the key split's threadgroup target
+    // (0 = no split, default 64), IMPARO_VERIFY_HEADS=0 one query head a threadgroup.
+    let verify_tgs = std::env::var("IMPARO_VERIFY_TGS").ok().and_then(|v| v.parse::<u32>().ok());
+    let verify_heads = std::env::var("IMPARO_VERIFY_HEADS").ok().and_then(|v| v.parse::<u32>().ok());
+    if verify_tgs.is_some() || verify_heads.is_some() {
+        set_verify_attention(verify_tgs.unwrap_or(64), verify_heads.unwrap_or(1));
     }
     if let Ok(v) = std::env::var("IMPARO_ATTN_GQA") {
         if let Ok(n) = v.parse::<u32>() {
@@ -1982,6 +2807,76 @@ pub fn page_round(n: u64) -> u64 {
     unsafe { imparo_metal_page_round(n) }
 }
 
+/// Reserve room for each layer's KV and commit `bytes` of it; later growth never copies.
+///
+/// # Errors
+/// Returns a non-zero code when the reservation or a view cannot be made, or work is in flight.
+pub fn alloc_kv_reserved(bytes: &[u64], reserve: &[u64]) -> Result<(), i32> {
+    if bytes.len() != reserve.len() {
+        return Err(6);
+    }
+    let rc = unsafe {
+        imparo_metal_alloc_kv_reserved(
+            u32::try_from(bytes.len()).unwrap_or(0),
+            bytes.as_ptr(),
+            reserve.as_ptr(),
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(rc) }
+}
+
+/// Prepare a commit of `bytes` per layer on a background thread.
+pub fn kv_prefetch(bytes: &[u64]) {
+    unsafe {
+        imparo_metal_kv_prefetch(
+            u32::try_from(bytes.len()).unwrap_or(0),
+            bytes.as_ptr(),
+        );
+    }
+}
+
+/// Adopt a prepared commit that covers `need` per layer.
+pub fn kv_adopt(need: &[u64]) {
+    unsafe {
+        imparo_metal_kv_adopt(u32::try_from(need.len()).unwrap_or(0), need.as_ptr());
+    }
+}
+
+/// Shrink each layer's KV view to `bytes` (0 leaves a layer alone) and give the pages above
+/// back to the system. Between requests only: nothing in flight may address the part given up.
+///
+/// # Errors
+/// The native code: 1 no device, 2 a view could not be made, 5 past the reservation.
+pub fn kv_release(bytes: &[u64]) -> Result<(), i32> {
+    let rc = unsafe {
+        imparo_metal_kv_release(u32::try_from(bytes.len()).unwrap_or(0), bytes.as_ptr())
+    };
+    if rc == 0 { Ok(()) } else { Err(rc) }
+}
+
+/// Whether the system reported memory pressure since the last call.
+pub fn take_memory_pressure() -> bool {
+    unsafe { imparo_metal_take_memory_pressure() != 0 }
+}
+
+/// Seconds the residency is held past the last region; None when it is held for good.
+pub fn idle_release_after() -> Option<std::time::Duration> {
+    let s = unsafe { imparo_metal_idle_release_s() };
+    (s > 0).then(|| std::time::Duration::from_secs(u64::from(s)))
+}
+
+/// Bytes the KV views cover now, K and V together.
+#[must_use]
+pub fn kv_committed_bytes() -> u64 {
+    unsafe { imparo_metal_kv_committed_bytes() }
+}
+
+/// The device's largest buffer, in bytes: no view can be longer.
+#[must_use]
+pub fn max_buffer_bytes() -> u64 {
+    unsafe { imparo_metal_max_buffer_bytes() }
+}
+
 pub fn alloc_kv(bytes: &[u64]) -> Result<(), i32> {
     let rc = unsafe {
         imparo_metal_alloc_kv(u32::try_from(bytes.len()).unwrap_or(0), bytes.as_ptr())
@@ -2057,6 +2952,17 @@ pub fn set_weight_path(path: &std::path::Path) {
         return;
     };
     unsafe { imparo_metal_set_weight_path(c.as_ptr()) }
+}
+/// How many weight segments the placement put in the slow tier (0 = the whole model wired).
+#[must_use]
+pub fn slow_segments() -> u32 {
+    unsafe { imparo_metal_slow_segments() }
+}
+/// The model's size for the tune key, set before init. 0 means not set: the mapping's length.
+static MODEL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// See `Backend::set_model_bytes`.
+pub fn set_model_bytes(bytes: u64) {
+    MODEL_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 /// Make the weights GPU-resident now, so the first request does not wait for it.
 pub fn wire_weights(stall_budget_s: f64) {
@@ -2241,7 +3147,7 @@ pub fn mega_slot_kv(role: u32) -> MegaSlotFfi {
 /// and the down projection at 36.0 against ~27 (+33%), and down is the phase whose 640 units
 /// do not divide the 288-simdgroup grid: three waves run for 2.22 units of work. The grid is
 /// derived from the phases' item counts now (18 x 18 here), which takes the route to 131.4
-/// with the same step hash. See docs/grid-balance-and-occupancy.md. What is left against the
+/// with the same step hash. See docs/metal-kernel-playbook.md. What is left against the
 /// dispatch path is the gated pair's 4% residual waste and the norm and tail phases; the
 /// fold's 3064 fewer dispatches only pay once the mixer arms join it. The pre-step state
 /// copy that cost 2.4 ms a token here is gone -- the state is planes now (task #165).
@@ -2495,10 +3401,388 @@ pub fn head_norm_rope(
         );
     }
 }
+/// Whether the row-layout entries serve this head dim; builds their pipelines on first ask.
+pub fn supports_row_layout(head_dim: u32) -> bool {
+    unsafe { imparo_metal_supports_row_layout(head_dim) != 0 }
+}
+/// See `Backend::attention_rows`; `layout` is the buffer holding the row layout.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_rows(
+    kv_layer: u32,
+    head_dim: u32,
+    n_heads: u32,
+    n_kv: u32,
+    kv_width: u32,
+    start_pos: u32,
+    key_lo: u32,
+    n_tok: u32,
+    scale: f32,
+    layout: u32,
+    float_q: bool,
+) -> bool {
+    unsafe {
+        imparo_metal_attention_rows(
+            kv_layer,
+            head_dim,
+            n_heads,
+            n_kv,
+            kv_width,
+            start_pos,
+            key_lo,
+            n_tok,
+            scale,
+            layout,
+            u32::from(float_q),
+        ) != 0
+    }
+}
+/// See `Backend::head_norm_rope_rows`; `layout` is the buffer holding the row layout.
+#[allow(clippy::too_many_arguments)]
+pub fn head_norm_rope_rows(
+    buf: u32,
+    w_off: u64,
+    head_dim: u32,
+    eps: f32,
+    n_heads: u32,
+    n_tok: u32,
+    n_rot: u32,
+    base: f32,
+    freqs: Option<&[f32]>,
+    layout: u32,
+) -> bool {
+    unsafe {
+        imparo_metal_head_norm_rope_rows(
+            buf,
+            w_off,
+            head_dim,
+            eps,
+            n_heads,
+            n_tok,
+            n_rot,
+            base,
+            freqs.map_or(std::ptr::null(), <[f32]>::as_ptr),
+            freqs.map_or(0, |f| u32::try_from(f.len()).unwrap_or(0)),
+            layout,
+        ) != 0
+    }
+}
+/// See `Backend::causal_conv_rows`; `layout` is the buffer holding the row layout.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv_rows(
+    form: u32,
+    src: u32,
+    w_off: u64,
+    state: u32,
+    state_off: u32,
+    out: u32,
+    width: u32,
+    kern: u32,
+    n_tok: u32,
+    layout: u32,
+) -> bool {
+    unsafe {
+        imparo_metal_causal_conv_rows(
+            form, src, w_off, state, state_off, out, width, kern, n_tok, layout,
+        ) != 0
+    }
+}
+/// See `Backend::causal_conv_row_inputs`.
+pub fn conv_row_inputs(
+    form: u32,
+    src: u32,
+    inputs: u32,
+    inputs_off: u32,
+    row_elems: u32,
+    width: u32,
+    n_tok: u32,
+) -> bool {
+    unsafe {
+        imparo_metal_conv_row_inputs(
+            form, src, inputs, inputs_off, row_elems, width, n_tok,
+        ) != 0
+    }
+}
+/// See `Backend::kv_move_rows`.
+pub fn kv_move_rows(
+    layer: u32,
+    k_stride: u64,
+    v_stride: u64,
+    from: &[u32],
+    to: &[u32],
+) -> bool {
+    let Ok(n) = u32::try_from(from.len()) else {
+        return false;
+    };
+    if to.len() != from.len() {
+        return false;
+    }
+    unsafe {
+        imparo_metal_kv_move_rows(
+            layer,
+            k_stride,
+            v_stride,
+            from.as_ptr(),
+            to.as_ptr(),
+            n,
+        ) != 0
+    }
+}
 /// Encodes a greedy argmax over `n` floats of `src`; `dst` receives ONE u32 (the index,
 /// smallest on ties) at offset 0, to be read back with [`read`] and `f32::to_bits`.
 pub fn argmax(src: u32, dst: u32, n: u32) {
     unsafe { imparo_metal_argmax(src, dst, n) }
+}
+/// Encodes one greedy argmax per row: `dst[r]` receives, as one u32, the index within row
+/// `r` of the `rows` rows of `width` floats in `src`. Each is [`argmax`] over that row alone.
+pub fn argmax_rows(src: u32, dst: u32, width: u32, rows: u32) {
+    unsafe { imparo_metal_argmax_rows(src, dst, width, rows) }
+}
+/// The largest `k` a [`top_k_rows`] list holds.
+pub fn top_k_rows_max() -> u32 {
+    unsafe { imparo_metal_top_k_rows_max() }
+}
+/// Elements [`top_k_rows`] needs in its destination: the output, then its working space.
+pub fn top_k_rows_len(width: u32, rows: u32, k: u32) -> u64 {
+    unsafe { imparo_metal_top_k_rows_len(width, rows, k) }
+}
+/// Encodes the `k` largest entries of each of `rows` rows of `width` floats in `src`, as
+/// `imparo_backend::Backend::top_k_rows` lays them out. False when refused, with nothing encoded.
+pub fn top_k_rows(src: u32, dst: u32, width: u32, rows: u32, k: u32) -> bool {
+    unsafe { imparo_metal_top_k_rows(src, dst, width, rows, k) == 0 }
+}
+/// Encodes a routed feed-forward's gating: `probs` receives each token's expert
+/// probabilities and `sel` those probabilities plus the file's selection bias, which is what
+/// the pick reads. `bias_off` is `u64::MAX` when the file carries no bias. False when
+/// refused, with nothing encoded.
+pub fn moe_gate(
+    scores: u32,
+    probs: u32,
+    sel: u32,
+    bias_off: u64,
+    n_tok: u32,
+    n_expert: u32,
+    gating: u32,
+) -> bool {
+    unsafe {
+        imparo_metal_moe_gate(scores, probs, sel, bias_off, n_tok, n_expert, gating)
+            == 0
+    }
+}
+/// Encodes the counting sort of the picked (token, slot) pairs by expert, as
+/// `imparo_backend::Backend::moe_plan` defines its four outputs. False when refused, with
+/// nothing encoded.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_plan(
+    topk: u32,
+    probs: u32,
+    perm: u32,
+    wgt: u32,
+    seg: u32,
+    inv: u32,
+    n_tok: u32,
+    n_expert: u32,
+    k: u32,
+    normalise: bool,
+    scale: f32,
+) -> bool {
+    unsafe {
+        imparo_metal_moe_plan(
+            topk,
+            probs,
+            perm,
+            wgt,
+            seg,
+            inv,
+            n_tok,
+            n_expert,
+            k,
+            u32::from(normalise),
+            scale,
+        ) == 0
+    }
+}
+/// Encodes one matmul over the work rows of every expert, each row reading the expert's own
+/// slice of the stacked weight. False when refused, with nothing encoded.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped(
+    wkind: u32,
+    w_off: u64,
+    expert_stride: u64,
+    src: u32,
+    dst: u32,
+    perm: u32,
+    seg: u32,
+    n_in: u32,
+    n_out: u32,
+    n_expert: u32,
+    n_tok: u32,
+    rows: u32,
+    src_work_rows: bool,
+    prefill_chunk: bool,
+) -> bool {
+    unsafe {
+        imparo_metal_moe_grouped(
+            wkind,
+            w_off,
+            expert_stride,
+            src,
+            dst,
+            perm,
+            seg,
+            n_in,
+            n_out,
+            n_expert,
+            n_tok,
+            rows,
+            u32::from(src_work_rows),
+            u32::from(prefill_chunk),
+        ) == 0
+    }
+}
+/// Encodes the gate, the top-k pick and the work-row plan as ONE dispatch. False when
+/// refused, with nothing encoded -- the caller then runs the three, which compute the same
+/// thing.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_route(
+    scores: u32,
+    probs: u32,
+    sel: u32,
+    topk: u32,
+    perm: u32,
+    wgt: u32,
+    seg: u32,
+    inv: u32,
+    bias_off: u64,
+    n_tok: u32,
+    n_expert: u32,
+    k: u32,
+    gating: u32,
+    normalise: bool,
+    scale: f32,
+) -> bool {
+    unsafe {
+        imparo_metal_moe_route(
+            scores,
+            probs,
+            sel,
+            topk,
+            perm,
+            wgt,
+            seg,
+            inv,
+            bias_off,
+            n_tok,
+            n_expert,
+            k,
+            gating,
+            u32::from(normalise),
+            scale,
+        ) == 0
+    }
+}
+/// Encodes the gate and up projections and the activation between them as ONE routed
+/// dispatch, writing `act(gate(x)) * up(x)` to `dst`. False when refused, with nothing
+/// encoded -- the caller then runs the three dispatches, which compute the same thing.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_pair(
+    wkind: u32,
+    gate_off: u64,
+    up_off: u64,
+    expert_stride: u64,
+    src: u32,
+    dst: u32,
+    perm: u32,
+    seg: u32,
+    n_in: u32,
+    n_out: u32,
+    n_expert: u32,
+    n_tok: u32,
+    rows: u32,
+    prefill_chunk: bool,
+) -> bool {
+    unsafe {
+        imparo_metal_moe_grouped_pair(
+            wkind,
+            gate_off,
+            up_off,
+            expert_stride,
+            src,
+            dst,
+            perm,
+            seg,
+            n_in,
+            n_out,
+            n_expert,
+            n_tok,
+            rows,
+            u32::from(prefill_chunk),
+        ) == 0
+    }
+}
+/// Encodes the weighted sum of each token's `k` expert outputs, in slot order. False when
+/// refused, with nothing encoded.
+pub fn moe_combine(
+    src: u32,
+    wgt: u32,
+    inv: u32,
+    dst: u32,
+    n_embd: u32,
+    k: u32,
+    n_tok: u32,
+) -> bool {
+    unsafe { imparo_metal_moe_combine(src, wgt, inv, dst, n_embd, k, n_tok) == 0 }
+}
+/// `resid += W . src` on the register-tiled GEMM's residual-add store. False when refused,
+/// with nothing encoded that changes a result.
+pub fn matmat_resid(wkind: u32, w_off: u64, n_in: u32, n_out: u32, src: u32, resid: u32, n_tok: u32) -> bool {
+    unsafe { imparo_metal_matmat_resid(wkind, w_off, n_in, n_out, src, resid, n_tok) == 0 }
+}
+/// `dst = rms_norm(resid) * w` with the pre-add norm's reduction, `resid` already summed.
+pub fn rms_norm_resid(dst: u32, resid: u32, w_off: u64, width: u32, eps: f32, n_row: u32) -> bool {
+    unsafe { imparo_metal_rms_norm_resid(dst, resid, w_off, width, eps, n_row) == 0 }
+}
+/// The combine folded into the next norm: `resid += combine(ydown)`, `dst = rms_norm(resid) *
+/// w`, one dispatch. False when refused, with nothing encoded.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_combine_add_rms_norm(
+    ydown: u32,
+    wgt: u32,
+    inv: u32,
+    k: u32,
+    dst: u32,
+    resid: u32,
+    w_off: u64,
+    width: u32,
+    eps: f32,
+    n_row: u32,
+) -> bool {
+    unsafe {
+        imparo_metal_moe_combine_add_rms_norm(ydown, wgt, inv, k, dst, resid, w_off, width, eps, n_row)
+            == 0
+    }
+}
+/// Elements [`logistic_rows`] needs in its destination from its offset: the outputs, then its
+/// working space.
+pub fn logistic_rows_len(a_width: u32, b_width: u32, rows: u32) -> u64 {
+    unsafe { imparo_metal_logistic_rows_len(a_width, b_width, rows) }
+}
+/// Encodes one logistic output per row, as `imparo_backend::Backend::logistic_rows` defines it.
+/// False when refused, with nothing encoded.
+pub fn logistic_rows(
+    a: u32,
+    a_width: u32,
+    b: u32,
+    b_width: u32,
+    w: u32,
+    w_off: u32,
+    dst: u32,
+    dst_off: u32,
+    rows: u32,
+) -> bool {
+    unsafe {
+        imparo_metal_logistic_rows(a, a_width, b, b_width, w, w_off, dst, dst_off, rows)
+            == 0
+    }
 }
 /// Sets the KV cache storage types (GGML ids: 1 f16, 2 q4_0, 8 q8_0).
 /// The configured cache types as a short tag -- the same string the tuner keys its stored
@@ -2524,6 +3808,14 @@ pub fn kv_tag() -> String {
 
 pub fn set_kv_types(k: u32, v: u32) {
     unsafe { imparo_metal_set_kv_types(k, v) }
+}
+
+/// The host address of `n` bytes of a layer's KV cache at `off`, or null when the range
+/// is not inside the side's current view. The storage is shared with the GPU, so a read
+/// into it is the whole restore transfer; use it with the GPU idle, as `write_kv_bytes`.
+#[must_use]
+pub fn kv_host_span(layer: u32, is_v: bool, off: u64, n: u64) -> *mut u8 {
+    unsafe { imparo_metal_kv_host_span(layer, u32::from(is_v), off, n) }
 }
 
 /// Restore raw bytes into a KV cache buffer (call after the GPU is idle) -- the KV
@@ -2689,6 +3981,56 @@ pub fn causal_conv_snapshot(
     }
 }
 
+/// The one-token delta rule for co-batched rows (`Backend::delta_net_slot_rows`): row r's
+/// matrix is read at `state_off[r]` and written at `state_out_off[r]` in `slots[r]`'s state.
+/// False when a slot cannot be selected or the rule refuses a row.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn delta_net_slot_rows(
+    qkv: u32,
+    alpha: u32,
+    beta: u32,
+    a_off: u64,
+    dt_off: u64,
+    state: u32,
+    slots: &[u32],
+    state_off: &[u32],
+    state_out_off: &[u32],
+    out: u32,
+    k_heads: u32,
+    v_heads: u32,
+    key_dim: u32,
+    value_dim: u32,
+    eps: f32,
+    norm_w_off: u64,
+    gate: u32,
+) -> bool {
+    assert!(slots.len() == state_off.len() && state_off.len() == state_out_off.len());
+    let n = u32::try_from(slots.len()).expect("row count fits u32");
+    unsafe {
+        imparo_metal_delta_net_slot_rows(
+            qkv,
+            alpha,
+            beta,
+            a_off,
+            dt_off,
+            state,
+            slots.as_ptr(),
+            state_off.as_ptr(),
+            state_out_off.as_ptr(),
+            n,
+            out,
+            k_heads,
+            v_heads,
+            key_dim,
+            value_dim,
+            eps,
+            norm_w_off,
+            gate,
+        )
+    }
+}
+
 /// The gated delta rule; see `Backend::delta_net`. False when the pipeline was not built
 /// or was built for other head widths, and then nothing is written.
 #[allow(clippy::too_many_arguments)]
@@ -2742,6 +4084,70 @@ pub fn delta_net(
             snap_row,
         )
     }
+}
+
+/// The gated delta rule over a draft tree: every node's output from the state at `state_off`
+/// and its own ancestors, as `delta_net` returns it run along the node's path; the state is
+/// only read. The inputs are `delta_net`'s. `words` are the rows' `BufId::RowLayout` words,
+/// the ones written to `layout`, and must hold the tree depth-first within the kernel's depth
+/// (`imparo_backend::row_layout_depth_first`). False, and nothing written, when the words fail
+/// that check, the pipeline was not built, or it was built for other head widths.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net_tree(
+    qkv: u32,
+    alpha: u32,
+    beta: u32,
+    a_off: u64,
+    dt_off: u64,
+    state: u32,
+    state_off: u32,
+    out: u32,
+    layout: u32,
+    words: &[u32],
+    k_heads: u32,
+    v_heads: u32,
+    key_dim: u32,
+    value_dim: u32,
+    eps: f32,
+) -> bool {
+    if !imparo_backend::row_layout_depth_first(words, delta_tree_depth()) {
+        return false;
+    }
+    let width = imparo_backend::ROW_LAYOUT_WORDS;
+    let (Ok(n_tok), Ok(layout_words)) =
+        (u32::try_from(words.len() / width), u32::try_from(width))
+    else {
+        return false;
+    };
+    let keep = imparo_backend::row_layout_branching_rows(words);
+    unsafe {
+        imparo_metal_delta_net_tree(
+            qkv,
+            alpha,
+            beta,
+            a_off,
+            dt_off,
+            state,
+            state_off,
+            out,
+            layout,
+            layout_words,
+            keep as u32,
+            (keep >> 32) as u32,
+            k_heads,
+            v_heads,
+            key_dim,
+            value_dim,
+            n_tok,
+            eps,
+        )
+    }
+}
+
+/// The tree delta kernel's depth limit: every node must be shallower.
+#[must_use]
+pub fn delta_tree_depth() -> u32 {
+    unsafe { imparo_metal_delta_tree_depth() }
 }
 
 /// `snap` for a `delta_net` call with no boundary inside the batch. Not a buffer id.
@@ -2807,6 +4213,18 @@ pub fn copy_strided(
     n_row: u32,
 ) {
     unsafe { imparo_metal_copy_strided(dst, src, width, src_off, src_stride, n_row) }
+}
+
+/// Contiguous rows into one sub-block of every row; see `Backend::scatter_strided`.
+pub fn scatter_strided(
+    dst: u32,
+    src: u32,
+    width: u32,
+    dst_off: u32,
+    dst_stride: u32,
+    n_row: u32,
+) {
+    unsafe { imparo_metal_scatter_strided(dst, src, width, dst_off, dst_stride, n_row) }
 }
 pub fn add(a: u32, b: u32, n: u32) {
     unsafe { imparo_metal_add(a, b, n) }
@@ -2936,6 +4354,21 @@ pub fn refused_dispatches() -> u64 {
     unsafe { imparo_metal_refused_dispatches() }
 }
 
+/// Matmul calls this process encoded, per route (the kernel a projection ran), by name.
+#[must_use]
+pub fn matmul_routes() -> Vec<(&'static str, u64)> {
+    let n = unsafe { imparo_metal_route_count_n() };
+    (0..n)
+        .map(|i| {
+            // The names are static C strings in the library.
+            let name = unsafe { std::ffi::CStr::from_ptr(imparo_metal_route_name(i)) };
+            (name.to_str().unwrap_or("?"), unsafe {
+                imparo_metal_route_count(i)
+            })
+        })
+        .collect()
+}
+
 /// The weight kinds whose matmul the register-tiled GEMM serves, one bit per wire kind.
 /// Asked of the routing itself so an `applies` predicate cannot fall behind it; valid
 /// only after `set_weight_kind_types`, which is where the kind -> ggml mapping arrives.
@@ -3039,7 +4472,29 @@ pub fn apply_device_profile() {
     }
 }
 
+/// The fingerprint and model this process's stored config was keyed by, once
+/// `apply_host_config` has run. `None` under `IMPARO_NO_HOSTCONFIG` or before load, and a
+/// caller that needs to key a file the same way must then not key one.
+static G_CONFIG_KEY: std::sync::OnceLock<(String, u64)> = std::sync::OnceLock::new();
+
 #[must_use]
+pub fn config_key() -> Option<(String, u64)> {
+    G_CONFIG_KEY.get().cloned()
+}
+
+/// The tuned config's prefill chunk for the model keyed by `model_bytes`, read without
+/// applying anything (see `Backend::stored_prefill_batch`). `None` under
+/// `IMPARO_NO_HOSTCONFIG=1` or without a config.
+#[must_use]
+pub fn stored_prefill_batch(model_bytes: u64) -> Option<usize> {
+    use imparo_backend::BackendKnobs as _;
+    if std::env::var("IMPARO_NO_HOSTCONFIG").is_ok_and(|v| v == "1") {
+        return None;
+    }
+    let space = MetalBackend.space_version();
+    imparo_host::read_for_device(model_bytes, true, ("metal", space, &kv_tag()))?.batch
+}
+
 pub fn apply_host_config(model_bytes: u64) -> Option<usize> {
     use imparo_backend::BackendKnobs as _;
     // The registry is the one enumeration: every stored key is applied through its
@@ -3047,6 +4502,13 @@ pub fn apply_host_config(model_bytes: u64) -> Option<usize> {
     // this function once hardcoded the list and lost first `lanes`, then
     // `gemv_max_tok`, and read space v10 after the space moved to v11.
     let space = MetalBackend.space_version();
+    // REMEMBERED for whoever needs to key a file the same way this config was keyed --
+    // the verify-cost table's own file. Set here because this is the one place that
+    // knows the space, the cache tag and the model together.
+    let _ = G_CONFIG_KEY.set((
+        imparo_host::fingerprint_for("metal", space, &kv_tag()),
+        model_bytes,
+    ));
     let c =
         imparo_host::read_for_device(model_bytes, false, ("metal", space, &kv_tag()))?;
     let reg = MetalBackend.knob_registry();
@@ -3062,6 +4524,30 @@ pub fn apply_host_config(model_bytes: u64) -> Option<usize> {
                                ignored"
             ),
         }
+    }
+    // PER-TENSOR SEATS, which are not knobs: one value per (wire kind, n_in, n_out) rather than
+    // one for the engine. A seat can be refused -- an unknown wire kind, or more distinct
+    // triples than the table holds -- and a refused seat is not silent, because that tensor then
+    // runs its format's crossing while the file says otherwise. Seats from a previous model are
+    // dropped first, so a reload does not inherit another file's table.
+    clear_blk_rows_seats();
+    let refused = c
+        .seats
+        .iter()
+        .filter(|&&(kind, n_in, n_out, v)| !set_blk_rows_seat(kind, n_in, n_out, v))
+        .count();
+    if refused != 0 {
+        eprintln!(
+            "[imparo] host config: {refused} of {} per-tensor kernel seats were refused; those \
+             tensors run their weight format's crossing instead",
+            c.seats.len()
+        );
+    }
+    if !c.seats.is_empty() {
+        eprintln!(
+            "[imparo] host config: {} per-tensor kernel seats applied",
+            blk_rows_seat_count()
+        );
     }
     // READ BACK WHAT TOOK (#74). A setter can refuse or clamp (rt_shape past the measured
     // accumulator cliff, a lane count off the ladder) and the registry swallows that, so the

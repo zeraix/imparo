@@ -128,6 +128,23 @@ pub(crate) fn gprobe_half(name: &str, buf: BufId, off_halves: u64, n: usize) {
 ///
 /// Gated on IMPARO_GPU_PROBE; it slices the command buffer, so it is a debugging tool and
 /// not something to leave on.
+/// A probe over a buffer of u32s: index arrays, which `gprobe` cannot read.
+///
+/// A permutation's entries are small integers, and their bit patterns as f32 are denormals
+/// -- every one of them prints as 0.00000 and an rms of zero. Reading `inv` that way once
+/// looked exactly like a kernel that had written nothing.
+pub(crate) fn gprobe_u32(name: &str, buf: BufId, off: u64, n: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("IMPARO_GPU_PROBE").is_ok()) {
+        return;
+    }
+    let _ = be().end();
+    let mut v = vec![0.0_f32; n];
+    be().read(buf, off, &mut v);
+    let ids: Vec<String> = v.iter().map(|x| x.to_bits().to_string()).collect();
+    eprintln!("[gpu] {name}: n={n} [{}]", ids.join(", "));
+}
+
 pub(crate) fn gprobe(name: &str, buf: BufId, off: u64, n: usize) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static VALUES: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -742,6 +759,32 @@ pub fn probe_first(label: &str) {
     }
 }
 
+/// Prefill fuses the activation into the up projection's write-back; decode does not --
+/// one token is one row, and the masked write-back the fusion forces costs more than the
+/// pass it saves.
+pub(crate) fn should_fuse_epilogue(
+    n_tok: u32,
+    backend_supports_activation: bool,
+) -> bool {
+    fuse_epilogue_enabled() && backend_supports_activation && n_tok > 1
+}
+
+/// IMPARO_FUSE_EPILOGUE=0 issues the two projections and a separate `act_mul` instead,
+/// which is what llama.cpp does (two `mul_mat`s and a GLU op).
+///
+/// The two are not the trade they look like. Fusing moves FEWER bytes -- the up
+/// projection reads the gate output and writes once, where the split path writes the up
+/// output, then reads both and writes again -- but on the Metal Q8 GEMM it forces the
+/// MASKED write-back for every one of those dispatches, because the predicate-free route
+/// requires `epilogue == 0`. That path spills the accumulators through threadgroup
+/// memory, barriers, and finishes with a SCALAR per-element read-modify-write where the
+/// unfused route ends in a vector `simdgroup_store`. Which side wins is a measurement,
+/// and it is one knob for every architecture rather than one per directory.
+pub(crate) fn fuse_epilogue_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IMPARO_FUSE_EPILOGUE").map_or(true, |v| v != "0"))
+}
+
 /// Layers per command buffer for this forward: the tuner's seat, LOWERED so that no one
 /// buffer holds the device longer than the stall budget.
 ///
@@ -978,6 +1021,19 @@ impl<A: Architecture> Workflow<A> {
                 *bytes as f64 / (1 << 20) as f64
             );
         }
+        if let Some(d) = &self.plan.drafter {
+            let first = self.plan.config.n_layers as usize;
+            let bytes = kv_bytes[first..].iter().sum::<u64>() * 2; // K and V
+            eprintln!(
+                "[imparo] kv: {:>2} drafter layers head_dim={:<4} slots={:<6} {:>8.1} MiB, \
+                 {:.1} KiB per token",
+                d.layers,
+                d.head_dim,
+                self.state.kv_rt.capacity,
+                bytes as f64 / (1 << 20) as f64,
+                crate::kv::drafter_kv_bytes_per_token(&self.plan) as f64 / 1024.0
+            );
+        }
     }
 
     /// Allocates the activation buffers for a batch of `b_req` tokens.
@@ -999,13 +1055,16 @@ impl<A: Architecture> Workflow<A> {
     // The opt-in observer lease retains exactly the already required M3 layout:
     // batch_floor(3) is unchanged, and prefill/capture-off retain normal shrinking.
     fn activation_layout_request(&self, rows: usize) -> (usize, crate::OutputDemand) {
+        let rows = rows.max(self.state.activation_floor_rows);
         if (1..=3).contains(&rows)
             && self
                 .state
                 .layer_outputs
                 .as_ref()
                 .is_some_and(crate::layer_outputs::LayerOutputCapture::active)
-            && std::env::var("IMPARO_LAB_SPEC_ACTIVATION_CAP").as_deref() == Ok("3")
+            && (crate::e4b_retained_decode_policy_enabled()
+                || std::env::var("IMPARO_LAB_SPEC_ACTIVATION_CAP").as_deref()
+                    == Ok("3"))
         {
             static REPORTED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
@@ -1152,9 +1211,30 @@ impl<A: Architecture> Workflow<A> {
 
         let kv_bytes = self.kv_bytes_for(crate::kv::KV_FIRST_SLOTS);
         let kv_layout = self.kv_layout_for(crate::kv::KV_FIRST_SLOTS);
+        // Room to grow in place: the pooled layers reach the pool's whole device tier, every
+        // other layer the whole context, without moving a row.
+        let tier = if be().kv_commits_on_demand() {
+            crate::placement::kv_tier()
+        } else {
+            None
+        };
+        let pool_blocks = crate::kv::pool_capacity_blocks(
+            &self.plan,
+            self.state.kv_rt.capacity,
+            max_batch,
+            tier,
+            be().kv_max_view_bytes(),
+        );
+        self.state.kv_commit.pool_capacity = pool_blocks;
+        let kv_reserve = crate::kv::kv_reserve_for_pool(
+            &self.plan,
+            self.state.kv_rt.capacity,
+            max_batch,
+            pool_blocks,
+        );
         self.log_kv_groups(&kv_bytes);
         crate::host::log_footprint("gpu activations");
-        be().alloc_kv_layout(&kv_bytes, &kv_layout)
+        be().alloc_kv_reserved(&kv_bytes, &kv_reserve, &kv_layout)
             .map_err(|rc| format!("metal kv alloc failed rc={rc}"))?;
         crate::host::log_footprint("gpu kv");
 
@@ -1197,22 +1277,70 @@ impl<A: Architecture> Workflow<A> {
     /// # Errors
     /// When the backend cannot allocate.
     pub fn kv_fit(&mut self, positions: usize) -> Result<(), String> {
-        if positions <= self.state.kv_rt.slots {
+        if !be().supports_kv_incremental_commit() {
+            if positions <= self.state.kv_rt.slots {
+                return Ok(());
+            }
+            let want = crate::kv::kv_round(positions).min(self.state.kv_rt.capacity);
+            if want <= self.state.kv_rt.slots {
+                return Ok(());
+            }
+            let bytes = self.kv_bytes_for(want);
+            let layout = self.kv_layout_for(want);
+            be().grow_kv_layout(&bytes, &layout)
+                .map_err(|rc| format!("metal kv grow failed rc={rc}"))?;
+            if crate::log_on() {
+                eprintln!("[imparo] kv slots {} -> {want}", self.state.kv_rt.slots);
+            }
+            self.state.kv_rt.slots = want;
             return Ok(());
         }
-        let want = crate::kv::kv_round(positions).min(self.state.kv_rt.capacity);
-        if want <= self.state.kv_rt.slots {
-            return Ok(());
+        let cap = self.state.kv_rt.capacity;
+        if positions > self.state.kv_rt.slots {
+            // Asking for exactly what a preparation covers lets the backend adopt it with no
+            // wait; past it, the next chunk boundary.
+            let prepared = self.state.kv_commit.prefetched;
+            let want = if prepared >= positions {
+                prepared
+            } else {
+                crate::kv::kv_commit_rows(positions, cap)
+            };
+            let bytes = self.kv_fit_bytes(want);
+            let layout = self.kv_layout_for(want);
+            be().grow_kv_layout(&bytes, &layout)
+                .map_err(|rc| format!("metal kv grow failed rc={rc}"))?;
+            if crate::log_on() {
+                eprintln!("[imparo] kv slots {} -> {want}", self.state.kv_rt.slots);
+            }
+            self.state.kv_rt.slots = want;
+            self.state.kv_commit.prefetched = 0;
         }
-        let bytes = self.kv_bytes_for(want);
-        let layout = self.kv_layout_for(want);
-        be().grow_kv_layout(&bytes, &layout)
-            .map_err(|rc| format!("metal kv grow failed rc={rc}"))?;
-        if crate::log_on() {
-            eprintln!("[imparo] kv slots {} -> {want}", self.state.kv_rt.slots);
+        // Within a chunk of the end: get the next chunk ready off the step's path.
+        let slots = self.state.kv_rt.slots;
+        let step = crate::prefill_batch();
+        if slots < cap
+            && slots - positions.min(slots) < step
+            && self.state.kv_commit.prefetched <= slots
+        {
+            let next = (slots + step).min(cap);
+            be().kv_prefetch(&self.kv_fit_bytes(next));
+            self.state.kv_commit.prefetched = next;
         }
-        self.state.kv_rt.slots = want;
         Ok(())
+    }
+
+    /// Per-layer bytes for `positions`, leaving out the layers the pool places: their
+    /// storage follows its blocks (`KvPoolMember::kv_commit_blocks`), not a position count.
+    fn kv_fit_bytes(&self, positions: usize) -> Vec<u64> {
+        let mut bytes = self.kv_bytes_for(positions);
+        if self.state.kv_commit.pooled {
+            for g in crate::kv::state_geometry(&self.plan, self.state.kv_ring_batch) {
+                if matches!(g.kind, imparo_kv::StateKind::Full) {
+                    bytes[g.layer as usize] = 0;
+                }
+            }
+        }
+        bytes
     }
 
     /// Clears the device recurrent state: the device twin of `RecurrentState::reset`.
@@ -1272,7 +1400,9 @@ impl<A: Architecture> Workflow<A> {
     /// A no-op, leaving None, for a model with no recurrent layers or a batch that
     /// reaches no boundary.
     pub fn arm_recurrent_snapshot(&mut self, at: usize, n: usize, last: usize) {
+        // A row-layout batch (a tree) holds no boundary: its rows are not a prefix of the answer.
         self.state.recur_snap = (self.plan.recurrent_elems() > 0
+            && self.state.row_layout == 0
             && last > at
             && last <= at + n
             && last % imparo_kv::grid_tokens() == 0)
@@ -1354,6 +1484,52 @@ pub(crate) fn tail_align() -> u32 {
 /// A probe, not a knob: it changes nothing but stderr.
 pub(crate) fn layer_skip_log() -> bool {
     std::env::var("IMPARO_LAYER_SKIP_LOG").is_ok_and(|v| v == "1")
+}
+
+/// IMPARO_COBATCH_TRACE=1: a hash of every row of `buf` at this point of the co-batched step,
+/// on stderr. Ends and restarts the command buffer; off, it does nothing at all.
+pub(crate) fn trace_rows(tag: &str, layer: usize, buf: BufId, rows: u32, width: u32) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("IMPARO_COBATCH_TRACE").is_some()) {
+        return;
+    }
+    let _ = be().end();
+    let mut v = vec![0.0_f32; (rows * width) as usize];
+    be().read(buf, 0, &mut v);
+    for (r, row) in v.chunks(width as usize).enumerate() {
+        let h = row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+        });
+        eprintln!("[cobatch] {tag} layer={layer} row={r} hash={h:016x}");
+    }
+    be().begin();
+}
+
+/// The convolution window of every recurrent layer: `r_elems / n_embd` inputs of `n_embd`
+/// values, which is what a tree verify must keep per row so a commit can rebuild the
+/// accepted path's windows.
+///
+/// Shared rather than per model: LFM2 and LFM2-MoE hold the same short convolution, and a
+/// second copy of this rule is a second place for it to drift.
+#[must_use]
+pub fn conv_windows(plan: &crate::ModelPlan) -> Vec<crate::ConvWindow> {
+    let width = plan.config.n_embd;
+    plan.layers
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, l)| match l.attention {
+            crate::Attention::Recurrent { r_elems, .. }
+                if width != 0 && r_elems != 0 && r_elems % width == 0 =>
+            {
+                Some(crate::ConvWindow {
+                    layer: u32::try_from(layer).ok()?,
+                    width,
+                    history: r_elems / width,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

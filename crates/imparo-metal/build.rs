@@ -133,7 +133,7 @@ mod mega_slots {
         let up = |xs: &[&str]| -> Vec<String> {
             xs.iter().map(|n| n.to_uppercase()).collect()
         };
-        let programs: [(&str, Vec<String>, Vec<String>, Vec<String>, Vec<String>); 3] = [
+        let programs: [(&str, Vec<String>, Vec<String>, Vec<String>, Vec<String>); 4] = [
             (
                 "G4",
                 up(MEGA_G4_PTR),
@@ -154,6 +154,13 @@ mod mega_slots {
                 up(MEGA_Q35_OFF),
                 words(MEGA_Q35_U),
                 floats(MEGA_Q35_F),
+            ),
+            (
+                "L2M",
+                up(MEGA_L2M_PTR),
+                up(MEGA_L2M_OFF),
+                words(MEGA_L2M_U),
+                floats(MEGA_L2M_F),
             ),
         ];
         for (name, ptr, off, u, f) in &programs {
@@ -314,8 +321,12 @@ mod mega_kernels {
     /// The row counts the programs declare, as one host function. The bridge reads the entry's
     /// words through it, so the balance rule needs no per-architecture code on the host side.
     pub fn emit_grid() -> String {
-        let progs: [(&str, &[MegaPhase]); 3] =
-            [("G4", G4_PROGRAM), ("L2", L2_PROGRAM), ("Q35", Q35_PROGRAM)];
+        let progs: [(&str, &[MegaPhase]); 4] = [
+            ("G4", G4_PROGRAM),
+            ("L2", L2_PROGRAM),
+            ("Q35", Q35_PROGRAM),
+            ("L2M", L2M_PROGRAM),
+        ];
         let declared = |p: &[MegaPhase]| -> Vec<(&'static str, &'static str)> {
             p.iter()
                 .filter(|x| !x.rows.is_empty())
@@ -376,6 +387,13 @@ mod mega_kernels {
             "Q35",
             "ent.u[Q35_U_N_TG] != tok.n_tg || ent.u[Q35_U_N_EMBD] == 0u || ent.u[Q35_U_N_FF] == 0u\n        || ent.u[Q35_U_KIND] > MEGA_Q35_KIND_DELTA\n        || ent.u[Q35_U_N_EMBD] % TM_UNIT_ROWS != 0u || ent.u[Q35_U_N_FF] % TM_UNIT_ROWS != 0u",
             Q35_PROGRAM,
+        );
+        o += "\n";
+        o += &kernel(
+            "imparo_mega_lfm2moe_layer",
+            "L2M",
+            "ent.u[L2M_U_N_TG] != tok.n_tg || ent.u[L2M_U_N_EMBD] == 0u || ent.u[L2M_U_N_FF] == 0u\n        || ent.u[L2M_U_K] == 0u || ent.u[L2M_U_K] > MOE_MAX_K || ent.u[L2M_U_N_EXPERT] < ent.u[L2M_U_K]\n        || ent.u[L2M_U_N_EXPERT] > L2M_MAX_EXPERTS\n        || ent.u[L2M_U_N_EMBD] % TM_UNIT_ROWS != 0u || ent.u[L2M_U_N_FF] % TM_UNIT_ROWS != 0u",
+            L2M_PROGRAM,
         );
         o
     }

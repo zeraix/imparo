@@ -56,6 +56,12 @@ pub fn build(
     path: &Path,
 ) -> Result<ModelPlan, PlanError> {
     let _ = path;
+    super::weight_basis::validate_header(document).map_err(PlanError::Inconsistent)?;
+    if document.tensor("output.weight").is_none() {
+        return Err(PlanError::Inconsistent(
+            "qwen35 requires an independent output.weight".into(),
+        ));
+    }
     let blocks = u32_at(document, "qwen35.block_count")?;
     let n_embd = u32_at(document, "qwen35.embedding_length")?;
     let n_ff = u32_at(document, "qwen35.feed_forward_length")?;
@@ -206,13 +212,18 @@ pub fn build(
             per_layer_row_bytes: None,
         },
         kv_storage_basis: crate::KvStorageBasisPolicy::BackendOverrideOrCanonical,
-        weight_residency: crate::WeightResidencyPlan::default(),
+        // The input table is row-gathered, never used as the independent output head.
+        // Existing placement may stage its few requested rows to preserve VRAM for layers.
+        weight_residency: crate::WeightResidencyPlan {
+            row_gathered: &["token_embd.weight"],
+        },
         layers,
         // Neither decode route: the interleave is worth 0.65% at this model's 119 ms step
         // and there is no mega-kernel route for the architecture, so the recurrent state
         // is one plane (149.6 MiB), updated in place.
         decode_interleave: false,
         mega_decode: false,
+        drafter: None,
         output: OutputPlan {
             final_norm: true,
             logit_softcap: None,

@@ -622,6 +622,121 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Where each part of an extent file sits, from the extent and its layers alone.
+///
+/// The file is one frame: the unit magic and format, the `EXTN` section, then a `FULL`
+/// section holding, per layer, a 20-byte header (layer, K stride, V stride) followed by
+/// that layer's K rows and then its V rows. So every offset is arithmetic on
+/// `[from, to)` and the strides. The writer fills rows in place from it (`blob`), and a
+/// restore reads rows from the file straight to where they belong, then checks the header
+/// bytes it read on the way against `head` and `layer_head`.
+///
+/// A file with other sections, or these two in another order, does not have this layout.
+/// The sections reader (`full_from_units`) would still accept it; the direct restore
+/// refuses it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnitLayout {
+    pub from: usize,
+    pub to: usize,
+    /// (layer, K bytes per position, V bytes per position), in file order.
+    pub layers: Vec<(u32, usize, usize)>,
+}
+
+impl UnitLayout {
+    /// Magic and format, the `EXTN` section (tag, length, two positions), the `FULL`
+    /// section's tag and length, and its layer count.
+    pub const HEAD_BYTES: usize = 4 + 4 + (4 + 8 + 16) + (4 + 8) + 4;
+    /// Per layer: its index and its two strides.
+    pub const LAYER_HEAD_BYTES: usize = 4 + 8 + 8;
+
+    fn rows(&self) -> usize {
+        self.to - self.from
+    }
+
+    fn layer_bytes(&self, li: usize) -> u64 {
+        let (_, ks, vs) = self.layers[li];
+        (Self::LAYER_HEAD_BYTES + self.rows() * (ks + vs)) as u64
+    }
+
+    /// File offset of layer `li`'s header.
+    #[must_use]
+    pub fn layer_head_at(&self, li: usize) -> u64 {
+        Self::HEAD_BYTES as u64 + (0..li).map(|i| self.layer_bytes(i)).sum::<u64>()
+    }
+
+    /// The file's length.
+    #[must_use]
+    pub fn file_len(&self) -> u64 {
+        self.layer_head_at(self.layers.len())
+    }
+
+    /// File offset of layer `li`'s K (or V) row at absolute position `pos`.
+    #[must_use]
+    pub fn row_at(&self, li: usize, is_v: bool, pos: usize) -> u64 {
+        let (_, ks, vs) = self.layers[li];
+        let k0 = self.layer_head_at(li) + Self::LAYER_HEAD_BYTES as u64;
+        let (base, stride) = if is_v {
+            (k0 + (self.rows() * ks) as u64, vs)
+        } else {
+            (k0, ks)
+        };
+        base + ((pos - self.from) * stride) as u64
+    }
+
+    /// The bytes the file begins with, through the `FULL` layer count.
+    #[must_use]
+    pub fn head(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::HEAD_BYTES);
+        push_u32(&mut out, UNIT_MAGIC);
+        push_u32(&mut out, FORMAT);
+        out.extend_from_slice(b"EXTN");
+        push_u64(&mut out, 16);
+        push_u64(&mut out, self.from as u64);
+        push_u64(&mut out, self.to as u64);
+        out.extend_from_slice(b"FULL");
+        // The payload runs from the layer count to the end of the file.
+        push_u64(&mut out, self.file_len() - (Self::HEAD_BYTES - 4) as u64);
+        push_u32(&mut out, self.layers.len() as u32);
+        debug_assert_eq!(out.len(), Self::HEAD_BYTES);
+        out
+    }
+
+    /// Layer `li`'s header bytes.
+    #[must_use]
+    pub fn layer_head(&self, li: usize) -> [u8; Self::LAYER_HEAD_BYTES] {
+        let (layer, ks, vs) = self.layers[li];
+        let mut out = [0_u8; Self::LAYER_HEAD_BYTES];
+        out[..4].copy_from_slice(&layer.to_le_bytes());
+        out[4..12].copy_from_slice(&(ks as u64).to_le_bytes());
+        out[12..].copy_from_slice(&(vs as u64).to_le_bytes());
+        out
+    }
+
+    /// The whole file, framed, with `fill(li, is_v, rows)` writing layer `li`'s K or V
+    /// rows for the extent straight into place: the one copy a writer makes.
+    ///
+    /// # Errors
+    /// What `fill` returns.
+    pub fn blob<E>(
+        &self,
+        mut fill: impl FnMut(usize, bool, &mut [u8]) -> Result<(), E>,
+    ) -> Result<Vec<u8>, E> {
+        let mut out = vec![0_u8; self.file_len() as usize];
+        let head = self.head();
+        out[..head.len()].copy_from_slice(&head);
+        for li in 0..self.layers.len() {
+            let at = self.layer_head_at(li) as usize;
+            out[at..at + Self::LAYER_HEAD_BYTES].copy_from_slice(&self.layer_head(li));
+            let (_, ks, vs) = self.layers[li];
+            for (is_v, stride) in [(false, ks), (true, vs)] {
+                let lo = self.row_at(li, is_v, self.from) as usize;
+                fill(li, is_v, &mut out[lo..lo + self.rows() * stride])?;
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Slices a captured state's full-attention layers into one blob per extent.
 ///
 /// `cuts` are absolute end positions, ascending, the last at most `state.boundary`.
@@ -652,28 +767,32 @@ pub fn unit_blobs_at(state: &KvState, cuts: &[usize]) -> Vec<Vec<u8>> {
         if end <= start || end > state.boundary {
             break;
         }
-        let mut full = Vec::new();
-        push_u32(&mut full, state.full.len() as u32);
-        for ls in &state.full {
-            let ks = ls.k.len() / ls.positions;
-            let vs = ls.v.len() / ls.positions;
-            let lo = start - ls.base_pos;
-            let hi = end - ls.base_pos;
-            push_u32(&mut full, ls.layer);
-            push_u64(&mut full, ks as u64);
-            push_u64(&mut full, vs as u64);
-            full.extend_from_slice(&ls.k[lo * ks..hi * ks]);
-            full.extend_from_slice(&ls.v[lo * vs..hi * vs]);
-        }
-        let mut blob = Vec::new();
-        push_u32(&mut blob, UNIT_MAGIC);
-        push_u32(&mut blob, FORMAT);
-        let mut extent = Vec::new();
-        push_u64(&mut extent, start as u64);
-        push_u64(&mut extent, end as u64);
-        push_section(&mut blob, *b"EXTN", &extent);
-        push_section(&mut blob, *b"FULL", &full);
-        out.push(blob);
+        let layout = UnitLayout {
+            from: start,
+            to: end,
+            layers: state
+                .full
+                .iter()
+                .map(|ls| {
+                    (
+                        ls.layer,
+                        ls.k.len() / ls.positions,
+                        ls.v.len() / ls.positions,
+                    )
+                })
+                .collect(),
+        };
+        let blob = layout.blob(|li, is_v, rows| {
+            let ls = &state.full[li];
+            let src = if is_v { &ls.v } else { &ls.k };
+            let lo = (start - ls.base_pos) * (src.len() / ls.positions);
+            rows.copy_from_slice(&src[lo..lo + rows.len()]);
+            Ok::<(), std::convert::Infallible>(())
+        });
+        out.push(match blob {
+            Ok(b) => b,
+            Err(never) => match never {},
+        });
         start = end;
     }
     out
@@ -1188,6 +1307,87 @@ mod tests {
             // Non-empty on purpose: the round trip must carry it, and a zero-length
             // blob would pass whether or not the format writes it at all.
             recurrent: (0..64_u32).flat_map(u32::to_le_bytes).collect(),
+        }
+    }
+
+    /// The direct restore reads extent files by `UnitLayout`'s arithmetic, never by
+    /// parsing them, so the layout must be exactly the frame the sections reader reads:
+    /// built here from the section primitives, byte for byte, with every row where
+    /// `row_at` says it is.
+    #[test]
+    fn the_layout_is_the_frame_the_sections_reader_reads() {
+        let n = 3 * grid_tokens();
+        let mk = |layer: u32, ks: usize, vs: usize, seed: usize| KvLayerState {
+            layer,
+            base_pos: 0,
+            positions: n,
+            k: (0..n * ks).map(|i| ((i * 7 + seed) % 253) as u8).collect(),
+            v: (0..n * vs).map(|i| ((i * 13 + seed) % 247) as u8).collect(),
+        };
+        // Two layers of different strides, so a layout that assumed one stride shows.
+        let s = KvState {
+            boundary: n,
+            full: vec![mk(2, 6, 10, 1), mk(5, 4, 4, 2)],
+            window: Vec::new(),
+            recurrent: Vec::new(),
+        };
+        let cuts = [grid_tokens(), n];
+        let blobs = unit_blobs_at(&s, &cuts);
+        assert_eq!(blobs.len(), 2);
+        let mut from = 0;
+        for (blob, &to) in blobs.iter().zip(&cuts) {
+            let mut full = Vec::new();
+            push_u32(&mut full, 2);
+            for ls in &s.full {
+                let (ks, vs) = (ls.k.len() / n, ls.v.len() / n);
+                push_u32(&mut full, ls.layer);
+                push_u64(&mut full, ks as u64);
+                push_u64(&mut full, vs as u64);
+                full.extend_from_slice(&ls.k[from * ks..to * ks]);
+                full.extend_from_slice(&ls.v[from * vs..to * vs]);
+            }
+            let mut extent = Vec::new();
+            push_u64(&mut extent, from as u64);
+            push_u64(&mut extent, to as u64);
+            let mut want = Vec::new();
+            push_u32(&mut want, UNIT_MAGIC);
+            push_u32(&mut want, FORMAT);
+            push_section(&mut want, *b"EXTN", &extent);
+            push_section(&mut want, *b"FULL", &full);
+            assert!(
+                *blob == want,
+                "extent [{from}, {to}) is not the section frame"
+            );
+            let l = UnitLayout {
+                from,
+                to,
+                layers: vec![(2, 6, 10), (5, 4, 4)],
+            };
+            assert_eq!(l.file_len(), blob.len() as u64);
+            assert_eq!(blob[..UnitLayout::HEAD_BYTES], l.head()[..]);
+            for (li, ls) in s.full.iter().enumerate() {
+                let at = l.layer_head_at(li) as usize;
+                assert_eq!(
+                    blob[at..at + UnitLayout::LAYER_HEAD_BYTES],
+                    l.layer_head(li)
+                );
+                for p in [from, to - 1] {
+                    for (is_v, rows) in [(false, &ls.k), (true, &ls.v)] {
+                        let stride = rows.len() / n;
+                        let at = l.row_at(li, is_v, p) as usize;
+                        assert_eq!(
+                            blob[at..at + stride],
+                            rows[p * stride..(p + 1) * stride]
+                        );
+                    }
+                }
+            }
+            from = to;
+        }
+        // And the sections reader takes the frame back to the rows it came from.
+        let back = full_from_units(&blobs, n).unwrap();
+        for (a, b) in s.full.iter().zip(&back) {
+            assert_eq!((a.layer, &a.k, &a.v), (b.layer, &b.k, &b.v));
         }
     }
 

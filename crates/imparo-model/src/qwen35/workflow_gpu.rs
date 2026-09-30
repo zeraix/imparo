@@ -29,9 +29,10 @@ use imparo_backend::{BufId, ConvForm};
 
 use crate::ModelPlan;
 use crate::gpu_support::{
-    BufferRequirement, Placement, be, gprobe, gpu_probe_last_row, gpu_probe_layer,
-    half_activation_mirror_requirements, kv_dequant_scratch_requirements, kvq_mask_on,
-    layer_skip_log, scores_needed, tail_align, tail_split,
+    BufferRequirement, Placement, be, fuse_epilogue_enabled, gprobe,
+    gpu_probe_last_row, gpu_probe_layer, half_activation_mirror_requirements,
+    kv_dequant_scratch_requirements, kvq_mask_on, layer_skip_log, scores_needed,
+    should_fuse_epilogue, tail_align, tail_split, trace_rows,
 };
 use crate::kv::{KvType, effective_workflow_kv_route, had_nrot, ring_mask};
 use crate::qwen35::Qwen35;
@@ -1079,13 +1080,514 @@ pub fn batch(
     Ok(())
 }
 
-/// Prefill fuses the activation into the up projection's write-back; decode does not.
-fn should_fuse_epilogue(n_tok: u32, backend_supports_activation: bool) -> bool {
-    fuse_epilogue_enabled() && backend_supports_activation && n_tok > 1
+/// One co-batched decode step (docs/continuous-batching.md): row r decodes `rows[r].token` in
+/// slot `rows[r].slot` at `rows[r].pos`. The operations are the one-row dispatch path's decode
+/// (`batch` at one token, mega route off), in its order and with its arithmetic choices: the
+/// projections, norms and FFN take all rows at once on the step's route
+/// (`WorkflowState::row_route`, `Backend::set_decode_rows`), so on the exact route every row
+/// gets its lone decode's bits. Each operation that touches one conversation's own state -- Q
+/// and K normed and roped at the row's position, the KV store, attention over the row's cache,
+/// the convolution and the delta rule on the row's slot -- is handed every row with its
+/// position and slot.
+///
+/// # Errors
+/// For a quantized cache, a backend without decode rows or a per-row operation, or a device
+/// failure.
+pub fn rows(
+    wf: &mut Qwen35,
+    rows: &[crate::DecodeRow],
+    logits: Option<&mut Vec<f32>>,
+    picks: &mut Vec<u32>,
+) -> Result<(), String> {
+    if !be().supports_gated_delta() {
+        return Err(format!(
+            "qwen35: the {} backend does not serve the gated delta-net mixer",
+            be().device_tag()
+        ));
+    }
+    if KvType::k() != KvType::F16 || KvType::v() != KvType::F16 {
+        return Err("co-batched decode reads an f16 cache only".into());
+    }
+    if !be().supports_argmax_rows() {
+        return Err("co-batched decode needs a per-row argmax".into());
+    }
+    let b = u32::try_from(rows.len()).map_err(|_| "too many co-batched rows")?;
+    let most = be().decode_rows_max(wf.state.row_route);
+    if rows.len() > most {
+        return Err(format!(
+            "{} co-batched rows; the {:?} route serves at most {most}",
+            rows.len(),
+            wf.state.row_route
+        ));
+    }
+    // Every row's logits are live: the lm head writes one row per conversation.
+    wf.state.output_demand = crate::OutputDemand::AllTokens;
+    let fit = wf.gpu_fit_batch(rows.len());
+    wf.state.output_demand = crate::OutputDemand::LastToken;
+    fit?;
+    if !be().set_decode_rows(Some(wf.state.row_route)) {
+        return Err("the backend has no decode rows".into());
+    }
+    let encoded = encode_rows(wf, rows, b);
+    be().set_decode_rows(None);
+    encoded?;
+    let mut got = vec![0.0_f32; rows.len()];
+    be().read(BufId::Tmp, 0, &mut got);
+    picks.clear();
+    picks.extend(got.iter().map(|v| v.to_bits()));
+    if let Some(out) = logits {
+        out.resize(rows.len() * wf.plan.config.vocab_size as usize, 0.0);
+        be().read(BufId::Logits, 0, out);
+    }
+    Ok(())
 }
 
-fn fuse_epilogue_enabled() -> bool {
-    !std::env::var("IMPARO_FUSE_EPILOGUE").is_ok_and(|v| v == "0")
+/// The graph of [`rows`], ending with the per-row argmax in `BufId::Tmp`.
+#[allow(clippy::too_many_lines)]
+fn encode_rows(wf: &Qwen35, rows: &[crate::DecodeRow], b: u32) -> Result<(), String> {
+    let c = &wf.plan.config;
+    let n_embd = c.n_embd;
+    let n_head = c.n_heads;
+    let n_kv = c.n_kv_heads;
+    let n_ff = c.n_ff;
+    let eps = c.norm_eps;
+    let wkind = |t: &imparo_gguf::weights::Tensor| {
+        imparo_gguf::weights::weight_kind(t.ggml_type).expect("validated at load")
+            as u32
+    };
+    let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
+    let pos: Vec<u32> = rows.iter().map(|r| r.pos).collect();
+    let slot_rows: Vec<imparo_backend::SlotRow> = rows
+        .iter()
+        .map(|r| imparo_backend::SlotRow {
+            slot: r.slot,
+            pos: r.pos,
+        })
+        .collect();
+    let recur = wf.plan.recurrent_layout();
+    let recur_elems = wf.plan.recurrent_elems();
+    let state_rows = |off: u32| -> Vec<imparo_backend::SlotStateRow> {
+        rows.iter()
+            .map(|r| imparo_backend::SlotStateRow {
+                slot: r.slot,
+                state_off: off + r.plane_in * recur_elems,
+                state_out_off: off + r.plane_out * recur_elems,
+            })
+            .collect()
+    };
+
+    be().begin_forward(false);
+    be().write_u32(BufId::Tokens, 0, &tokens);
+    let embd_kind = wkind(&wf.w.token_embd);
+    let embd_off = wf.w.token_embd.offset as u64;
+    if !be().gather_rows(
+        embd_kind,
+        embd_off,
+        n_embd,
+        c.vocab_size,
+        1.0,
+        BufId::X,
+        0,
+        BufId::Tokens,
+        b,
+    ) {
+        for (t, &tok) in tokens.iter().enumerate() {
+            be().row(
+                embd_kind,
+                embd_off,
+                n_embd,
+                tok,
+                1.0,
+                BufId::X,
+                t as u32 * n_embd,
+            );
+        }
+    }
+    trace_rows("embd", 0, BufId::X, b, n_embd);
+    let n_layers = wf.plan.layers.len();
+    // The decode seat: every row is a decode row.
+    let flush_every = crate::gpu_support::flush_layers_bounded(1, n_layers);
+    for (li, (&layer, &(r_off, s_off, _, _))) in
+        wf.plan.layers.iter().zip(recur.iter()).enumerate()
+    {
+        let lw = &wf.w.layers[li];
+        be().rms_norm_from(
+            BufId::Cur,
+            BufId::X,
+            lw.attn_norm.offset,
+            n_embd,
+            eps,
+            b,
+            n_embd,
+            0,
+        );
+        match (&lw.mixer, layer.attention) {
+            (
+                MixerW::Attention {
+                    q_norm,
+                    k_norm,
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                },
+                crate::Attention::Full {
+                    head_dim: hd,
+                    rope_base,
+                    rope_dim,
+                },
+            ) => {
+                let (qw, kw) = (n_head * hd, n_kv * hd);
+                be().matmat(
+                    wkind(wq),
+                    wq.offset as u64,
+                    n_embd,
+                    2 * qw,
+                    BufId::Cur,
+                    MIX,
+                    b,
+                );
+                be().copy_strided(BufId::Q, MIX, hd, 0, 2 * hd, b * n_head);
+                be().matmat(
+                    wkind(wk),
+                    wk.offset as u64,
+                    n_embd,
+                    kw,
+                    BufId::Cur,
+                    BufId::K,
+                    b,
+                );
+                be().matmat(
+                    wkind(wv),
+                    wv.offset as u64,
+                    n_embd,
+                    kw,
+                    BufId::Cur,
+                    BufId::V,
+                    b,
+                );
+                let ring = ring_mask(layer.attention, wf.state.kv_ring_batch);
+                let max_scores: Vec<u32> =
+                    pos.iter().map(|&p| scores_needed(p, 1, 0)).collect();
+                let served = be().head_norm_rope_at(
+                    BufId::Q,
+                    q_norm.offset,
+                    hd,
+                    eps,
+                    n_head,
+                    &pos,
+                    rope_dim,
+                    rope_base,
+                    None,
+                ) && be().head_norm_rope_at(
+                    BufId::K,
+                    k_norm.offset,
+                    hd,
+                    eps,
+                    n_kv,
+                    &pos,
+                    rope_dim,
+                    rope_base,
+                    None,
+                ) && be().kv_store_slot_rows(
+                    BufId::K,
+                    li as u32,
+                    kw,
+                    &slot_rows,
+                    false,
+                    ring,
+                ) && be().kv_store_slot_rows(
+                    BufId::V,
+                    li as u32,
+                    kw,
+                    &slot_rows,
+                    true,
+                    ring,
+                ) && be().attention_slot_rows(
+                    li as u32,
+                    hd,
+                    n_head,
+                    n_kv,
+                    kw,
+                    1.0 / (hd as f32).sqrt(),
+                    0,
+                    &slot_rows,
+                    &max_scores,
+                    ring,
+                );
+                if !served {
+                    return Err(format!(
+                        "co-batched attention not served at layer {li}"
+                    ));
+                }
+                // The output gate, before o_proj: plain sigmoid of each packed head's
+                // second half.
+                be().mul_strided_sigmoid(
+                    BufId::Attn,
+                    MIX,
+                    hd,
+                    hd,
+                    2 * hd,
+                    hd,
+                    b * n_head,
+                );
+                be().matmat(
+                    wkind(wo),
+                    wo.offset as u64,
+                    qw,
+                    n_embd,
+                    BufId::Attn,
+                    BufId::O,
+                    b,
+                );
+            }
+            (
+                MixerW::GatedDelta {
+                    qkv,
+                    gate: gate_w,
+                    conv,
+                    a,
+                    dt_bias,
+                    alpha,
+                    beta,
+                    ssm_norm,
+                    out: out_w,
+                },
+                crate::Attention::Recurrent { .. },
+            ) => {
+                let (sh, taps) = delta_shape(layer.attention, conv.w.len())?;
+                let qkv_width =
+                    u32::try_from(sh.qkv_width()).map_err(|_| "qkv width")?;
+                let v_width = u32::try_from(sh.v_heads * sh.value_dim)
+                    .map_err(|_| "value width")?;
+                let (kd, vd) = (sh.key_dim as u32, sh.value_dim as u32);
+                let vh = u32::try_from(sh.v_heads).map_err(|_| "value heads")?;
+                let taps = u32::try_from(taps).map_err(|_| "conv taps")?;
+                be().matmat(
+                    wkind(qkv),
+                    qkv.offset as u64,
+                    n_embd,
+                    qkv_width,
+                    BufId::Cur,
+                    MIX,
+                    b,
+                );
+                be().matmat(
+                    wkind(gate_w),
+                    gate_w.offset as u64,
+                    n_embd,
+                    v_width,
+                    BufId::Cur,
+                    Z,
+                    b,
+                );
+                if !skip_alpha_beta() {
+                    be().matmat(
+                        wkind(alpha),
+                        alpha.offset as u64,
+                        n_embd,
+                        vh,
+                        BufId::Cur,
+                        ALPHA,
+                        b,
+                    );
+                    be().matmat(
+                        wkind(beta),
+                        beta.offset as u64,
+                        n_embd,
+                        vh,
+                        BufId::Cur,
+                        BETA,
+                        b,
+                    );
+                }
+                if !be().causal_conv_slot_rows(
+                    ConvForm::PlainSilu,
+                    MIX,
+                    conv.offset,
+                    BufId::Recur,
+                    &state_rows(r_off),
+                    CONV,
+                    qkv_width,
+                    taps,
+                ) {
+                    return Err(format!(
+                        "co-batched convolution not served at layer {li}"
+                    ));
+                }
+                let fuse_epi = be().delta_net_fuses_epilogue();
+                if !be().delta_net_slot_rows(
+                    &imparo_backend::DeltaNet {
+                        qkv: CONV,
+                        alpha: ALPHA,
+                        beta: BETA,
+                        a_off: a.offset,
+                        dt_bias_off: dt_bias.offset,
+                        state: BufId::Recur,
+                        state_off: 0,
+                        state_out_off: 0,
+                        out: BufId::Attn,
+                        epilogue: fuse_epi.then_some(imparo_backend::DeltaEpilogue {
+                            norm_w_off: ssm_norm.offset,
+                            gate: Z,
+                        }),
+                        snap: None,
+                        k_heads: u32::try_from(sh.k_heads).map_err(|_| "key heads")?,
+                        v_heads: vh,
+                        key_dim: kd,
+                        value_dim: vd,
+                        n_tok: b,
+                        eps,
+                    },
+                    &state_rows(s_off),
+                ) {
+                    return Err(format!(
+                        "co-batched delta rule not served at layer {li}"
+                    ));
+                }
+                if !fuse_epi {
+                    be().rms_norm(BufId::Attn, ssm_norm.offset, vd, eps, b * vh, vd, 0);
+                    be().act_mul(Z, BufId::Attn, b * v_width);
+                }
+                be().matmat(
+                    wkind(out_w),
+                    out_w.offset as u64,
+                    v_width,
+                    n_embd,
+                    Z,
+                    BufId::O,
+                    b,
+                );
+            }
+            (_, at) => {
+                return Err(format!(
+                    "qwen35 layer {li}: plan says {at:?} but the weights resolved otherwise"
+                ));
+            }
+        }
+        trace_rows("mix", li, BufId::O, b, n_embd);
+        // The one-row decode's tail on the dispatch path: the residual, the FFN norm, gate
+        // and up as two projections multiplied by the activation, down, the residual.
+        be().add(BufId::X, BufId::O, b * n_embd);
+        be().rms_norm_from(
+            BufId::Cur,
+            BufId::X,
+            lw.ffn_norm.offset,
+            n_embd,
+            eps,
+            b,
+            n_embd,
+            0,
+        );
+        let fused_ffn = be().ffn_gated_down(
+            wkind(&lw.ffn_gate),
+            lw.ffn_gate.offset as u64,
+            wkind(&lw.ffn_up),
+            lw.ffn_up.offset as u64,
+            wkind(&lw.ffn_down),
+            lw.ffn_down.offset as u64,
+            n_embd,
+            n_ff,
+            n_embd,
+            BufId::Cur,
+            BufId::G,
+            BufId::O,
+            b,
+        );
+        if !fused_ffn {
+            let fused_pair = be().matmat_gated(
+                wkind(&lw.ffn_gate),
+                lw.ffn_gate.offset as u64,
+                wkind(&lw.ffn_up),
+                lw.ffn_up.offset as u64,
+                n_embd,
+                n_ff,
+                BufId::Cur,
+                BufId::G,
+                BufId::U,
+                b,
+            );
+            if !fused_pair {
+                // No activation epilogue on the up projection: a one-row decode never fuses it.
+                be().matmat(
+                    wkind(&lw.ffn_gate),
+                    lw.ffn_gate.offset as u64,
+                    n_embd,
+                    n_ff,
+                    BufId::Cur,
+                    BufId::G,
+                    b,
+                );
+                be().matmat(
+                    wkind(&lw.ffn_up),
+                    lw.ffn_up.offset as u64,
+                    n_embd,
+                    n_ff,
+                    BufId::Cur,
+                    BufId::U,
+                    b,
+                );
+                be().act_mul(BufId::G, BufId::U, b * n_ff);
+            }
+            be().matmat(
+                wkind(&lw.ffn_down),
+                lw.ffn_down.offset as u64,
+                n_ff,
+                n_embd,
+                BufId::G,
+                BufId::O,
+                b,
+            );
+        }
+        be().add(BufId::X, BufId::O, b * n_embd);
+        trace_rows("out", li, BufId::X, b, n_embd);
+        if flush_every > 0 && (li + 1) % flush_every == 0 && li + 1 < n_layers {
+            be().flush();
+        }
+    }
+    be().rms_norm(BufId::X, wf.w.output_norm.offset, n_embd, eps, b, n_embd, 0);
+    be().matmat_from(
+        wkind(&wf.w.output),
+        wf.w.output.offset as u64,
+        n_embd,
+        c.vocab_size,
+        BufId::X,
+        BufId::Logits,
+        b,
+        0,
+    );
+    if let Some(cap) = wf.plan.output.logit_softcap {
+        be().softcap(BufId::Logits, cap, b * c.vocab_size);
+    }
+    // A row whose step ends on a checkpoint boundary keeps its state there: its slot's
+    // snapshot twin takes a copy of the plane the step wrote, as the one-row decode's
+    // boundary snapshot writes it aside.
+    if rows.iter().any(|r| r.snap) {
+        for r in rows.iter().filter(|r| r.snap) {
+            if !be().select_slot(r.slot) {
+                return Err(format!(
+                    "co-batched snapshot: slot {} not selected",
+                    r.slot
+                ));
+            }
+            be().copy_range(
+                BufId::RecurSnap,
+                0,
+                BufId::Recur,
+                r.plane_out * recur_elems,
+                recur_elems,
+            );
+        }
+        if !be().select_slot(wf.state.slot) {
+            return Err(format!(
+                "co-batched snapshot: slot {} not selected",
+                wf.state.slot
+            ));
+        }
+    }
+    be().argmax_rows(BufId::Logits, BufId::Tmp, c.vocab_size, b);
+    be().end()
+        .map_err(|rc| format!("qwen35 co-batched step failed rc={rc}"))
 }
 
 /// IMPARO_SKIP_AB=1 drops the alpha and beta projections. A skip lever for the

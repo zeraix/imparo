@@ -165,6 +165,10 @@ impl Canonical {
                 experts,
                 experts_used,
                 shared_hidden,
+                gating,
+                normalise_weights,
+                weights_scale,
+                expert_bias,
             } => {
                 self.u8(1);
                 self.activation(activation);
@@ -172,6 +176,15 @@ impl Canonical {
                 self.u32(experts);
                 self.u32(experts_used);
                 self.u32(shared_hidden);
+                self.u8(match gating {
+                    crate::ExpertGating::Softmax => 0,
+                    crate::ExpertGating::Sigmoid => 1,
+                });
+                self.bool(normalise_weights);
+                // The scale is a float, so its BITS are hashed: two files that differ
+                // only in it are two models.
+                self.u32(weights_scale.to_bits());
+                self.bool(expert_bias);
             }
         }
     }
@@ -284,6 +297,7 @@ mod tests {
             },
             decode_interleave: true,
             mega_decode: true,
+            drafter: None,
             layers: vec![
                 LayerPlan {
                     index: 0,
@@ -313,6 +327,10 @@ mod tests {
                         experts: 8,
                         experts_used: 2,
                         shared_hidden: 32,
+                        gating: crate::ExpertGating::Sigmoid,
+                        normalise_weights: true,
+                        weights_scale: 2.5,
+                        expert_bias: true,
                     },
                     kv_source: KvSource::SharedWith(0),
                 },

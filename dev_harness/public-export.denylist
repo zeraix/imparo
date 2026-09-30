@@ -1,0 +1,80 @@
+# Files kept out of the public export; everything else Git tracks is public.
+# dev_harness/public_allowlist.py --write turns this list into dev_harness/public-export.allowlist.
+# A line ending in / names a directory; other lines are paths or fnmatch patterns; a line
+# starting with ! makes matching paths public again; the last line that matches decides.
+
+# Documents and records. A few docs are public.
+docs/
+!docs/STATUS.md
+!docs/adr/0001-triton-program-pack-boundary.md
+!docs/cuda-kernel-lab.md
+!docs/cuda-sm86-benchmark-protocol.md
+!docs/cuda-sm86-experiment-ledger.md
+!docs/cuda-sm86-optimization-playbook.md
+!docs/evidence/triton/decision-a.md
+!docs/evidence/triton/lab-a-phase-a1.md
+!docs/evidence/triton/lab-a-q4-q8-builder.md
+!docs/evidence/triton/lab-a-q4-q8-variants-sm86.md
+!docs/evidence/triton/lab-a-q4-q8-windows-sm86-design.md
+!docs/evidence/triton/lab-a-rms-q8-builder.md
+!docs/evidence/triton/lab-a-rms-q8-windows-sm86.md
+!docs/evidence/triton/pr-e.md
+!docs/evidence/triton/pr-f.md
+!docs/program-pack-contract-abi.md
+!docs/program-pack-test-plan.md
+!docs/program-pack-threat-model.md
+!docs/program-packs.md
+evidence/
+handoff/
+dspark-paper/notes/
+dspark-paper/plan.md
+
+# CUDA probe programs that include a file generated when they run (baseline-current.inc).
+crates/imparo-cuda/native/tests/bonsai_gqa6_m1_probe.cu
+crates/imparo-cuda/native/tests/bonsai_gqa6_prefill_probe.cu
+
+# Internal design notes.
+mida/
+
+# dev_harness: only what public code, CI or the paper harness needs -- the exporter and its
+# checks, the CI test modules, the CUDA kernel-lab tools, and the three modules
+# dspark-paper/harness imports (engine, bracket, harness).
+dev_harness/
+!dev_harness/aggregate_triton_gate_a.py
+!dev_harness/audit_q4_gate_a_evidence.py
+!dev_harness/bracket.py
+!dev_harness/engine.py
+!dev_harness/finalize_q4_gate_a_evidence.py
+!dev_harness/finalize_q4_sanitizer_evidence.py
+!dev_harness/finalize_rms_gate_a_evidence.py
+!dev_harness/finalize_triton_gate_a_decision.py
+!dev_harness/harness.py
+!dev_harness/kernel_lab_q4_contract.ps1
+!dev_harness/kernel_lab_tools.ps1
+!dev_harness/public-export.allowlist
+!dev_harness/public-export.denylist
+!dev_harness/public_allowlist.py
+!dev_harness/public_export.py
+!dev_harness/run_cuda_kernel_lab.ps1
+!dev_harness/run_cuda_kernel_lab_q4.ps1
+!dev_harness/run_q4_variant_sanitizer_matrix.py
+!dev_harness/sync_public.sh
+!dev_harness/test_aggregate_triton_gate_a.py
+!dev_harness/test_audit_q4_gate_a_evidence.py
+!dev_harness/test_cuda_kernel_lab.py
+!dev_harness/test_cuda_kernel_lab_q4_contract.py
+!dev_harness/test_cuda_kernel_lab_q4_policy.py
+!dev_harness/test_finalize_q4_gate_a_evidence.py
+!dev_harness/test_finalize_rms_gate_a_evidence.py
+!dev_harness/test_finalize_triton_gate_a_decision.py
+!dev_harness/test_phase_a1_prefill_wall_source.py
+!dev_harness/test_program_pack_release.py
+!dev_harness/test_public_export.py
+!dev_harness/test_run_q4_variant_sanitizer_matrix.py
+!dev_harness/test_triton_pack_smoke.py
+!dev_harness/test_validate_q4_sanitizer_schema2.py
+!dev_harness/test_verify_nsys_prefill_denominator.py
+!dev_harness/validate_q4_sanitizer_schema2.py
+!dev_harness/verify_nsys_prefill_denominator.py
+!dev_harness/verify_program_pack_release.py
+!dev_harness/verify_public_export.py

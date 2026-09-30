@@ -1,0 +1,173 @@
+{
+ "lfm25_1596A": {
+  "tokens": 1596,
+  "packed_tokens": 10791,
+  "items": [
+   "gov_report:4bd6930b3b65caf89aa127d679a80294f31f9cfa7cdab703"
+  ],
+  "tokenizer_model": "LFM2.5-2.6B-Q8_0.gguf",
+  "sha256": "dbb543da9eb8437b"
+ },
+ "lfm25_1596B": {
+  "tokens": 1596,
+  "packed_tokens": 2850,
+  "items": [
+   "multi_news:e45abfcb82a3c862c0f772e6f461866839955c11ea2f46a8"
+  ],
+  "tokenizer_model": "LFM2.5-2.6B-Q8_0.gguf",
+  "sha256": "430d6566317742c7"
+ },
+ "lfm25_1596C": {
+  "tokens": 1596,
+  "packed_tokens": 12493,
+  "items": [
+   "lcc:28ce5cf5e0beeb47248c6cba20ae17fa71d60d402770d464"
+  ],
+  "tokenizer_model": "LFM2.5-2.6B-Q8_0.gguf",
+  "sha256": "33d085d072e7aefa"
+ },
+ "lfm25_443A": {
+  "tokens": 443,
+  "packed_tokens": 10791,
+  "items": [
+   "gov_report:4bd6930b3b65caf89aa127d679a80294f31f9cfa7cdab703"
+  ],
+  "tokenizer_model": "LFM2.5-2.6B-Q8_0.gguf",
+  "sha256": "fcc5cb58311eb0d2"
+ },
+ "lfm25_443B": {
+  "tokens": 443,
+  "packed_tokens": 2850,
+  "items": [
+   "multi_news:e45abfcb82a3c862c0f772e6f461866839955c11ea2f46a8"
+  ],
+  "tokenizer_model": "LFM2.5-2.6B-Q8_0.gguf",
+  "sha256": "987a8a5bdc81e286"
+ },
+ "lfm25_443C": {
+  "tokens": 443,
+  "packed_tokens": 12493,
+  "items": [
+   "lcc:28ce5cf5e0beeb47248c6cba20ae17fa71d60d402770d464"
+  ],
+  "tokenizer_model": "LFM2.5-2.6B-Q8_0.gguf",
+  "sha256": "40911a651d4d60c7"
+ },
+ "lfm25_8444A": {
+  "tokens": 8444,
+  "packed_tokens": 10791,
+  "items": [
+   "gov_report:4bd6930b3b65caf89aa127d679a80294f31f9cfa7cdab703"
+  ],
+  "tokenizer_model": "LFM2.5-2.6B-Q8_0.gguf",
+  "sha256": "8c35645d51aa4d42"
+ },
+ "lfm25_8444B": {
+  "tokens": 8444,
+  "packed_tokens": 8768,
+  "items": [
+   "multi_news:e45abfcb82a3c862c0f772e6f461866839955c11ea2f46a8",
+   "multi_news:0cd7b0bfc70d78aa6805925975d9fb26b281c482ff482b7c",
+   "multi_news:82cafb9831bcafa681b45205a34677e2bf6b6c2fb992649f",
+   "multi_news:2e5eae4e8ae651f706cfaee0918b5da3fede2e742d98f71c",
+   "multi_news:3a7faeaefe15b8c33d9120f97591dfdad212b0778e2b830b"
+  ],
+  "tokenizer_model": "LFM2.5-2.6B-Q8_0.gguf",
+  "sha256": "060dd1780027d027"
+ },
+ "lfm25_8444C": {
+  "tokens": 8444,
+  "packed_tokens": 12493,
+  "items": [
+   "lcc:28ce5cf5e0beeb47248c6cba20ae17fa71d60d402770d464"
+  ],
+  "tokenizer_model": "LFM2.5-2.6B-Q8_0.gguf",
+  "sha256": "6b89e89a020202da"
+ },
+ "qwen3_1596A": {
+  "tokens": 1596,
+  "packed_tokens": 11006,
+  "items": [
+   "gov_report:4bd6930b3b65caf89aa127d679a80294f31f9cfa7cdab703"
+  ],
+  "tokenizer_model": "Qwen3-4B-Q4_K_M.gguf",
+  "sha256": "431cbecf525ea5ad"
+ },
+ "qwen3_1596B": {
+  "tokens": 1596,
+  "packed_tokens": 2658,
+  "items": [
+   "multi_news:e45abfcb82a3c862c0f772e6f461866839955c11ea2f46a8"
+  ],
+  "tokenizer_model": "Qwen3-4B-Q4_K_M.gguf",
+  "sha256": "2e65675338efac38"
+ },
+ "qwen3_1596C": {
+  "tokens": 1596,
+  "packed_tokens": 11468,
+  "items": [
+   "lcc:28ce5cf5e0beeb47248c6cba20ae17fa71d60d402770d464"
+  ],
+  "tokenizer_model": "Qwen3-4B-Q4_K_M.gguf",
+  "sha256": "01f2a9ea706f4335"
+ },
+ "qwen3_443A": {
+  "tokens": 443,
+  "packed_tokens": 11006,
+  "items": [
+   "gov_report:4bd6930b3b65caf89aa127d679a80294f31f9cfa7cdab703"
+  ],
+  "tokenizer_model": "Qwen3-4B-Q4_K_M.gguf",
+  "sha256": "e1edee20a839b787"
+ },
+ "qwen3_443B": {
+  "tokens": 443,
+  "packed_tokens": 2658,
+  "items": [
+   "multi_news:e45abfcb82a3c862c0f772e6f461866839955c11ea2f46a8"
+  ],
+  "tokenizer_model": "Qwen3-4B-Q4_K_M.gguf",
+  "sha256": "0ef0696c6ba04012"
+ },
+ "qwen3_443C": {
+  "tokens": 443,
+  "packed_tokens": 11468,
+  "items": [
+   "lcc:28ce5cf5e0beeb47248c6cba20ae17fa71d60d402770d464"
+  ],
+  "tokenizer_model": "Qwen3-4B-Q4_K_M.gguf",
+  "sha256": "f9f51d3e60bb62e6"
+ },
+ "qwen3_8444A": {
+  "tokens": 8444,
+  "packed_tokens": 11006,
+  "items": [
+   "gov_report:4bd6930b3b65caf89aa127d679a80294f31f9cfa7cdab703"
+  ],
+  "tokenizer_model": "Qwen3-4B-Q4_K_M.gguf",
+  "sha256": "591e277ae6dcc007"
+ },
+ "qwen3_8444B": {
+  "tokens": 8444,
+  "packed_tokens": 9594,
+  "items": [
+   "multi_news:e45abfcb82a3c862c0f772e6f461866839955c11ea2f46a8",
+   "multi_news:0cd7b0bfc70d78aa6805925975d9fb26b281c482ff482b7c",
+   "multi_news:82cafb9831bcafa681b45205a34677e2bf6b6c2fb992649f",
+   "multi_news:2e5eae4e8ae651f706cfaee0918b5da3fede2e742d98f71c",
+   "multi_news:3a7faeaefe15b8c33d9120f97591dfdad212b0778e2b830b",
+   "multi_news:3c382dfa0b8fe302ceead369a782680ad9e36897e99ee903"
+  ],
+  "tokenizer_model": "Qwen3-4B-Q4_K_M.gguf",
+  "sha256": "4d81d19b9e6357bb"
+ },
+ "qwen3_8444C": {
+  "tokens": 8444,
+  "packed_tokens": 11468,
+  "items": [
+   "lcc:28ce5cf5e0beeb47248c6cba20ae17fa71d60d402770d464"
+  ],
+  "tokenizer_model": "Qwen3-4B-Q4_K_M.gguf",
+  "sha256": "0c1e03f00588537f"
+ }
+}

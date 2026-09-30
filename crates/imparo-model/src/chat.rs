@@ -318,7 +318,11 @@ pub mod think {
 pub fn codec(plan: &crate::ModelPlan) -> Result<&'static dyn ChatCodec, String> {
     match plan.config.architecture.as_str() {
         "gemma4" => Ok(&crate::gemma4::chat_format::Codec),
-        "lfm2" => Ok(&crate::lfm2::chat_format::Codec),
+        "lfm2" => Ok(&crate::lfm2::chat_format::CODEC_THINK_PREFILL),
+        // The same markup, minus the `<think>` the 2.6B's generation prompt prefills --
+        // LFM2.5-8B-A1B's template ends the assistant's opening at the newline.
+        "lfm2moe" => Ok(&crate::lfm2::chat_format::CODEC_NO_THINK_PREFILL),
+        "qwen3" => Ok(&crate::qwen3::chat_format::Codec),
         "qwen35" => Ok(&crate::qwen35::chat_format::Codec),
         other => Err(format!("no chat codec for architecture '{other}'")),
     }

@@ -725,14 +725,14 @@ impl ResidentKv {
         freed
     }
 
-    /// Drop the least-recently-probed conversation (not `keep`) entirely,
-    /// returning all residency releases. The safety valve when allocation still
-    /// fails after unreferenced eviction.
+    /// Drop the least-recently-probed conversation that `spare` does not name, entirely,
+    /// returning all residency releases. The safety valve when allocation still fails
+    /// after unreferenced eviction.
     pub fn drop_lru_conversation(
         &mut self,
-        keep: &ConversationId,
+        spare: &dyn Fn(&ConversationId) -> bool,
     ) -> Option<DroppedConversation> {
-        let v = self.lru.iter().find(|c| *c != keep).cloned()?;
+        let v = self.lru.iter().find(|c| !spare(c)).cloned()?;
         self.pool.forget(&v);
         self.lru.retain(|c| c != &v);
         let evicted = self.evict_unreferenced();
@@ -755,6 +755,58 @@ impl ResidentKv {
         self.alloc
             .get(&layer)
             .map_or(0, BlockAllocator::free_blocks)
+    }
+
+    /// Holds back `units` units on every layer (`BlockAllocator::set_withheld`), replacing the
+    /// amount held back before. False, and nothing changed on any layer, when a layer's blocks
+    /// in use leave fewer unallocated.
+    pub fn set_withheld_units(&mut self, units: usize) -> bool {
+        let Ok(blocks) = u32::try_from(units.saturating_mul(UNIT_BLOCKS)) else {
+            return false;
+        };
+        if self
+            .alloc
+            .values()
+            .any(|a| u64::from(a.used()) + u64::from(blocks) > u64::from(a.capacity()))
+        {
+            return false;
+        }
+        for a in self.alloc.values_mut() {
+            a.set_withheld(blocks);
+        }
+        true
+    }
+
+    /// Units held back from allocation (`set_withheld_units`).
+    #[must_use]
+    pub fn withheld_units(&self) -> usize {
+        self.alloc
+            .values()
+            .map(|a| a.withheld() as usize / UNIT_BLOCKS)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Blocks each layer's storage holds. Layers allocate in lockstep, so this is every
+    /// layer's answer.
+    #[must_use]
+    pub fn capacity_blocks(&self) -> u32 {
+        self.alloc
+            .values()
+            .map(BlockAllocator::capacity)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// One past the highest block any layer has allocated: how far the device storage must
+    /// reach. Layers allocate in lockstep, so this is every layer's answer.
+    #[must_use]
+    pub fn high_water(&self) -> u32 {
+        self.alloc
+            .values()
+            .map(BlockAllocator::high_water)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -871,7 +923,7 @@ mod tests {
         r.seal_unit(&cid("old"), h, &pl);
         r.probe(&cid("keep"), &[]).unwrap();
 
-        let dropped = r.drop_lru_conversation(&cid("keep")).unwrap();
+        let dropped = r.drop_lru_conversation(&|c| *c == cid("keep")).unwrap();
         assert_eq!(dropped.conversation, cid("old"));
         assert_eq!(dropped.evicted, vec![EvictedResidency::Device(pl.clone())]);
         assert_eq!(r.drain_lifecycle(), vec![PlacementLifecycle::Free(pl)]);

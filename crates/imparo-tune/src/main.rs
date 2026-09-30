@@ -38,6 +38,63 @@ use imparo_backend::{Backend, KnobDecl, SweepKind};
 use imparo_model::PREFILL_BATCH;
 use imparo_model::build_plan;
 
+/// A real matrix address and its timing-only synthetic storage. The transform is
+/// model metadata; only its address changes when the tuner avoids mapping weights.
+#[derive(Clone, Copy, Debug)]
+struct SyntheticMatrix {
+    source_offset: u64,
+    offset: u64,
+    width: u32,
+    kind: u32,
+    bytes: u64,
+}
+
+fn remap_weight_input_transforms(
+    transforms: &[imparo_backend::WeightInputTransform],
+    matrices: &[SyntheticMatrix],
+    blob_bytes: u64,
+) -> Result<Vec<imparo_backend::WeightInputTransform>, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut source = BTreeMap::new();
+    for transform in transforms {
+        if source.insert(transform.weight_offset, transform).is_some() {
+            return Err("duplicate source weight basis".into());
+        }
+    }
+    let mut offsets = BTreeSet::new();
+    let mut result = Vec::new();
+    for matrix in matrices {
+        if matrix.offset == 0
+            || matrix.bytes == 0
+            || matrix
+                .offset
+                .checked_add(matrix.bytes)
+                .is_none_or(|end| end > blob_bytes)
+            || !offsets.insert(matrix.offset)
+        {
+            return Err(
+                "synthetic matrix address is duplicate or outside its blob".into()
+            );
+        }
+        let Some(transform) = source.get(&matrix.source_offset) else {
+            if matrix.kind == 39 {
+                return Err("synthetic PTQ matrix has no model input basis".into());
+            }
+            continue;
+        };
+        if matrix.kind != 39 || transform.inverse || transform.width != matrix.width {
+            return Err(
+                "synthetic projection does not match its forward weight basis".into(),
+            );
+        }
+        let mut mapped = (*transform).clone();
+        mapped.weight_offset = matrix.offset;
+        result.push(mapped);
+    }
+    result.sort_by_key(|transform| transform.weight_offset);
+    Ok(result)
+}
+
 /// The backend under test, chosen at the composition root -- the one place the cfg
 /// rule allows a target check. A CUDA host adds its arm here; nothing else changes.
 struct Space {
@@ -47,6 +104,13 @@ struct Space {
     tag: &'static str,
     /// Backend-specific process preparation (pipeline pre-builds), run before init.
     prepare: fn(),
+    /// Times both candidate rows kernels on each (kind, shape) and returns the winners as
+    /// `(wire kind, n_in, n_out, value)`. A backend without this axis returns nothing, and the
+    /// tuner then writes no per-tensor seat lines.
+    row_kernel_seats: fn(&[(u32, u64, u32, u32)], u32) -> Vec<(u32, u32, u32, u32)>,
+    /// The prefill chunk the backend derives for the model from the compiled one, or `None`
+    /// to keep the stored (or compiled) chunk. Written as the `batch` line.
+    prefill_batch: fn(&imparo_backend::ModelFacts, usize) -> Option<usize>,
     /// The widest token tile in the backend's prefill GEMM shape table: the width that
     /// exercises every candidate for the pair's second tile (`Shapes::pair_tile_tokens`).
     pair_tile_tokens: fn() -> u32,
@@ -130,6 +194,8 @@ fn space() -> Space {
         ops: &BE,
         reg: BE.knob_registry(),
         version: BE.space_version(),
+        row_kernel_seats: |t, rows| BE.measure_row_kernel_seats(t, rows),
+        prefill_batch: |m, compiled| BE.prefill_batch(m, compiled),
         tag: "metal",
         // Every candidate pipeline has to exist BEFORE init, or a sweep finds a nil
         // pipeline and silently measures whichever candidate was selected last.
@@ -163,6 +229,8 @@ fn space() -> Space {
         ops: &BE,
         reg: BE.knob_registry(),
         version: BE.space_version(),
+        row_kernel_seats: |t, rows| BE.measure_row_kernel_seats(t, rows),
+        prefill_batch: |m, compiled| BE.prefill_batch(m, compiled),
         tag: "cuda",
         // Opt into the GPU path (backend::enable_gpu); CUDA needs no pipeline
         // pre-builds, so that is the whole preparation.
@@ -541,15 +609,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--emit-candidate requires both --knob NAME and --out FILE".into());
     }
     let fp = imparo_host::fingerprint_for(sp.tag, sp.version, &kv);
-    let model_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+    // Shapes come from the GGUF HEADER. `read` parses metadata; the tensor DATA is only
+    // mapped by `Weights::open_with`.
+    let document = imparo_gguf::read(&path)?;
+    // Keyed by the model's bytes: where its tensor data ends, read the same way the engine
+    // reads it (a paired drafter is mapped past that point).
+    let model_bytes = document.data_end();
     let out = out_path.unwrap_or_else(|| imparo_host::path_for(&fp, model_bytes));
     println!("host  {fp}");
     println!("out   {}", out.display());
 
-    // Shapes come from the GGUF HEADER. `read` parses metadata; the tensor DATA is only
-    // mapped by `Weights::open_with`.
-    let document = imparo_gguf::read(&path)?;
     let plan = build_plan(&document, &path)?;
+    // Parse the exact model basis before device allocation, as ordinary model load does.
+    let input_transforms = if plan.config.architecture == "qwen35" {
+        imparo_model::qwen35::weight_basis::from_document(&document, &path)?
+    } else {
+        Vec::new()
+    };
     let c = plan.config.clone();
     // Two attention geometries exist in this model; measure the one most layers use.
     let mut hd_count: std::collections::BTreeMap<u32, usize> =
@@ -591,12 +667,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(0),
     )
     .unwrap_or(0);
+    // The experts a token picks, and the windowed-attention layers: what the prefill chunk's
+    // derivation reads (a routed model's per-expert rows, and whether a chunk boundary can
+    // move a windowed layer's answer).
+    let experts_used = u32::try_from(
+        document
+            .unsigned_value(&format!("{arch_name}.expert_used_count"))
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    let windowed_layers = u32::try_from(
+        plan.layers
+            .iter()
+            .filter(|l| matches!(l.attention, imparo_model::Attention::Window { .. }))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
     let shapes = micro::Shapes {
         activation: imparo_model::backend::model_activation(&plan)?.epilogue(),
         // Resolved below, once the bench extension says whether the workflow offers entries.
         mega_seat: imparo_backend::MegaSeat::None,
         mega_layers: Vec::new(),
         n_experts,
+        experts_used,
+        windowed_layers,
         n_embd: c.n_embd,
         n_ff: c.n_ff,
         n_head: c.n_heads,
@@ -760,64 +854,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let norm_off = wbytes as u64;
     let wbytes =
         wbytes + ((4 * shapes.n_embd.max(shapes.n_ff) as usize + 16383) & !16383);
-    let layout = std::alloc::Layout::from_size_align(wbytes, 16384)
-        .map_err(|e| format!("synthetic weight layout: {e}"))?;
-    // SAFETY: freshly allocated, 16 KB aligned, and it outlives every use below.
-    let base = unsafe { std::alloc::alloc_zeroed(layout) };
-    if base.is_null() {
-        return Err("synthetic weight blob allocation failed".into());
-    }
-    // THE SAME HEAD DIMS THE ENGINE INJECTS, from the same place, before the same call.
-    // The kernel library is compiled inside init_weights and specialises on these: one
-    // attention kernel slot per dim the model uses. Skipping them here compiled a library
-    // with NO qcomb slots at all, so the tuner's prefill attention workload dispatched
-    // qtile while the engine dispatched qcomb, and every qcomb knob read "N/A to this
-    // model" -- a whole kernel family the tuner could neither see nor rank.
-    //
-    // This is the rule that a workload must dispatch what the engine dispatches, one
-    // level down: it applies to the LIBRARY, not only to the tensor shapes.
-    let mut hds: Vec<u32> = plan
-        .layers
-        .iter()
-        .filter(|l| l.attention.is_attention())
-        .map(|l| l.attention.head_dim())
-        .collect();
-    hds.sort_unstable();
-    hds.dedup();
-    sp.ops.set_attention_head_dims(&hds);
-    // The K/V row width goes with each dim, as the engine passes it (imparo-model
-    // backend.rs): the prefill attention kernels compile the stride as a constant, and a
-    // library compiled without it is a different kernel from the one the engine runs.
-    let kvws: Vec<u32> = hds.iter().map(|hd| plan.config.n_kv_heads * hd).collect();
-    sp.ops.set_attention_kv_widths(&kvws);
-    sp.ops.set_activation(shapes.activation);
-    unsafe { sp.ops.init_weights(base, wbytes as u64) }
-        .map_err(|rc| format!("backend init_weights rc={rc}"))?;
-
-    // WHAT THE BACKEND ACTUALLY HOLDS, checked against what --kv asked for, and checked
-    // HERE because this is the first moment it can be: the cache type is applied when the
-    // backend initialises, so asking before this returns the default no matter what was
-    // requested. The config is keyed by the cache type, so a flag that never arrived would
-    // MISLABEL every answer in the file rather than fail.
-    {
-        let live = sp.ops.kv_tag();
-        assert!(
-            live == kv,
-            "--kv {kv} did not reach the backend: it reports {live}. The config would be \
-             labelled {kv} and hold measurements taken on {live}."
-        );
-    }
-
-    if let Some(stored) = stored_config.as_ref() {
-        for (name, value) in &stored.knobs {
-            if let Some(declaration) = sp.reg.iter().find(|d| d.name == name.as_str()) {
-                (declaration.apply)(*value);
-            }
-        }
-    }
-    // Validate the completed tuple below, once model facts are available. Checking
-    // during the apply loop would miss a later coupled setter changing an earlier seat.
-
     // The decode matmuls at their REAL per-tensor dimensions, read from the header. The
     // tensor list comes from the model's bench extension (knobs.rs); the tuner core stays
     // model-agnostic. Offsets are spread across the blob rather than the model's own,
@@ -850,6 +886,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A tensor whose type this engine cannot run is DROPPED and counted, not silently
     // measured as something else -- the print below says how many made it.
     let mut unsupported: Vec<String> = Vec::new();
+    let mut synthetic_matrices = Vec::new();
     // Keep one slot per declared tensor even when a tensor is unsupported. Flattening
     // only after named FFN extraction prevents one dropped projection from shifting all
     // later names onto the wrong offsets.
@@ -887,15 +924,172 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // breaks silently. tensor_layout(runtime_type) answers both.
                 let layout = imparo_gguf::tensor_layout(runtime_type).ok()?;
                 let need = ne0 * ne1 / layout.block_elements * layout.block_bytes;
-                (off + need <= blk_bytes as u64).then_some((
-                    off,
-                    ne0 as u32,
-                    ne1 as u32,
-                    kind as u32,
-                ))
+                (off + need <= blk_bytes as u64).then(|| {
+                    synthetic_matrices.push(SyntheticMatrix {
+                        source_offset: t.absolute_offset,
+                        offset: off,
+                        width: ne0 as u32,
+                        kind: kind as u32,
+                        bytes: need,
+                    });
+                    (off, ne0 as u32, ne1 as u32, kind as u32)
+                })
             })
         })
         .collect();
+    if let Some((offset, width, _, kind, bytes)) = lm_head_info {
+        let tensor = ["output.weight", "token_embd.weight"]
+            .iter()
+            .find_map(|name| document.tensor(name))
+            .expect("resolved lm head");
+        synthetic_matrices.push(SyntheticMatrix {
+            source_offset: tensor.absolute_offset,
+            offset,
+            width,
+            kind,
+            bytes: bytes as u64,
+        });
+    }
+    let synthetic_transforms = remap_weight_input_transforms(
+        &input_transforms,
+        &synthetic_matrices,
+        wbytes as u64,
+    )?;
+    let layout = std::alloc::Layout::from_size_align(wbytes, 16384)
+        .map_err(|e| format!("synthetic weight layout: {e}"))?;
+    // All-zero PTQ1_0 blocks have finite FP16 scale=0; BF16 zero is +0.
+    // This legal timing payload is not an independent numerical reference.
+    // SAFETY: freshly allocated, 16 KB aligned, and it outlives every use below.
+    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    if base.is_null() {
+        return Err("synthetic weight blob allocation failed".into());
+    }
+    // THE SAME HEAD DIMS THE ENGINE INJECTS, from the same place, before the same call.
+    // The kernel library is compiled inside init_weights and specialises on these: one
+    // attention kernel slot per dim the model uses. Skipping them here compiled a library
+    // with NO qcomb slots at all, so the tuner's prefill attention workload dispatched
+    // qtile while the engine dispatched qcomb, and every qcomb knob read "N/A to this
+    // model" -- a whole kernel family the tuner could neither see nor rank.
+    //
+    // This is the rule that a workload must dispatch what the engine dispatches, one
+    // level down: it applies to the LIBRARY, not only to the tensor shapes.
+    let mut hds: Vec<u32> = plan
+        .layers
+        .iter()
+        .filter(|l| l.attention.is_attention())
+        .map(|l| l.attention.head_dim())
+        .collect();
+    hds.sort_unstable();
+    hds.dedup();
+    sp.ops.set_attention_head_dims(&hds);
+    // The K/V row width goes with each dim, as the engine passes it (imparo-model
+    // backend.rs): the prefill attention kernels compile the stride as a constant, and a
+    // library compiled without it is a different kernel from the one the engine runs.
+    let kvws: Vec<u32> = hds.iter().map(|hd| plan.config.n_kv_heads * hd).collect();
+    sp.ops.set_attention_kv_widths(&kvws);
+    sp.ops.set_activation(shapes.activation);
+    unsafe { sp.ops.init_weights(base, wbytes as u64) }
+        .map_err(|rc| format!("backend init_weights rc={rc}"))?;
+    // Registration must precede any buffer/execution-owner allocation in micro::measure.
+    sp.ops
+        .register_weight_input_transforms(&synthetic_transforms)?;
+
+    // PER-TENSOR KERNEL SEATS, measured over EVERY layer's tensors rather than layer 0's.
+    //
+    // The knob sweeps below read one workload total, which is why a per-tensor choice could
+    // never be a knob: a total dominated by one tensor group picks that group's kernel for
+    // every tensor. This times each (kind, shape) on its own instead.
+    //
+    // EVERY LAYER, and that is not pedantry: a UD mixed quant gives one tensor NAME several
+    // formats down the stack -- Qwen3.8-27B UD-Q4_K_S carries ffn_down as IQ4_XS in 27 layers,
+    // Q5_K in 13, Q4_K in 12 and IQ3_S in 6 -- so enumerating blk.0 alone, as the knob mix
+    // does, would seat a fraction of the table and leave the rest on their format's crossing.
+    //
+    // EVERY TRIPLE GETS ITS OWN START, spread across the blob, for the reason the blob is
+    // oversized in the first place (see the comment above it): candidates measured one after
+    // another at the SAME address each read pages the previous one just warmed, which is not the
+    // stream the engine sees -- it reads real tensors spread over the whole file. Stacking them
+    // at one offset made this probe disagree with imparo-metalbench on the real file for
+    // Q4_K_TM 5120->10240, a 2.7% gap on the shape with the most tensors a step.
+    //
+    // Starts are spread and reads MAY overlap: the bytes are meaningless, so only the start
+    // needs to differ, and the modulus keeps the largest tensor inside the blob.
+    let row_seats: Vec<(u32, u32, u32, u32)> = {
+        let mut seen: std::collections::BTreeSet<(u32, u32, u32)> =
+            std::collections::BTreeSet::new();
+        let mut probe: Vec<(u32, u64, u32, u32)> = Vec::new();
+        let mut spread: u64 = 0;
+        for t in &document.tensors {
+            let (Some(&ne0), Some(&ne1)) = (t.dimensions.first(), t.dimensions.get(1))
+            else {
+                continue;
+            };
+            if t.dimensions.len() != 2 || t.name == "token_embd.weight" {
+                continue;
+            }
+            let runtime_type = imparo_model::backend::runtime_weight_type(
+                &t.name,
+                t.ggml_type,
+                &t.dimensions,
+            );
+            let Some(kind) = imparo_gguf::weights::weight_kind(runtime_type) else {
+                continue;
+            };
+            let Ok(layout) = imparo_gguf::tensor_layout(runtime_type) else {
+                continue;
+            };
+            let need = ne0 * ne1 / layout.block_elements * layout.block_bytes;
+            let align = SYNTHETIC_TENSOR_ALIGNMENT as u64;
+            // A tensor larger than the synthetic blob cannot be timed in it; it keeps its
+            // format's crossing rather than being measured against a short read.
+            if align + need > blk_bytes as u64 {
+                continue;
+            }
+            if seen.insert((kind as u32, ne0 as u32, ne1 as u32)) {
+                // Walk the blob in aligned strides, wrapping inside what this tensor's own size
+                // leaves free, so consecutive candidates start far apart and none runs past the
+                // end. A prime-ish stride keeps the wrap from revisiting the same few starts.
+                let room = (blk_bytes as u64 - align - need).max(1);
+                let off = (align + (spread * 0x0010_0003) % room) & !(align - 1);
+                spread += 1;
+                probe.push((kind as u32, off, ne0 as u32, ne1 as u32));
+            }
+        }
+        let seats = (sp.row_kernel_seats)(&probe, 2);
+        if !seats.is_empty() {
+            println!(
+                "rows kernel seats: {} of {} distinct (kind, shape) measured on both kernels",
+                seats.len(),
+                probe.len()
+            );
+        }
+        seats
+    };
+
+    // WHAT THE BACKEND ACTUALLY HOLDS, checked against what --kv asked for, and checked
+    // HERE because this is the first moment it can be: the cache type is applied when the
+    // backend initialises, so asking before this returns the default no matter what was
+    // requested. The config is keyed by the cache type, so a flag that never arrived would
+    // MISLABEL every answer in the file rather than fail.
+    {
+        let live = sp.ops.kv_tag();
+        assert!(
+            live == kv,
+            "--kv {kv} did not reach the backend: it reports {live}. The config would be \
+             labelled {kv} and hold measurements taken on {live}."
+        );
+    }
+
+    if let Some(stored) = stored_config.as_ref() {
+        for (name, value) in &stored.knobs {
+            if let Some(declaration) = sp.reg.iter().find(|d| d.name == name.as_str()) {
+                (declaration.apply)(*value);
+            }
+        }
+    }
+    // Validate the completed tuple below, once model facts are available. Checking
+    // during the apply loop would miss a later coupled setter changing an earlier seat.
+
     let decode_mix: Vec<(u64, u32, u32, u32)> = mapped
         .iter()
         .take(decode_names.len())
@@ -920,7 +1114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lookup_tensor("ffn_down"),
     ) {
         (Some(gate), Some(up), Some(down))
-            if matches!(gate.3, 1..=3)
+            if matches!(gate.3, 1..=3 | 39)
                 && gate.3 == up.3
                 && up.3 == down.3
                 && gate.1 == shapes.n_embd
@@ -1106,6 +1300,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         head_dim: shapes.head_dim,
         deep_head_dim: shapes.deep_head_dim,
         n_experts: shapes.n_experts,
+        experts_used: shapes.experts_used,
+        windowed_layers: shapes.windowed_layers,
         n_layers: shapes.n_layers,
         layer_dispatches: shapes.layer_dispatches,
         weight_kinds: shapes.weight_kinds,
@@ -1138,14 +1334,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Capture only the final, checked readback -- never publish the stale request or
     // rank candidates against it. No kernel workload has run since stored-seat apply.
+    // A DERIVED chunk replaces the stored one: a stored 512 on a routed model is the
+    // compiled default written back by an earlier run, not a choice.
+    let derived_batch = (sp.prefill_batch)(&facts, PREFILL_BATCH);
     let incumbent = Candidate {
-        batch: seated_prefill_batch(stored_config.as_ref().and_then(|c| c.batch)),
+        batch: derived_batch.unwrap_or_else(|| {
+            seated_prefill_batch(stored_config.as_ref().and_then(|c| c.batch))
+        }),
         vals: sp.reg.iter().map(|d| (d.current)()).collect(),
     };
-    println!(
-        "prefill batch={} retained from the stored config or compiled default; batch is not swept",
-        incumbent.batch
-    );
+    if derived_batch.is_some() {
+        println!(
+            "prefill batch={} derived for this model ({} experts, {} used, no windowed layers); \
+             batch is not swept",
+            incumbent.batch, facts.n_experts, facts.experts_used
+        );
+    } else {
+        println!(
+            "prefill batch={} retained from the stored config or compiled default; batch is not swept",
+            incumbent.batch
+        );
+    }
 
     if explain {
         let profile = discover::profile(sp.ops, false);
@@ -1308,6 +1517,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = writeln!(s, "{}={v}", d.name);
                 s
             });
+    // PER-TENSOR SEAT LINES, after the knobs. They are not knobs -- each names one
+    // (wire kind, n_in, n_out) rather than the whole engine -- and a reader that does not know
+    // them treats each as an unknown key and ignores it, so a file carrying them stays readable
+    // by an older build. That is also why adding them needs no search-space bump: a file
+    // without seats and a build without seats both mean "every tensor takes its format's
+    // crossing", which is what shipped before.
+    let seat_lines =
+        row_seats
+            .iter()
+            .fold(String::new(), |mut s, &(k, n_in, n_out, v)| {
+                use std::fmt::Write as _;
+                let _ = writeln!(s, "blk_rows.{k}.{n_in}.{n_out}={v}");
+                s
+            });
     let body = format!(
         "# imparo host tuning, {} search space v{}\n\
          # complete candidate; selection scope is recorded below\n\
@@ -1315,7 +1538,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          fingerprint={fp}\n\
          toolchain={}\n\
          model={}\nmodel_bytes={model_bytes}\n\
-         {knob_lines}batch={}\n",
+         {seat_lines}{knob_lines}batch={}\n",
         sp.tag,
         sp.version,
         imparo_host::toolchain(),
@@ -1446,6 +1669,8 @@ mod stored_seat_tests {
                 head_dim: 64,
                 deep_head_dim: 64,
                 n_experts: 0,
+                experts_used: 0,
+                windowed_layers: 0,
                 n_layers: 30,
                 layer_dispatches: 0,
                 weight_kinds: 4,
@@ -1621,7 +1846,8 @@ fn explain_registry(
             Sw::Crossing { .. }
             | Sw::TokenMinCrossing { .. }
             | Sw::TokenMaxCrossing { .. }
-            | Sw::SpanCrossing { .. } => "boundary",
+            | Sw::SpanCrossing { .. }
+            | Sw::RowsCrossing { .. } => "boundary",
         };
         let regime = match d.sweep {
             Sw::Derived => "-".to_string(),
@@ -1631,7 +1857,8 @@ fn explain_registry(
             Sw::Crossing { .. }
             | Sw::TokenMinCrossing { .. }
             | Sw::TokenMaxCrossing { .. }
-            | Sw::SpanCrossing { .. } => "own ladder".to_string(),
+            | Sw::SpanCrossing { .. }
+            | Sw::RowsCrossing { .. } => "own ladder".to_string(),
             Sw::Values => format!("{:?}", d.workload),
         };
         let mut notes: Vec<String> = Vec::new();
@@ -1666,6 +1893,7 @@ fn explain_registry(
                 | Sw::TokenMinCrossing { .. }
                 | Sw::TokenMaxCrossing { .. }
                 | Sw::SpanCrossing { .. }
+                | Sw::RowsCrossing { .. }
         ) {
             notes.push("defines a regime".into());
         }
@@ -1673,7 +1901,8 @@ fn explain_registry(
             Sw::Crossing { .. }
             | Sw::TokenMinCrossing { .. }
             | Sw::TokenMaxCrossing { .. }
-            | Sw::SpanCrossing { .. } => "own ladder".to_string(),
+            | Sw::SpanCrossing { .. }
+            | Sw::RowsCrossing { .. } => "own ladder".to_string(),
             Sw::Derived => "-".to_string(),
             Sw::External | Sw::Values => {
                 let v = ladder(d);
@@ -1709,4 +1938,156 @@ fn explain_registry(
         "really one decision. A computed knob is never searched -- ground truth already"
     );
     println!("determines it.");
+}
+
+#[cfg(test)]
+mod ptq_tuner_tests {
+    use super::{SyntheticMatrix, remap_weight_input_transforms};
+    use imparo_backend::{GroupedHeads, WeightInputTransform};
+
+    fn basis() -> WeightInputTransform {
+        WeightInputTransform {
+            weight_offset: 900_000,
+            width: 6144,
+            block_size: 1024,
+            signs: (0..6144).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect(),
+            inverse: false,
+            permutation: Some(GroupedHeads {
+                head_dim: 128,
+                key_heads: 16,
+                value_heads: 48,
+            }),
+        }
+    }
+    fn matrix() -> SyntheticMatrix {
+        SyntheticMatrix {
+            source_offset: 900_000,
+            offset: 256,
+            width: 6144,
+            kind: 39,
+            bytes: 1344,
+        }
+    }
+    #[test]
+    fn remap_preserves_complete_basis_and_excludes_unmeasured_embedding() {
+        let original = basis();
+        let mut embedding = original.clone();
+        embedding.weight_offset = 1_000_000;
+        embedding.inverse = true;
+        let bf16 = SyntheticMatrix {
+            source_offset: 2_000_000,
+            offset: 4096,
+            width: 5120,
+            kind: 40,
+            bytes: 10240,
+        };
+        let got = remap_weight_input_transforms(
+            &[original.clone(), embedding],
+            &[matrix(), bf16],
+            16384,
+        )
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        let mut expected = original;
+        expected.weight_offset = 256;
+        assert_eq!(got[0], expected);
+    }
+    #[test]
+    fn remap_rejects_missing_inverse_width_duplicate_and_out_of_bounds() {
+        let b = basis();
+        let m = matrix();
+        assert!(remap_weight_input_transforms(&[], &[m], 16384).is_err());
+        let mut wrong = b.clone();
+        wrong.inverse = true;
+        assert!(remap_weight_input_transforms(&[wrong], &[m], 16384).is_err());
+        let mut wrong = b.clone();
+        wrong.width = 5120;
+        assert!(remap_weight_input_transforms(&[wrong], &[m], 16384).is_err());
+        assert!(
+            remap_weight_input_transforms(std::slice::from_ref(&b), &[m, m], 16384)
+                .is_err()
+        );
+        assert!(
+            remap_weight_input_transforms(&[b.clone(), b.clone()], &[m], 16384)
+                .is_err()
+        );
+        assert!(
+            remap_weight_input_transforms(std::slice::from_ref(&b), &[m], 1599)
+                .is_err()
+        );
+        let mut wrong = m;
+        wrong.offset = u64::MAX;
+        assert!(
+            remap_weight_input_transforms(std::slice::from_ref(&b), &[wrong], u64::MAX)
+                .is_err()
+        );
+        let mut wrong = m;
+        wrong.kind = 40;
+        assert!(remap_weight_input_transforms(&[b], &[wrong], 16384).is_err());
+    }
+    #[test]
+    fn zeroed_ptq_and_bf16_payloads_are_finite_legal_rows() {
+        for width in [5120, 6144, 17408] {
+            let mut output = vec![f32::NAN; width];
+            imparo_cpu::quants::row_codec(143).unwrap()(
+                &vec![0; width / 128 * 28],
+                &mut output,
+            );
+            assert!(output.iter().all(|v| v.is_finite() && *v == 0.0));
+            imparo_cpu::quants::row_codec(30).unwrap()(
+                &vec![0; width * 2],
+                &mut output,
+            );
+            assert!(output.iter().all(|v| v.to_bits() == 0));
+        }
+    }
+    #[test]
+    #[ignore = "requires explicit local GGUF; CPU metadata only"]
+    fn actual_bonsai_metadata_maps_seven_measured_forward_bases() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("IMPARO_TUNER_METADATA_MODEL").expect("model fixture"),
+        );
+        let doc = imparo_gguf::read(&path).unwrap();
+        let source =
+            imparo_model::qwen35::weight_basis::from_document(&doc, &path).unwrap();
+        let mut matrices = Vec::new();
+        let mut cursor = 256;
+        for name in [
+            "blk.0.attn_qkv.weight",
+            "blk.0.attn_gate.weight",
+            "blk.0.ssm_alpha.weight",
+            "blk.0.ssm_beta.weight",
+            "blk.0.ssm_out.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            "output.weight",
+        ] {
+            let t = doc.tensor(name).unwrap();
+            let layout = imparo_gguf::tensor_layout(t.ggml_type).unwrap();
+            let bytes = t.dimensions[0] * t.dimensions[1] / layout.block_elements
+                * layout.block_bytes;
+            matrices.push(SyntheticMatrix {
+                source_offset: t.absolute_offset,
+                offset: cursor,
+                width: t.dimensions[0] as u32,
+                kind: imparo_gguf::weights::weight_kind(t.ggml_type).unwrap() as u32,
+                bytes,
+            });
+            cursor = (cursor + bytes + 255) & !255;
+        }
+        let got = remap_weight_input_transforms(&source, &matrices, cursor).unwrap();
+        assert_eq!(got.len(), 7);
+        assert!(got.iter().all(|b| !b.inverse));
+        assert_eq!(got.iter().filter(|b| b.permutation.is_some()).count(), 1);
+        for (m, b) in matrices.iter().filter(|m| m.kind == 39).zip(&got) {
+            let mut expected = source
+                .iter()
+                .find(|b| b.weight_offset == m.source_offset)
+                .unwrap()
+                .clone();
+            expected.weight_offset = m.offset;
+            assert_eq!(*b, expected);
+        }
+    }
 }

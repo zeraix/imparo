@@ -75,13 +75,17 @@ __device__ __forceinline__ void prefetch_cache_batch(
 #endif
 }
 
-template <bool Ringed /* compile-time ring policy */>
+template <bool Ringed /* compile-time ring policy */, uint32_t GqaHeads = 4>
 __device__ __forceinline__ float masked_score(
         float score, uint32_t qcol, uint32_t key, uint32_t query_tile,
         uint32_t query_tokens, uint32_t n_tok, uint32_t start_pos,
         uint32_t window, uint32_t ring, uint32_t valid_span) {
+    static_assert(GqaHeads == 4 || GqaHeads == 6, "D256 FA GQA domain");
+    if constexpr (GqaHeads == 6) {
+        if (qcol >= query_tokens * GqaHeads) return kNegInf;
+    }
     const uint32_t token = query_tile * query_tokens
-        + qcol / imparo_sm80_prefill::kGqaHeads;
+        + qcol / GqaHeads;
     const uint32_t pos = start_pos + token;
     if constexpr (Ringed) {
         const uint32_t key_pos = key
@@ -103,7 +107,9 @@ __device__ __forceinline__ float masked_score(
         ? score : kNegInf;
 }
 
-template <bool Ringed, bool F32Numerator = false>
+// GQA4 defaults preserve existing production calls. GQA6 uses 8 query tokens
+// in the unchanged 64-column tile; all 16 padding columns must stay inactive.
+template <bool Ringed, bool F32Numerator = false, uint32_t GqaHeads = 4>
 __global__ __launch_bounds__(128, 2) void flash(
         const __half * q, const __half * kc, const __half * vc,
         float * workspace, float * out, uint32_t block_base,
@@ -157,11 +163,12 @@ __global__ __launch_bounds__(128, 2) void flash(
             const uint32_t pair = item & 7;
             const uint32_t qcol = column_tile * 16 + qrow;
             const uint32_t token = query_tile * query_tokens
-                + qcol / imparo_sm80_prefill::kGqaHeads;
-            const uint32_t head = kvh * imparo_sm80_prefill::kGqaHeads
-                + qcol % imparo_sm80_prefill::kGqaHeads;
+                + qcol / GqaHeads;
+            const uint32_t head = kvh * GqaHeads
+                + qcol % GqaHeads;
             __half2 value = __float2half2_rn(0.0f);
-            if (token < n_tok && head < n_heads) {
+            if ((GqaHeads == 4 || qcol < query_tokens * GqaHeads)
+                    && token < n_tok && head < n_heads) {
                 value = reinterpret_cast<const __half2 *>(q
                     + (uint64_t(token) * n_heads + head) * kHeadDim
                     + d0)[pair];
@@ -260,7 +267,7 @@ __global__ __launch_bounds__(128, 2) void flash(
                         + fragment_q_column(lane, l);
                     const uint32_t key = group * 32 + partition * 16
                         + fragment_key_row(lane, l);
-                    scores[partition].x[l] = masked_score<Ringed>(
+                    scores[partition].x[l] = masked_score<Ringed, GqaHeads>(
                         scores[partition].x[l], qcol, key, query_tile,
                         query_tokens, n_tok, start_pos, window, ring, valid_span);
                 }
@@ -472,11 +479,12 @@ __global__ __launch_bounds__(128, 2) void flash(
                                 scale_add * denominator);
                         }
                         const uint32_t token = query_tile * query_tokens
-                            + qcol / imparo_sm80_prefill::kGqaHeads;
+                            + qcol / GqaHeads;
                         const uint32_t head =
-                            kvh * imparo_sm80_prefill::kGqaHeads
-                            + qcol % imparo_sm80_prefill::kGqaHeads;
-                        if (token < n_tok && head < n_heads) {
+                            kvh * GqaHeads
+                            + qcol % GqaHeads;
+                        if ((GqaHeads == 4 || qcol < query_tokens * GqaHeads)
+                    && token < n_tok && head < n_heads) {
                             float * dst = out
                                 + (uint64_t(token) * n_heads + head) * kHeadDim
                                 + output;
@@ -520,11 +528,12 @@ __global__ __launch_bounds__(128, 2) void flash(
                                 scale_add * denominator);
                         }
                         const uint32_t token = query_tile * query_tokens
-                            + qcol / imparo_sm80_prefill::kGqaHeads;
+                            + qcol / GqaHeads;
                         const uint32_t head =
-                            kvh * imparo_sm80_prefill::kGqaHeads
-                            + qcol % imparo_sm80_prefill::kGqaHeads;
-                        if (token < n_tok && head < n_heads) {
+                            kvh * GqaHeads
+                            + qcol % GqaHeads;
+                        if ((GqaHeads == 4 || qcol < query_tokens * GqaHeads)
+                    && token < n_tok && head < n_heads) {
                             float * dst = out
                                 + (uint64_t(token) * n_heads + head) * kHeadDim
                                 + output0;

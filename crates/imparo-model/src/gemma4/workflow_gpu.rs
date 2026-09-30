@@ -30,7 +30,7 @@ const PLE_ROWS: BufId = BufId::Model3;
 use crate::gpu_support::{
     BufferRequirement, Placement, be, gprobe, gpu_probe_layer,
     half_activation_mirror_requirements, kv_dequant_scratch_requirements, kvq_mask_on,
-    probe_first, scores_needed,
+    probe_first, scores_needed, trace_rows,
 };
 
 /// KV cache storage types (GGML type ids: 1 = f16, 2 = q4_0, 8 = q8_0). User config via
@@ -177,11 +177,24 @@ pub fn batch(
     let gate0_capture_active = gate0_capture.is_active();
     #[cfg(not(feature = "cuda-gate0-capture"))]
     let gate0_capture_active = false;
+    let retained_policy = crate::e4b_retained_decode_policy_enabled();
+    if retained_policy
+        && (c.n_layers != 42
+            || c.n_embd != 2560
+            || c.n_ff != 10240
+            || c.n_heads != 8
+            || c.n_kv_heads != 2)
+    {
+        return Err("retained E4B policy requires the qualified target geometry".into());
+    }
     let output_reference_lab = !all_logits
         && cfg!(feature = "cuda-speculative")
-        && std::env::var("IMPARO_OUTPUT_REFERENCE_LAB").as_deref() == Ok("1");
+        && (retained_policy
+            || std::env::var("IMPARO_OUTPUT_REFERENCE_LAB").as_deref() == Ok("1"));
     if output_reference_lab {
-        if std::env::var("IMPARO_NO_HOSTCONFIG").as_deref() != Ok("1") {
+        if !retained_policy
+            && std::env::var("IMPARO_NO_HOSTCONFIG").as_deref() != Ok("1")
+        {
             return Err("output reference experiment requires NOHOST".into());
         }
         if gate0_capture_active
@@ -197,7 +210,8 @@ pub fn batch(
         .iter()
         .rposition(|l| l.kv_source == KvSource::Own);
     #[cfg(feature = "cuda-speculative")]
-    if std::env::var("IMPARO_STATE_DEMAND_LAB").as_deref() == Ok("1") {
+    if retained_policy || std::env::var("IMPARO_STATE_DEMAND_LAB").as_deref() == Ok("1")
+    {
         // Demand belongs to this physical batch, not to an outer multi-chunk
         // request. State-only execution stops before the last KV owner's FFN.
         let ffn_layers = if wf.state.output_demand.wants_logits() {
@@ -245,6 +259,7 @@ pub fn batch(
         && wf.state.output_demand.wants_logits()
         && !gate0_capture_active
         && gpu_probe_layer() == usize::MAX
+        && !retained_policy
         && std::env::var("IMPARO_LAB_MTP_M1_GRAPH").as_deref() == Ok("1");
     if defer_decode_capture {
         static REPORTED: std::sync::atomic::AtomicBool =
@@ -253,6 +268,11 @@ pub fn batch(
             eprintln!("[imparo] mtp-m1-graph deferred-capture=1");
         }
     }
+    // Verification keeps its existing Prefill numerical geometry. Prepare the
+    // weight layout on the already-active owner before any graph capture/replay.
+    // Ordinary Prefill switches back even after a prior decode/verification turn.
+    be().prepare_projection_phase(b <= 3 && (decode || all_logits))
+        .map_err(|rc| format!("GPU projection phase prepare failed rc={rc}"))?;
     let replayed = if all_logits
         || gate0_capture_active
         || (!decode && (layer_outputs || output_reference_lab))
@@ -389,37 +409,54 @@ pub fn batch(
                 PER_LAYER,
                 b,
             );
-            be().scale(PER_LAYER, 1.0 / embd_scale, b * width);
-            be().rms_norm(
-                PER_LAYER,
-                mw.per_layer_proj_norm.offset,
-                ple,
-                eps,
-                b * ple_layers as u32,
-                ple,
-                0,
-            );
-            let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
-            if ple_staged {
-                be().ple_gather_combine_staged(
-                    PER_LAYER,
-                    PLE_ROWS,
-                    width,
-                    (f64::from(ple)).sqrt() as f32,
-                    inv_sqrt2,
-                    b,
-                );
-            } else {
-                be().ple_gather_combine_prefix(
+            let combined = !ple_staged
+                && be().ple_norm_gather_combine_prefix(
                     PER_LAYER,
                     BufId::Tokens,
+                    mw.per_layer_proj_norm.offset,
                     pt.offset as u64,
+                    ple,
+                    ple_layers as u32,
                     source_width,
-                    width,
+                    1.0 / embd_scale,
+                    eps,
                     (f64::from(ple)).sqrt() as f32,
-                    inv_sqrt2,
+                    1.0 / 2.0_f32.sqrt(),
                     b,
                 );
+            if !combined {
+                be().scale(PER_LAYER, 1.0 / embd_scale, b * width);
+                be().rms_norm(
+                    PER_LAYER,
+                    mw.per_layer_proj_norm.offset,
+                    ple,
+                    eps,
+                    b * ple_layers as u32,
+                    ple,
+                    0,
+                );
+                let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
+                if ple_staged {
+                    be().ple_gather_combine_staged(
+                        PER_LAYER,
+                        PLE_ROWS,
+                        width,
+                        (f64::from(ple)).sqrt() as f32,
+                        inv_sqrt2,
+                        b,
+                    );
+                } else {
+                    be().ple_gather_combine_prefix(
+                        PER_LAYER,
+                        BufId::Tokens,
+                        pt.offset as u64,
+                        source_width,
+                        width,
+                        (f64::from(ple)).sqrt() as f32,
+                        inv_sqrt2,
+                        b,
+                    );
+                }
             }
             gprobe("ple_combined", PER_LAYER, 0, ple as usize);
         }
@@ -539,7 +576,13 @@ pub fn batch(
     // chunk is under 2 x TAIL_ROWS, so the move never overlaps itself.
     const TAIL_ROWS: u32 = 64;
     let tail_override = if !gate0_capture_active && gpu_probe_layer() == usize::MAX {
-        be().shared_kv_prefill_tail_rows()
+        be().shared_kv_prefill_tail_rows().or_else(|| {
+            // Reuse the backend's workload-bounded row-local policy only after
+            // the last KV writer. Keep the proven aligned multi-row family;
+            // the same override also defines the output projection reference.
+            let rows = be().row_local_prefill_tail_rows(b);
+            matches!(rows, 16 | 32).then_some(rows)
+        })
     } else {
         None
     };
@@ -1873,6 +1916,573 @@ pub fn batch(
         wf.kv_scan(sp_chunk as usize + b_chunk as usize);
     }
     Ok(())
+}
+
+/// One co-batched decode step (docs/continuous-batching.md): row r decodes `rows[r].token` in
+/// slot `rows[r].slot` at `rows[r].pos`. The operations are the one-row dispatch path's decode
+/// (`batch` at one token, mega route off), in its order and with its arithmetic choices: the
+/// projections, norms, FFN and per-layer block take all rows at once on the step's route
+/// (`WorkflowState::row_route`, `Backend::set_decode_rows`), so on the exact route every row
+/// gets its lone decode's bits. Each operation that touches one conversation's own state -- Q
+/// and K normed and roped at the row's position, the KV store, attention over the row's cache
+/// (a windowed layer's ring is its slot's own) -- is handed every row with its position and
+/// slot. The per-layer inputs are per row by construction: each row gathers its own token's
+/// rows of the per-layer table.
+///
+/// # Errors
+/// For a quantized cache, a backend without decode rows or a per-row operation, or a device
+/// failure.
+pub fn rows(
+    wf: &mut Gemma4,
+    rows: &[crate::DecodeRow],
+    logits: Option<&mut Vec<f32>>,
+    picks: &mut Vec<u32>,
+) -> Result<(), String> {
+    if KvType::k() != KvType::F16 || KvType::v() != KvType::F16 {
+        return Err("co-batched decode reads an f16 cache only".into());
+    }
+    if !be().supports_argmax_rows() {
+        return Err("co-batched decode needs a per-row argmax".into());
+    }
+    let b = u32::try_from(rows.len()).map_err(|_| "too many co-batched rows")?;
+    let most = be().decode_rows_max(wf.state.row_route);
+    if rows.len() > most {
+        return Err(format!(
+            "{} co-batched rows; the {:?} route serves at most {most}",
+            rows.len(),
+            wf.state.row_route
+        ));
+    }
+    // Every row's logits are live: the lm head writes one row per conversation.
+    wf.state.output_demand = crate::OutputDemand::AllTokens;
+    let fit = wf.gpu_fit_batch(rows.len());
+    wf.state.output_demand = crate::OutputDemand::LastToken;
+    fit?;
+    if !be().set_decode_rows(Some(wf.state.row_route)) {
+        return Err("the backend has no decode rows".into());
+    }
+    let encoded = encode_rows(wf, rows, b);
+    be().set_decode_rows(None);
+    encoded?;
+    let mut got = vec![0.0_f32; rows.len()];
+    be().read(BufId::Tmp, 0, &mut got);
+    picks.clear();
+    picks.extend(got.iter().map(|v| v.to_bits()));
+    if let Some(out) = logits {
+        out.resize(rows.len() * wf.plan.config.vocab_size as usize, 0.0);
+        be().read(BufId::Logits, 0, out);
+    }
+    Ok(())
+}
+
+/// The graph of [`rows`], ending with the per-row argmax in `BufId::Tmp`.
+#[allow(clippy::too_many_lines)]
+fn encode_rows(wf: &Gemma4, rows: &[crate::DecodeRow], b: u32) -> Result<(), String> {
+    let c = &wf.plan.config;
+    let mw = &wf.w;
+    let n_embd = c.n_embd;
+    let n_head = c.n_heads;
+    let n_kv = c.n_kv_heads;
+    let n_ff = c.n_ff;
+    let eps = c.norm_eps;
+    let n_layers = c.n_layers as usize;
+    let ple = wf.plan.embed.per_layer_dim.unwrap_or(0);
+    // The whole per-layer table's width: a decode runs every layer, so no prefix is elided.
+    let width = ple * c.n_layers;
+    let wkind = |t: &imparo_gguf::weights::Tensor| {
+        imparo_gguf::weights::weight_kind(t.ggml_type).expect("validated at load")
+            as u32
+    };
+    let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
+    let pos: Vec<u32> = rows.iter().map(|r| r.pos).collect();
+    let slot_rows: Vec<imparo_backend::SlotRow> = rows
+        .iter()
+        .map(|r| imparo_backend::SlotRow {
+            slot: r.slot,
+            pos: r.pos,
+        })
+        .collect();
+
+    be().begin_forward(false);
+    be().write_u32(BufId::Tokens, 0, &tokens);
+    // A host-staged per-layer table: the host copies each row's table row, as it does for a
+    // one-row decode.
+    let ple_staged = match (wf.plan.embed.per_layer_row_bytes, mw.per_layer_token_embd)
+    {
+        (Some(row_bytes), Some(pt)) => {
+            be().stage_rows(pt.offset as u64, row_bytes as u32, &tokens, PLE_ROWS)
+        }
+        _ => false,
+    };
+    let embd_scale = (f64::from(n_embd)).sqrt() as f32;
+    let embd_kind = wkind(&mw.token_embd);
+    let embd_off = mw.token_embd.offset as u64;
+    if !be().gather_rows(
+        embd_kind,
+        embd_off,
+        n_embd,
+        c.vocab_size,
+        embd_scale,
+        BufId::X,
+        0,
+        BufId::Tokens,
+        b,
+    ) {
+        for (t, &tok) in tokens.iter().enumerate() {
+            be().row(
+                embd_kind,
+                embd_off,
+                n_embd,
+                tok,
+                embd_scale,
+                BufId::X,
+                t as u32 * n_embd,
+            );
+        }
+    }
+    trace_rows("embd", 0, BufId::X, b, n_embd);
+    if ple > 0 {
+        if let (Some(pm), Some(pt)) = (mw.per_layer_model_proj, mw.per_layer_token_embd)
+        {
+            be().matmat_output_prefix(
+                wkind(&pm),
+                pm.offset as u64,
+                n_embd,
+                width,
+                width,
+                BufId::X,
+                PER_LAYER,
+                b,
+            );
+            be().scale(PER_LAYER, 1.0 / embd_scale, b * width);
+            be().rms_norm(
+                PER_LAYER,
+                mw.per_layer_proj_norm.offset,
+                ple,
+                eps,
+                b * c.n_layers,
+                ple,
+                0,
+            );
+            let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
+            if ple_staged {
+                be().ple_gather_combine_staged(
+                    PER_LAYER,
+                    PLE_ROWS,
+                    width,
+                    (f64::from(ple)).sqrt() as f32,
+                    inv_sqrt2,
+                    b,
+                );
+            } else {
+                be().ple_gather_combine_prefix(
+                    PER_LAYER,
+                    BufId::Tokens,
+                    pt.offset as u64,
+                    width,
+                    width,
+                    (f64::from(ple)).sqrt() as f32,
+                    inv_sqrt2,
+                    b,
+                );
+            }
+            trace_rows("ple", 0, PER_LAYER, b, width);
+        }
+    }
+
+    // The decode seat: every row is a decode row.
+    let flush_every = crate::gpu_support::flush_layers_bounded(1, n_layers);
+    let mut input_norm_ready = false;
+    let mut final_norm_ready = false;
+    for li in 0..n_layers {
+        let layer = wf.plan.layers[li];
+        let lw = &mw.layers[li];
+        let hd = layer.attention.head_dim();
+        // Only the full-attention layers scale rope, which is what the one-row path does.
+        let rope_freqs = if matches!(layer.attention, Attention::Full { .. }) {
+            mw.rope_freqs.as_deref()
+        } else {
+            None
+        };
+        let (rope_base, rope_dim, window) = match layer.attention {
+            Attention::Full {
+                rope_base,
+                rope_dim,
+                ..
+            } => (rope_base, rope_dim, 0),
+            Attention::Window {
+                rope_base,
+                rope_dim,
+                window,
+                ..
+            } => (rope_base, rope_dim, window),
+            Attention::Recurrent { .. } => {
+                return Err(format!("gemma4 layer {li} planned as a recurrent block"));
+            }
+        };
+        if !input_norm_ready {
+            be().rms_norm_projection(
+                BufId::Cur,
+                BufId::X,
+                lw.attn_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+            );
+        }
+        input_norm_ready = false;
+        trace_rows("attn_norm", li, BufId::Cur, b, n_embd);
+        be().matmat(
+            wkind(&lw.wq),
+            lw.wq.offset as u64,
+            n_embd,
+            n_head * hd,
+            BufId::Cur,
+            BufId::Q,
+            b,
+        );
+        if !be().head_norm_rope_at(
+            BufId::Q,
+            lw.attn_q_norm.offset,
+            hd,
+            eps,
+            n_head,
+            &pos,
+            rope_dim,
+            rope_base,
+            rope_freqs,
+        ) {
+            return Err(format!("co-batched query rope not served at layer {li}"));
+        }
+        let kv_width = n_kv * hd;
+        if let (Some(wk), Some(wv)) = (lw.wk, lw.wv) {
+            be().matmat_pair(
+                wkind(&wk),
+                wk.offset as u64,
+                BufId::K,
+                wkind(&wv),
+                wv.offset as u64,
+                BufId::V,
+                n_embd,
+                kv_width,
+                BufId::Cur,
+                b,
+            );
+            // `kv_head_postprocess` without a rotation (f16 cache): K normed and roped at each
+            // row's position, V's weightless norm. K and V are different buffers, so the order
+            // moves no value.
+            let ring = ring_mask(layer.attention, wf.state.kv_ring_batch);
+            let served = be().head_norm_rope_at(
+                BufId::K,
+                lw.attn_k_norm.offset,
+                hd,
+                eps,
+                n_kv,
+                &pos,
+                rope_dim,
+                rope_base,
+                rope_freqs,
+            ) && {
+                be().rms_norm(
+                    BufId::V,
+                    imparo_backend::NO_WEIGHT,
+                    hd,
+                    eps,
+                    b * n_kv,
+                    hd,
+                    0,
+                );
+                be().kv_store_slot_rows(
+                    BufId::K,
+                    li as u32,
+                    kv_width,
+                    &slot_rows,
+                    false,
+                    ring,
+                )
+            } && be().kv_store_slot_rows(
+                BufId::V,
+                li as u32,
+                kv_width,
+                &slot_rows,
+                true,
+                ring,
+            );
+            if !served {
+                return Err(format!("co-batched KV store not served at layer {li}"));
+            }
+        }
+        let kv_layer = match layer.kv_source {
+            KvSource::Own => li as u32,
+            KvSource::SharedWith(src) => src,
+        };
+        let kv_attention = wf.plan.layers[kv_layer as usize].attention;
+        let kvw = n_kv * kv_attention.head_dim();
+        let kv_ring = ring_mask(kv_attention, wf.state.kv_ring_batch);
+        let max_scores: Vec<u32> =
+            pos.iter().map(|&p| scores_needed(p, 1, window)).collect();
+        if !be().attention_slot_rows(
+            kv_layer,
+            hd,
+            n_head,
+            n_kv,
+            kvw,
+            1.0,
+            window,
+            &slot_rows,
+            &max_scores,
+            kv_ring,
+        ) {
+            return Err(format!("co-batched attention not served at layer {li}"));
+        }
+        trace_rows("attn", li, BufId::Attn, b, n_head * hd);
+        be().matmat(
+            wkind(&lw.wo),
+            lw.wo.offset as u64,
+            n_head * hd,
+            n_embd,
+            BufId::Attn,
+            BufId::O,
+            b,
+        );
+        let fused_dual_norm = be().rms_norm_add_dual_projection(
+            BufId::O,
+            BufId::X,
+            lw.post_attention_norm.offset,
+            BufId::O,
+            lw.ffn_norm.offset,
+            BufId::Cur,
+            n_embd,
+            eps,
+            b,
+            n_embd,
+            0,
+            1.0,
+        );
+        let fused_attn_residual = fused_dual_norm
+            || be().rms_norm_add(
+                BufId::O,
+                BufId::O,
+                lw.post_attention_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+                BufId::X,
+                1.0,
+            );
+        if !fused_attn_residual {
+            be().rms_norm(
+                BufId::O,
+                lw.post_attention_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+            );
+            be().add(BufId::O, BufId::X, b * n_embd); // O = attn_out
+        }
+        if !fused_dual_norm {
+            be().rms_norm_projection(
+                BufId::Cur,
+                BufId::O,
+                lw.ffn_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+            );
+        }
+        let fused_ffn = be().ffn_gated_down(
+            wkind(&lw.ffn_gate),
+            lw.ffn_gate.offset as u64,
+            wkind(&lw.ffn_up),
+            lw.ffn_up.offset as u64,
+            wkind(&lw.ffn_down),
+            lw.ffn_down.offset as u64,
+            n_embd,
+            n_ff,
+            n_embd,
+            BufId::Cur,
+            BufId::G,
+            BufId::X,
+            b,
+        );
+        if !fused_ffn {
+            let fused_gated = be().matmat_gated(
+                wkind(&lw.ffn_gate),
+                lw.ffn_gate.offset as u64,
+                wkind(&lw.ffn_up),
+                lw.ffn_up.offset as u64,
+                n_embd,
+                n_ff,
+                BufId::Cur,
+                BufId::G,
+                BufId::U,
+                b,
+            );
+            if !fused_gated {
+                // No activation epilogue on the up projection: a one-row decode never fuses it.
+                be().matmat(
+                    wkind(&lw.ffn_gate),
+                    lw.ffn_gate.offset as u64,
+                    n_embd,
+                    n_ff,
+                    BufId::Cur,
+                    BufId::G,
+                    b,
+                );
+                be().matmat(
+                    wkind(&lw.ffn_up),
+                    lw.ffn_up.offset as u64,
+                    n_embd,
+                    n_ff,
+                    BufId::Cur,
+                    BufId::U,
+                    b,
+                );
+                be().act_mul(BufId::G, BufId::U, b * n_ff);
+            }
+            be().matmat(
+                wkind(&lw.ffn_down),
+                lw.ffn_down.offset as u64,
+                n_ff,
+                n_embd,
+                BufId::G,
+                BufId::X,
+                b,
+            );
+        }
+        trace_rows("ffn", li, BufId::X, b, n_embd);
+        let projection_follows = ple > 0 && lw.inp_gate.is_some() && lw.proj.is_some();
+        let prepared_ffn_residual = projection_follows
+            && be().rms_norm_add_projection(
+                BufId::X,
+                BufId::X,
+                lw.post_ffw_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+                BufId::O,
+            );
+        let fused_ffn_residual = prepared_ffn_residual
+            || be().rms_norm_add(
+                BufId::X,
+                BufId::X,
+                lw.post_ffw_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+                BufId::O,
+                1.0,
+            );
+        if !fused_ffn_residual {
+            be().rms_norm(BufId::X, lw.post_ffw_norm.offset, n_embd, eps, b, n_embd, 0);
+            be().add(BufId::X, BufId::O, b * n_embd); // X = pe_in
+        }
+        let mut layer_scaled = false;
+        if ple > 0 {
+            if let (Some(ig), Some(pj)) = (lw.inp_gate, lw.proj) {
+                be().ple_project(
+                    wkind(&ig),
+                    ig.offset as u64,
+                    wkind(&pj),
+                    pj.offset as u64,
+                    n_embd,
+                    ple,
+                    BufId::X,
+                    GATE,
+                    PER_LAYER,
+                    (li as u32) * ple,
+                    width,
+                    BACK,
+                    b,
+                );
+                // The one-row decode's tail: the residual after the per-layer block and the
+                // next layer's input norm (or the final norm) in one dispatch where the backend
+                // has it for these rows; otherwise the two dispatches, the same arithmetic.
+                let next_norm = if li + 1 < n_layers {
+                    (mw.layers[li + 1].attn_norm.offset, BufId::Cur)
+                } else {
+                    (mw.output_norm.offset, BufId::X)
+                };
+                let fused_tail = be().rms_norm_add_dual_projection(
+                    BACK,
+                    BufId::X,
+                    lw.post_norm.offset,
+                    BufId::X,
+                    next_norm.0,
+                    next_norm.1,
+                    n_embd,
+                    eps,
+                    b,
+                    n_embd,
+                    0,
+                    lw.out_scale,
+                );
+                if fused_tail {
+                    if next_norm.1 == BufId::Cur {
+                        input_norm_ready = true;
+                    } else {
+                        final_norm_ready = true;
+                    }
+                }
+                let fused_ple_residual = fused_tail
+                    || be().rms_norm_add(
+                        BufId::X,
+                        BACK,
+                        lw.post_norm.offset,
+                        n_embd,
+                        eps,
+                        b,
+                        n_embd,
+                        0,
+                        BufId::X,
+                        lw.out_scale,
+                    );
+                if !fused_ple_residual {
+                    be().rms_norm(BACK, lw.post_norm.offset, n_embd, eps, b, n_embd, 0);
+                    be().add_scale(BufId::X, BACK, lw.out_scale, b * n_embd);
+                }
+                layer_scaled = true;
+            }
+        }
+        if !layer_scaled {
+            be().scale(BufId::X, lw.out_scale, b * n_embd);
+        }
+        trace_rows("out", li, BufId::X, b, n_embd);
+        if flush_every > 0 && (li + 1) % flush_every == 0 && li + 1 < n_layers {
+            be().flush();
+        }
+    }
+    if !final_norm_ready {
+        be().rms_norm(BufId::X, mw.output_norm.offset, n_embd, eps, b, n_embd, 0);
+    }
+    be().matmat_from(
+        embd_kind,
+        embd_off,
+        n_embd,
+        c.vocab_size,
+        BufId::X,
+        BufId::Logits,
+        b,
+        0,
+    );
+    if let Some(cap) = wf.plan.output.logit_softcap {
+        be().softcap(BufId::Logits, cap, b * c.vocab_size);
+    }
+    be().argmax_rows(BufId::Logits, BufId::Tmp, c.vocab_size, b);
+    be().end()
+        .map_err(|rc| format!("gemma4 co-batched step failed rc={rc}"))
 }
 
 /// Every activation buffer this model needs for a batch of `b`, and which of them may

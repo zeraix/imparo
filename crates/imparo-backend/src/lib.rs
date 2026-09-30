@@ -88,6 +88,36 @@ pub enum BufId {
     /// which the same kernel wrote; the host reads slot N % 2 after step N retires and
     /// before it queues step N+2, the next writer of that slot.
     Pick = 27,
+    /// A batch whose rows are not one causal chain -- a tree verify -- described once per
+    /// batch in `ROW_LAYOUT_WORDS` u32 words per row. Only the `_rows` entries read it.
+    RowLayout = 28,
+    /// A tree verify's input to every convolution window, one row per node: what a commit
+    /// rebuilds the accepted path's windows from, instead of a window kept per node.
+    RowInputs = 29,
+    /// A paired drafter's input: the target's tapped layer outputs, the taps side by side in
+    /// one row per forward row (row r, tap k at `r * taps * n_embd + k * n_embd`). Written as
+    /// each tapped layer finishes; the drafter reads it after the target's forward.
+    DraftFeatures = 30,
+    /// A drafter's head logits, one row per drafted position (block x vocab).
+    DraftLogits = 31,
+    /// The drafted position being biased: one vocabulary row copied out of `DraftLogits`.
+    DraftColumn = 32,
+    /// The Markov head's bias for the column, `W2 . W1[previous token]`.
+    DraftBias = 33,
+    /// The Markov head's rank rows `W1[previous token]`, one per drafted position, then the
+    /// drafted ids as u32.
+    DraftRank = 34,
+    /// A drafter's candidates: `top_k_rows` over `DraftLogits` once the chain has written its
+    /// biased columns there, ids and values, then the entry's working space.
+    DraftTop = 35,
+    /// A drafter's confidence head: its weights and bias as the drafter uploaded them, then one
+    /// output per drafted position and the logistic entry's working space.
+    DraftConfidence = 36,
+    /// A ninth model-private slot. A ROUTED feed-forward needs nine pieces of scratch where a
+    /// dense one needs none: the router's scores, the probabilities, the biased scores the
+    /// pick reads, the picked ids, and the four arrays of the work-row sort -- beside the
+    /// convolution projection LFM2's recurrent blocks already hold.
+    Model8 = 37,
 }
 
 impl BufId {
@@ -101,7 +131,147 @@ impl BufId {
     ///
     /// Three declarations of one number is how NO_WEIGHT ended up with two different
     /// values in this codebase, so there is one declaration and a check.
-    pub const COUNT: usize = 28;
+    pub const COUNT: usize = 38;
+}
+
+/// Words per row in `BufId::RowLayout`:
+///
+/// ```text
+/// [0]      position     where the row is roped (start + depth for a tree)
+/// [1]      depth        steps from the batch's first row along the row's own path
+/// [2]      rows 0..31   bit j set: the row attends to batch row j
+/// [3]      rows 32..63
+/// [4..12]  ancestors    the batch row 1..8 steps up the path, read only for steps <= depth
+/// ```
+///
+/// Every row attends to the whole cache below the batch. A chain is the layout whose row t
+/// has position start + t, depth t, rows 0..=t visible and ancestors t - 1, t - 2, ...
+/// A row may also see rows after its own: every row of a drafted block sees the whole block.
+pub const ROW_LAYOUT_WORDS: usize = 12;
+/// Rows one layout can describe: the width of its visibility mask.
+pub const ROW_LAYOUT_MAX_ROWS: usize = 64;
+/// Ancestors a layout row carries: the longest short-convolution history it serves.
+pub const ROW_LAYOUT_ANCESTORS: usize = 8;
+
+/// Whether row-layout `words` (`ROW_LAYOUT_WORDS` per row) hold a tree depth-first with every
+/// node shallower than `depth_limit`: the first row at depth 0, and each later row a child of
+/// the latest row one level up, at most one level below the row before it. A kernel that walks
+/// the rows in order, as the gated delta rule's tree verify does, then finds every node's parent
+/// state where the parent left it.
+#[must_use]
+pub fn row_layout_depth_first(words: &[u32], depth_limit: u32) -> bool {
+    if words.is_empty() || words.len() % ROW_LAYOUT_WORDS != 0 {
+        return false;
+    }
+    // The latest row at each depth of the current path.
+    let mut path: Vec<u32> = Vec::new();
+    for (t, row) in words.chunks_exact(ROW_LAYOUT_WORDS).enumerate() {
+        let Ok(t) = u32::try_from(t) else {
+            return false;
+        };
+        let (depth, parent) = (row[1] as usize, row[4]);
+        let fits = row[1] < depth_limit
+            && if t == 0 {
+                depth == 0
+            } else {
+                depth >= 1 && depth <= path.len() && path[depth - 1] == parent
+            };
+        if !fits {
+            return false;
+        }
+        path.truncate(depth);
+        path.push(t);
+    }
+    true
+}
+
+#[cfg(test)]
+mod row_layout_depth_first_tests {
+    use super::{ROW_LAYOUT_WORDS, row_layout_depth_first};
+
+    /// Layout words holding only what the check reads: each row's depth and parent.
+    fn words(rows: &[(u32, u32)]) -> Vec<u32> {
+        rows.iter()
+            .flat_map(|&(depth, parent)| {
+                let mut row = [0_u32; ROW_LAYOUT_WORDS];
+                row[1] = depth;
+                row[4] = parent;
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_depth_first_tree_passes_and_other_orders_do_not() {
+        // 0 -> 1 -> 2, then 3 under 0, then 4 under 3.
+        assert!(row_layout_depth_first(
+            &words(&[(0, 0), (1, 0), (2, 1), (1, 0), (2, 3)]),
+            16
+        ));
+        // 4 under 1, which 3 has replaced at depth 1.
+        assert!(!row_layout_depth_first(
+            &words(&[(0, 0), (1, 0), (2, 1), (1, 0), (2, 1)]),
+            16
+        ));
+        // A row two levels below the row before it.
+        assert!(!row_layout_depth_first(&words(&[(0, 0), (2, 0)]), 16));
+        // A second root.
+        assert!(!row_layout_depth_first(
+            &words(&[(0, 0), (1, 0), (0, 0)]),
+            16
+        ));
+    }
+
+    #[test]
+    fn a_node_at_the_depth_limit_is_refused() {
+        let chain: Vec<(u32, u32)> =
+            (0_u32..17).map(|t| (t, t.saturating_sub(1))).collect();
+        assert!(row_layout_depth_first(&words(&chain[..16]), 16));
+        assert!(!row_layout_depth_first(&words(&chain), 16));
+    }
+}
+
+/// The rows of row-layout `words` that have more than one child, as a mask (bit t for row t):
+/// in a depth-first layout (`row_layout_depth_first`) a later child starts again from the state
+/// its parent left, after the first child's subtree, so a kernel that walks the tree keeps the
+/// state after exactly these rows. Rows past the mask's 64 bits are not marked.
+#[must_use]
+pub fn row_layout_branching_rows(words: &[u32]) -> u64 {
+    let mut children = [0_u32; ROW_LAYOUT_MAX_ROWS];
+    for row in words.chunks_exact(ROW_LAYOUT_WORDS) {
+        if row[1] > 0
+            && let Some(count) = children.get_mut(row[4] as usize)
+        {
+            *count += 1;
+        }
+    }
+    children
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count > 1)
+        .fold(0, |mask, (t, _)| mask | (1_u64 << t))
+}
+
+#[cfg(test)]
+mod row_layout_branching_rows_tests {
+    use super::{ROW_LAYOUT_WORDS, row_layout_branching_rows};
+
+    #[test]
+    fn only_rows_with_a_second_child_are_marked() {
+        // 0 -> 1 -> 2, then 3 under 0 and 4 under 3: row 0 has children 1 and 3.
+        let rows: [(u32, u32); 5] = [(0, 0), (1, 0), (2, 1), (1, 0), (2, 3)];
+        let words: Vec<u32> = rows
+            .iter()
+            .flat_map(|&(depth, parent)| {
+                let mut row = [0_u32; ROW_LAYOUT_WORDS];
+                row[1] = depth;
+                row[4] = parent;
+                row
+            })
+            .collect();
+        assert_eq!(row_layout_branching_rows(&words), 0b1);
+        assert_eq!(row_layout_branching_rows(&words[..3 * ROW_LAYOUT_WORDS]), 0);
+    }
 }
 
 /// Fail loudly when a backend's buffer table cannot hold every `BufId`.
@@ -295,6 +465,48 @@ pub struct Qwen35MegaLayer {
     pub cur: BufId,
 }
 
+/// The ROUTED feed-forward of one LFM2-MoE decode layer, one variant of [`MegaLayer`]. The
+/// mixer ran on the dispatch path and left its output in `add`; the entry forms
+/// `x' = x + add; cur = rms(x') * w_ffn`, the router's rows into `scores`, the route (gating,
+/// the pick over the probabilities plus `bias`, the weights), the k experts' gated rows into
+/// `g` (k rows of `n_ff`), and ends with `x = x' + sum_j w_j * down_j(g_j)` summed in slot
+/// order. Each expert stack is addressed by its base offset and its per-expert byte stride.
+#[derive(Clone, Copy, Debug)]
+pub struct Lfm2MoeMegaLayer {
+    pub router_kind: WeightKindWire,
+    pub router_off: u64,
+    /// The file's selection bias (`exp_probs_b`), [`NO_WEIGHT`] when it has none -- the
+    /// convention `Backend::moe_route` takes.
+    pub bias_off: u64,
+    pub gate_kind: WeightKindWire,
+    pub gate_off: u64,
+    pub gate_stride: u64,
+    pub up_kind: WeightKindWire,
+    pub up_off: u64,
+    pub up_stride: u64,
+    pub down_kind: WeightKindWire,
+    pub down_off: u64,
+    pub down_stride: u64,
+    pub ffn_norm_off: u64,
+    pub n_embd: u32,
+    /// One expert's hidden width.
+    pub n_ff: u32,
+    pub n_expert: u32,
+    pub k: u32,
+    pub gating: ExpertGating,
+    pub normalise: bool,
+    pub weights_scale: f32,
+    pub eps: f32,
+    pub x: BufId,
+    pub add: BufId,
+    pub g: BufId,
+    pub scores: BufId,
+    /// The next layer's operator-norm weight, [`NO_WEIGHT`] for none: when given, the entry
+    /// ends by writing `rms(x) * w` into `cur`, which is that layer's mixer input.
+    pub next_norm_off: u64,
+    pub cur: BufId,
+}
+
 /// What one decode layer IS, per architecture. A backend that runs the whole layer as one
 /// operation reads the variant it knows; a new architecture is a new variant, never a new
 /// `Backend` method.
@@ -303,6 +515,7 @@ pub enum MegaLayer<'a> {
     Gemma4(Gemma4MegaLayer<'a>),
     Lfm2(Lfm2MegaLayer),
     Qwen35(Qwen35MegaLayer),
+    Lfm2Moe(Lfm2MoeMegaLayer),
 }
 
 /// One decode layer offered to the backend as a MEGA ENTRY (see [`Backend::mega_layer`]).
@@ -339,6 +552,39 @@ pub enum Epilogue {
     Gelu = 1,
     /// `y = silu(y) * product`. SwiGLU -- LFM2's, and most other architectures'.
     Silu = 2,
+}
+
+/// How a co-batched decode step's projections serve their rows (`Backend::set_decode_rows`,
+/// docs/continuous-batching.md, section 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowRoute {
+    /// Every row takes the one-row decode's arithmetic, so its bits equal its lone decode on
+    /// the dispatch path. The route that proves the per-row plumbing: any difference is a
+    /// block table, position or state slot, never arithmetic.
+    Exact,
+    /// Whichever kernel the backend measured fastest at the step's row count. A row's tokens
+    /// match its lone decode's to the standard the mega route keeps against the dispatch path.
+    Fast,
+}
+
+/// One row of a co-batched decode step (`Backend::kv_store_slot_rows`,
+/// `Backend::attention_slot_rows`): the slot whose cache it reads and writes, and the
+/// position of its token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotRow {
+    pub slot: u32,
+    pub pos: u32,
+}
+
+/// One row of a co-batched recurrent step (`Backend::causal_conv_slot_rows`,
+/// `Backend::delta_net_slot_rows`): its slot and where its state -- a convolution's history,
+/// a delta rule's matrix -- is read and written, as element offsets into that slot's state
+/// buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotStateRow {
+    pub slot: u32,
+    pub state_off: u32,
+    pub state_out_off: u32,
 }
 
 /// What a causal depthwise convolution reads, and what it does with the tap sum.
@@ -433,6 +679,27 @@ pub struct DeltaEpilogue {
     /// The SiLU gate, `v_heads * value_dim` per token, READ AND WRITTEN: the fused form
     /// leaves `silu(gate) * norm(core)` here, which is what the out projection reads.
     pub gate: BufId,
+}
+
+/// A packed matrix can declare an orthogonal input basis independently of its codec.
+/// Model metadata owns this contract; it is never a performance knob.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupedHeads {
+    pub head_dim: u32,
+    pub key_heads: u32,
+    pub value_heads: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WeightInputTransform {
+    pub weight_offset: u64,
+    pub width: u32,
+    pub block_size: u32,
+    pub signs: Vec<i8>,
+    /// Embedding rows apply the inverse basis after decoding, instead of rotating
+    /// activations before a matrix product.
+    pub inverse: bool,
+    pub permutation: Option<GroupedHeads>,
 }
 
 pub struct DeltaNet {
@@ -792,7 +1059,7 @@ pub struct StreamedWeightSpan {
 /// `Slow { layer }`: a whole layer the fast tier could not hold; the pageable mapping on
 /// Metal, host RAM on CUDA. `HostStaged`: a row-gathered tensor (an embedding table read by token
 /// id) that lives in no tier: the host gathers the rows a batch needs into a small
-/// fast-tier staging buffer.
+/// fast-tier staging buffer. `Unread`: a block the forward never runs; no tier holds it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WeightTier {
     Fast,
@@ -804,6 +1071,10 @@ pub enum WeightTier {
     /// per batch (`Backend::stage_rows`). The smallest wired set, and the reason a decode
     /// step on such a model needs the next token on the host before it is encoded.
     HostStaged,
+    /// Never read: a block past the plan's layer count, such as the multi-token-prediction
+    /// head a Qwen3.8 file carries and the plan drops. It gets no buffer and is never wired
+    /// or copied; a backend that streams its non-fast spans lists it and never touches it.
+    Unread,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -915,6 +1186,20 @@ pub struct QuantizedWeightPrepack {
     pub reserved: u32,
 }
 
+/// How a router's scores become the weights a token's picked experts carry.
+///
+/// The file names it (`<arch>.expert_gating_func`), and the two the models here declare are
+/// the two spelled out; llama.cpp's enum has more, and one of those arriving must be READ
+/// and added rather than folded into the nearer of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpertGating {
+    /// Scores are a distribution over ALL experts before the pick (value 1 in the file).
+    Softmax,
+    /// Each score is squashed independently, so the picked weights do not sum to 1 and
+    /// the renormalisation step is what makes them a weighting (value 2 in the file).
+    Sigmoid,
+}
+
 /// Process-wide backend handle.
 ///
 /// The composition root publishes one static handle and the server may move a
@@ -923,6 +1208,11 @@ pub struct QuantizedWeightPrepack {
 /// remains serialized by the engine owner.
 pub trait Backend: Sync {
     // --- session ---
+    /// Static target-only Q8 numerical admission, called once before any forward.
+    /// Unsupported backends return false. This is not a dynamic plugin ABI.
+    fn prepare_batch_invariant_q8_v1(&self) -> Result<bool, i32> {
+        Ok(false)
+    }
     fn begin(&self);
     /// Begins a forward pass while allowing the backend to select decode-specific
     /// lifecycle machinery. The default deliberately preserves the established
@@ -987,6 +1277,12 @@ pub trait Backend: Sync {
     ) -> Result<bool, i32> {
         Ok(false)
     }
+    /// Select the projection weight representation before graph preparation.
+    /// This lifecycle hint does not change numerical batch geometry: verification
+    /// may deliberately retain a Prefill-shaped batch. Other backends need no work.
+    fn prepare_projection_phase(&self, _decode_or_verify: bool) -> Result<(), i32> {
+        Ok(())
+    }
     /// Optionally capture the already-materialized verification body until end().
     /// Capture encodes current operations, while Replay has already submitted the
     /// body. Both defer external feature publication until after end().
@@ -1006,6 +1302,10 @@ pub trait Backend: Sync {
     /// CPU encodes what follows. A read after this sees whatever was there before.
     fn flush(&self);
     /// Commit and WAIT. The only call after which a `read` is meaningful.
+    ///
+    /// A read in the middle of a forward is `end`, the read, then `begin` before anything else is
+    /// encoded. On Metal `end` leaves no encoder, so a dispatch encoded before the next `begin` is
+    /// dropped with no error.
     ///
     /// # Errors
     /// Returns the command buffer's error code.
@@ -1276,6 +1576,70 @@ pub trait Backend: Sync {
     fn grow_kv_layout(&self, bytes: &[u64], _layouts: &[KvLayout]) -> Result<(), i32> {
         self.grow_kv(bytes)
     }
+    /// Whether KV supports independent per-layer commits, with zero bytes meaning
+    /// "leave this layer alone", without losing its paging layout. Opt in only when
+    /// prepared commits and unchanged-layer semantics are implemented. Other backends
+    /// keep full-capacity pool storage and the existing layout-aware growth path.
+    fn supports_kv_incremental_commit(&self) -> bool {
+        false
+    }
+    /// Allocate KV that can grow without moving a row (docs/memory-tiers-and-fit.md section
+    /// 12): `reserve[i]` bytes of room per layer side, `bytes[i]` of it committed now.
+    /// The default allocates `bytes` and keeps growing by copy, as before.
+    fn alloc_kv_reserved(
+        &self,
+        bytes: &[u64],
+        reserve: &[u64],
+        layouts: &[KvLayout],
+    ) -> Result<(), i32> {
+        let _ = reserve;
+        self.alloc_kv_layout(bytes, layouts)
+    }
+    /// Get a commit of `bytes` per layer ready off the step's path, so the forward that
+    /// needs it does not wait (0 leaves a layer alone). Smaller than now is a release,
+    /// adopted once it still covers what the next forward needs. Default: nothing -- the next
+    /// grow does the work in place.
+    fn kv_prefetch(&self, _bytes: &[u64]) {}
+    /// Shrink each layer's KV storage to `bytes` (0 leaves a layer alone), with nothing
+    /// in flight that addresses the part given up. The storage above goes back to the
+    /// system. Default: nothing -- a backend whose storage is sized once keeps it.
+    ///
+    /// # Errors
+    /// A backend code when the smaller storage cannot be installed.
+    fn kv_release(&self, _bytes: &[u64]) -> Result<(), i32> {
+        Ok(())
+    }
+    /// Whether the system has reported memory pressure since the last call (the report is
+    /// taken). The KV tier gives idle conversations back when it has. Default: never.
+    fn take_memory_pressure(&self) -> bool {
+        false
+    }
+    /// How long the device's residency is held after the last work before it is released,
+    /// None when it is held for good. The KV tier releases idle conversations on the same
+    /// clock, so a server that has gone quiet gives back its KV and its wiring together.
+    fn idle_release_after(&self) -> Option<std::time::Duration> {
+        None
+    }
+    /// Take a prepared commit if it covers `need` per layer (0 = no need for that layer): a
+    /// forward entry's chance to adopt a prepared release. Default: nothing.
+    fn kv_adopt(&self, _need: &[u64]) {}
+    /// Bytes the KV cache holds committed now, K and V together; 0 when the backend does not
+    /// track it.
+    fn kv_committed_bytes(&self) -> u64 {
+        0
+    }
+    /// True when committed KV memory follows the storage in use rather than the storage
+    /// reserved: a KV tier larger than one context then costs address space until blocks are
+    /// written, and the pool may size its device tier from the fit. False (the default): a
+    /// reservation is an allocation, and the pool's device tier stays one context.
+    fn kv_commits_on_demand(&self) -> bool {
+        false
+    }
+    /// The largest KV storage one layer side can have, in bytes; None when the backend sets
+    /// no limit of its own. The fit keeps every reservation under it.
+    fn kv_max_view_bytes(&self) -> Option<u64> {
+        None
+    }
     /// Load is over: make every weight the device will read ready to be read.
     ///
     /// A LOAD THAT RETURNS WITH WORK STILL OWED IS CLAIMING READY WHEN IT IS NOT. On Metal
@@ -1300,6 +1664,15 @@ pub trait Backend: Sync {
     /// tensor used DIRECTLY has no such twin: the mapping is the resident copy, one copy, and
     /// should stay mapped. Backends that convert nothing inherit the no-op.
     fn set_weight_path(&self, _path: &std::path::Path) {}
+    /// The model's size in bytes, which keys measured configuration: the end of its tensor
+    /// data. A paired drafter's mapping runs past it. Called before init; default: unused.
+    fn set_model_bytes(&self, _bytes: u64) {}
+    /// The prefill chunk this host's tuned config stores for the model keyed by
+    /// `model_bytes`, read WITHOUT applying anything, or `None` for no config. Asked before
+    /// placement, because the KV and activation reserves are sized from the chunk.
+    fn stored_prefill_batch(&self, _model_bytes: u64) -> Option<usize> {
+        None
+    }
     fn write(&self, id: BufId, off: u64, src: &[f32]);
     /// Set `elems` floats of a device buffer to zero, starting at `off`.
     ///
@@ -1327,6 +1700,20 @@ pub trait Backend: Sync {
     fn read_kv_bytes(&self, layer: u32, is_v: bool, off: u64, dst: &mut [u8]);
     /// The KV pool's restore path: raw bytes back into a layer's cache (device idle).
     fn write_kv_bytes(&self, layer: u32, is_v: bool, off: u64, src: &[u8]);
+    /// Lends the host bytes of `ranges` of the KV cache to `with`, one slice per range in
+    /// order, so a restore reads a file straight into the cache. On storage the GPU shares
+    /// with the host, that read is the whole transfer. Device idle, as for
+    /// `write_kv_bytes`; the ranges must not overlap.
+    ///
+    /// `None` when this backend's KV storage is not host-addressable: the caller reads
+    /// into buffers of its own and writes them through `write_kv_bytes`.
+    fn lend_kv_ranges(
+        &self,
+        _ranges: &[KvRange],
+        _with: &mut dyn FnMut(&mut [&mut [u8]]) -> Result<(), String>,
+    ) -> Option<Result<(), String>> {
+        None
+    }
     /// The pool's placement decision for one layer: entry i maps positions
     /// [i*64, i*64+64) to physical block entries[i]. Capability-gated on
     /// `pool_caps().paged_reads` growing true per backend.
@@ -1407,6 +1794,16 @@ pub trait Backend: Sync {
     }
 
     // --- compute ---
+    /// The fingerprint and model bytes this backend's stored config was keyed by, or `None`
+    /// when it loaded none.
+    ///
+    /// A caller that wants to store its OWN measurements beside the tuner's -- keyed by the
+    /// same host, backend, search space, cache type and model -- asks here instead of
+    /// rebuilding the key and drifting from it.
+    fn config_key(&self) -> Option<(String, u64)> {
+        None
+    }
+
     fn matmat(
         &self,
         wkind: WeightKindWire,
@@ -1660,6 +2057,227 @@ pub trait Backend: Sync {
         kernel: u32,
         n_tok: u32,
     );
+    /// Whether this backend serves a batch described by `BufId::RowLayout` at this head
+    /// dim through `attention_rows`, `head_norm_rope_rows`, `causal_conv_rows` and
+    /// `causal_conv_row_inputs`. Each entry still returns false for a call it cannot serve.
+    fn supports_row_layout(&self, _head_dim: u32) -> bool {
+        false
+    }
+    /// `attention` in which row t sees the cache in `key_lo..start_pos` and the batch rows its
+    /// layout names, instead of rows 0..=t. No window, no ring. `key_lo` is 0 for every caller
+    /// but a drafter whose cache holds this request's rows only from a restore point up; it may
+    /// not exceed `start_pos`. `float_q`: Q enters the scores in float where the backend
+    /// otherwise rounds it to half (an option; every caller leaves it off by default). False:
+    /// nothing was encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_rows(
+        &self,
+        _kv_layer: u32,
+        _head_dim: u32,
+        _n_heads: u32,
+        _n_kv: u32,
+        _kv_width: u32,
+        _start_pos: u32,
+        _key_lo: u32,
+        _scale: f32,
+        _n_tok: u32,
+        _float_q: bool,
+    ) -> bool {
+        false
+    }
+    /// `head_norm_rope_hadamard` with no rotation and each row roped at its layout position.
+    /// False: nothing was encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn head_norm_rope_rows(
+        &self,
+        _buf: BufId,
+        _w_off: u64,
+        _head_dim: u32,
+        _eps: f32,
+        _n_heads: u32,
+        _n_tok: u32,
+        _rope_dim: u32,
+        _rope_base: f32,
+        _freqs: Option<&[f32]>,
+    ) -> bool {
+        false
+    }
+    /// `causal_conv`'s outputs for a layout batch: tap k of row t reads the row
+    /// `kernel - 1 - k` steps up its own path, or `state` where the path leaves the batch.
+    /// `state` is read and not advanced. False: nothing was encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn causal_conv_rows(
+        &self,
+        _form: ConvForm,
+        _src: BufId,
+        _w_off: u64,
+        _state: BufId,
+        _state_off: u32,
+        _out: BufId,
+        _width: u32,
+        _kernel: u32,
+        _n_tok: u32,
+    ) -> bool {
+        false
+    }
+    /// CO-BATCHED DECODE (docs/continuous-batching.md). A slot holds one conversation's
+    /// device state: its KV page table per layer, its recurrent-state buffers
+    /// (`BufId::Recur`, `BufId::RecurSnap`) and the rings of the windowed layers
+    /// `ring_layers` names (a windowed layer keeps no page table: each conversation's window is
+    /// its own ring). The one-row paths -- prefill, a lone decode, capture and restore -- read
+    /// and write the SELECTED slot; a co-batched step names each row's slot. `set_slots(n, ..)`
+    /// makes slots `0..n` exist, each new one to hold buffers and rings of their current
+    /// sizes, made zeroed on its first select (a slot never used costs no memory); slot 0 is
+    /// the one every process starts in, and its rings are the ones the load allocated.
+    /// False: this backend has no slots, and nothing changed.
+    fn set_slots(&self, _n: u32, _ring_layers: &[u32]) -> bool {
+        false
+    }
+    /// The slot the one-row paths address from now on. False: the slot does not exist or its
+    /// buffers could not be made on this first select, and the selection is unchanged. A
+    /// backend without slots has slot 0 only.
+    fn select_slot(&self, slot: u32) -> bool {
+        slot == 0
+    }
+    /// Gives back a slot's per-conversation buffers; its next select makes them again, as its
+    /// first did. For a slot no conversation occupies, other than the selected one, with
+    /// nothing in flight. True when buffers went back; false for the selected slot, one that
+    /// does not exist, one holding none, with work in flight, or on a backend without slots.
+    fn release_slot(&self, _slot: u32) -> bool {
+        false
+    }
+    /// While `Some`, a projection of 2+ rows is that many independent decode rows, served on
+    /// `route` (docs/continuous-batching.md, section 6); `None` ends the step, and 2+ rows are
+    /// one prompt's chunk again. False: this backend has no decode rows, and nothing changed.
+    fn set_decode_rows(&self, _route: Option<RowRoute>) -> bool {
+        false
+    }
+    /// False keeps a row-layout attention from splitting its keys across threadgroups, so a
+    /// chain as a row layout computes what the causal forward computes; true restores the
+    /// backend's configured split. False: this backend has no split, and nothing changed.
+    fn set_verify_split(&self, _on: bool) -> bool {
+        false
+    }
+    /// The most rows one co-batched step serves on `route`; 0 when this backend has no decode
+    /// rows. The exact route ends where the one-row arithmetic does; the fast route serves any
+    /// width (its widest steps on the GEMM), so memory bounds it, not this.
+    fn decode_rows_max(&self, _route: RowRoute) -> usize {
+        0
+    }
+    /// `kv_store` for co-batched rows: row r of `src` is stored at `rows[r].pos` in
+    /// `rows[r].slot`'s cache, by the one-row store's kernel. False: nothing was encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_store_slot_rows(
+        &self,
+        _src: BufId,
+        _layer: u32,
+        _width: u32,
+        _rows: &[SlotRow],
+        _is_v: bool,
+        _ring: u32,
+    ) -> bool {
+        false
+    }
+    /// `attention` for co-batched rows: row r of `BufId::Q` attends over `rows[r].slot`'s
+    /// cache through position `rows[r].pos` into row r of `BufId::Attn`, by the one-row
+    /// decode's kernel; `max_scores[r]` is that one-row call's score count. False: nothing
+    /// was encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_slot_rows(
+        &self,
+        _kv_layer: u32,
+        _head_dim: u32,
+        _n_heads: u32,
+        _n_kv: u32,
+        _kv_width: u32,
+        _scale: f32,
+        _window: u32,
+        _rows: &[SlotRow],
+        _max_scores: &[u32],
+        _ring: u32,
+    ) -> bool {
+        false
+    }
+    /// `causal_conv` at one token for co-batched rows: row r reads row r of `src`, its
+    /// history at `rows[r].state_off` in its slot's `state` buffer, writes the advanced
+    /// history at `rows[r].state_out_off` there and row r of `out`, by the one-token step's
+    /// kernel. False: nothing was encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn causal_conv_slot_rows(
+        &self,
+        _form: ConvForm,
+        _src: BufId,
+        _w_off: u64,
+        _state: BufId,
+        _rows: &[SlotStateRow],
+        _out: BufId,
+        _width: u32,
+        _kernel: u32,
+    ) -> bool {
+        false
+    }
+    /// `delta_net` at one token for co-batched rows: row r reads row r of `op.qkv`,
+    /// `op.alpha` and `op.beta`, its matrix at `rows[r].state_off` in its slot's `op.state`,
+    /// writes the advanced matrix at `rows[r].state_out_off` there and row r of `op.out` (of the
+    /// epilogue's gate when fused), by the one-token step's kernel. `op.state_off`,
+    /// `op.state_out_off`, `op.n_tok` and `op.snap` are not read. False: the step failed.
+    fn delta_net_slot_rows(&self, _op: &DeltaNet, _rows: &[SlotStateRow]) -> bool {
+        false
+    }
+    /// `head_norm_rope_hadamard` without a rotation for rows at unrelated positions: row r of
+    /// `buf` (`n_heads` heads) is normed and roped at `pos[r]`, by the one-row call's kernel.
+    /// False: nothing was encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn head_norm_rope_at(
+        &self,
+        _buf: BufId,
+        _w_off: u64,
+        _head_dim: u32,
+        _eps: f32,
+        _n_heads: u32,
+        _pos: &[u32],
+        _rope_dim: u32,
+        _rope_base: f32,
+        _freqs: Option<&[f32]>,
+    ) -> bool {
+        false
+    }
+    /// Each batch row's input to a convolution window -- the value `causal_conv` shifts into
+    /// the state for that row -- `width` values written to `inputs` at element
+    /// `inputs_off + row * row_elems`. Reads `src` only. False: nothing was encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn causal_conv_row_inputs(
+        &self,
+        _form: ConvForm,
+        _src: BufId,
+        _inputs: BufId,
+        _inputs_off: u32,
+        _row_elems: u32,
+        _width: u32,
+        _n_tok: u32,
+    ) -> bool {
+        false
+    }
+    /// Copy cache rows of one full-attention layer between logical positions: row `from[i]`
+    /// to row `to[i]`, K and V, in the order given, through the layer's own block table. A
+    /// row is `k_stride` / `v_stride` bytes, the widths the KV pool addresses. Call with the
+    /// device idle.
+    ///
+    /// The copies run in order, so the caller keeps every destination off the sources of
+    /// later copies. A tree commit does: it moves each accepted node down to its depth, and a
+    /// node's depth is never larger than its batch row.
+    ///
+    /// False: nothing was copied -- the default, or a row outside the layer's cache.
+    fn kv_move_rows(
+        &self,
+        _layer: u32,
+        _k_stride: u64,
+        _v_stride: u64,
+        _from: &[u32],
+        _to: &[u32],
+    ) -> bool {
+        false
+    }
     /// The gated delta rule over `n_tok` tokens, advancing the recurrent matrix in place.
     ///
     /// Returns false when this backend has no kernel for it, and writes nothing: a model
@@ -1707,6 +2325,26 @@ pub trait Backend: Sync {
     ) {
         for r in 0..n_row {
             self.copy_range(dst, r * width, src, r * src_stride + src_off, width);
+        }
+    }
+    /// `dst[r * dst_stride + dst_off + i] = src[r * width + i]` for `i < width`,
+    /// `r < n_row`: contiguous rows written into ONE sub-block of every row, the inverse of
+    /// `copy_strided`.
+    ///
+    /// A drafter's feature taps write each tapped layer's residual rows beside the other
+    /// taps' this way. The default walks the rows with `copy_range`, one dispatch per row; a
+    /// backend with a strided copy overrides it with one.
+    fn scatter_strided(
+        &self,
+        dst: BufId,
+        src: BufId,
+        width: u32,
+        dst_off: u32,
+        dst_stride: u32,
+        n_row: u32,
+    ) {
+        for r in 0..n_row {
+            self.copy_range(dst, r * dst_stride + dst_off, src, r * width, width);
         }
     }
     /// `a[r * a_stride + i] *= sigmoid(b[r * b_stride + b_off + i])`, the strided sigmoid
@@ -2126,6 +2764,295 @@ pub trait Backend: Sync {
     ) {
         self.argmax(src, pick, n);
     }
+    /// Whether `argmax_rows` is served. Asked before a forward that needs it, so a backend
+    /// that answers false is never dispatched into `argmax_rows`.
+    fn supports_argmax_rows(&self) -> bool {
+        false
+    }
+    /// One greedy pick per row: `dst[r]` receives, as one u32, the index within row `r` of
+    /// the `rows` rows of `width` floats in `src`, smallest on ties. That is the rule of
+    /// `argmax`, so a row's pick is `argmax` over that row alone.
+    fn argmax_rows(&self, _src: BufId, _dst: BufId, _width: u32, _rows: u32) {
+        unreachable!(
+            "argmax_rows on a backend whose supports_argmax_rows returned false"
+        )
+    }
+    /// Whether `top_k_rows` is served at `k` entries per row.
+    fn supports_top_k_rows(&self, _k: u32) -> bool {
+        false
+    }
+    /// Elements `top_k_rows` needs in `dst` for `rows` rows of `width` floats at `k` entries
+    /// per row: the output, then the entry's working space.
+    fn top_k_rows_len(&self, _width: u32, rows: u32, k: u32) -> u64 {
+        2 * u64::from(rows) * u64::from(k)
+    }
+    /// The `k` largest entries of each of the `rows` rows of `width` floats in `src`. Row `r`'s
+    /// `j`-th entry lands in `dst[r * k + j]`, its index within the row as a u32, and in
+    /// `dst[rows * k + r * k + j]`, its value. Larger values come first, and the smaller index
+    /// first among equal values: the rule of `argmax`, so a row's entry 0 is its `argmax`. The
+    /// rest of `dst`, up to `top_k_rows_len` elements, is working space. Rows hold no NaN and
+    /// `k <= width`. False when refused, with nothing written.
+    fn top_k_rows(
+        &self,
+        _src: BufId,
+        _dst: BufId,
+        _width: u32,
+        _rows: u32,
+        _k: u32,
+    ) -> bool {
+        false
+    }
+    /// Whether a ROUTED feed-forward is served: `moe_gate`, `moe_plan`, `moe_grouped` and
+    /// `moe_combine` together. A backend answers for the set, because a model that has only
+    /// some of them cannot run a routed layer at all.
+    fn supports_moe(&self) -> bool {
+        false
+    }
+    /// A routed layer's gating. `scores` holds `n_tok` rows of `n_expert` router outputs.
+    /// Writes `probs`, the probabilities (softmax over the row, or the logistic of each
+    /// entry), and `sel`, those probabilities PLUS the file's per-expert selection bias at
+    /// `bias_off` (`u64::MAX` when the file carries none).
+    ///
+    /// TWO OUTPUTS BECAUSE THE BIAS SELECTS AND DOES NOT WEIGH: the pick reads `sel`, the
+    /// weights read `probs`. One buffer would silently weigh by the biased value, which
+    /// still produces fluent text.
+    ///
+    /// False when refused, with nothing written.
+    fn moe_gate(
+        &self,
+        _scores: BufId,
+        _probs: BufId,
+        _sel: BufId,
+        _bias_off: u64,
+        _n_tok: u32,
+        _n_expert: u32,
+        _gating: ExpertGating,
+    ) -> bool {
+        false
+    }
+    /// The work rows of a routed layer, sorted by expert. `topk` holds each token's `k`
+    /// picked expert ids as u32 (`top_k_rows`' index half over `sel`), `probs` the gating's
+    /// unbiased probabilities.
+    ///
+    /// Writes, over `n_tok * k` work rows: `perm[w]`, the token work row `w` belongs to;
+    /// `wgt[w]`, its routing weight (the picked probabilities, renormalised over the `k`
+    /// picks when `normalise` is set, then scaled by `scale`); `seg[e..=e+1]`, expert `e`'s
+    /// half-open range of work rows, `n_expert + 1` entries; and `inv[t * k + j]`, the work
+    /// row of token `t`'s `j`-th pick, which the combine reads back.
+    ///
+    /// False when refused, with nothing written.
+    fn moe_plan(
+        &self,
+        _topk: BufId,
+        _probs: BufId,
+        _perm: BufId,
+        _wgt: BufId,
+        _seg: BufId,
+        _inv: BufId,
+        _n_tok: u32,
+        _n_expert: u32,
+        _k: u32,
+        _normalise: bool,
+        _scale: f32,
+    ) -> bool {
+        false
+    }
+    /// One matmul over `rows` work rows, each reading the weight of the expert whose segment
+    /// it falls in: `dst[w]` is `src[perm[w]]` times expert `e`'s `n_in` by `n_out` matrix,
+    /// where `seg[e] <= w < seg[e + 1]`. The stacked weight starts at `w_off` and expert `e`
+    /// begins `e * expert_stride` bytes into it.
+    ///
+    /// `dst` holds one row per WORK ROW. Where `src`'s rows live is `src_work_rows`: false
+    /// means one row per TOKEN and work row `w` reads `perm[w]` (the gate and up
+    /// projections), true means one row per work row and `w` reads `w` (the down
+    /// projection, whose input the other two just wrote). Both counts are passed and
+    /// neither is derived from the other.
+    ///
+    /// `prefill_chunk`: this forward is a prompt chunk of one sequence. Its positions must
+    /// then compute the same whatever the chunk's width -- a resumed prompt is chunked
+    /// differently from a cold one, and the KV pool reuses one for the other byte for
+    /// byte. False for a verify batch, a decode step and co-batched rows.
+    ///
+    /// False when refused, with nothing written.
+    fn moe_grouped(
+        &self,
+        _wkind: u32,
+        _w_off: u64,
+        _expert_stride: u64,
+        _src: BufId,
+        _dst: BufId,
+        _perm: BufId,
+        _seg: BufId,
+        _n_in: u32,
+        _n_out: u32,
+        _n_expert: u32,
+        _n_tok: u32,
+        _rows: u32,
+        _src_work_rows: bool,
+        _prefill_chunk: bool,
+    ) -> bool {
+        false
+    }
+    /// The gate, the top-k pick and the work-row plan as ONE dispatch: everything
+    /// `moe_gate`, `top_k_rows` and `moe_plan` write, written by one kernel.
+    ///
+    /// A fold of ALREADY DEPENDENT work -- the pick reads what the gate wrote and the plan
+    /// reads what the pick wrote -- so no dispatch that could have overlapped is serialised.
+    ///
+    /// False when refused, with nothing written; the caller then runs the three.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_route(
+        &self,
+        _scores: BufId,
+        _probs: BufId,
+        _sel: BufId,
+        _topk: BufId,
+        _perm: BufId,
+        _wgt: BufId,
+        _seg: BufId,
+        _inv: BufId,
+        _bias_off: u64,
+        _n_tok: u32,
+        _n_expert: u32,
+        _k: u32,
+        _gating: ExpertGating,
+        _normalise: bool,
+        _scale: f32,
+    ) -> bool {
+        false
+    }
+    /// The gate and up projections and the activation between them, as ONE routed dispatch:
+    /// `dst[w] = act(src[perm[w]] . gate_e) * (src[perm[w]] . up_e)`, one row per work row,
+    /// for the expert `e` whose segment `w` falls in. The two stacks share `expert_stride`
+    /// and a weight kind.
+    ///
+    /// A GRID MERGE, NOT A FOLD. Gate and up both read the token's hidden state and neither
+    /// is an input to the other, so running them in one kernel introduces no dependency the
+    /// three dispatches did not have.
+    ///
+    /// False when refused, with nothing written -- the caller then runs `moe_grouped` twice
+    /// and `act_mul`, which computes the same thing. `prefill_chunk` as for `moe_grouped`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_pair(
+        &self,
+        _wkind: u32,
+        _gate_off: u64,
+        _up_off: u64,
+        _expert_stride: u64,
+        _src: BufId,
+        _dst: BufId,
+        _perm: BufId,
+        _seg: BufId,
+        _n_in: u32,
+        _n_out: u32,
+        _n_expert: u32,
+        _n_tok: u32,
+        _rows: u32,
+        _prefill_chunk: bool,
+    ) -> bool {
+        false
+    }
+    /// Each token's expert outputs, summed by routing weight: `dst[t]` is the sum over the
+    /// `k` slots of `wgt[inv[t * k + j]] * src[inv[t * k + j]]`, `n_embd` floats a row.
+    ///
+    /// SLOT ORDER, EVERY RUN. Atomics would order the sum differently each time and this
+    /// engine's determinism gate fails on the next step.
+    ///
+    /// False when refused, with nothing written.
+    fn moe_combine(
+        &self,
+        _src: BufId,
+        _wgt: BufId,
+        _inv: BufId,
+        _dst: BufId,
+        _n_embd: u32,
+        _k: u32,
+        _n_tok: u32,
+    ) -> bool {
+        false
+    }
+    /// `resid += W . src`: a projection whose output only ever feeds the residual stream,
+    /// added into it in the matmul's store instead of written to a scratch row that
+    /// `add_rms_norm` then adds. Bits as `matmat` into a scratch followed by that add.
+    /// Returning `false` promises nothing a result depends on was written; the caller then
+    /// runs `matmat` into its scratch. A caller that got `true` normalises with
+    /// `rms_norm_resid`, never `rms_norm_from` (the reduction must be the pre-add one).
+    #[allow(clippy::too_many_arguments)]
+    fn matmat_resid(
+        &self,
+        _kind: u32,
+        _w_off: u64,
+        _n_in: u32,
+        _n_out: u32,
+        _src: BufId,
+        _resid: BufId,
+        _n_tok: u32,
+    ) -> bool {
+        false
+    }
+    /// `dst = rms_norm(resid) * w` over rows already holding the residual sum, with the same
+    /// floats `add_rms_norm` computes on that sum. False when refused, nothing written.
+    fn rms_norm_resid(
+        &self,
+        _dst: BufId,
+        _resid: BufId,
+        _w_off: u64,
+        _width: u32,
+        _eps: f32,
+        _n_row: u32,
+    ) -> bool {
+        false
+    }
+    /// `moe_combine` into a residual that the next block's norm reads, as one operation:
+    /// `resid[t] += sum over the k slots of wgt * src`, then `dst = rms_norm(resid) * w` --
+    /// what `moe_combine` into a scratch row followed by `add_rms_norm` computes, with the
+    /// same floats (slot-order sum, the same reduction). Returning `false` promises nothing
+    /// was written; the caller runs the two steps.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_combine_add_rms_norm(
+        &self,
+        _src: BufId,
+        _wgt: BufId,
+        _inv: BufId,
+        _k: u32,
+        _dst: BufId,
+        _resid: BufId,
+        _w_off: u64,
+        _width: u32,
+        _eps: f32,
+        _n_row: u32,
+    ) -> bool {
+        false
+    }
+    /// Whether `logistic_rows` is served.
+    fn supports_logistic_rows(&self) -> bool {
+        false
+    }
+    /// Elements `logistic_rows` needs in `dst` from `dst_off`: the `rows` outputs, then the
+    /// entry's working space.
+    fn logistic_rows_len(&self, _a_width: u32, _b_width: u32, rows: u32) -> u64 {
+        u64::from(rows)
+    }
+    /// One logistic output per row: `dst[dst_off + r] = 1 / (1 + exp(-z))` with
+    /// `z = w . [a_r ; b_r] + bias`, over the `rows` rows of `a_width` floats in `a` and of
+    /// `b_width` floats in `b`. `w` holds the `a_width + b_width` weights from `w_off`, then the
+    /// bias. `dst` from `dst_off`, `logistic_rows_len` elements, may share `w`'s buffer where the
+    /// two do not overlap. Each row sums in one fixed order and adds the bias last, so a row's
+    /// output does not change between calls. False when refused, with nothing written.
+    fn logistic_rows(
+        &self,
+        _a: BufId,
+        _a_width: u32,
+        _b: BufId,
+        _b_width: u32,
+        _w: BufId,
+        _w_off: u32,
+        _dst: BufId,
+        _dst_off: u32,
+        _rows: u32,
+    ) -> bool {
+        false
+    }
     /// Optional whole-logit greedy selection with accepted-prefix recurrent restore.
     fn supports_greedy_verification(&self) -> bool {
         false
@@ -2203,6 +3130,27 @@ pub trait Backend: Sync {
     ) {
         assert_eq!(canonical_out, output_out, "projection prefix not admitted");
         self.matmat(kind, offset, n_in, output_out, src, dst, n_tok);
+    }
+
+    /// Fuse projection scaling, per-layer normalization and token-row addition.
+    /// Returning false leaves all buffers unchanged and selects the caller fallback.
+    /// source_width is the immutable table pitch; output_layers may be a prefix.
+    fn ple_norm_gather_combine_prefix(
+        &self,
+        _proj: BufId,
+        _tokens: BufId,
+        _norm_offset: u64,
+        _table_offset: u64,
+        _ple_width: u32,
+        _output_layers: u32,
+        _source_width: u32,
+        _input_scale: f32,
+        _eps: f32,
+        _emb_scale: f32,
+        _comb_scale: f32,
+        _n_tok: u32,
+    ) -> bool {
+        false
     }
 
     fn ple_gather_combine_prefix(
@@ -2306,6 +3254,20 @@ pub trait Backend: Sync {
     /// reads it there and hands the pairs over; a backend that does not need them ignores
     /// this.
     fn set_weight_kind_types(&self, _pairs: &[(WeightKindWire, u32)]) {}
+    /// Registers validated model-defined input bases at load, before any forward.
+    /// Backends must reject a nonempty unsupported basis rather than produce
+    /// plausible output with the wrong model mathematics.
+    fn register_weight_input_transforms(
+        &self,
+        transforms: &[WeightInputTransform],
+    ) -> Result<(), String> {
+        if transforms.is_empty() {
+            Ok(())
+        } else {
+            Err("backend does not implement this model's weight input basis".into())
+        }
+    }
+
     /// Dispatches the backend REFUSED rather than encoding: a weight kind no kernel
     /// serves, a width no route can walk, a span past a kernel's slices. Every refusal
     /// logs, and a log line is not something a harness can act on -- a tuner run refused
@@ -2318,6 +3280,13 @@ pub trait Backend: Sync {
     /// moved during a workload it knows dispatches.
     fn refused_dispatches(&self) -> u64 {
         0
+    }
+    /// Matmul calls this process encoded, per route -- the kernel each projection ran -- by
+    /// name. A harness prints the counts that grew while it measured, so a number names the
+    /// kernel behind it; a route whose name ends in `_fallback` ran because the chosen kernel
+    /// could not. Empty by default: a backend that does not count names no kernel.
+    fn matmul_routes(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
     }
     /// Read `dst.len()` weight bytes as the backend will serve them at file offset
     /// `file_off` (after any load-time transform). For verification only; false when the
@@ -2412,6 +3381,16 @@ pub struct KvTransferSpan {
     pub device_offset: u64,
     pub host_offset: u64,
     pub len: u64,
+}
+
+/// `len` bytes of one layer side's KV cache at `off`, in the coordinates
+/// `Backend::write_kv_bytes` takes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvRange {
+    pub layer: u32,
+    pub is_v: bool,
+    pub off: u64,
+    pub len: usize,
 }
 
 /// Measured facts for deciding whether a discrete Host tier is useful and safe.
@@ -2607,7 +3586,8 @@ pub struct ProfStats {
     /// buys nothing -- every kernel's tail waits for the next one's head.
     pub barriers: u64,
     /// (category name, ticks, calls) since the last read.
-    pub categories: Vec<(String, f64, u64)>,
+    /// name, seconds, calls, WEIGHT BYTES (0 = the site did not declare any).
+    pub categories: Vec<(String, f64, u64, u64)>,
 }
 
 /// The five-category knob taxonomy (see imparo-tune's knobs.rs for the doctrine):
@@ -2945,6 +3925,15 @@ pub enum SweepKind {
         hi: u32,
         lo: u32,
     },
+    /// `Crossing`, timed as the independent decode rows of a co-batched step: the backend's
+    /// fast decode-rows route is on while each rung runs, so `hi` keeps the rows on the
+    /// decode-rows GEMV and `lo` sends them to the GEMM. Without the route on, both arms
+    /// would dispatch the GEMM and the sweep would measure nothing.
+    RowsCrossing {
+        ladder: &'static [u32],
+        hi: u32,
+        lo: u32,
+    },
 }
 
 /// One backend-owned performance knob. The shared tuner machinery consumes these;
@@ -3079,6 +4068,12 @@ pub struct ModelFacts {
     pub deep_head_dim: u32,
     /// 0 for a dense model. Non-zero enables the MoE knobs and nothing else.
     pub n_experts: u32,
+    /// Experts a token picks (0 for a dense model). With `n_experts`, it says how many
+    /// work rows a prefill chunk gives each expert: `chunk * experts_used / n_experts`.
+    pub experts_used: u32,
+    /// Windowed-attention layers. Non-zero means a chunk boundary can land inside a window
+    /// and move that layer's answer, so the chunk must stay at the compiled width.
+    pub windowed_layers: u32,
     /// Blocks in the model. From the GGUF header.
     pub n_layers: u32,
     /// Compute dispatches ONE layer encodes in a decode step. Counted from the model's
@@ -3312,6 +4307,35 @@ pub struct KnobDecl {
 pub trait BackendKnobs {
     fn knob_registry(&self) -> &'static [KnobDecl];
     fn space_version(&self) -> u32;
+
+    /// PER-TENSOR SEATS, which a knob cannot express: one value for each
+    /// `(wire kind, n_in, n_out)` the model carries rather than one for the whole engine.
+    ///
+    /// `tensors` is `(wire kind, weight offset, n_in, n_out)`; the answer is
+    /// `(wire kind, n_in, n_out, value)`, which the tuner writes as `blk_rows.K.IN.OUT=V`.
+    ///
+    /// A backend that times BOTH candidate kernels on each tensor returns its winners. The
+    /// default returns nothing, so a backend without this axis writes no such lines and
+    /// nothing else changes.
+    ///
+    /// It is a measurement, not a sweep, and that is the point: a sweep reads one workload
+    /// total, and a total dominated by one tensor group picks that group's kernel for every
+    /// tensor. Timing each tensor on its own has no aggregate to hide in.
+    fn measure_row_kernel_seats(
+        &self,
+        _tensors: &[(u32, u64, u32, u32)],
+        _rows: u32,
+    ) -> Vec<(u32, u32, u32, u32)> {
+        Vec::new()
+    }
+
+    /// The prefill chunk this backend derives for the model, starting from the engine's
+    /// `compiled` chunk, or `None` to keep the stored one (or the compiled one). The tuner
+    /// writes it as the config's `batch` line, which the engine applies at load;
+    /// `IMPARO_BATCH` still overrides it.
+    fn prefill_batch(&self, _m: &ModelFacts, _compiled: usize) -> Option<usize> {
+        None
+    }
 }
 
 #[cfg(test)]

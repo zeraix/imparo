@@ -68,6 +68,54 @@ constant uint EPI_SILU = 2u;
 constant uint ATTN_SKIP_FC [[function_constant(17)]];
 constant uint ATTN_SKIP = is_function_constant_defined(ATTN_SKIP_FC) ? ATTN_SKIP_FC : 0u;
 
+// ROW LAYOUT (constant 25): the batch's rows are not one causal chain -- a tree verify, or a
+// drafted block whose rows all see each other. Each row's position, the batch rows it sees
+// and its ancestors come from a buffer of
+// ROW_LAYOUT_WORDS u32 per row (imparo_backend::ROW_LAYOUT_WORDS):
+//   [0] position  [1] depth  [2] sees batch rows 0..31  [3] rows 32..63
+//   [4..11] the batch row 1..8 steps up the row's path (read only for steps <= depth)
+// A kernel compiled without the constant keeps its causal code.
+constant bool ROW_LAYOUT_FC [[function_constant(25)]];
+constant bool ROW_LAYOUT = is_function_constant_defined(ROW_LAYOUT_FC) ? ROW_LAYOUT_FC : false;
+// FA_FLOAT_Q (constant 26): the FA entry keeps Q in float for the scores instead of rounding it to
+// half. Only the row-layout entry builds it, for a caller that asks for float Q.
+constant bool FA_FLOAT_Q_FC [[function_constant(26)]];
+constant bool FA_FLOAT_Q = is_function_constant_defined(FA_FLOAT_Q_FC) ? FA_FLOAT_Q_FC : false;
+// ROW_SPLIT (constant 63), row-layout register-softmax op only: the key range is cut into
+// consecutive slices, one a threadgroup (grid z), each writing its rows' unnormalised output, max
+// and sum to a partials buffer that imparo_attention_rows_combine merges. A verify has one query
+// tile, so without it the grid is one threadgroup a head walking every key.
+constant bool ROW_SPLIT_FC [[function_constant(63)]];
+constant bool ROW_SPLIT = is_function_constant_defined(ROW_SPLIT_FC) ? ROW_SPLIT_FC : false;
+// ROW_HEADS (constant 64), same op: a threadgroup serves one KV head, its four simdgroups the four
+// query heads that share it, 8 rows each -- each staged K/V block serves four heads, and no
+// simdgroup computes rows past the batch at 8 rows. Only where a KV head has exactly four query
+// heads.
+constant bool ROW_HEADS_FC [[function_constant(64)]];
+constant bool ROW_HEADS = is_function_constant_defined(ROW_HEADS_FC) ? ROW_HEADS_FC : false;
+constant uint ROW_LAYOUT_WORDS = 12u;
+// CO-BATCHED ROWS (constant 32): the dispatch's rows are different conversations
+// (docs/continuous-batching.md), each at its own position with its own page table and recurrent
+// state, so row t reads them from rows[t] (constant memory, one entry per row). A kernel
+// compiled without the constant keeps its one-conversation code.
+constant bool COB_ROWS_FC [[function_constant(32)]];
+constant bool COB_ROWS = is_function_constant_defined(COB_ROWS_FC) ? COB_ROWS_FC : false;
+struct CobRow {
+    device const uint * pt;     // the conversation's page table for the dispatch's layer
+    device float * state;       // its recurrent state, at the row's live history
+    device float * state_out;   // where its advanced history lands
+    uint pos;                   // the row's position
+    uint pad;
+};
+// Every row sees the whole cache below the batch; a batch key is seen when its bit is set.
+inline bool row_layout_sees(device const uint * layout, uint t, uint gp, uint start_pos) {
+    if (gp < start_pos) { return true; }
+    const uint j = gp - start_pos;
+    if (j >= 64u) { return false; }
+    const uint w = layout[t * ROW_LAYOUT_WORDS + 2u + (j >> 5)];
+    return ((w >> (j & 31u)) & 1u) != 0u;
+}
+
 constant uint EPI_ACT_FC [[function_constant(11)]];
 constant uint EPI_ACT = is_function_constant_defined(EPI_ACT_FC) ? EPI_ACT_FC : EPI_GELU;
 
@@ -92,6 +140,12 @@ constant uint Q8_0_BYTES = 34u;
 // real offset congruent to it mod 2^32 while the offset was 32 bits, and with exactly
 // 4294967295 once it was widened. All-ones in 64 bits cannot be a real offset.
 constant ulong IMPARO_NO_WEIGHT = ~0ul;
+// The norm's threadgroup stage: on when the host sized the memory for it, and the offset
+// (in floats) past the reduction partials where the staged row starts.
+constant bool STAGED_FC [[function_constant(56)]];
+constant bool STAGED = is_function_constant_defined(STAGED_FC) && STAGED_FC;
+constant uint STAGE_OFF_FC [[function_constant(57)]];
+constant uint STAGE_OFF = is_function_constant_defined(STAGE_OFF_FC) ? STAGE_OFF_FC : 0u;
 
 // `x` is a float buffer and every n_in here is a multiple of 4, so it can be read as
 // float4 -- one load instruction instead of four.
@@ -167,6 +221,23 @@ constant uint NR0 [[function_constant(2)]];
 #endif
 constant uint TOKEN_TILE    = Q4_TOKEN_TILE;
 
+// DECODE ROWS: the decode GEMV over MV_TOKENS independent rows at once, the rows of different
+// conversations in one co-batched step (imparo_q4_0_matmat, imparo_q8_0_gemv). Every row keeps
+// the one-row kernel's K split, its accumulation and its reduction order, so a row's bits equal
+// what the one-row kernel gives it; only the weight loads are shared. A row's K/V bytes must not
+// depend on who else is in its step (docs/kv-identity-grid.md), and this is what keeps them the
+// same. A compile-time count: undefined is 1, the one-row kernel. Rows past n_tok read the last
+// live row and store nothing. The arrays are sized by the largest count (a function constant
+// cannot size an array); the loops run to the specialized count, so a one-row pipeline's unused
+// slots are dead code.
+constant uint MV_TOKENS_FC [[function_constant(28)]];
+constant uint MV_TOKENS = is_function_constant_defined(MV_TOKENS_FC) ? MV_TOKENS_FC : 1u;
+#define MV_MAX 8u
+// Lane groups of a simdgroup that share one row set and split its tokens (imparo_q4_0_matmat's
+// decode rows): 1 gives every lane group its own rows and all the tokens.
+constant uint MV_SPLIT_FC [[function_constant(29)]];
+constant uint MV_SPLIT = is_function_constant_defined(MV_SPLIT_FC) ? MV_SPLIT_FC : 1u;
+
 // BRICK: Q4_0 ROW GROUP PARTIAL. This lane's blocks (sub, sub + LANES_PER_ROW, ...) of NR0 rows
 // (row_off[i] = byte offset of row i from `w`), one activation read shared by all NR0 rows;
 // acc[i] accumulates block-by-block in the decode GEMV's order: part = sum over the 4 nibble
@@ -223,6 +294,100 @@ kernel void imparo_q4_0_matmat(
     uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
 {
+    if (MV_TOKENS > 1u) {
+        // DECODE ROWS. Each row keeps what fixes its bits in the one-row path below: its blocks
+        // go to the LANES_PER_ROW lanes of one lane group by b % LANES_PER_ROW, each lane sums
+        // them in order as q4_rows_partial does (part over the four nibble groups, then
+        // acc += part * d), and lane_group_sum folds the group with the same shuffle tree.
+        // Which lane group holds a row does not enter, so the MV_SPLIT lane groups of a row set
+        // share its weight loads and split the tokens; every lane serves NR0 rows, so one
+        // activation load feeds NR0 multiplies. Rows past n_out and tokens past n_tok read
+        // clamped operands and store nothing. The grid is n_out / (nsg * groups * NR0) wide.
+        const uint split = MV_SPLIT;
+        const uint tpl   = MV_TOKENS / split;                  // tokens per lane
+        const uint sub   = lane % LANES_PER_ROW;
+        const uint slot  = lane / LANES_PER_ROW;
+        const uint sets  = (32u / LANES_PER_ROW) / split;      // row sets per simdgroup
+        const uint r     = ((tgid.x * nsg + sgid) * sets + slot / split) * NR0;
+        const uint tok0  = slot % split;
+        if (r >= n_out) { return; }
+        const uint blocks = n_in / QK4_0;
+        const uint last = n_tok - 1u;
+        ulong row_off[8];
+        #pragma unroll
+        for (uint i = 0; i < NR0; ++i) {
+            row_off[i] = w_offset + (ulong)min(r + i, n_out - 1u) * blocks * Q4_0_BYTES;
+        }
+        device const float4 * xs[MV_MAX];
+        #pragma unroll
+        for (uint tt = 0; tt < tpl; ++tt) {
+            const uint t = min(tok0 + tt * split, last);
+            xs[tt] = (device const float4 *)(x + (ulong)(src_row + t) * n_in);
+        }
+        float acc[8][MV_MAX];
+        #pragma unroll
+        for (uint i = 0; i < NR0; ++i) {
+            #pragma unroll
+            for (uint tt = 0; tt < tpl; ++tt) { acc[i][tt] = 0.0f; }
+        }
+        for (uint b = sub; b < blocks; b += LANES_PER_ROW) {
+            const uint base4 = b * (QK4_0 / 4u);
+            float d[8], part[8][MV_MAX];
+            #pragma unroll
+            for (uint i = 0; i < NR0; ++i) {
+                device const uchar * blk = weights + row_off[i] + b * Q4_0_BYTES;
+                d[i] = float(as_type<half>((ushort)(blk[0] | (blk[1] << 8))));
+                #pragma unroll
+                for (uint tt = 0; tt < tpl; ++tt) { part[i][tt] = 0.0f; }
+            }
+            #pragma unroll
+            for (uint g = 0; g < 4; ++g) {
+                uchar4 pk[8];
+                #pragma unroll
+                for (uint i = 0; i < NR0; ++i) {
+                    pk[i] = *(device const uchar4 *)(weights + row_off[i] + b * Q4_0_BYTES + 2u + g * 4u);
+                }
+                #pragma unroll
+                for (uint tt = 0; tt < tpl; ++tt) {
+                    const float4 xa = xs[tt][base4 + g];
+                    const float4 xb = xs[tt][base4 + g + 4u];
+                    #pragma unroll
+                    for (uint i = 0; i < NR0; ++i) {
+                        part[i][tt] += dot(unpack_lo(pk[i]), xa) + dot(unpack_hi(pk[i]), xb);
+                    }
+                }
+            }
+            {
+                // The one-row brick rounds part * d before the add; this body, with more rows
+                // in flight, was contracted to one fma, which rounds once and moves the bits of
+                // every lane that sums two or more blocks.
+#pragma clang fp contract(off)
+                #pragma unroll
+                for (uint i = 0; i < NR0; ++i) {
+                    #pragma unroll
+                    for (uint tt = 0; tt < tpl; ++tt) { acc[i][tt] += part[i][tt] * d[i]; }
+                }
+            }
+        }
+        #pragma unroll
+        for (uint i = 0; i < NR0; ++i) {
+            #pragma unroll
+            for (uint tt = 0; tt < tpl; ++tt) { acc[i][tt] = lane_group_sum(acc[i][tt]); }
+        }
+        if (sub == 0u) {
+            #pragma unroll
+            for (uint i = 0; i < NR0; ++i) {
+                #pragma unroll
+                for (uint tt = 0; tt < tpl; ++tt) {
+                    const uint t = tok0 + tt * split;
+                    if (r + i >= n_out || t >= n_tok) { continue; }
+                    device float * slot_p = y + (ulong)t * n_out + r + i;
+                    *slot_p = epilogue ? (imparo_act_f(*slot_p) * acc[i][tt]) : acc[i][tt];
+                }
+            }
+        }
+        return;
+    }
     const uint rows_per_simd = 32u / LANES_PER_ROW;
     const uint sub  = lane % LANES_PER_ROW;
     const uint slot = lane / LANES_PER_ROW;
@@ -526,6 +691,23 @@ constant bool WFMT_PROBE = is_function_constant_defined(WFMT_PROBE_FC) ? WFMT_PR
 constant bool RT_MMA_FENCE_FC [[function_constant(16)]];
 constant bool RT_MMA_FENCE = is_function_constant_defined(RT_MMA_FENCE_FC)
                            ? RT_MMA_FENCE_FC : false;
+// rt_gemm's straight store for an n_out that is not a multiple of 8, where the last 8x8 block
+// straddles n_out (see the store). The host builds this variant only for such an n_out.
+constant bool RT_EDGE8_FC [[function_constant(30)]];
+constant bool RT_EDGE8 = is_function_constant_defined(RT_EDGE8_FC) ? RT_EDGE8_FC : false;
+// THE RESIDUAL ADD IN THE STORE (a pipeline variant, never a runtime branch: a runtime epilogue
+// value once moved gemma4's logits without running). The plain store writes y = acc; this one
+// writes y = y + acc, so a mixer's output projection adds into the residual stream X instead of
+// writing O for the next norm to add. Same float sum as that norm's `resid + O`.
+constant bool RT_RESID_FC [[function_constant(60)]];
+constant bool RT_RESID = is_function_constant_defined(RT_RESID_FC) && RT_RESID_FC;
+inline void rt_resid_add(thread simdgroup_float8x8 & m, device const float * yp, uint ld) {
+    simdgroup_float8x8 old;
+    simdgroup_load(old, yp, ld);
+    const float2 a = reinterpret_cast<thread float2 &>(old.thread_elements());
+    const float2 b = reinterpret_cast<thread float2 &>(m.thread_elements());
+    reinterpret_cast<thread float2 &>(m.thread_elements()) = float2(a.x + b.x, a.y + b.y);
+}
 inline bool getenv_probe_const() { return WFMT_PROBE; }
 // Codes follow the ggml type ids so a reader can recover the source at a glance.
 constant uint WF_ROWMAJOR = 0u;
@@ -535,6 +717,10 @@ constant uint WF_IQ3_S = 21u;
 constant uint WF_IQ2_XS = 17u, WF_IQ3_XXS = 18u, WF_IQ2_S = 22u, WF_IQ2_XXS = 16u;
 constant uint WF_Q2_K = 10u;
 constant uint WF_Q4_1 = 3u, WF_Q5_0 = 6u, WF_Q5_1 = 7u, WF_IQ1_S = 19u, WF_IQ1_M = 29u;
+// Q4_0 has its own dense kernels (E4B's); this arm serves only the ROUTED matmuls, which
+// the host stamps with it through moe_wfmt_for -- wfmt_for never returns it, so no dense
+// pipeline changes format by its presence here.
+constant uint WF_Q4_0 = 2u;
 
 // The sign table IQ2_XS and IQ3_XXS share: a 7-bit index whose EIGHTH sign is the parity
 // of the other seven. llama.cpp writes it out as ksigns_iq2xs[128]; it is one expression,
@@ -545,6 +731,80 @@ inline uchar ksign_iq(uchar i) { return i | (uchar)((popcount((uint)i) & 1u) << 
 // this table, so no arithmetic reproduces the value -- the table is part of the format.
 constant char KVALUES_IQ4NL[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+// The same levels as floats, for the rows matmul's fetch (tm_run8): float((int)level) is exact,
+// so a value decoded through either table has the same bits (tests/brick_rows.rs).
+constant float KVALUES_IQ4NL_F[16] = {
+    -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+    1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
+};
+// Both levels of one IQ4 byte, low nibble then high nibble, for the rows matmul's fetch: one
+// lookup per byte instead of one per nibble. Generated from the table above.
+constant float2 KVALUES_IQ4NL_PAIR[256] = {
+    float2(-127.0f, -127.0f), float2(-104.0f, -127.0f), float2(-83.0f, -127.0f), float2(-65.0f, -127.0f),
+    float2(-49.0f, -127.0f), float2(-35.0f, -127.0f), float2(-22.0f, -127.0f), float2(-10.0f, -127.0f),
+    float2(1.0f, -127.0f), float2(13.0f, -127.0f), float2(25.0f, -127.0f), float2(38.0f, -127.0f),
+    float2(53.0f, -127.0f), float2(69.0f, -127.0f), float2(89.0f, -127.0f), float2(113.0f, -127.0f),
+    float2(-127.0f, -104.0f), float2(-104.0f, -104.0f), float2(-83.0f, -104.0f), float2(-65.0f, -104.0f),
+    float2(-49.0f, -104.0f), float2(-35.0f, -104.0f), float2(-22.0f, -104.0f), float2(-10.0f, -104.0f),
+    float2(1.0f, -104.0f), float2(13.0f, -104.0f), float2(25.0f, -104.0f), float2(38.0f, -104.0f),
+    float2(53.0f, -104.0f), float2(69.0f, -104.0f), float2(89.0f, -104.0f), float2(113.0f, -104.0f),
+    float2(-127.0f, -83.0f), float2(-104.0f, -83.0f), float2(-83.0f, -83.0f), float2(-65.0f, -83.0f),
+    float2(-49.0f, -83.0f), float2(-35.0f, -83.0f), float2(-22.0f, -83.0f), float2(-10.0f, -83.0f),
+    float2(1.0f, -83.0f), float2(13.0f, -83.0f), float2(25.0f, -83.0f), float2(38.0f, -83.0f),
+    float2(53.0f, -83.0f), float2(69.0f, -83.0f), float2(89.0f, -83.0f), float2(113.0f, -83.0f),
+    float2(-127.0f, -65.0f), float2(-104.0f, -65.0f), float2(-83.0f, -65.0f), float2(-65.0f, -65.0f),
+    float2(-49.0f, -65.0f), float2(-35.0f, -65.0f), float2(-22.0f, -65.0f), float2(-10.0f, -65.0f),
+    float2(1.0f, -65.0f), float2(13.0f, -65.0f), float2(25.0f, -65.0f), float2(38.0f, -65.0f),
+    float2(53.0f, -65.0f), float2(69.0f, -65.0f), float2(89.0f, -65.0f), float2(113.0f, -65.0f),
+    float2(-127.0f, -49.0f), float2(-104.0f, -49.0f), float2(-83.0f, -49.0f), float2(-65.0f, -49.0f),
+    float2(-49.0f, -49.0f), float2(-35.0f, -49.0f), float2(-22.0f, -49.0f), float2(-10.0f, -49.0f),
+    float2(1.0f, -49.0f), float2(13.0f, -49.0f), float2(25.0f, -49.0f), float2(38.0f, -49.0f),
+    float2(53.0f, -49.0f), float2(69.0f, -49.0f), float2(89.0f, -49.0f), float2(113.0f, -49.0f),
+    float2(-127.0f, -35.0f), float2(-104.0f, -35.0f), float2(-83.0f, -35.0f), float2(-65.0f, -35.0f),
+    float2(-49.0f, -35.0f), float2(-35.0f, -35.0f), float2(-22.0f, -35.0f), float2(-10.0f, -35.0f),
+    float2(1.0f, -35.0f), float2(13.0f, -35.0f), float2(25.0f, -35.0f), float2(38.0f, -35.0f),
+    float2(53.0f, -35.0f), float2(69.0f, -35.0f), float2(89.0f, -35.0f), float2(113.0f, -35.0f),
+    float2(-127.0f, -22.0f), float2(-104.0f, -22.0f), float2(-83.0f, -22.0f), float2(-65.0f, -22.0f),
+    float2(-49.0f, -22.0f), float2(-35.0f, -22.0f), float2(-22.0f, -22.0f), float2(-10.0f, -22.0f),
+    float2(1.0f, -22.0f), float2(13.0f, -22.0f), float2(25.0f, -22.0f), float2(38.0f, -22.0f),
+    float2(53.0f, -22.0f), float2(69.0f, -22.0f), float2(89.0f, -22.0f), float2(113.0f, -22.0f),
+    float2(-127.0f, -10.0f), float2(-104.0f, -10.0f), float2(-83.0f, -10.0f), float2(-65.0f, -10.0f),
+    float2(-49.0f, -10.0f), float2(-35.0f, -10.0f), float2(-22.0f, -10.0f), float2(-10.0f, -10.0f),
+    float2(1.0f, -10.0f), float2(13.0f, -10.0f), float2(25.0f, -10.0f), float2(38.0f, -10.0f),
+    float2(53.0f, -10.0f), float2(69.0f, -10.0f), float2(89.0f, -10.0f), float2(113.0f, -10.0f),
+    float2(-127.0f, 1.0f), float2(-104.0f, 1.0f), float2(-83.0f, 1.0f), float2(-65.0f, 1.0f),
+    float2(-49.0f, 1.0f), float2(-35.0f, 1.0f), float2(-22.0f, 1.0f), float2(-10.0f, 1.0f),
+    float2(1.0f, 1.0f), float2(13.0f, 1.0f), float2(25.0f, 1.0f), float2(38.0f, 1.0f),
+    float2(53.0f, 1.0f), float2(69.0f, 1.0f), float2(89.0f, 1.0f), float2(113.0f, 1.0f),
+    float2(-127.0f, 13.0f), float2(-104.0f, 13.0f), float2(-83.0f, 13.0f), float2(-65.0f, 13.0f),
+    float2(-49.0f, 13.0f), float2(-35.0f, 13.0f), float2(-22.0f, 13.0f), float2(-10.0f, 13.0f),
+    float2(1.0f, 13.0f), float2(13.0f, 13.0f), float2(25.0f, 13.0f), float2(38.0f, 13.0f),
+    float2(53.0f, 13.0f), float2(69.0f, 13.0f), float2(89.0f, 13.0f), float2(113.0f, 13.0f),
+    float2(-127.0f, 25.0f), float2(-104.0f, 25.0f), float2(-83.0f, 25.0f), float2(-65.0f, 25.0f),
+    float2(-49.0f, 25.0f), float2(-35.0f, 25.0f), float2(-22.0f, 25.0f), float2(-10.0f, 25.0f),
+    float2(1.0f, 25.0f), float2(13.0f, 25.0f), float2(25.0f, 25.0f), float2(38.0f, 25.0f),
+    float2(53.0f, 25.0f), float2(69.0f, 25.0f), float2(89.0f, 25.0f), float2(113.0f, 25.0f),
+    float2(-127.0f, 38.0f), float2(-104.0f, 38.0f), float2(-83.0f, 38.0f), float2(-65.0f, 38.0f),
+    float2(-49.0f, 38.0f), float2(-35.0f, 38.0f), float2(-22.0f, 38.0f), float2(-10.0f, 38.0f),
+    float2(1.0f, 38.0f), float2(13.0f, 38.0f), float2(25.0f, 38.0f), float2(38.0f, 38.0f),
+    float2(53.0f, 38.0f), float2(69.0f, 38.0f), float2(89.0f, 38.0f), float2(113.0f, 38.0f),
+    float2(-127.0f, 53.0f), float2(-104.0f, 53.0f), float2(-83.0f, 53.0f), float2(-65.0f, 53.0f),
+    float2(-49.0f, 53.0f), float2(-35.0f, 53.0f), float2(-22.0f, 53.0f), float2(-10.0f, 53.0f),
+    float2(1.0f, 53.0f), float2(13.0f, 53.0f), float2(25.0f, 53.0f), float2(38.0f, 53.0f),
+    float2(53.0f, 53.0f), float2(69.0f, 53.0f), float2(89.0f, 53.0f), float2(113.0f, 53.0f),
+    float2(-127.0f, 69.0f), float2(-104.0f, 69.0f), float2(-83.0f, 69.0f), float2(-65.0f, 69.0f),
+    float2(-49.0f, 69.0f), float2(-35.0f, 69.0f), float2(-22.0f, 69.0f), float2(-10.0f, 69.0f),
+    float2(1.0f, 69.0f), float2(13.0f, 69.0f), float2(25.0f, 69.0f), float2(38.0f, 69.0f),
+    float2(53.0f, 69.0f), float2(69.0f, 69.0f), float2(89.0f, 69.0f), float2(113.0f, 69.0f),
+    float2(-127.0f, 89.0f), float2(-104.0f, 89.0f), float2(-83.0f, 89.0f), float2(-65.0f, 89.0f),
+    float2(-49.0f, 89.0f), float2(-35.0f, 89.0f), float2(-22.0f, 89.0f), float2(-10.0f, 89.0f),
+    float2(1.0f, 89.0f), float2(13.0f, 89.0f), float2(25.0f, 89.0f), float2(38.0f, 89.0f),
+    float2(53.0f, 89.0f), float2(69.0f, 89.0f), float2(89.0f, 89.0f), float2(113.0f, 89.0f),
+    float2(-127.0f, 113.0f), float2(-104.0f, 113.0f), float2(-83.0f, 113.0f), float2(-65.0f, 113.0f),
+    float2(-49.0f, 113.0f), float2(-35.0f, 113.0f), float2(-22.0f, 113.0f), float2(-10.0f, 113.0f),
+    float2(1.0f, 113.0f), float2(13.0f, 113.0f), float2(25.0f, 113.0f), float2(38.0f, 113.0f),
+    float2(53.0f, 113.0f), float2(69.0f, 113.0f), float2(89.0f, 113.0f), float2(113.0f, 113.0f),
 };
 
 // The 6-bit sub-block scale and min for sub-block j of a Q4_K / Q5_K super-block, unpacked
@@ -1734,6 +1994,36 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
         }
         return;
     }
+    if (F == WF_Q4_0) {
+        // THE SYMMETRIC 4-BIT LEGACY BLOCK: (q - 8) * d with `sc` = d; byte j's low nibble is
+        // element j and its high nibble element j + 16. Byte loads: a row-major block is 18
+        // bytes, so its payload is not word aligned.
+        const float d = float(as_type<half>((ushort)(sc[0] | (sc[1] << 8))));
+        if (a16) {
+            // Tile-major: a row's 16 payload bytes sit 16-aligned after the unit's scales.
+            const uint4 w = *((device const uint4 *)pay);
+            const uint words[4] = { w.x, w.y, w.z, w.w };
+            #pragma unroll
+            for (uint q = 0; q < 4u; ++q) {
+                const uchar4 by = as_type<uchar4>(words[q]);
+                #pragma unroll
+                for (uint i = 0; i < 4u; ++i) {
+                    const uint j = 4u * q + i;
+                    out[j]      = T(d * float((int)((uint)by[i] & 0xFu) - 8));
+                    out[j + 16] = T(d * float((int)((uint)by[i] >> 4) - 8));
+                }
+            }
+            return;
+        }
+        #pragma unroll
+        for (uint j = 0; j < 16u; ++j) {
+            const int x0 = (int)((uint)pay[j] & 0xFu) - 8;
+            const int x1 = (int)((uint)pay[j] >> 4) - 8;
+            out[j]      = T(d * float(x0));
+            out[j + 16] = T(d * float(x1));
+        }
+        return;
+    }
     if (F == WF_Q5_0) {
         // THE SYMMETRIC 5-BIT LEGACY BLOCK: ((q | fifth bit) - 16) * d with `sc` = d; the
         // payload is laid out as Q5_1's (the fifth-bit word, then the nibbles).
@@ -1813,11 +2103,498 @@ inline void tm_sub32_t(device const uchar * sc, device const uchar * pay, uint s
     for (uint l = 0; l < 32u; ++l) { out[l] = T(0.0h); }
 }
 
+// DIAGNOSTIC (IMPARO_BLK_RUN_PROBE, 0 in every served pipeline): what a repacked layout could
+// remove from the run fetch, priced by removing it and keeping every load. Bit 0 replaces the
+// packed sub-scale unpack with a byte of a word the fetch already holds (Q4_K, Q5_K, Q3_K, Q6_K,
+// IQ4_XS); bit 1 replaces a codebook or grid lookup with the index itself (IQ4_XS, IQ4_NL, IQ3_S,
+// IQ3_XXS, IQ2_*). Wrong values on purpose.
+constant uint BLK_RUN_PROBE_FC [[function_constant(50)]];
+constant uint BLK_RUN_PROBE = is_function_constant_defined(BLK_RUN_PROBE_FC) ? BLK_RUN_PROBE_FC : 0u;
+// Bit 4: DROP THE OFFSET TERM from the affine formats (Q4_K, Q5_K, Q6_K, Q3_K, Q2_K), keeping the
+// scale. It prices the ceiling of deferring the affine -- `s*Sum(q*x) - off*Sum(x)` with Sum(x)
+// precomputed outside the matmul -- WITHOUT building Sum(x), because what the deferral removes
+// from this loop is exactly this subtract. Wrong values on purpose.
+
+// THE RUN FETCH: the eight values one lane holds in a rows matmul's 8x8 weight fragments, for
+// SUB-BLOCK `sub` and the lane's pair of fragment columns `q` (0..3). Each value is the float
+// `tm_sub32_t<F, float>` gives it -- the same expression per value, so the same bits. Which eight
+// is the format's K ORDER (`tm_run_order_t`), picked so they sit next to each other in the block:
+//
+//   order 0   lo = k 8q .. 8q+3,   hi = k 8q+4 .. 8q+7          the k-quants and the grid formats
+//   order 1   lo = k 4q .. 4q+3,   hi = k 16+4q .. 16+4q+3      the nibble formats, whose byte j
+//                                                             holds value j low, value j+16 high
+//
+// `a16` as for `tm_sub32`: the payload sits where word loads are aligned (every tile-major unit);
+// without it the plane formats read bytes.
+template <uint F>
+inline uint tm_run_order_t() {
+    return (F == WF_IQ4_XS || F == WF_IQ4_NL || F == WF_Q4_0 || F == WF_Q4_1 || F == WF_Q5_0
+            || F == WF_Q5_1) ? 1u : 0u;
+}
+inline uint2 tm_bytes8(device const uchar * p) {
+    return uint2((uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24),
+                 (uint)p[4] | ((uint)p[5] << 8) | ((uint)p[6] << 16) | ((uint)p[7] << 24));
+}
+template <uint F>
+inline void tm_run8_t(device const uchar * sc, device const uchar * pay, uint sub, uint q,
+                      bool a16, thread float4 & lo, thread float4 & hi)
+{
+    if (F == WF_Q4_K || F == WF_Q5_K) {
+        // Bytes 8q .. 8q + 7 of the sub-block pair's 32: this sub-block's nibble of each (Q5_K:
+        // and bit `sub` of the same bytes of the high-bit plane). Both layouts keep these words
+        // aligned (see tm_sub32_t).
+        const uint4 h = *((device const uint4 *)sc);
+        const half d    = as_type<half>((ushort)(h.x & 0xFFFFu));
+        const half dmin = as_type<half>((ushort)(h.x >> 16));
+        uint s, m;
+        if (BLK_RUN_PROBE & 1u) { s = h.y & 63u; m = (h.z >> 8) & 63u; }
+        else { k_scale_min(sub, h.y, h.z, h.w, s, m); }
+        const float ds = float(d) * float(s), off = float(dmin) * float(m);
+        // Four values a word: one shift and one mask, then each byte read as a uchar (the
+        // fifth bit or'd into bit 4 of its byte), where a per-value shift cost two instructions.
+        const uint shift = (sub & 1u) * 4u;
+        const uint qoff = (F == WF_Q5_K ? 32u : 0u) + (sub >> 1) * 32u + 8u * q;
+        const uint2 p = *((device const uint2 *)(pay + qoff));
+        uint2 v = (p >> shift) & 0x0F0F0F0Fu;
+        if (F == WF_Q5_K) {
+            const uint2 hb = *((device const uint2 *)(pay + 8u * q));
+            v |= ((hb >> sub) & 0x01010101u) << 4;
+        }
+        const uchar4 a = as_type<uchar4>(v.x), b = as_type<uchar4>(v.y);
+        lo = float4(ds * float(a.x) - ((BLK_RUN_PROBE & 4u) ? 0.0f : off), ds * float(a.y) - ((BLK_RUN_PROBE & 4u) ? 0.0f : off),
+                    ds * float(a.z) - ((BLK_RUN_PROBE & 4u) ? 0.0f : off), ds * float(a.w) - ((BLK_RUN_PROBE & 4u) ? 0.0f : off));
+        hi = float4(ds * float(b.x) - ((BLK_RUN_PROBE & 4u) ? 0.0f : off), ds * float(b.y) - ((BLK_RUN_PROBE & 4u) ? 0.0f : off),
+                    ds * float(b.z) - ((BLK_RUN_PROBE & 4u) ? 0.0f : off), ds * float(b.w) - ((BLK_RUN_PROBE & 4u) ? 0.0f : off));
+        return;
+    }
+    if (F == WF_Q6_K) {
+        // The lane's eight values sit in one half of the sub-block, so they take one sub-scale.
+        const uint n = sub >> 2, c = sub & 3u;
+        const half d = as_type<half>((ushort)(sc[16] | (sc[17] << 8)));
+        device const char * s8 = (device const char *)sc + n * 8u;
+        const float ds = float(d) * float((int)((BLK_RUN_PROBE & 1u) ? s8[0] : s8[2u * c + (q >> 1)]));
+        const float cc = -32.0f * ds;
+        const uint shift = 2u * c, shift4 = (c >= 2u) ? 4u : 0u;
+        device const uchar * ql = pay + n * 64u + ((c & 1u) * 32u) + 8u * q;
+        device const uchar * qh = pay + 128u + n * 32u + 8u * q;
+        const uint2 lw = a16 ? *((device const uint2 *)ql) : tm_bytes8(ql);
+        const uint2 hw = a16 ? *((device const uint2 *)qh) : tm_bytes8(qh);
+        const uchar4 a = as_type<uchar4>(((lw.x >> shift4) & 0x0F0F0F0Fu)
+                                       | (((hw.x >> shift) & 0x03030303u) << 4));
+        const uchar4 b = as_type<uchar4>(((lw.y >> shift4) & 0x0F0F0F0Fu)
+                                       | (((hw.y >> shift) & 0x03030303u) << 4));
+        lo = float4(fma(ds, float(a.x), ((BLK_RUN_PROBE & 4u) ? 0.0f : cc)), fma(ds, float(a.y), ((BLK_RUN_PROBE & 4u) ? 0.0f : cc)),
+                    fma(ds, float(a.z), ((BLK_RUN_PROBE & 4u) ? 0.0f : cc)), fma(ds, float(a.w), ((BLK_RUN_PROBE & 4u) ? 0.0f : cc)));
+        hi = float4(fma(ds, float(b.x), ((BLK_RUN_PROBE & 4u) ? 0.0f : cc)), fma(ds, float(b.y), ((BLK_RUN_PROBE & 4u) ? 0.0f : cc)),
+                    fma(ds, float(b.z), ((BLK_RUN_PROBE & 4u) ? 0.0f : cc)), fma(ds, float(b.w), ((BLK_RUN_PROBE & 4u) ? 0.0f : cc)));
+        return;
+    }
+    if (F == WF_Q3_K) {
+        // The lane's one 6-bit field, is = n*8 + j*2 + (q >> 1), straight from the 12 packed bytes
+        // (ggml's layout): its low four bits are the low nibble of byte is (is < 8) or the high
+        // nibble of byte is - 8, its top two bits sit in byte 8 + (is & 3) at 2 * (is >> 2). The
+        // same integer tm_sub32_t gets by unpacking all sixteen fields.
+        const uint n = sub >> 2, j = sub & 3u;
+        device const ushort * sh = (device const ushort *)sc;
+        const half d = as_type<half>(sh[6]);
+        const uint is = n * 8u + j * 2u + (q >> 1);
+        int sv;
+        if (BLK_RUN_PROBE & 1u) {
+            sv = (int)((uint)sc[0] & 63u) - 32;
+        } else {
+            const uint lo4 = is < 8u ? ((uint)sc[is] & 0xFu) : ((uint)sc[is - 8u] >> 4);
+            const uint hi2 = ((uint)sc[8u + (is & 3u)] >> (2u * (is >> 2))) & 3u;
+            sv = (int)(lo4 | (hi2 << 4)) - 32;
+        }
+        const float dl = float(d) * float(sv);
+        const float c = -4.0f * dl;
+        const uint mb = n * 4u + j, shift = 2u * j;
+        device const uchar * hm = pay + 8u * q;
+        device const uchar * qs = pay + 32u + n * 32u + 8u * q;
+        const uint2 qw = a16 ? *((device const uint2 *)qs) : tm_bytes8(qs);
+        const uint2 mw = a16 ? *((device const uint2 *)hm) : tm_bytes8(hm);
+        const uchar4 a = as_type<uchar4>(((qw.x >> shift) & 0x03030303u)
+                                       | (((mw.x >> mb) & 0x01010101u) << 2));
+        const uchar4 b = as_type<uchar4>(((qw.y >> shift) & 0x03030303u)
+                                       | (((mw.y >> mb) & 0x01010101u) << 2));
+        lo = float4(fma(dl, float(a.x), ((BLK_RUN_PROBE & 4u) ? 0.0f : c)), fma(dl, float(a.y), ((BLK_RUN_PROBE & 4u) ? 0.0f : c)),
+                    fma(dl, float(a.z), ((BLK_RUN_PROBE & 4u) ? 0.0f : c)), fma(dl, float(a.w), ((BLK_RUN_PROBE & 4u) ? 0.0f : c)));
+        hi = float4(fma(dl, float(b.x), ((BLK_RUN_PROBE & 4u) ? 0.0f : c)), fma(dl, float(b.y), ((BLK_RUN_PROBE & 4u) ? 0.0f : c)),
+                    fma(dl, float(b.z), ((BLK_RUN_PROBE & 4u) ? 0.0f : c)), fma(dl, float(b.w), ((BLK_RUN_PROBE & 4u) ? 0.0f : c)));
+        return;
+    }
+    if (F == WF_Q2_K) {
+        const half d    = as_type<half>((ushort)(sc[16] | (sc[17] << 8)));
+        const half dmin = as_type<half>((ushort)(sc[18] | (sc[19] << 8)));
+        const uint shift = 2u * (sub & 3u);
+        const uint scb = (uint)sc[2u * sub + (q >> 1)];
+        const float dl = float(d)    * float(scb & 0xFu);
+        const float ml = float(dmin) * float(scb >> 4);
+        device const uchar * qb = pay + (sub >> 2) * 32u + 8u * q;
+        const uint2 w = a16 ? *((device const uint2 *)qb) : tm_bytes8(qb);
+        #pragma unroll
+        for (uint i = 0; i < 4u; ++i) {
+            lo[i] = dl * float((w.x >> (8u * i + shift)) & 3u) - ((BLK_RUN_PROBE & 4u) ? 0.0f : ml);
+            hi[i] = dl * float((w.y >> (8u * i + shift)) & 3u) - ((BLK_RUN_PROBE & 4u) ? 0.0f : ml);
+        }
+        return;
+    }
+    if (F == WF_IQ4_XS || F == WF_IQ4_NL) {
+        // Bytes 4q .. 4q + 3: values 4q + i in the low nibbles, 16 + 4q + i in the high ones.
+        float dl;
+        device const uchar * qb;
+        if (F == WF_IQ4_XS) {
+            // The 8-byte header as one word (d, scales_h, then scales_l, whose nibble 'sub' is
+            // this sub-block's low four bits), and the payload as one word below, in either
+            // layout: a row-major block is 136 bytes, so both stay aligned there too.
+            const uint2 h = *((device const uint2 *)sc);
+            const uint hx = h.x, hy = h.y;
+            const half d = as_type<half>((ushort)(hx & 0xFFFFu));
+            const uint sh = hx >> 16;
+            const uint ls = ((hy >> (4u * sub)) & 0xFu) | (((sh >> (2u * sub)) & 3u) << 4);
+            dl = float(d) * float((int)ls - 32);
+            qb = pay + sub * 16u + 4u * q;
+        } else {
+            dl = float(as_type<half>((ushort)(sc[0] | (sc[1] << 8))));
+            qb = pay + 4u * q;
+        }
+        const uint w = (a16 || F == WF_IQ4_XS)
+            ? *((device const uint *)qb)
+            : ((uint)qb[0] | ((uint)qb[1] << 8) | ((uint)qb[2] << 16) | ((uint)qb[3] << 24));
+        // One lookup per byte: its low nibble's level (value 4q + i) and its high nibble's (value
+        // 16 + 4q + i), as floats, so no convert per value either.
+        const uchar4 by = as_type<uchar4>(w);
+        const bool nolut = (BLK_RUN_PROBE & 2u) != 0u;
+        const float2 p0 = nolut ? float2(float(by.x & 15u), float(by.x >> 4)) : KVALUES_IQ4NL_PAIR[by.x];
+        const float2 p1 = nolut ? float2(float(by.y & 15u), float(by.y >> 4)) : KVALUES_IQ4NL_PAIR[by.y];
+        const float2 p2 = nolut ? float2(float(by.z & 15u), float(by.z >> 4)) : KVALUES_IQ4NL_PAIR[by.z];
+        const float2 p3 = nolut ? float2(float(by.w & 15u), float(by.w >> 4)) : KVALUES_IQ4NL_PAIR[by.w];
+        lo = float4(dl * p0.x, dl * p1.x, dl * p2.x, dl * p3.x);
+        hi = float4(dl * p0.y, dl * p1.y, dl * p2.y, dl * p3.y);
+        return;
+    }
+    if (F == WF_Q4_1 || F == WF_Q5_1) {
+        const float d = float(as_type<half>((ushort)(sc[0] | (sc[1] << 8))));
+        const float m = float(as_type<half>((ushort)(sc[2] | (sc[3] << 8))));
+        const bool q5 = F == WF_Q5_1;
+        const uint qh = q5 ? ((uint)pay[0] | ((uint)pay[1] << 8) | ((uint)pay[2] << 16)
+                              | ((uint)pay[3] << 24)) : 0u;
+        device const uchar * qb = pay + (q5 ? 4u : 0u) + 4u * q;
+        #pragma unroll
+        for (uint i = 0; i < 4u; ++i) {
+            const uint j = 4u * q + i;
+            const uint x0 = ((uint)qb[i] & 0xFu) | (((qh >> j) & 1u) << 4);
+            const uint x1 = ((uint)qb[i] >> 4)   | (((qh >> (j + 16u)) & 1u) << 4);
+            lo[i] = fma(d, float(x0), m);
+            hi[i] = fma(d, float(x1), m);
+        }
+        return;
+    }
+    if (F == WF_Q4_0) {
+        const float d = float(as_type<half>((ushort)(sc[0] | (sc[1] << 8))));
+        device const uchar * qb = pay + 4u * q;
+        #pragma unroll
+        for (uint i = 0; i < 4u; ++i) {
+            const int x0 = (int)((uint)qb[i] & 0xFu) - 8;
+            const int x1 = (int)((uint)qb[i] >> 4) - 8;
+            lo[i] = d * float(x0);
+            hi[i] = d * float(x1);
+        }
+        return;
+    }
+    if (F == WF_Q5_0) {
+        const float d = float(as_type<half>((ushort)(sc[0] | (sc[1] << 8))));
+        const uint qh = (uint)pay[0] | ((uint)pay[1] << 8) | ((uint)pay[2] << 16)
+                      | ((uint)pay[3] << 24);
+        device const uchar * qb = pay + 4u + 4u * q;
+        #pragma unroll
+        for (uint i = 0; i < 4u; ++i) {
+            const uint j = 4u * q + i;
+            const int x0 = (int)(((uint)qb[i] & 0xFu) | (((qh >> j) & 1u) << 4)) - 16;
+            const int x1 = (int)(((uint)qb[i] >> 4)   | (((qh >> (j + 16u)) & 1u) << 4)) - 16;
+            lo[i] = d * float(x0);
+            hi[i] = d * float(x1);
+        }
+        return;
+    }
+    if (F == WF_IQ3_S) {
+        // Values 8q .. 8q + 7 are grid entries 2q and 2q + 1: tm_sub32_t's iteration l = q.
+        const half d = as_type<half>((ushort)(sc[0] | (sc[1] << 8)));
+        const uint scb = (uint)sc[2u + (sub >> 1)];
+        const uint s6 = (sub & 1u) != 0u ? (scb >> 4) : (scb & 0xFu);
+        const float db = float(d) * (1.0f + 2.0f * float(s6));
+        device const uchar * qs = pay + sub * 8u;
+        const uint qhb = (uint)pay[64u + sub];
+        const uint i1 = (uint)qs[2u * q]      | ((qhb << (8u - 2u * q)) & 256u);
+        const uint i2 = (uint)qs[2u * q + 1u] | ((qhb << (7u - 2u * q)) & 256u);
+        const uint g1 = (BLK_RUN_PROBE & 2u) ? (i1 * 0x01010101u) : IQ3S_GRID[i1];
+        const uint g2 = (BLK_RUN_PROBE & 2u) ? (i2 * 0x01010101u) : IQ3S_GRID[i2];
+        const uint sgn = (uint)pay[72u + sub * 4u + q];
+        #pragma unroll
+        for (uint j = 0; j < 4u; ++j) {
+            const float v1 = float((g1 >> (8u * j)) & 0xFFu);
+            const float v2 = float((g2 >> (8u * j)) & 0xFFu);
+            lo[j] = (sgn & (1u << j))        ? -db * v1 : db * v1;
+            hi[j] = (sgn & (1u << (j + 4u))) ? -db * v2 : db * v2;
+        }
+        return;
+    }
+    if (F == WF_IQ2_XXS || F == WF_IQ2_XS || F == WF_IQ2_S) {
+        // Values 8q .. 8q + 7 are one grid entry: tm_sub32_t's iteration l = q.
+        const half d = as_type<half>((ushort)(sc[0] | (sc[1] << 8)));
+        float dl;
+        ulong gg;
+        uint sgn;
+        if (F == WF_IQ2_XXS) {
+            device const uchar * qb = pay + sub * 8u;
+            const uint w1 = (uint)qb[4] | ((uint)qb[5] << 8) | ((uint)qb[6] << 16)
+                          | ((uint)qb[7] << 24);
+            dl = float(d) * (0.5f + float(w1 >> 28)) * 0.25f;
+            gg = (BLK_RUN_PROBE & 2u) ? ((ulong)qb[q] * 0x0101010101010101ul) : IQ2XXS_GRID[(uint)qb[q]];
+            sgn = (uint)ksign_iq((uchar)((w1 >> (7u * q)) & 127u));
+        } else if (F == WF_IQ2_XS) {
+            const uint scb = (uint)sc[2u + sub];
+            const uint nib = (q >> 1) != 0u ? (scb >> 4) : (scb & 0xFu);
+            dl = float(d) * (0.5f + float(nib)) * 0.25f;
+            device const uchar * qb = pay + sub * 8u;
+            const uint w = (uint)qb[2u * q] | ((uint)qb[2u * q + 1u] << 8);
+            gg = (BLK_RUN_PROBE & 2u) ? ((ulong)(w & 511u) * 0x0101010101010101ul) : IQ2XS_GRID[w & 511u];
+            sgn = (uint)ksign_iq((uchar)(w >> 9));
+        } else {
+            const uint qh  = (uint)sc[2u + sub];
+            const uint scb = (uint)sc[10u + sub];
+            const uint nib = (q >> 1) != 0u ? (scb >> 4) : (scb & 0xFu);
+            dl = float(d) * (0.5f + float(nib)) * 0.25f;
+            const uint gi = (uint)pay[sub * 4u + q] | ((qh << (8u - 2u * q)) & 0x300u);
+            gg = (BLK_RUN_PROBE & 2u) ? ((ulong)gi * 0x0101010101010101ul) : IQ2S_GRID[gi];
+            sgn = (uint)pay[32u + sub * 4u + q];
+        }
+        const uint g0 = (uint)gg, g1 = (uint)(gg >> 32);
+        #pragma unroll
+        for (uint j = 0; j < 4u; ++j) {
+            const float v0 = dl * float((g0 >> (8u * j)) & 0xFFu);
+            const float v1 = dl * float((g1 >> (8u * j)) & 0xFFu);
+            lo[j] = (sgn & (1u << j))        ? -v0 : v0;
+            hi[j] = (sgn & (1u << (j + 4u))) ? -v1 : v1;
+        }
+        return;
+    }
+    if (F == WF_IQ3_XXS) {
+        const half d = as_type<half>((ushort)(sc[0] | (sc[1] << 8)));
+        device const uchar * w = sc + 2u + sub * 4u;
+        const uint aux = (uint)w[0] | ((uint)w[1] << 8) | ((uint)w[2] << 16) | ((uint)w[3] << 24);
+        const float db = float(d) * (0.5f + float(aux >> 28)) * 0.5f;
+        const uint sgn = (uint)ksign_iq((uchar)((aux >> (7u * q)) & 127u));
+        device const uchar * qs = pay + sub * 8u;
+        const uint j1 = (uint)qs[2u * q], j2 = (uint)qs[2u * q + 1u];
+        const uint g1 = (BLK_RUN_PROBE & 2u) ? (j1 * 0x01010101u) : IQ3XXS_GRID[j1];
+        const uint g2 = (BLK_RUN_PROBE & 2u) ? (j2 * 0x01010101u) : IQ3XXS_GRID[j2];
+        #pragma unroll
+        for (uint j = 0; j < 4u; ++j) {
+            const float v1 = db * float((g1 >> (8u * j)) & 0xFFu);
+            const float v2 = db * float((g2 >> (8u * j)) & 0xFFu);
+            lo[j] = (sgn & (1u << j))        ? -v1 : v1;
+            hi[j] = (sgn & (1u << (j + 4u))) ? -v2 : v2;
+        }
+        return;
+    }
+    if (F == WF_IQ1_S || F == WF_IQ1_M) {
+        float dl, delta;
+        uint g;
+        if (F == WF_IQ1_S) {
+            const float d = float(as_type<half>((ushort)(sc[0] | (sc[1] << 8))));
+            const uint qh = (uint)pay[32u + 2u * sub] | ((uint)pay[33u + 2u * sub] << 8);
+            dl = d * float(2u * ((qh >> 12) & 7u) + 1u);
+            delta = (qh & 0x8000u) != 0u ? -0.125f : 0.125f;
+            g = (uint)IQ1S_GRID[(uint)pay[sub * 4u + q] | (((qh >> (3u * q)) & 7u) << 8)];
+        } else {
+            const uint s0 = (uint)sc[0] | ((uint)sc[1] << 8), s1 = (uint)sc[2] | ((uint)sc[3] << 8);
+            const uint s2 = (uint)sc[4] | ((uint)sc[5] << 8), s3 = (uint)sc[6] | ((uint)sc[7] << 8);
+            const float d = float(as_type<half>((ushort)((s0 >> 12) | ((s1 >> 8) & 0x00F0u)
+                                                        | ((s2 >> 4) & 0x0F00u) | (s3 & 0xF000u))));
+            const uint sw = (uint)sc[2u * (sub >> 1)] | ((uint)sc[2u * (sub >> 1) + 1u] << 8);
+            const uint sh = 6u * (sub & 1u);
+            dl = q < 2u ? d * float(2u * ((sw >> sh) & 7u) + 1u)
+                        : d * float(2u * ((sw >> (sh + 3u)) & 7u) + 1u);
+            const uint hb = (uint)pay[32u + sub * 2u + (q >> 1)] >> (4u * (q & 1u));
+            g = (uint)IQ1S_GRID[(uint)pay[sub * 4u + q] | ((hb & 7u) << 8)];
+            delta = (hb & 8u) != 0u ? -0.125f : 0.125f;
+        }
+        #pragma unroll
+        for (uint j = 0; j < 4u; ++j) {
+            lo[j] = dl * (float((g >> (2u * j)) & 3u) - 1.0f + delta);
+            hi[j] = dl * (float((g >> (2u * (j + 4u))) & 3u) - 1.0f + delta);
+        }
+        return;
+    }
+    lo = float4(0.0f);
+    hi = float4(0.0f);
+}
+
+// THE PAIR FETCH (Q4_K, Q5_K): sub-blocks 2i and 2i+1 keep their codes in the low and the high
+// nibble of the same bytes (and Q5_K their fifth bits in the same plane bytes) under one header,
+// so one load of each serves both sub-blocks. `sub0` is the even sub-block; each value is the
+// float tm_run8_t gives it (tests/brick_rows.rs).
+template <uint F>
+inline bool tm_run_pairs_t() { return F == WF_Q4_K || F == WF_Q5_K; }
+template <uint F>
+inline void tm_run8_pair_t(device const uchar * sc, device const uchar * pay, uint sub0, uint q,
+                           thread float4 & lo0, thread float4 & hi0,
+                           thread float4 & lo1, thread float4 & hi1)
+{
+    if (F == WF_Q4_K || F == WF_Q5_K) {
+        const uint4 h = *((device const uint4 *)sc);
+        const half d    = as_type<half>((ushort)(h.x & 0xFFFFu));
+        const half dmin = as_type<half>((ushort)(h.x >> 16));
+        uint s0, m0, s1, m1;
+        if (BLK_RUN_PROBE & 1u) {
+            s0 = h.y & 63u; m0 = (h.z >> 8) & 63u; s1 = (h.y >> 8) & 63u; m1 = h.z & 63u;
+        } else {
+            k_scale_min(sub0, h.y, h.z, h.w, s0, m0);
+            k_scale_min(sub0 + 1u, h.y, h.z, h.w, s1, m1);
+        }
+        const float ds0 = float(d) * float(s0), off0 = float(dmin) * float(m0);
+        const float ds1 = float(d) * float(s1), off1 = float(dmin) * float(m1);
+        const uint qoff = (F == WF_Q5_K ? 32u : 0u) + (sub0 >> 1) * 32u + 8u * q;
+        const uint2 p = *((device const uint2 *)(pay + qoff));
+        uint2 v0 = p & 0x0F0F0F0Fu, v1 = (p >> 4u) & 0x0F0F0F0Fu;
+        if (F == WF_Q5_K) {
+            const uint2 hb = *((device const uint2 *)(pay + 8u * q));
+            v0 |= ((hb >> sub0) & 0x01010101u) << 4;
+            v1 |= ((hb >> (sub0 + 1u)) & 0x01010101u) << 4;
+        }
+        const uchar4 a0 = as_type<uchar4>(v0.x), b0 = as_type<uchar4>(v0.y);
+        const uchar4 a1 = as_type<uchar4>(v1.x), b1 = as_type<uchar4>(v1.y);
+        lo0 = float4(ds0 * float(a0.x) - off0, ds0 * float(a0.y) - off0,
+                     ds0 * float(a0.z) - off0, ds0 * float(a0.w) - off0);
+        hi0 = float4(ds0 * float(b0.x) - off0, ds0 * float(b0.y) - off0,
+                     ds0 * float(b0.z) - off0, ds0 * float(b0.w) - off0);
+        lo1 = float4(ds1 * float(a1.x) - off1, ds1 * float(a1.y) - off1,
+                     ds1 * float(a1.z) - off1, ds1 * float(a1.w) - off1);
+        hi1 = float4(ds1 * float(b1.x) - off1, ds1 * float(b1.y) - off1,
+                     ds1 * float(b1.z) - off1, ds1 * float(b1.w) - off1);
+        return;
+    }
+    lo0 = hi0 = lo1 = hi1 = float4(0.0f);
+}
+
+// THE QUAD SCALES (Q4_K, Q5_K, Q3_K): the four sub-block scales of one HALF-BLOCK, unpacked
+// once with word-wide masks instead of once per run. Sub-blocks 4i .. 4i + 3 are always the low
+// or the high half of a k-quant block, and each half's six-bit fields lie in one byte position of
+// the header words, so four scales (and four mins) come out of two masks. Every value is the
+// float the per-run unpack gives it: the same integer, the same multiply.
+template <uint F>
+inline bool tm_run_quads_t() { return F == WF_Q4_K || F == WF_Q5_K || F == WF_Q3_K; }
+template <uint F>
+inline void tm_quad_scales_t(device const uchar * sc, uint sub0, uint q,
+                             thread float4 & a, thread float4 & b)
+{
+    if (F == WF_Q4_K || F == WF_Q5_K) {
+        // a = d * scale, b = dmin * min, for sub-blocks sub0 .. sub0 + 3.
+        const uint4 h = *((device const uint4 *)sc);
+        const half d    = as_type<half>((ushort)(h.x & 0xFFFFu));
+        const half dmin = as_type<half>((ushort)(h.x >> 16));
+        uint sw, mw;
+        if (sub0 < 4u) {
+            sw = h.y & 0x3F3F3F3Fu;
+            mw = h.z & 0x3F3F3F3Fu;
+        } else {
+            sw = (h.w & 0x0F0F0F0Fu) | (((h.y >> 6) & 0x03030303u) << 4);
+            mw = ((h.w >> 4) & 0x0F0F0F0Fu) | (((h.z >> 6) & 0x03030303u) << 4);
+        }
+        const uchar4 sb = as_type<uchar4>(sw), mb = as_type<uchar4>(mw);
+        a = float4(float(d) * float(sb.x), float(d) * float(sb.y),
+                   float(d) * float(sb.z), float(d) * float(sb.w));
+        b = float4(float(dmin) * float(mb.x), float(dmin) * float(mb.y),
+                   float(dmin) * float(mb.z), float(dmin) * float(mb.w));
+        return;
+    }
+    if (F == WF_Q3_K) {
+        // a = d * (field - 32) for the lane's own six-bit field of each sub-block, b its -4x
+        // companion (the 2-bit codes are biased by 4). The two bytes holding the top bits are
+        // the same for j and j + 2, so the loads fold.
+        device const ushort * sh = (device const ushort *)sc;
+        const float d = float(as_type<half>(sh[6]));
+        const uint n = sub0 >> 2, hq = q >> 1;
+        #pragma unroll
+        for (uint j = 0; j < 4u; ++j) {
+            const uint is = n * 8u + 2u * j + hq;
+            const uint lo4 = is < 8u ? ((uint)sc[is] & 0xFu) : ((uint)sc[is - 8u] >> 4);
+            const uint hi2 = ((uint)sc[8u + (is & 3u)] >> (2u * (is >> 2))) & 3u;
+            a[j] = d * float((int)(lo4 | (hi2 << 4)) - 32);
+        }
+        b = -4.0f * a;
+        return;
+    }
+    a = float4(0.0f);
+    b = float4(0.0f);
+}
+
+// The pair fetch with the quad's scales (Q4_K, Q5_K): `i` is the pair's first sub-block inside the
+// half-block, so the scales are a[i], b[i] and a[i + 1], b[i + 1].
+template <uint F>
+inline void tm_run8_pair_q_t(float4 a, float4 b, uint i, device const uchar * pay, uint sub0,
+                             uint q, thread float4 & lo0, thread float4 & hi0,
+                             thread float4 & lo1, thread float4 & hi1)
+{
+    if (F == WF_Q4_K || F == WF_Q5_K) {
+        const uint qoff = (F == WF_Q5_K ? 32u : 0u) + (sub0 >> 1) * 32u + 8u * q;
+        const uint2 p = *((device const uint2 *)(pay + qoff));
+        uint2 v0 = p & 0x0F0F0F0Fu, v1 = (p >> 4u) & 0x0F0F0F0Fu;
+        if (F == WF_Q5_K) {
+            const uint2 hb = *((device const uint2 *)(pay + 8u * q));
+            v0 |= ((hb >> sub0) & 0x01010101u) << 4;
+            v1 |= ((hb >> (sub0 + 1u)) & 0x01010101u) << 4;
+        }
+        const uchar4 a0 = as_type<uchar4>(v0.x), b0 = as_type<uchar4>(v0.y);
+        const uchar4 a1 = as_type<uchar4>(v1.x), b1 = as_type<uchar4>(v1.y);
+        const float ds0 = a[i], off0 = b[i], ds1 = a[i + 1u], off1 = b[i + 1u];
+        lo0 = float4(ds0 * float(a0.x) - off0, ds0 * float(a0.y) - off0,
+                     ds0 * float(a0.z) - off0, ds0 * float(a0.w) - off0);
+        hi0 = float4(ds0 * float(b0.x) - off0, ds0 * float(b0.y) - off0,
+                     ds0 * float(b0.z) - off0, ds0 * float(b0.w) - off0);
+        lo1 = float4(ds1 * float(a1.x) - off1, ds1 * float(a1.y) - off1,
+                     ds1 * float(a1.z) - off1, ds1 * float(a1.w) - off1);
+        hi1 = float4(ds1 * float(b1.x) - off1, ds1 * float(b1.y) - off1,
+                     ds1 * float(b1.z) - off1, ds1 * float(b1.w) - off1);
+        return;
+    }
+    lo0 = hi0 = lo1 = hi1 = float4(0.0f);
+}
+
+// The run fetch with the quad's scales (Q3_K): `i` is the sub-block inside the half-block.
+template <uint F>
+inline void tm_run8_q_t(float4 a, float4 b, uint i, device const uchar * pay, uint sub, uint q,
+                        bool a16, thread float4 & lo, thread float4 & hi)
+{
+    if (F == WF_Q3_K) {
+        const uint n = sub >> 2, j = sub & 3u;
+        const float dl = a[i], c = b[i];
+        const uint mb = n * 4u + j, shift = 2u * j;
+        device const uchar * hm = pay + 8u * q;
+        device const uchar * qs = pay + 32u + n * 32u + 8u * q;
+        const uint2 qw = a16 ? *((device const uint2 *)qs) : tm_bytes8(qs);
+        const uint2 mw = a16 ? *((device const uint2 *)hm) : tm_bytes8(hm);
+        const uchar4 av = as_type<uchar4>(((qw.x >> shift) & 0x03030303u)
+                                        | (((mw.x >> mb) & 0x01010101u) << 2));
+        const uchar4 bv = as_type<uchar4>(((qw.y >> shift) & 0x03030303u)
+                                        | (((mw.y >> mb) & 0x01010101u) << 2));
+        lo = float4(fma(dl, float(av.x), c), fma(dl, float(av.y), c),
+                    fma(dl, float(av.z), c), fma(dl, float(av.w), c));
+        hi = float4(fma(dl, float(bv.x), c), fma(dl, float(bv.y), c),
+                    fma(dl, float(bv.z), c), fma(dl, float(bv.w), c));
+        return;
+    }
+    lo = float4(0.0f);
+    hi = float4(0.0f);
+}
+
 // Geometry of the tile-major unit for format F, mirroring TmRule. Sub-blocks per block is
 // block_elems / 32, so a legacy format is one and a super-block is eight.
 template <uint F>
 inline uint tm_block_elems_t() {
-    return (F == WF_IQ4_NL || F == WF_Q4_1 || F == WF_Q5_0 || F == WF_Q5_1) ? 32u : 256u;
+    return (F == WF_IQ4_NL || F == WF_Q4_0 || F == WF_Q4_1 || F == WF_Q5_0 || F == WF_Q5_1)
+        ? 32u : 256u;
 }
 template <uint F>
 inline uint tm_block_bytes_t() {
@@ -1834,6 +2611,7 @@ inline uint tm_block_bytes_t() {
     if (F == WF_Q2_K)    { return 84u; }
     if (F == WF_IQ1_S)   { return 50u; }
     if (F == WF_IQ1_M)   { return 56u; }
+    if (F == WF_Q4_0)    { return 18u; }
     if (F == WF_Q4_1)    { return 20u; }
     if (F == WF_Q5_0)    { return 22u; }
     if (F == WF_Q5_1)    { return 24u; }
@@ -1864,7 +2642,7 @@ inline uint tm_scale_bytes_t() {
     if (F == WF_Q2_K)    { return 20u; }        // scales[16] + d + dmin
     if (F == WF_IQ1_M)   { return 8u; }         // the four scale words; d in their top nibbles
     if (F == WF_Q4_1 || F == WF_Q5_1) { return 4u; }   // d, m
-    return 2u;                                     // d alone: IQ4_NL, Q5_0, IQ1_S
+    return 2u;                                     // d alone: IQ4_NL, Q4_0, Q5_0, IQ1_S
 }
 
 // THE FORMAT LIST, written once. Every brick above is a template over the format, so its
@@ -1899,6 +2677,7 @@ inline uint tm_scale_bytes_t() {
     case WF_IQ2_XS:  { constexpr uint FMT = WF_IQ2_XS;  __VA_ARGS__ }                 \
     case WF_IQ2_XXS: { constexpr uint FMT = WF_IQ2_XXS; __VA_ARGS__ }                 \
     case WF_IQ2_S:   { constexpr uint FMT = WF_IQ2_S;   __VA_ARGS__ }                 \
+    case WF_Q4_0:    { constexpr uint FMT = WF_Q4_0;    __VA_ARGS__ }                 \
     case WF_Q4_1:    { constexpr uint FMT = WF_Q4_1;    __VA_ARGS__ }                 \
     case WF_Q5_0:    { constexpr uint FMT = WF_Q5_0;    __VA_ARGS__ }                 \
     case WF_Q5_1:    { constexpr uint FMT = WF_Q5_1;    __VA_ARGS__ }                 \
@@ -1916,8 +2695,34 @@ inline uint tm_block_elems_fmt(uint f)   { TM_BY_FORMAT(f, return tm_block_elems
 inline uint tm_block_bytes_fmt(uint f)   { TM_BY_FORMAT(f, return tm_block_bytes_t<FMT>();) }
 inline uint tm_scale_src_off_fmt(uint f) { TM_BY_FORMAT(f, return tm_scale_src_off_t<FMT>();) }
 inline uint tm_scale_bytes_fmt(uint f)   { TM_BY_FORMAT(f, return tm_scale_bytes_t<FMT>();) }
+inline uint tm_run_order_fmt(uint f)     { TM_BY_FORMAT(f, return tm_run_order_t<FMT>();) }
+inline bool tm_run_pairs_fmt(uint f)     { TM_BY_FORMAT(f, return tm_run_pairs_t<FMT>();) }
+inline bool tm_run_quads_fmt(uint f)     { TM_BY_FORMAT(f, return tm_run_quads_t<FMT>();) }
+inline void tm_quad_scales_fmt(uint f, device const uchar * sc, uint sub0, uint q,
+                               thread float4 & a, thread float4 & b) {
+    TM_BY_FORMAT(f, tm_quad_scales_t<FMT>(sc, sub0, q, a, b); return;)
+}
+inline void tm_run8_pair_q_fmt(uint f, float4 a, float4 b, uint i, device const uchar * pay,
+                               uint sub0, uint q, thread float4 & lo0, thread float4 & hi0,
+                               thread float4 & lo1, thread float4 & hi1) {
+    TM_BY_FORMAT(f, tm_run8_pair_q_t<FMT>(a, b, i, pay, sub0, q, lo0, hi0, lo1, hi1); return;)
+}
+inline void tm_run8_q_fmt(uint f, float4 a, float4 b, uint i, device const uchar * pay, uint sub,
+                          uint q, bool a16, thread float4 & lo, thread float4 & hi) {
+    TM_BY_FORMAT(f, tm_run8_q_t<FMT>(a, b, i, pay, sub, q, a16, lo, hi); return;)
+}
+inline void tm_run8_pair_fmt(uint f, device const uchar * sc, device const uchar * pay, uint sub0,
+                             uint q, thread float4 & lo0, thread float4 & hi0,
+                             thread float4 & lo1, thread float4 & hi1) {
+    TM_BY_FORMAT(f, tm_run8_pair_t<FMT>(sc, pay, sub0, q, lo0, hi0, lo1, hi1); return;)
+}
+inline void tm_run8_fmt(uint f, device const uchar * sc, device const uchar * pay, uint sub, uint q,
+                        bool a16, thread float4 & lo, thread float4 & hi) {
+    TM_BY_FORMAT(f, tm_run8_t<FMT>(sc, pay, sub, q, a16, lo, hi); return;)
+}
 
 // The pipeline's own format: what every existing caller compiles to.
+
 // `a16`: the caller's payload pointers sit on 16-byte boundaries. A TILE-MAJOR unit
 // guarantees it when the format's payload per block is a multiple of 16 -- every format
 // but Q5_0 and Q5_1, whose 20-byte payload rows the tile-major callers flag all the same,
@@ -1931,8 +2736,49 @@ inline uint tm_block_elems()   { return tm_block_elems_fmt(WFMT); }
 inline uint tm_block_bytes()   { return tm_block_bytes_fmt(WFMT); }
 inline uint tm_scale_src_off() { return tm_scale_src_off_fmt(WFMT); }
 inline uint tm_scale_bytes()   { return tm_scale_bytes_fmt(WFMT); }
+inline uint tm_run_order()     { return tm_run_order_fmt(WFMT); }
+inline bool tm_run_pairs()     { return tm_run_pairs_fmt(WFMT); }
+inline bool tm_run_quads()     { return tm_run_quads_fmt(WFMT); }
+inline void tm_quad_scales(device const uchar * sc, uint sub0, uint q,
+                           thread float4 & a, thread float4 & b) {
+    tm_quad_scales_fmt(WFMT, sc, sub0, q, a, b);
+}
+inline void tm_run8_pair_q(float4 a, float4 b, uint i, device const uchar * pay, uint sub0,
+                           uint q, thread float4 & lo0, thread float4 & hi0,
+                           thread float4 & lo1, thread float4 & hi1) {
+    tm_run8_pair_q_fmt(WFMT, a, b, i, pay, sub0, q, lo0, hi0, lo1, hi1);
+}
+inline void tm_run8_q(float4 a, float4 b, uint i, device const uchar * pay, uint sub, uint q,
+                      bool a16, thread float4 & lo, thread float4 & hi) {
+    tm_run8_q_fmt(WFMT, a, b, i, pay, sub, q, a16, lo, hi);
+}
+inline void tm_run8_pair(device const uchar * sc, device const uchar * pay, uint sub0, uint q,
+                         thread float4 & lo0, thread float4 & hi0,
+                         thread float4 & lo1, thread float4 & hi1) {
+    tm_run8_pair_fmt(WFMT, sc, pay, sub0, q, lo0, hi0, lo1, hi1);
+}
+inline void tm_run8(device const uchar * sc, device const uchar * pay, uint sub, uint q, bool a16,
+                    thread float4 & lo, thread float4 & hi) {
+    tm_run8_fmt(WFMT, sc, pay, sub, q, a16, lo, hi);
+}
 
 constant bool BLK_PROBE_HALF [[function_constant(24)]];
+// The probe's other outputs: BLK_PROBE_RUN assembles each sub-block from the run fetch
+// (`tm_run8`, all four column pairs, each value put back at its k), so a test can require it to
+// equal `tm_sub32`'s floats bit for bit; BLK_PROBE_A16 hands both bricks the aligned flag the
+// tile-major kernels pass (the probe's runs keep every payload on the alignment a unit gives it).
+constant bool BLK_PROBE_RUN_FC [[function_constant(41)]];
+constant bool BLK_PROBE_RUN = is_function_constant_defined(BLK_PROBE_RUN_FC) && BLK_PROBE_RUN_FC;
+constant bool BLK_PROBE_A16_FC [[function_constant(42)]];
+constant bool BLK_PROBE_A16 = is_function_constant_defined(BLK_PROBE_A16_FC) && BLK_PROBE_A16_FC;
+// With BLK_PROBE_RUN, the pair fetch (tm_run8_pair) where the format has one: each sub-block's
+// values come from the pair call on its even sub-block.
+constant bool BLK_PROBE_PAIR_FC [[function_constant(48)]];
+constant bool BLK_PROBE_PAIR = is_function_constant_defined(BLK_PROBE_PAIR_FC) && BLK_PROBE_PAIR_FC;
+// With BLK_PROBE_RUN, the half-block fetch (tm_quad_scales with tm_run8_pair_q / tm_run8_q) where
+// the format has one: each sub-block's values come from its half-block's scales.
+constant bool BLK_PROBE_QUAD_FC [[function_constant(52)]];
+constant bool BLK_PROBE_QUAD = is_function_constant_defined(BLK_PROBE_QUAD_FC) && BLK_PROBE_QUAD_FC;
 
 // THE BRICK'S GATE. Decodes a ROW-MAJOR block row through `tm_sub32` -- the same brick the
 // prefill GEMM, the decode GEMV and the row gather call -- so a test can diff it against
@@ -1960,13 +2806,43 @@ kernel void imparo_blk_decode_probe(
     const uint sc_bytes = tm_scale_bytes();
     device const uchar * sc = scales + blk * sc_bytes;
     device const uchar * pay = payload + blk * (tm_block_bytes() - sc_bytes);
-    if (BLK_PROBE_HALF) {
+    if (BLK_PROBE_RUN) {
+        const bool o1 = tm_run_order() == 1u;
+        for (uint q = 0; q < 4u; ++q) {
+            float4 lo, hi;
+            if (BLK_PROBE_QUAD && tm_run_quads()) {
+                // The sub-block's half-block: scales for sub0 .. sub0 + 3, then its own values.
+                const uint sub0 = sub & ~3u, i = sub & 3u;
+                float4 a, b;
+                tm_quad_scales(sc, sub0, q, a, b);
+                if (tm_run_pairs()) {
+                    float4 lo0, hi0, lo1, hi1;
+                    tm_run8_pair_q(a, b, i & ~1u, pay, sub & ~1u, q, lo0, hi0, lo1, hi1);
+                    lo = (sub & 1u) != 0u ? lo1 : lo0;
+                    hi = (sub & 1u) != 0u ? hi1 : hi0;
+                } else {
+                    tm_run8_q(a, b, i, pay, sub, q, BLK_PROBE_A16, lo, hi);
+                }
+            } else if (BLK_PROBE_PAIR && tm_run_pairs()) {
+                float4 lo0, hi0, lo1, hi1;
+                tm_run8_pair(sc, pay, sub & ~1u, q, lo0, hi0, lo1, hi1);
+                lo = (sub & 1u) != 0u ? lo1 : lo0;
+                hi = (sub & 1u) != 0u ? hi1 : hi0;
+            } else {
+                tm_run8(sc, pay, sub, q, BLK_PROBE_A16, lo, hi);
+            }
+            for (uint f = 0; f < 4u; ++f) {
+                out[sb * 32u + (o1 ? 4u * q + f : 8u * q + f)] = lo[f];
+                out[sb * 32u + (o1 ? 16u + 4u * q + f : 8u * q + 4u + f)] = hi[f];
+            }
+        }
+    } else if (BLK_PROBE_HALF) {
         half v[32];
-        tm_sub32(sc, pay, sub, v, false);
+        tm_sub32(sc, pay, sub, v, BLK_PROBE_A16);
         for (uint l = 0; l < 32u; ++l) { out[sb * 32u + l] = float(v[l]); }
     } else {
         float v[32];
-        tm_sub32(sc, pay, sub, v, false);
+        tm_sub32(sc, pay, sub, v, BLK_PROBE_A16);
         for (uint l = 0; l < 32u; ++l) { out[sb * 32u + l] = v[l]; }
     }
 }
@@ -2434,9 +3310,19 @@ static void rt_gemm(
     // (byteshape's IQ4_XS-4.40bpw: IQ4_XS, Q5_K, Q6_K, IQ3_XXS on them) sends n_out = 48
     // here, and the unguarded tile wrote columns 48..63 of every token into the next
     // token's row -- one prompt token agreed with the CPU backend, two or more did not
-    // (docs/evidence/bracket/2026-09-11-27b-dequant-tables.md). A tile-major n_out is a
-    // multiple of 8 (the unit), so an 8x8 tile is whole or absent: skip the absent ones.
-    // The full-tile case keeps the unconditional loop (the same code as before).
+    // (docs/evidence/bracket/2026-09-11-27b-dequant-tables.md). So the absent 8x8 blocks are
+    // skipped. The full-tile case keeps the unconditional loop (the same code as before).
+    //
+    // AN 8x8 BLOCK CAN STRADDLE n_out TOO, when n_out is not a multiple of 8 (a tile-major
+    // n_out always is; a Q4_0 or Q8_0 row-major one need not be). Stored whole, its columns
+    // past n_out are the next token's first outputs, written with zeros (dead rows stage zero
+    // weights) in a race with the row tile that owns them, and the last token's run past the
+    // buffer: Q4_0 at n_out 4097 wrote 7 floats past an 8-row output and changed the first
+    // outputs of a random row in 2 of 5 identical runs. Each lane of that block stores its
+    // own two elements, stopping at n_out -- in the RT_EDGE8 variant only, which the host
+    // builds for such an n_out. Compiled into every pipeline, the straddle store never ran on
+    // E4B (its n_out are multiples of 64) and still cost its prefill 16%: 1042 -> 876 tok/s
+    // at 5643 tokens, in either form (per lane, or through the staging tile).
     //
     // Tokens can straddle, so the caller rounds the activation buffers up to a whole token
     // tile; rows past the token count receive values nothing reads.
@@ -2448,9 +3334,9 @@ static void rt_gemm(
             for (uint i = 0; i < NA; ++i) {
                 #pragma unroll
                 for (uint j = 0; j < NB; ++j) {
-                    simdgroup_store(mc[i * NB + j],
-                                    y + (ulong)(t0 + ty + i * 8u) * n_out + r0 + rx + j * 8u,
-                                    n_out);
+                    device float * yp = y + (ulong)(t0 + ty + i * 8u) * n_out + r0 + rx + j * 8u;
+                    if (RT_RESID) { rt_resid_add(mc[i * NB + j], yp, n_out); }
+                    simdgroup_store(mc[i * NB + j], yp, n_out);
                 }
             }
             return;
@@ -2459,10 +3345,24 @@ static void rt_gemm(
         for (uint i = 0; i < NA; ++i) {
             #pragma unroll
             for (uint j = 0; j < NB; ++j) {
-                if (rx + j * 8u < nrow) {
-                    simdgroup_store(mc[i * NB + j],
-                                    y + (ulong)(t0 + ty + i * 8u) * n_out + r0 + rx + j * 8u,
-                                    n_out);
+                const uint c0 = rx + j * 8u;
+                if (!RT_EDGE8 || c0 + 8u <= nrow) {
+                    if (c0 < nrow) {
+                        device float * yp = y + (ulong)(t0 + ty + i * 8u) * n_out + r0 + c0;
+                        if (RT_RESID) { rt_resid_add(mc[i * NB + j], yp, n_out); }
+                        simdgroup_store(mc[i * NB + j], yp, n_out);
+                    }
+                } else if (c0 < nrow) {
+                    // Lane l holds row (l/4 & 4) + (l/2 % 4) of the block and the two columns
+                    // from (l/4 & 2)*2 + (l % 2)*2 -- the 8x8 layout MLX's steel GEMM stores
+                    // by (BaseMMAFrag::get_coord) -- and stores them itself, up to n_out.
+                    const uint q = lane / 4u;
+                    const uint fr = (q & 4u) + ((lane / 2u) % 4u);
+                    const uint fc = (q & 2u) * 2u + (lane % 2u) * 2u;
+                    const thread auto & e = mc[i * NB + j].thread_elements();
+                    device float * o = y + (ulong)(t0 + ty + i * 8u + fr) * n_out + r0 + c0 + fc;
+                    if (c0 + fc < nrow) { o[0] = RT_RESID ? o[0] + e[0] : e[0]; }
+                    if (c0 + fc + 1u < nrow) { o[1] = RT_RESID ? o[1] + e[1] : e[1]; }
                 }
             }
         }
@@ -2824,6 +3724,134 @@ kernel void imparo_f32_matmat(
     if (lane == 0) { y[(ulong)t * n_out + r] = acc; }
 }
 
+// AN F32 PROJECTION TO AT MOST 32 OUTPUTS OVER MANY TOKENS: LFM2.5-8B-A1B's router gate,
+// 2048 -> 32, on every routed layer of a prefill chunk. imparo_f32_matmat above gives each
+// (output, token) pair its own simdgroup, so a token's activation row is read once per
+// output and the weight once per token: 0.74 ms for a 2048-token chunk, ~5x the bandwidth
+// floor.
+//
+// Here a simdgroup owns TPS tokens and holds all 32 outputs of each in registers, and the
+// threadgroup stages the weight 128 columns at a time (32 x 128 floats, 16 KB) once for
+// all its tokens. Each activation is read once.
+//
+// BIT-IDENTICAL to imparo_f32_matmat: lane l still adds i = l, l+32, l+64, ... in ascending
+// order into each output, and the same simd_sum reduces the lanes. Rows past n_out stage as
+// zeros and are never written. The host routes here only when n_in is a multiple of 128.
+constant constexpr uint F32N_K = 128u;   // weight columns staged per step
+constant constexpr uint F32N_R = 32u;    // outputs held per lane
+
+template <uint TPS>
+inline void f32_narrow_mm_body(device const float * weights, device const float * x,
+                               device float * y, ulong w_offset, uint n_in, uint n_out,
+                               uint n_tok, uint src_row, threadgroup float * wt, uint tg,
+                               uint tid, uint lane, uint sgid, uint nsg)
+{
+    const uint t0 = (tg * nsg + sgid) * TPS;
+    device const float * w = weights + (w_offset / 4u);
+    float acc[TPS][F32N_R];
+    for (uint u = 0; u < TPS; ++u) {
+        for (uint r = 0; r < F32N_R; ++r) { acc[u][r] = 0.0f; }
+    }
+    // A token past n_tok reads token 0's row and is never written, so the loop below has no
+    // per-token test.
+    device const float * xt[TPS];
+    for (uint u = 0; u < TPS; ++u) {
+        const uint t = t0 + u < n_tok ? t0 + u : 0u;
+        xt[u] = x + (ulong)(src_row + t) * n_in;
+    }
+    const uint nthr = nsg * 32u;
+    for (uint k0 = 0; k0 < n_in; k0 += F32N_K) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < F32N_R * F32N_K / 4u; e += nthr) {
+            const uint r = e / (F32N_K / 4u);
+            const uint c = (e % (F32N_K / 4u)) * 4u;
+            const float4 v = r < n_out
+                ? *(device const float4 *)(w + (ulong)r * n_in + k0 + c) : float4(0.0f);
+            *(threadgroup float4 *)(wt + r * F32N_K + c) = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint q = 0; q < F32N_K / 32u; ++q) {
+            const uint j = q * 32u + lane;
+            float xv[TPS];
+            for (uint u = 0; u < TPS; ++u) { xv[u] = xt[u][k0 + j]; }
+            for (uint r = 0; r < F32N_R; ++r) {
+                const float wv = wt[r * F32N_K + j];
+                for (uint u = 0; u < TPS; ++u) { acc[u][r] += wv * xv[u]; }
+            }
+        }
+    }
+    // Output r's sum is the same on every lane; lane r keeps it and writes it, so the
+    // store is one coalesced row.
+    for (uint u = 0; u < TPS; ++u) {
+        const uint t = t0 + u;
+        if (t >= n_tok) { break; }
+        float mine = 0.0f;
+        for (uint r = 0; r < F32N_R; ++r) {
+            const float s = simd_sum(acc[u][r]);
+            if (lane == r) { mine = s; }
+        }
+        if (lane < n_out) { y[(ulong)t * n_out + lane] = mine; }
+    }
+}
+
+#define IMPARO_F32_NARROW_MM(NAME, TPS)                                                      \
+kernel void NAME(                                                                           \
+    device const float * weights [[buffer(0)]], device const float * x [[buffer(1)]],       \
+    device float * y [[buffer(2)]],                                                         \
+    constant ulong & w_offset [[buffer(3)]], constant uint & n_in [[buffer(4)]],            \
+    constant uint & n_out [[buffer(5)]], constant uint & n_tok [[buffer(6)]],               \
+    constant uint & src_row [[buffer(7)]],                                                  \
+    uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],  \
+    uint lane [[thread_index_in_simdgroup]], uint sgid [[simdgroup_index_in_threadgroup]],  \
+    uint nsg [[simdgroups_per_threadgroup]])                                                \
+{                                                                                           \
+    threadgroup float wt[F32N_R * F32N_K];                                                  \
+    f32_narrow_mm_body<TPS>(weights, x, y, w_offset, n_in, n_out, n_tok, src_row, wt,       \
+                            tgid.x, tid, lane, sgid, nsg);                                  \
+}
+IMPARO_F32_NARROW_MM(imparo_f32_narrow_mm, 2u)
+
+// A NARROW PROJECTION SPLIT ALONG K, not along the rows. `imparo_f32_matmat` gives each
+// output row ONE simdgroup, so a 2048 -> 32 projection -- the router's gate on every routed
+// layer -- has 32 simdgroups for the whole device and reads 13.1 GB/s against the output
+// head's 132. There are no more rows to hand out; the parallelism has to come from the dot
+// product itself.
+//
+// Here a threadgroup owns one output row and its `nsg` simdgroups split K between them.
+// Lane strides run across the WHOLE threadgroup (`sgid * 32 + lane`, stepping `nsg * 32`),
+// so consecutive lanes still read consecutive floats and the loads stay coalesced.
+//
+// BIT-AFFECTING, and deliberately so: the row's sum is now nsg partial simd_sums added
+// together instead of one. The partials are summed in SIMDGROUP INDEX ORDER by a single
+// thread, so the result is the same on every run -- reproducible, but not equal to what
+// the one-simdgroup kernel produced.
+kernel void imparo_f32_gemv_ksplit(
+    device const float * weights [[buffer(0)]],
+    device const float * x       [[buffer(1)]],
+    device float       * y       [[buffer(2)]],
+    constant ulong & w_offset [[buffer(3)]], constant uint & n_in  [[buffer(4)]],
+    constant uint & n_out    [[buffer(5)]], constant uint & n_tok [[buffer(6)]],
+    constant uint & src_row  [[buffer(7)]],
+    threadgroup float * part [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
+{
+    const uint r = tgid.x, t = tgid.y;
+    if (r >= n_out || t >= n_tok) { return; }
+    device const float * row = weights + (w_offset / 4u) + (ulong)r * n_in;
+    device const float * xt  = x + (ulong)(src_row + t) * n_in;
+    float acc = 0.0f;
+    for (uint i = sgid * 32u + lane; i < n_in; i += nsg * 32u) { acc += row[i] * xt[i]; }
+    acc = simd_sum(acc);
+    if (lane == 0u) { part[sgid] = acc; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0u && lane == 0u) {
+        float total = 0.0f;
+        for (uint j = 0u; j < nsg; ++j) { total += part[j]; }   // index order, every run
+        y[(ulong)t * n_out + r] = total;
+    }
+}
+
 // ---- Q8_0 WEIGHTS -----------------------------------------------------------------
 //
 // Ported from the LFM2.5 bring-up branch, where a Q8_0 model was the target quant. Three
@@ -2882,14 +3910,46 @@ constant uint Q8_SKIP = is_function_constant_defined(Q8_SKIP_FC) ? Q8_SKIP_FC : 
 // change -- what changes is that the staging loop has no branch and no zero-fill arm.
 // This is the one difference between the two staging loops that had not been tested;
 // unlike the two instruction reductions already measured slower, it removes BRANCHES
-// rather than arithmetic.
+// rather than arithmetic. ON by default, with the pad skip above OFF: alone it measured flat,
+// together they remove every runtime bound from the staging loops.
 constant bool Q8_CLAMP_EDGE_FC [[function_constant(13)]];
 constant bool Q8_CLAMP_EDGE = is_function_constant_defined(Q8_CLAMP_EDGE_FC)
-                            ? Q8_CLAMP_EDGE_FC : false;
+                            ? Q8_CLAMP_EDGE_FC : true;
 
 constant bool Q8_MMA_FENCE_FC [[function_constant(14)]];
 constant bool Q8_MMA_FENCE = is_function_constant_defined(Q8_MMA_FENCE_FC)
                            ? Q8_MMA_FENCE_FC : true;
+
+// A SIMDGROUP WHOSE TOKEN ROWS ARE ALL PAST THE LAST LIVE TOKEN DOES NOTHING.
+//
+// The grid covers ceil(n_tok / TOKENS) token groups, so the last group holds
+// n_tok mod TOKENS live token rows and TOKENS - that many dead ones. Those dead rows
+// were staged (from a clamped duplicate row) and multiplied like any other, and only the
+// write-back masked them: a 33-row batch on the 64x32 tile paid for 64 token rows of MMA.
+//
+// THE GRAIN IS ONE SIMDGROUP'S TOKEN ROWS, not one 8x8 tile, and that is a measurement,
+// not a simplification. The finer and more obvious form -- a per-tile predicate inside
+// the K loop -- was built and measured: it won 3.4-3.8% on a 10- or 16-row batch and LOST
+// 2.3% on a full 32-row one and 2.9% at prefill, because the loop is fully unrolled with
+// the accumulators in registers and a runtime test between the loads and the multiplies
+// breaks the schedule that carries them. A simdgroup's token tiles are contiguous, so
+// rounding the live rows up to TOKEN_TILES_PER_SG * 8 makes every simdgroup's set wholly
+// live or wholly dead, and the test becomes ONE loop-invariant branch outside the K loop.
+// A full tile -- every prefill chunk -- takes the instructions it always did.
+//
+// The write-back already skips dead rows (`tn` clamps to ntok, and the unmasked fast path
+// runs only at ntok == TOKENS), so the output is unchanged bit for bit.
+//
+// The weight stage is per ROW and does not move: a token group still reads the whole
+// weight tile. What this removes is the activation staging and the multiplies of the
+// token rows no simdgroup writes back.
+//
+// OFF by default, with the edge clamp below ON: the tile rule picks the narrowest tile that
+// holds the rows, so whole dead shares are rare, and the skip's runtime bound kept the staging
+// loop from compiling like the full tile's (the host's g_q8_pad_skip says what it cost).
+constant bool Q8_PAD_SKIP_FC [[function_constant(27)]];
+constant bool Q8_PAD_SKIP = is_function_constant_defined(Q8_PAD_SKIP_FC)
+                          ? Q8_PAD_SKIP_FC : false;
 
 // Q8_0_TM: the weight bytes are in the tile-major order imparo-repack writes
 // (docs/q8-tile-major-weights.md): per (8-row tile, 32-wide K block) a 256-byte unit
@@ -2946,9 +4006,10 @@ kernel void imparo_q8_0_gemv(
     uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
 {
-    if (n_tok != 1u) { return; }
+    if (n_tok == 0u || n_tok > MV_TOKENS) { return; }
     const uint blocks = n_in / QK8_0;
     device const float * xb = x + (ulong)src_row * n_in;
+    const uint last = n_tok - 1u;
     if (Q8_TM) {
         // TILE-MAJOR: a threadgroup owns one 8-row unit tile and every simdgroup step reads
         // ONE WHOLE 256-BYTE UNIT -- lane = (row in tile, k quarter), 8 bytes each, one
@@ -2968,6 +4029,91 @@ kernel void imparo_q8_0_gemv(
         const uint rowa = min(r0 + rp * 2u, n_out - 1u);
         const uint rowb = min(r0 + rp * 2u + 1u, n_out - 1u);
         device const uchar * w = weights + w_offset;
+        if (MV_TOKENS > 1u) {
+            // DECODE ROWS. The one-row mapping gives each lane two rows and every token, so four
+            // lanes load the same activations and each serves two rows: activation reads per
+            // tile grow as tokens/2 times the weight bytes, and at 8 rows they measured
+            // 73 ms/forward against 23. Here the four row-pair lanes (rp) take TOKENS instead,
+            // each over all eight rows of the unit, so one activation load feeds eight rows.
+            // What fixes a row's bits is untouched: its blocks still stream by (sgid, u), its
+            // 8-value quarter by il, and it reduces over the same partners (xor 1 and 2 over il,
+            // xor 16 over u, then the simdgroups in order) -- which lane holds it does not enter.
+            //   2 rows: lane group rp = (row half, token)   4 rows x 1 token
+            //   4 rows: rp = token                          8 rows x 1 token
+            //   8 rows: rp = tokens rp and rp + 4           8 rows x 2 tokens
+            const uint RPL = MV_TOKENS == 2u ? 4u : 8u;
+            const uint TPL = MV_TOKENS == 8u ? 2u : 1u;
+            const uint row0 = MV_TOKENS == 2u ? (rp / 2u) * 4u : 0u;
+            const uint tok0 = MV_TOKENS == 2u ? rp % 2u : rp;
+            uint rows[8];
+            #pragma unroll
+            for (uint rr = 0; rr < RPL; ++rr) { rows[rr] = min(r0 + row0 + rr, n_out - 1u); }
+            float acc[8][2];
+            #pragma unroll
+            for (uint rr = 0; rr < RPL; ++rr) {
+                #pragma unroll
+                for (uint tt = 0; tt < TPL; ++tt) { acc[rr][tt] = 0.0f; }
+            }
+            for (uint ib = sgid * 2u + u; ib < blocks; ib += nsg * 2u) {
+                const uint i = ib * QK8_0 + il * 8u;
+                char4 q0[8], q1[8];
+                float d[8];
+                #pragma unroll
+                for (uint rr = 0; rr < RPL; ++rr) {
+                    device const uchar * pr = w + q8_tm_payload(rows[rr], ib, blocks) + il * 8u;
+                    d[rr]  = float(*(device const half *)(w + q8_tm_scale(rows[rr], ib, blocks, n_out)));
+                    q0[rr] = as_type<char4>(*(device const uint *)pr);
+                    q1[rr] = as_type<char4>(*(device const uint *)(pr + 4u));
+                }
+                #pragma unroll
+                for (uint tt = 0; tt < TPL; ++tt) {
+                    device const float * xt = xb + (ulong)min(tok0 + tt * 4u, last) * n_in;
+                    const float4 xa  = *(device const float4 *)(xt + i);
+                    const float4 xb4 = *(device const float4 *)(xt + i + 4u);
+                    {
+                        // The one-row body rounds the block's product before the add; this
+                        // body, with more rows in flight, was contracted to one fma (see the
+                        // Q4_0 twin).
+                    #pragma clang fp contract(off)
+                        #pragma unroll
+                        for (uint rr = 0; rr < RPL; ++rr) {
+                            acc[rr][tt] += (dot(float4(q0[rr]), xa) + dot(float4(q1[rr]), xb4)) * d[rr];
+                        }
+                    }
+                }
+            }
+            #pragma unroll
+            for (uint rr = 0; rr < RPL; ++rr) {
+                #pragma unroll
+                for (uint tt = 0; tt < TPL; ++tt) {
+                    acc[rr][tt] += simd_shuffle_xor(acc[rr][tt], 1u);
+                    acc[rr][tt] += simd_shuffle_xor(acc[rr][tt], 2u);
+                    acc[rr][tt] += simd_shuffle_xor(acc[rr][tt], 16u);
+                }
+            }
+            if (lane < 16u && il == 0u) {
+                #pragma unroll
+                for (uint rr = 0; rr < RPL; ++rr) {
+                    #pragma unroll
+                    for (uint tt = 0; tt < TPL; ++tt) {
+                        const uint t = tok0 + tt * 4u;
+                        partial[(sgid * MV_TOKENS + t) * Q8_TM_UNIT_ROWS + row0 + rr] = acc[rr][tt];
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgid == 0u && lane < Q8_TM_UNIT_ROWS && r0 + lane < n_out) {
+                for (uint t = 0; t < n_tok; ++t) {
+                    float total = 0.0f;
+                    for (uint s = 0; s < nsg; ++s) {
+                        total += partial[(s * MV_TOKENS + t) * Q8_TM_UNIT_ROWS + lane];
+                    }
+                    device float * slot = y + (ulong)t * n_out + r0 + lane;
+                    *slot = epilogue ? (imparo_act_f(*slot) * total) : total;
+                }
+            }
+            return;
+        }
         float acca = 0.0f, accb = 0.0f;
         for (uint ib = sgid * 2u + u; ib < blocks; ib += nsg * 2u) {
             const uint i = ib * QK8_0 + il * 8u;
@@ -3014,6 +4160,64 @@ kernel void imparo_q8_0_gemv(
         const uint row = min(r0 + rr, n_out - 1u);
         rows[rr] = weights + w_offset + (ulong)row * blocks * Q8_0_BYTES;
     }
+    if (MV_TOKENS > 1u) {
+        // DECODE ROWS in the row-major layout: every lane already serves all of the
+        // threadgroup's rows from one activation load, so the tokens are simply added to it --
+        // each row's blocks, quarters and simd_sum are the one-row kernel's.
+        float acc[4][MV_MAX];
+        for (uint rr = 0; rr < 4u; ++rr) {
+            #pragma unroll
+            for (uint t = 0; t < MV_TOKENS; ++t) { acc[rr][t] = 0.0f; }
+        }
+        for (uint ib = ib0; ib < blocks; ib += nsg * 8u) {
+            const uint i = ib * QK8_0 + il * 8u;
+            float d[4];
+            char4 qa[4], qb[4];
+            #pragma unroll
+            for (uint rr = 0; rr < Q8_DECODE_ROWS; ++rr) {
+                device const uchar * blk = rows[rr] + (ulong)ib * Q8_0_BYTES;
+                d[rr]  = float(as_type<half>((ushort)(blk[0] | (blk[1] << 8))));
+                qa[rr] = char4(*(device const packed_char4 *)(blk + 2u + il * 8u));
+                qb[rr] = char4(*(device const packed_char4 *)(blk + 6u + il * 8u));
+            }
+            #pragma unroll
+            for (uint t = 0; t < MV_TOKENS; ++t) {
+                device const float * xt = xb + (ulong)min(t, last) * n_in;
+                const float4 xa = *(device const float4 *)(xt + i);
+                const float4 xb4 = *(device const float4 *)(xt + i + 4u);
+                #pragma unroll
+                for (uint rr = 0; rr < Q8_DECODE_ROWS; ++rr) {
+                    acc[rr][t] += (dot(float4(qa[rr]), xa) + dot(float4(qb[rr]), xb4)) * d[rr];
+                }
+            }
+        }
+        #pragma unroll
+        for (uint rr = 0; rr < Q8_DECODE_ROWS; ++rr) {
+            #pragma unroll
+            for (uint t = 0; t < MV_TOKENS; ++t) { acc[rr][t] = simd_sum(acc[rr][t]); }
+        }
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint rr = 0; rr < Q8_DECODE_ROWS; ++rr) {
+                #pragma unroll
+                for (uint t = 0; t < MV_TOKENS; ++t) {
+                    partial[(sgid * MV_TOKENS + t) * Q8_DECODE_ROWS + rr] = acc[rr][t];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgid == 0u && lane < Q8_DECODE_ROWS && r0 + lane < n_out) {
+            for (uint t = 0; t < n_tok; ++t) {
+                float total = 0.0f;
+                for (uint s = 0; s < nsg; ++s) {
+                    total += partial[(s * MV_TOKENS + t) * Q8_DECODE_ROWS + lane];
+                }
+                device float * slot = y + (ulong)t * n_out + r0 + lane;
+                *slot = epilogue ? (imparo_act_f(*slot) * total) : total;
+            }
+        }
+        return;
+    }
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     for (uint ib = ib0; ib < blocks; ib += nsg * 8u) {
         const uint i = ib * QK8_0 + il * 8u;
@@ -3043,6 +4247,233 @@ kernel void imparo_q8_0_gemv(
             total += partial[s * Q8_DECODE_ROWS + lane];
         }
         device float * slot = y + r0 + lane;
+        *slot = epilogue ? (imparo_act_f(*slot) * total) : total;
+    }
+}
+
+// CO-BATCHED ROWS ON THE FAST ROUTE, TILE-MAJOR Q8_0: 2..24 independent rows through the
+// simdgroup matrix unit, each weight block read once for all of them, on the one-row GEMV's
+// grid. A threadgroup owns one 8-row unit tile and its simdgroups split the K blocks, so a
+// projection keeps the one-row GEMV's parallelism. The GEMM's 64-row tiles give a 2048-wide
+// projection 32 threadgroups, each walking all of K: at 8 rows LFM2.5's down projection
+// (K = 10752) took 398 us on the GEMM against 173 us for one row on the GEMV.
+//
+// Per block (one 272-byte unit: 8 row scales, then 8 rows x 32 values) a simdgroup forms
+// P[8 rows x 8 tokens] = W[8 x 32] . X[8 x 32]^T as four 8x8x8 products and adds d_row * P to
+// its sums. THE K ORDER inside a block is permuted so every load is one word: fragment f's
+// slot j stands for k = 4j + f. Lane (fr, fc) of the 8x8 layout holds W row fr at slots fc and
+// fc + 1 -- k in [4fc, 4fc + 8), one 8-byte load -- and X^T slot fr for tokens fc and fc + 1 --
+// k in [4fr, 4fr + 4) of each, one float4 per token. A sum does not care in which order its
+// terms arrive, so the permutation moves rounding only, which the fast route allows. Weights
+// are exact in float; activations are read as float unless a producer left only their half
+// mirror (RM_HALF_X). From float, a row lands within about 1e-6 of its rms from the one-row
+// GEMV's value (tests/decode_rows.rs).
+// Token columns past n_tok read the last live row and are not stored.
+constant uint RM_TOKEN_FRAGS_FC [[function_constant(31)]];
+constant uint RM_TOKEN_FRAGS = is_function_constant_defined(RM_TOKEN_FRAGS_FC)
+                             ? RM_TOKEN_FRAGS_FC : 1u;   // token columns / 8: 1..3
+// Three columns at most: every threadgroup reads all its rows' activations, and a fourth column
+// (25..32 rows) made those reads cost more than the GEMM's whole step (evidence in
+// docs/evidence/cobatch/2026-09-19-per-row-operations.md, section 6).
+#define RM_MAX_FRAGS 3u
+// THE ACTIVATIONS' FORM: float from the source buffer, or half from its mirror when a producer
+// in mirror mode left the floats stale (a GEMM epilogue that writes only the half mirror).
+constant bool RM_HALF_X_FC [[function_constant(36)]];
+constant bool RM_HALF_X = is_function_constant_defined(RM_HALF_X_FC) && RM_HALF_X_FC;
+// THE WEIGHTS' FORM: tile-major Q8_0 (an 8-row unit's scales, then its rows' 32 values), or
+// row-major Q4_0 (each row's 18-byte blocks where the file has them: a half scale, then 16
+// bytes holding value k in the low nibble of byte k and value 16 + k in the high one). Either
+// gives a lane eight values of its row per block, in a K order of its own that the activation
+// offset follows (a sum does not care in which order its terms arrive), so everything after
+// the fetch -- the products, the scale, the sums -- is one body.
+constant bool RM_Q4_FC [[function_constant(37)]];
+constant bool RM_Q4 = is_function_constant_defined(RM_Q4_FC) && RM_Q4_FC;
+// UNIT TILES PER THREADGROUP, 1, 2 or 4: more tiles cut the threadgroups -- each pays its
+// set-up and its cross-simdgroup sum once -- and each activation fetch feeds both tiles' products.
+constant uint RM_TILES_FC [[function_constant(38)]];
+constant uint RM_TILES = is_function_constant_defined(RM_TILES_FC) ? RM_TILES_FC : 1u;
+#define RM_MAX_TILES 4u
+// DIAGNOSTIC, 0 in every served pipeline (IMPARO_RM_SKIP): bit 0 drops the matrix products (the
+// sums take one fragment element instead), bit 1 the weight loads, bit 2 the activation loads,
+// bit 3 every simdgroup matrix (plain multiply-adds on the loaded values), bit 4 the whole block
+// loop -- each skipped part's time is the difference. Wrong numbers on purpose.
+constant uint RM_SKIP_FC [[function_constant(34)]];
+constant uint RM_SKIP = is_function_constant_defined(RM_SKIP_FC) ? RM_SKIP_FC : 0u;
+
+// A lane's two elements of an 8x8 fragment, written or read as one float2 -- MLX steel's form
+// (mma.h). Two element writes through a bound reference cost this kernel 61.6 us against 41.0
+// on a 2048x2048 projection at 8 rows, with the same bits.
+inline void rm_frag_set(thread simdgroup_float8x8 & m, float a, float b) {
+    reinterpret_cast<thread float2 &>(m.thread_elements()) = float2(a, b);
+}
+inline float2 rm_frag_get(thread simdgroup_float8x8 & m) {
+    return reinterpret_cast<thread float2 &>(m.thread_elements());
+}
+
+kernel void imparo_q8_tm_rows_mma(
+    device const uchar * weights [[buffer(0)]],
+    device const void  * x       [[buffer(1)]],
+    device float       * y       [[buffer(2)]],
+    constant ulong & w_offset [[buffer(3)]], constant uint & n_in [[buffer(4)]],
+    constant uint & n_out    [[buffer(5)]], constant uint & n_tok [[buffer(6)]],
+    constant uint & src_row  [[buffer(7)]],
+    constant uint & epilogue [[buffer(13)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
+{
+    const uint blocks = n_in / QK8_0;
+    // The threadgroup's RM_TILES unit tiles: rows 8 * RM_TILES * tgid.x on, 8 per tile.
+    const uint g0 = tgid.x * RM_TILES;
+    if (g0 * Q8_TM_UNIT_ROWS >= n_out || n_tok == 0u) { return; }
+    // The 8x8 layout MLX's steel GEMM stores by (BaseMMAFrag::get_coord): lane holds row fr
+    // and the two columns fc, fc + 1.
+    const uint qd = lane / 4u;
+    const uint fr = (qd & 4u) + ((lane / 2u) % 4u);
+    const uint fc = (qd & 2u) * 2u + (lane % 2u) * 2u;
+    // Tile-major Q8_0: tile u's unit, block 0. Q4_0: this lane's row of tile u, block 0.
+    device const uchar * base0[RM_MAX_TILES];
+    #pragma unroll
+    for (uint u = 0; u < RM_TILES; ++u) {
+        base0[u] = weights + w_offset
+                 + (RM_Q4 ? (ulong)((g0 + u) * Q8_TM_UNIT_ROWS + fr) * blocks * Q4_0_BYTES
+                          : (ulong)(g0 + u) * blocks * Q8_TM_UNIT_BYTES);
+    }
+    const uint last = n_tok - 1u;
+    // This lane's element offset in each of its token rows: the first k of its slot fr in block 0
+    // -- 4fr for Q8_0; for Q4_0, whose order puts the low nibbles in even slots and the high ones
+    // in odd slots, 2fr, or 16 + 2(fr - 1) (see the fetch below).
+    const uint k0 = RM_Q4 ? ((fr & 1u) != 0u ? 14u + 2u * fr : 2u * fr) : 4u * fr;
+    ulong xo[RM_MAX_FRAGS][2];
+    #pragma unroll
+    for (uint t = 0; t < RM_TOKEN_FRAGS; ++t) {
+        #pragma unroll
+        for (uint c = 0; c < 2u; ++c) {
+            xo[t][c] = (ulong)(src_row + min(t * 8u + fc + c, last)) * n_in + k0;
+        }
+    }
+    float acc[RM_MAX_TILES][RM_MAX_FRAGS][2];
+    #pragma unroll
+    for (uint u = 0; u < RM_TILES; ++u) {
+        #pragma unroll
+        for (uint t = 0; t < RM_TOKEN_FRAGS; ++t) { acc[u][t][0] = 0.0f; acc[u][t][1] = 0.0f; }
+    }
+    for (uint b = sgid; b < ((RM_SKIP & 16u) ? 0u : blocks); b += nsg) {
+        // This lane's row fr of each tile at slots fc and fc + 1 of fragment f, f = 0..3. Q8_0:
+        // W[fr][4fc + f] and W[fr][4fc + 4 + f]. Q4_0: W[fr][2fc + f] and W[fr][16 + 2fc + f].
+        float d[RM_MAX_TILES];
+        float4 wlo[RM_MAX_TILES], whi[RM_MAX_TILES];
+        #pragma unroll
+        for (uint u = 0; u < RM_TILES; ++u) {
+            if (RM_SKIP & 2u) {
+                d[u] = float(b);
+                wlo[u] = float4(as_type<char4>(lane * 0x01010101u + b + u));
+                whi[u] = float4(as_type<char4>(fr));
+            } else if (RM_Q4) {
+                // Bytes 2fc .. 2fc + 3 of the row's block hold k = 2fc .. 2fc + 3 in their low
+                // nibbles and 16 + 2fc .. in their high ones: four bytes a lane, and the row's four
+                // lanes read its 16 bytes once. The block is 2-byte aligned, so they are read as
+                // packed halves.
+                device const uchar * blk = base0[u] + (ulong)b * Q4_0_BYTES;
+                d[u] = float(*(device const half *)blk);
+                const packed_ushort2 pw = *(device const packed_ushort2 *)(blk + 2u + 2u * fc);
+                wlo[u] = float4(float(pw[0] & 0xFu), float((pw[0] >> 8u) & 0xFu),
+                                float(pw[1] & 0xFu), float((pw[1] >> 8u) & 0xFu)) - 8.0f;
+                whi[u] = float4(float((pw[0] >> 4u) & 0xFu), float((pw[0] >> 12u) & 0xFu),
+                                float((pw[1] >> 4u) & 0xFu), float((pw[1] >> 12u) & 0xFu)) - 8.0f;
+            } else {
+                device const uchar * unit = base0[u] + (ulong)b * Q8_TM_UNIT_BYTES;
+                d[u] = float(*(device const half *)(unit + fr * 2u));
+                const uint2 wq =
+                    *(device const uint2 *)(unit + Q8_TM_UNIT_ROWS * 2u + fr * QK8_0 + 4u * fc);
+                wlo[u] = float4(as_type<char4>(wq.x));
+                whi[u] = float4(as_type<char4>(wq.y));
+            }
+        }
+        // One activation fetch per block, for every tile.
+        float4 xa[RM_MAX_FRAGS][2];
+        #pragma unroll
+        for (uint t = 0; t < RM_TOKEN_FRAGS; ++t) {
+            if (RM_SKIP & 4u) {
+                xa[t][0] = float4(float(b + t));
+                xa[t][1] = float4(float(lane + b));
+            } else if (RM_HALF_X) {
+                device const half * xh = (device const half *)x;
+                xa[t][0] = float4(*(device const half4 *)(xh + xo[t][0] + b * QK8_0));
+                xa[t][1] = float4(*(device const half4 *)(xh + xo[t][1] + b * QK8_0));
+            } else {
+                device const float * xf = (device const float *)x;
+                xa[t][0] = *(device const float4 *)(xf + xo[t][0] + b * QK8_0);
+                xa[t][1] = *(device const float4 *)(xf + xo[t][1] + b * QK8_0);
+            }
+        }
+        if (RM_SKIP & 8u) {
+            #pragma unroll
+            for (uint u = 0; u < RM_TILES; ++u) {
+                #pragma unroll
+                for (uint t = 0; t < RM_TOKEN_FRAGS; ++t) {
+                    acc[u][t][0] += d[u] * dot(wlo[u], xa[t][0]);
+                    acc[u][t][1] += d[u] * dot(whi[u], xa[t][1]);
+                }
+            }
+            continue;
+        }
+        simdgroup_float8x8 wm[RM_MAX_TILES][4];
+        #pragma unroll
+        for (uint u = 0; u < RM_TILES; ++u) {
+            #pragma unroll
+            for (uint f = 0; f < 4u; ++f) { rm_frag_set(wm[u][f], wlo[u][f], whi[u][f]); }
+        }
+        #pragma unroll
+        for (uint t = 0; t < RM_TOKEN_FRAGS; ++t) {
+            simdgroup_float8x8 xm[4];
+            #pragma unroll
+            for (uint f = 0; f < 4u; ++f) { rm_frag_set(xm[f], xa[t][0][f], xa[t][1][f]); }
+            #pragma unroll
+            for (uint u = 0; u < RM_TILES; ++u) {
+                if (RM_SKIP & 1u) {
+                    #pragma unroll
+                    for (uint f = 0; f < 4u; ++f) {
+                        const float2 a = rm_frag_get(wm[u][f]) * rm_frag_get(xm[f]);
+                        acc[u][t][0] += a.x;
+                        acc[u][t][1] += a.y;
+                    }
+                    continue;
+                }
+                simdgroup_float8x8 p;
+                simdgroup_multiply(p, wm[u][0], xm[0]);
+                simdgroup_multiply_accumulate(p, wm[u][1], xm[1], p);
+                simdgroup_multiply_accumulate(p, wm[u][2], xm[2], p);
+                simdgroup_multiply_accumulate(p, wm[u][3], xm[3], p);
+                const float2 e = rm_frag_get(p);
+                acc[u][t][0] += d[u] * e.x;
+                acc[u][t][1] += d[u] * e.y;
+            }
+        }
+    }
+    // The simdgroups' sums through threadgroup memory, then added in simdgroup order: 64 floats
+    // per (tile, 8-token column).
+    const uint per_sg = RM_TILES * RM_TOKEN_FRAGS * 64u;
+    #pragma unroll
+    for (uint u = 0; u < RM_TILES; ++u) {
+        #pragma unroll
+        for (uint t = 0; t < RM_TOKEN_FRAGS; ++t) {
+            threadgroup float * o =
+                partial + sgid * per_sg + (u * RM_TOKEN_FRAGS + t) * 64u + fr * 8u + fc;
+            o[0] = acc[u][t][0];
+            o[1] = acc[u][t][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = sgid * 32u + lane; i < per_sg; i += nsg * 32u) {
+        const uint col = i / 64u;                 // u * RM_TOKEN_FRAGS + t
+        const uint u = col / RM_TOKEN_FRAGS;
+        const uint row = (i / 8u) % 8u;
+        const uint tok = (col % RM_TOKEN_FRAGS) * 8u + i % 8u;
+        if (tok >= n_tok) { continue; }
+        float total = 0.0f;
+        for (uint s = 0; s < nsg; ++s) { total += partial[s * per_sg + i]; }
+        device float * slot = y + (ulong)tok * n_out + (g0 + u) * Q8_TM_UNIT_ROWS + row;
         *slot = epilogue ? (imparo_act_f(*slot) * total) : total;
     }
 }
@@ -3196,6 +4627,13 @@ static void st_gemm(
     const uint ntok = FULL ? TOKENS : min(TOKENS, n_tok - t0);
     const uint row_tile0 = (sgid % SGR) * ROW_TILES_PER_SG;
     const uint token_tile0 = (sgid / SGR) * TOKEN_TILES_PER_SG;
+    // Live token rows rounded up to one simdgroup's share, so a simdgroup's tiles are
+    // either all live or all dead. Equals TOKENS when the skip is off or the tile is full.
+    constexpr uint TOKEN_GRAIN = TOKEN_TILES_PER_SG * 8u;
+    const uint atok = (FULL || !Q8_PAD_SKIP)
+        ? TOKENS
+        : min(TOKENS, ((ntok + TOKEN_GRAIN - 1u) / TOKEN_GRAIN) * TOKEN_GRAIN);
+    const bool sg_live = (token_tile0 * 8u) < atok;
     const uint blocks = n_in / QK8_0;
     // STAGE_A=false reads the activation operand straight from device instead of copying
     // it into threadgroup memory first, which is what the Q4 rt_gemm does and what its
@@ -3333,7 +4771,7 @@ static void st_gemm(
         // tile-major threadgroup writes are vector operations rather than eight scalar
         // values from different token rows.
         #pragma unroll
-        for (uint e = tid; STAGE_A && e < TOKENS * K_TILES; e += THREADS_PER_TG) {
+        for (uint e = tid; STAGE_A && e < atok * K_TILES; e += THREADS_PER_TG) {
             const uint tt = e / K_TILES, kt = e % K_TILES;
             // K-major activation tiles keep the two token operands consumed by one
             // simdgroup adjacent for each K step. This is only a threadgroup-memory
@@ -3365,7 +4803,7 @@ static void st_gemm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (!(Q8_SKIP & 1u)) {
+        if (!(Q8_SKIP & 1u) && sg_live) {
         #pragma unroll
         for (uint kk = 0; kk < K; kk += 8u) {
             // A simdgroup owns a rectangular set of output tiles. Load each of its row
@@ -3456,9 +4894,11 @@ static void st_gemm(
     // What it costs: one extra barrier pair. A simdgroup's token tiles are contiguous, so
     // with SGT == 2 each pass is exactly one simdgroup group's share and the other group
     // stores nothing; with SGT == 1 every simdgroup stores half its tiles per pass.
-    static_assert((TOKENS % 16u) == 0u,
-                  "Q8 GEMM token tile must split into two whole 8-row halves");
-    constexpr uint WB_PASSES = 2u;
+    // ONE PASS below 16 token rows: the spill is TOKENS/WB_PASSES token rows wide and a
+    // simdgroup_store writes 8 of them, so a tile of 8 cannot be halved. At 8 tokens the
+    // whole spill is ROWS * 8 floats, which is smaller than the staged operands anyway,
+    // so the allocation does not grow. `out_bytes` in the bridge computes the same thing.
+    constexpr uint WB_PASSES = (TOKENS % 16u) == 0u ? 2u : 1u;
     constexpr uint WB_TOKENS = TOKENS / WB_PASSES;
     threadgroup float * out = (threadgroup float *)shared;
     for (uint p = 0; p < WB_PASSES; ++p) {
@@ -3607,6 +5047,10 @@ IMPARO_ST_GEMM(imparo_st_gemm_10,     64, 32,  4, 2, 64, false)
 IMPARO_ST_GEMM(imparo_st_gemm_10_full,64, 32,  4, 2, 64, true)
 IMPARO_ST_GEMM(imparo_st_gemm_11,     64, 64,  4, 2, 64, false)
 IMPARO_ST_GEMM(imparo_st_gemm_11_full,64, 64,  4, 2, 64, true)
+// EIGHT TOKEN ROWS, one 8x8 token tile: the narrowest tile the MMA can serve. Every
+// simdgroup owns that one tile (SGR == NSG), so the row tiles split four ways.
+IMPARO_ST_GEMM(imparo_st_gemm_12,     64,  8,  4, 4, 32, false)
+IMPARO_ST_GEMM(imparo_st_gemm_12_full,64,  8,  4, 4, 32, true)
 
 // The half-activation twin of each shape above, GENERATED FROM THOSE LINES: the
 // tuples were transcribed by hand once and four of ten had the wrong SGR, which
@@ -3644,6 +5088,7 @@ IMPARO_ST_GEMM_H(imparo_st_gemm_8_h, 32, 128, 4, 2, 32, false)
 IMPARO_ST_GEMM_H(imparo_st_gemm_9_h, 128, 32, 4, 4, 32, false)
 IMPARO_ST_GEMM_H(imparo_st_gemm_10_h, 64, 32, 4, 2, 64, false)
 IMPARO_ST_GEMM_H(imparo_st_gemm_11_h, 64, 64, 4, 2, 64, false)
+IMPARO_ST_GEMM_H(imparo_st_gemm_12_h, 64, 8, 4, 4, 32, false)
 IMPARO_ST_GEMM_GH(imparo_st_gemm_0_gh, 32, 16, 4, 2, 32)
 IMPARO_ST_GEMM_GH(imparo_st_gemm_1_gh, 32, 32, 4, 2, 32)
 IMPARO_ST_GEMM_GH(imparo_st_gemm_2_gh, 64, 16, 4, 2, 32)
@@ -3656,6 +5101,7 @@ IMPARO_ST_GEMM_GH(imparo_st_gemm_8_gh, 32, 128, 4, 2, 32)
 IMPARO_ST_GEMM_GH(imparo_st_gemm_9_gh, 128, 32, 4, 4, 32)
 IMPARO_ST_GEMM_GH(imparo_st_gemm_10_gh, 64, 32, 4, 2, 64)
 IMPARO_ST_GEMM_GH(imparo_st_gemm_11_gh, 64, 64, 4, 2, 64)
+IMPARO_ST_GEMM_GH(imparo_st_gemm_12_gh, 64, 8, 4, 4, 32)
 // FULL *and* the f16 activation mirror. Until these existed, selecting the
 // edge-predicate-free entry point silently dropped the mirror -- the host's mirror
 // condition carried `!full` because there was nothing to bind it to -- so the one knob
@@ -3673,6 +5119,7 @@ IMPARO_ST_GEMM_H(imparo_st_gemm_8_full_h,  32, 128, 4, 2, 32, true)
 IMPARO_ST_GEMM_H(imparo_st_gemm_9_full_h, 128, 32, 4, 4, 32, true)
 IMPARO_ST_GEMM_H(imparo_st_gemm_10_full_h, 64, 32, 4, 2, 64, true)
 IMPARO_ST_GEMM_H(imparo_st_gemm_11_full_h, 64, 64, 4, 2, 64, true)
+IMPARO_ST_GEMM_H(imparo_st_gemm_12_full_h, 64, 8, 4, 4, 32, true)
 
 // A READ STRAIGHT FROM THE MIRROR, no activation stage. Same tiles, same K order, same
 // answers -- only the operand's route into the MMA changes, and with it the threadgroup
@@ -3961,6 +5408,51 @@ kernel void imparo_rms_norm(
     device float * rrow = addend + base_off + (ulong)r * row_stride;
     const bool vec4 = (width % 4u) == 0u && ((base_off + r * row_stride) % 4u) == 0u
                    && (!pre_add || (((ulong)rrow & 15ul) == 0ul));
+    // THE ROW STAGED IN THREADGROUP MEMORY, when the host has allowed the space for it.
+    // The pre-add order reads BOTH rows twice -- resid and src in the sum pass, again in
+    // the scale pass -- which is 32 KB of the ~56 KB this kernel moves. Staging t once
+    // makes it 8 KB read plus 8 KB of threadgroup traffic, and the kernel is bandwidth
+    // bound on ONE CORE (48 KB in 6.1 us is 7.9 GB/s, one core's share of 136), so the
+    // bytes are the cost.
+    //
+    // The register form of this was measured SLOWER once (decode 36.7 -> 35.6): ten floats
+    // a thread costs occupancy. Threadgroup memory does too -- but at decode there is ONE
+    // row and so ONE threadgroup a core, and occupancy it cannot use is free. The host
+    // only sizes the stage when that holds.
+    threadgroup float4 * stage = (threadgroup float4 *)(partial + STAGE_OFF);
+    if (STAGED && pre_add && vec4) {
+        device const float4 * s4 = (device const float4 *)srow;
+        device const float4 * r4 = (device const float4 *)rrow;
+        const uint w4s = width / 4u;
+        float sqs = 0.0f;
+        for (uint i = tid; i < w4s; i += tcount) {
+            const float4 t = r4[i] + s4[i];
+            stage[i] = t;
+            sqs += dot(t, t);
+        }
+        sqs = simd_sum(sqs);
+        float invs;
+        if (nsg == 1u) {
+            invs = rsqrt(simd_broadcast_first(sqs) / float(width) + eps);
+            threadgroup_barrier(mem_flags::mem_threadgroup);   // the stage, not the sum
+        } else {
+            if (lane == 0) { partial[sgid] = sqs; }
+            invs = rms_finish(nsg, width, eps, partial, lane, sgid, false);
+        }
+        device float4 * row4s = (device float4 *)row;
+        device float4 * r4w = (device float4 *)rrow;
+        device const float4 * w4p = (device const float4 *)(weights + w_offset);
+        device half4 * xh4 = (device half4 *)(xh + base_off + (ulong)r * row_stride);
+        const bool wt = w_offset != IMPARO_NO_WEIGHT;
+        for (uint i = tid; i < w4s; i += tcount) {
+            const float4 t = stage[i];
+            r4w[i] = t;                                   // the residual stream
+            const float4 v = wt ? (t * invs * w4p[i]) : (t * invs);
+            row4s[i] = v;
+            if (xh_on != 0u) { xh4[i] = half4(v); }
+        }
+        return;
+    }
     float sq = 0.0f;
     if (vec4) {
         device const float4 * s4 = (device const float4 *)srow;
@@ -4129,6 +5621,8 @@ kernel void imparo_head_norm_rope(
     constant uint & n_rot    [[buffer(6)]], constant float & base [[buffer(7)]],
     constant uint & n_heads  [[buffer(8)]], constant uint & start_pos [[buffer(9)]],
     constant float * freqs   [[buffer(10)]], constant uint & n_freqs [[buffer(11)]],
+    device const uint * layout [[buffer(12), function_constant(ROW_LAYOUT)]],
+    constant CobRow * rows [[buffer(13), function_constant(COB_ROWS)]],
     threadgroup float * partial [[threadgroup(0)]],
     uint3 tgid  [[threadgroup_position_in_grid]],
     uint3 tid3  [[thread_position_in_threadgroup]],
@@ -4178,8 +5672,11 @@ kernel void imparo_head_norm_rope(
     threadgroup_barrier(mem_flags::mem_device);
     const uint half_rot = n_rot / 2u;
     const uint t = r / n_heads;
+    uint pos = start_pos + t;
+    if (ROW_LAYOUT) { pos = layout[t * ROW_LAYOUT_WORDS]; }   // a tree row ropes at its depth
+    if (COB_ROWS) { pos = rows[t].pos; }                        // a co-batched row at its own position
     for (uint i = tid; i < half_rot; i += tcount) {
-        rope_neox_pair(row, i, half_rot, n_rot, base, freqs, n_freqs, start_pos + t);
+        rope_neox_pair(row, i, half_rot, n_rot, base, freqs, n_freqs, pos);
     }
 }
 
@@ -4270,6 +5767,7 @@ kernel void imparo_kv_store(
     constant uint & width [[buffer(2)]], constant uint & start_pos [[buffer(3)]],
     constant uint & n_tok [[buffer(4)]], constant uint & ring_mask [[buffer(5)]],
     device const uint * pt [[buffer(6)]],
+    constant CobRow * rows [[buffer(7), function_constant(COB_ROWS)]],
     uint2 gid [[thread_position_in_grid]])
 {
     // Four values per thread. `width` is n_kv_heads * head_dim, a multiple of four for
@@ -4278,8 +5776,10 @@ kernel void imparo_kv_store(
     const uint w4 = width / 4u;
     const uint i = gid.x, t = gid.y;
     if (t >= n_tok) { return; }
-    const uint pos = start_pos + t;
-    const uint slot = kv_slot(pos, ring_mask, pt);
+    uint pos = start_pos + t;
+    device const uint * table = pt;
+    if (COB_ROWS) { pos = rows[t].pos; table = rows[t].pt; }
+    const uint slot = kv_slot(pos, ring_mask, table);
     if (i < w4) {
         device const float4 * s4 = (device const float4 *)(src + (ulong)t * width);
         device half4 * c4 = (device half4 *)(cache + (ulong)slot * width);
@@ -6338,7 +7838,7 @@ static void attention_prefill_fa_body(
     device float * out,
     uint n_heads, uint n_kv, uint kv_width,
     uint start_pos, uint window, uint ring_mask, device const uint * pt,
-    uint n_tok, float scale,
+    uint n_tok, float scale, device const uint * layout, uint reach, uint key_lo,
     device half * xh, uint xh_on,
     threadgroup float * shared, uint3 tgid, uint tid, uint tcount,
     uint lane, uint sgid, uint nsg)
@@ -6369,15 +7869,17 @@ static void attention_prefill_fa_body(
     // depth (register-resident prefetch of the next block measured -5..-27% instead, and
     // 4096 B by aliasing the output tile onto the dead Q staging measured no further gain).
     constexpr uint SS = CB;
-    threadgroup half  * sq = (threadgroup half *)shared;          // QB x HD, staged Q
-    threadgroup float * ss = shared + (QB * HD) / 2u;             // QB x SS, scores then P
+    // Staged Q: QB x HD halves, or QB x HD floats under FA_FLOAT_Q.
+    threadgroup half  * sq  = (threadgroup half *)shared;
+    threadgroup float * sqf = shared;
+    threadgroup float * ss = shared + (FA_FLOAT_Q ? QB * HD : (QB * HD) / 2u); // QB x SS, scores then P
     threadgroup float * so = ss + QB * SS;                        // QB x HD, output
 
     for (uint e = tid; e < QB * HD; e += tcount) {
         const uint row = e / HD, dim = e % HD;
         const uint t = q0 + row;
-        sq[row * HD + dim] =
-            t < n_tok ? half(q[((ulong)t * n_heads + h) * HD + dim]) : half(0.0f);
+        const float qv = t < n_tok ? q[((ulong)t * n_heads + h) * HD + dim] : 0.0f;
+        if (FA_FLOAT_Q) { sqf[row * HD + dim] = qv; } else { sq[row * HD + dim] = half(qv); }
     }
     for (uint e = tid; e < QB * HD; e += tcount) { so[e] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6391,8 +7893,12 @@ static void attention_prefill_fa_body(
     // Q*K^T step reads it from registers instead of re-loading it from threadgroup memory
     // per K tile (upstream re-loads; the port did too).
     simdgroup_half8x8 mq[HD8];
+    simdgroup_float8x8 mqf[HD8];
     #pragma unroll
-    for (uint i = 0; i < HD8; ++i) { simdgroup_load(mq[i], sq + 8u * i, HD); }
+    for (uint i = 0; i < HD8; ++i) {
+        if (FA_FLOAT_Q) { simdgroup_load(mqf[i], sqf + 8u * i, HD); }
+        else { simdgroup_load(mq[i], sq + 8u * i, HD); }
+    }
 
     // Retain the output fragments across KV blocks. The shared output area carries
     // an 8x8 broadcast of the row rescale factors during the loop; loading that as
@@ -6404,12 +7910,21 @@ static void attention_prefill_fa_body(
     }
 
     // Both bounds come from the whole query tile: the earliest query sets where the
-    // scan starts under a window, the latest sets where it ends.
+    // scan starts under a window, the latest sets where it ends. A ROW LAYOUT row may see
+    // batch rows after its own (every row of a drafted block sees the whole block), so there
+    // the scan ends `reach` rows past the tile's last row: the furthest any row of the batch
+    // sees past itself, 0 for a chain or a tree. Ending at the tile's last row dropped the
+    // later rows' keys for every row of an earlier tile.
     const uint last_q    = min(q0 + QB, n_tok) - 1u;
-    const uint pos_last  = start_pos + last_q;
+    const uint pos_last  = start_pos + (ROW_LAYOUT ? min(last_q + reach, n_tok - 1u) : last_q);
     const uint pos_first = start_pos + q0;
-    const uint scan_lo   = (window > 0u && pos_first + 1u > window)
-                         ? (pos_first + 1u - window) : 0u;
+    // A ROW LAYOUT may carry a key floor: no row sees a key below `key_lo` (a drafter whose
+    // cache holds rows only from a restore point up). The scan starts at the floor's block,
+    // so blocks wholly below it are never loaded; keys of that block below the floor are
+    // masked. Without a layout the floor is 0.
+    const uint scan_lo   = max((window > 0u && pos_first + 1u > window)
+                                   ? (pos_first + 1u - window) : 0u,
+                               key_lo & ~(CB - 1u));
 
     // ONE PAGE PER BLOCK, FETCHED A BLOCK AHEAD. kv_slot reads pt[gp / 64] for every 8-key
     // tile, and with the tile loads hoisted below that dependent load stands in front of all
@@ -6464,7 +7979,9 @@ static void attention_prefill_fa_body(
             simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             #pragma unroll
             for (uint i = 0; i < HD8; ++i) {
-                if (!(ATTN_SKIP & 1u)) { simdgroup_multiply_accumulate(mqk, mq[i], mkb[cc][i], mqk); }
+                if (ATTN_SKIP & 1u) { continue; }
+                if (FA_FLOAT_Q) { simdgroup_multiply_accumulate(mqk, mqf[i], mkb[cc][i], mqk); }
+                else { simdgroup_multiply_accumulate(mqk, mq[i], mkb[cc][i], mqk); }
             }
             simdgroup_store(mqk, ss + col, SS, 0, false);
         }
@@ -6487,7 +8004,11 @@ static void attention_prefill_fa_body(
             // blk_cur == 2: when the whole block is live for this query, the per-position
             // causal test is 2 comparisons per position that can never fire. At depth
             // almost every block is far below the diagonal and takes this path.
-            const bool blk_live = row_live && (ic + CB - 1u) <= t_pos && ic >= t_lo;
+            // A ROW LAYOUT sees the whole cache below the batch and the batch rows its mask
+            // names, so only a block wholly below the batch is live for every row.
+            const bool blk_live = ROW_LAYOUT
+                ? (row_live && (ic + CB) <= start_pos && ic >= key_lo)
+                : (row_live && (ic + CB - 1u) <= t_pos && ic >= t_lo);
             // ONE PASS, upstream's form: a lane owns columns 2*lane and 2*lane+1 as a
             // float2, so the block max is one simd_max and every score is read once and
             // written once. CB is 64 by construction (static_assert above).
@@ -6495,8 +8016,15 @@ static void attention_prefill_fa_body(
             float2 s2 = ss2[lane] * scale;
             if (!blk_live) {
                 const uint gp = ic + 2u * lane;
-                s2.x = (row_live && gp      <= t_pos && gp      >= t_lo) ? s2.x : -INFINITY;
-                s2.y = (row_live && gp + 1u <= t_pos && gp + 1u >= t_lo) ? s2.y : -INFINITY;
+                if (ROW_LAYOUT) {
+                    s2.x = (row_live && gp >= key_lo
+                            && row_layout_sees(layout, t, gp, start_pos))      ? s2.x : -INFINITY;
+                    s2.y = (row_live && gp + 1u >= key_lo
+                            && row_layout_sees(layout, t, gp + 1u, start_pos)) ? s2.y : -INFINITY;
+                } else {
+                    s2.x = (row_live && gp      <= t_pos && gp      >= t_lo) ? s2.x : -INFINITY;
+                    s2.y = (row_live && gp + 1u <= t_pos && gp + 1u >= t_lo) ? s2.y : -INFINITY;
+                }
             }
             M[jj] = simd_max(max(M[jj], max(s2.x, s2.y)));
             // A row with nothing live yet would make exp(-INF - -INF) a NaN; zero it
@@ -6593,6 +8121,9 @@ kernel void NAME(                                                               
     constant uint & xh_on       [[buffer(12)]],                                            \
     device const uint  * pt     [[buffer(13)]],                                            \
     constant float & scale      [[buffer(14)]],                                            \
+    device const uint  * layout [[buffer(15), function_constant(ROW_LAYOUT)]],             \
+    constant uint & row_reach   [[buffer(16), function_constant(ROW_LAYOUT)]],             \
+    constant uint & row_key_lo  [[buffer(17), function_constant(ROW_LAYOUT)]],             \
     threadgroup float * shared  [[threadgroup(0)]],                                        \
     uint3 tgid  [[threadgroup_position_in_grid]],                                          \
     uint3 tid3  [[thread_position_in_threadgroup]],                                        \
@@ -6601,9 +8132,13 @@ kernel void NAME(                                                               
     uint  sgid  [[simdgroup_index_in_threadgroup]],                                        \
     uint  nsg   [[simdgroups_per_threadgroup]])                                            \
 {                                                                                          \
+    device const uint * lay = nullptr;                                                     \
+    uint reach = 0u, key_lo = 0u;                                                          \
+    if (ROW_LAYOUT) { lay = layout; reach = row_reach; key_lo = row_key_lo; }              \
     attention_prefill_fa_body<HD_N, QB_N, CB_N, NSG_N, KVW_N>(                                    \
         q, kc, vc, out, n_heads, n_kv, kv_width, start_pos, window, ring_mask, pt,         \
-        n_tok, scale, xh, xh_on, shared, tgid, tid3.x, tcnt3.x, lane, sgid, nsg);          \
+        n_tok, scale, lay, reach, key_lo, xh, xh_on, shared, tgid, tid3.x, tcnt3.x, lane,  \
+        sgid, nsg);                                                                        \
 }
 
 #ifndef IMPARO_KVW0
@@ -6634,6 +8169,321 @@ kernel void NAME(                                                               
 // that only exists at library compile is inert to a sweep that runs after init. QB 8 is
 // structural: one 8-row MMA query tile per threadgroup (a two-tile body measured 70%
 // slower at 16). CB 64 is one page and the one-pass softmax's 2 x 32 lanes.
+
+// PREFILL ATTENTION WITH THE SOFTMAX IN REGISTERS, the default at head dims up to 128
+// (IMPARO_ATTN_FARS=0 keeps the 8-query op above): MLX's steel-attention structure. 32 queries a threadgroup, 8 rows a
+// simdgroup; each 32-key block of K and V staged once in threadgroup memory (rows padded by 8
+// halves, so a fragment load's 8 rows fall in different banks) for all four simdgroups; the
+// scores and probabilities stay in the simdgroup's fragments, each lane's row reduced with two
+// shuffles (a row's elements live on lanes l, l^1, l^8, l^9); two barriers a block. The 8-query
+// op stages S, P and a rescale broadcast through threadgroup memory with three barriers a
+// block and re-reads every K and V tile once per 8 queries.
+//
+// NOT the 8-query op's arithmetic: blocks of 32 keys, exp2 on prescaled scores, the row sum
+// by shuffles -- a numerics change, gated as one.
+// ROW LAYOUT (constant 25) as the 8-query op reads it: a tree verify's rows are masked by the
+// layout, not by position. For a chain the layout selects exactly the keys the causal test does,
+// so a chain as a row layout equals the causal forward over the same rows, bit for bit
+// (`imparo-forward --verify-tree`), unless ROW_SPLIT cuts the keys (it reassociates the softmax).
+// ROW_HEADS keeps every row's arithmetic.
+// Execution-only simdgroup fences around each fragment load (MLX steel attention's scheduling
+// hint; no arithmetic changes): attention 1428 / 1425 -> 1417 / 1413 ms at a 17115-token
+// prefill.
+// The P.V loop takes a full unroll, not the "#pragma unroll" hint: attention 1406 -> 1368 ms at
+// a 17115-token prefill (LFM2.5-8B-A1B), same bits. Full unrolls on the kernel's other loops
+// tie, and so do 16 query rows a simdgroup (1394 ms, same bits; 2.05x slower under the hint).
+#define FARS_UNROLL _Pragma("clang loop unroll(full)")
+template<uint HD, uint KVW>
+static void attention_prefill_fars_body(
+    device const float * q, device const half * kc, device const half * vc,
+    device float * out,
+    uint n_heads, uint n_kv, uint kv_width,
+    uint start_pos, uint window, uint ring_mask, device const uint * pt,
+    uint n_tok, float scale, device half * xh, uint xh_on,
+    device const uint * layout, uint reach, uint key_lo,
+    device float * part, uint slices, uint chunk,
+    threadgroup half * shared, uint3 tgid, uint tid, uint lane, uint sgid)
+{
+    constexpr uint QB = 32u, KB = 32u, THREADS = 128u;
+    constexpr uint HD8 = HD / 8u, KS = HD + 8u;
+    // Query rows a threadgroup: 32, or 8 under ROW_HEADS (four heads' 8 rows fill the 32).
+    const uint QT = ROW_HEADS ? 8u : QB;
+    const uint kvw = (KVW != 0u) ? KVW : kv_width;
+    const uint grp = n_heads / n_kv;
+    const uint h = ROW_HEADS ? tgid.x * grp + sgid : tgid.x;
+    const uint q0 = tgid.y * QT;
+    const uint kvh = ROW_HEADS ? tgid.x : h / grp;
+    threadgroup half * tk = shared;
+    threadgroup half * tv = shared + KB * KS;
+    // Staged 8 halves (16 bytes) a load: NF of K and NF of V a thread.
+    constexpr uint NF = (KB * (HD / 8u)) / THREADS;
+    static_assert((KB * (HD / 8u)) % THREADS == 0u, "the staging divides over the threads");
+
+    // Q through the K/V staging: QB x KS halves fit in the two blocks' 2 x KB x KS.
+    for (uint e = tid; e < QB * HD; e += THREADS) {
+        const uint row = e / HD, dim = e % HD;
+        const uint t = ROW_HEADS ? q0 + row % 8u : q0 + row;
+        const uint hq = ROW_HEADS ? tgid.x * grp + row / 8u : h;
+        shared[row * KS + dim] = half(t < n_tok ? q[((ulong)t * n_heads + hq) * HD + dim] : 0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 mq[HD8];
+    #pragma unroll
+    for (uint i = 0; i < HD8; ++i) { simdgroup_load(mq[i], shared + (8u * sgid) * KS + 8u * i, KS); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // This lane's place in every 8x8 fragment: row fm, columns fn and fn + 1 (MLX steel mma.h).
+    const uint qid = lane / 4u;
+    const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
+    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+    const uint t = ROW_HEADS ? q0 + fm : q0 + 8u * sgid + fm;
+    const bool row_live = t < n_tok;
+    const uint t_pos = start_pos + t;
+    const uint t_lo = (window > 0u && t_pos + 1u > window) ? (t_pos + 1u - window) : 0u;
+    const float sl2 = scale * M_LOG2E_F;
+
+    simdgroup_float8x8 lo[HD8];
+    #pragma unroll
+    for (uint ii = 0; ii < HD8; ++ii) { lo[ii] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); }
+    float m = -INFINITY, l = 0.0f;
+
+    const uint last_q    = min(q0 + QT, n_tok) - 1u;
+    // A layout row may see batch rows past its own (a drafted block): the scan ends `reach` rows
+    // past the tile's last row, and starts at the key floor's block.
+    const uint pos_last  = start_pos + (ROW_LAYOUT ? min(last_q + reach, n_tok - 1u) : last_q);
+    const uint pos_first = start_pos + q0;
+    const uint scan_lo = max((window > 0u && pos_first + 1u > window) ? (pos_first + 1u - window) : 0u,
+                             ROW_LAYOUT ? key_lo : 0u)
+                       & ~(KB - 1u);
+    const bool paged = KV_PAGED && ring_mask == 0u;
+
+    // A 32-aligned block lies inside one 64-cell page. Keys past the last position are staged
+    // as zeros (their probabilities are 0; garbage V could be NaN).
+    float4 pk[NF], pv[NF];   // 8 halves each, moved as raw 16-byte words
+    auto fetch = [&](uint kbn) {
+        const uint pgbase = paged ? pt[kbn / KV_PAGE_CELLS] * KV_PAGE_CELLS + (kbn % KV_PAGE_CELLS) : 0u;
+        // A block wholly at or below the last position needs no per-row test.
+        const bool whole = kbn + KB - 1u <= pos_last;
+        #pragma unroll
+        for (uint f = 0; f < NF; ++f) {
+            const uint e = tid + f * THREADS;
+            const uint key = e / (HD / 8u), d8 = (e % (HD / 8u)) * 8u;
+            const uint gp = kbn + key;
+            pk[f] = float4(0.0f); pv[f] = float4(0.0f);
+            if (whole || gp <= pos_last) {
+                const uint slot = paged ? pgbase + key : kv_slot(gp, ring_mask, pt);
+                const ulong off = (ulong)slot * kvw + kvh * HD + d8;
+                pk[f] = *(device const float4 *)(kc + off);
+                pv[f] = *(device const float4 *)(vc + off);
+            }
+        }
+    };
+    auto store = [&](threadgroup half * dk, threadgroup half * dv) {
+        #pragma unroll
+        for (uint f = 0; f < NF; ++f) {
+            const uint e = tid + f * THREADS;
+            const uint key = e / (HD / 8u), d8 = (e % (HD / 8u)) * 8u;
+            *(threadgroup float4 *)(dk + key * KS + d8) = pk[f];
+            *(threadgroup float4 *)(dv + key * KS + d8) = pv[f];
+        }
+    };
+    // ROW_SPLIT: this threadgroup's slice of the scan, `chunk` keys (a multiple of KB) from the
+    // floor's block.
+    const uint kb_lo = ROW_SPLIT ? scan_lo + tgid.z * chunk : scan_lo;
+    const uint kb_hi = ROW_SPLIT ? min(pos_last, kb_lo + chunk - 1u) : pos_last;
+    for (uint kb = kb_lo; kb <= kb_hi; kb += KB) {
+        // Double-buffering this staging (the next block's rows in registers across this
+        // block's multiplies) measured 52.6 against 51.6 ms at 16384 keys; 64-key blocks 56.5;
+        // 64 queries a threadgroup 52.1; unpadded rows a tie.
+        // V fetched after the scores instead (MLX's order) measured 1444 against 1428 ms
+        // of attention at a 17115-token prefill, same bits.
+        fetch(kb);
+        store(tk, tv);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup half * bk = tk;
+        threadgroup half * bv = tv;
+
+        simdgroup_float8x8 s[KB / 8u];
+        // Loading the block's K fragments ahead of the multiplies (or its V fragments ahead of
+        // the softmax) measured 2-5x SLOWER: 32 more fragments a lane spill.
+        #pragma unroll
+        for (uint c = 0; c < KB / 8u; ++c) {
+            s[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma unroll
+            for (uint i = 0; i < HD8; ++i) {
+                simdgroup_half8x8 kf;
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_load(kf, bk + (8u * c) * KS + 8u * i, KS, 0, true);
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(s[c], mq[i], kf, s[c]);
+            }
+        }
+
+        // A layout row sees the whole cache below the batch, so only a block wholly below it
+        // (and above the floor) is live for every row.
+        const bool blk_live = ROW_LAYOUT
+            ? (row_live && (kb + KB) <= start_pos && kb >= key_lo)
+            : (row_live && (kb + KB - 1u) <= t_pos && kb >= t_lo);
+        float2 sv[KB / 8u];
+        float mx = -INFINITY;
+        #pragma unroll
+        for (uint c = 0; c < KB / 8u; ++c) {
+            float2 e2 = rm_frag_get(s[c]) * sl2;
+            if (!blk_live) {
+                const uint gp = kb + 8u * c + fn;
+                if (ROW_LAYOUT) {
+                    e2.x = (row_live && gp >= key_lo
+                            && row_layout_sees(layout, t, gp, start_pos))      ? e2.x : -INFINITY;
+                    e2.y = (row_live && gp + 1u >= key_lo
+                            && row_layout_sees(layout, t, gp + 1u, start_pos)) ? e2.y : -INFINITY;
+                } else {
+                    e2.x = (row_live && gp      <= t_pos && gp      >= t_lo) ? e2.x : -INFINITY;
+                    e2.y = (row_live && gp + 1u <= t_pos && gp + 1u >= t_lo) ? e2.y : -INFINITY;
+                }
+            }
+            sv[c] = e2;
+            mx = max(mx, max(e2.x, e2.y));
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1u));
+        mx = max(mx, simd_shuffle_xor(mx, 8u));
+        const float m_new = max(m, mx);
+        const bool dead = m_new == -INFINITY;
+        const float fac = dead ? 0.0f : exp2(m - m_new);
+        float rs = 0.0f;
+        #pragma unroll
+        for (uint c = 0; c < KB / 8u; ++c) {
+            const float2 p = dead ? float2(0.0f) : exp2(sv[c] - m_new);
+            rm_frag_set(s[c], p.x, p.y);
+            rs += p.x + p.y;
+        }
+        rs += simd_shuffle_xor(rs, 1u);
+        rs += simd_shuffle_xor(rs, 8u);
+        l = l * fac + rs;
+        m = m_new;
+        #pragma unroll
+        for (uint ii = 0; ii < HD8; ++ii) {
+            const float2 o = rm_frag_get(lo[ii]) * fac;
+            rm_frag_set(lo[ii], o.x, o.y);
+        }
+        FARS_UNROLL
+        for (uint c = 0; c < KB / 8u; ++c) {
+            FARS_UNROLL
+            for (uint ii = 0; ii < HD8; ++ii) {
+                simdgroup_half8x8 vf;
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_load(vf, bv + (8u * c) * KS + 8u * ii, KS);
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(lo[ii], s[c], vf, lo[ii]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // before the next block's staging
+    }
+
+    if (ROW_SPLIT) {
+        // Unnormalised: the combine rescales each slice by its max (log2 units of the prescaled
+        // score) against the row's overall max. A slice with no key the row sees writes m = -inf,
+        // l = 0 and a zero output, which the combine weighs by 0.
+        if (row_live) {
+            device float * pp = part + (((ulong)t * n_heads + h) * slices + tgid.z) * (HD + 2u);
+            #pragma unroll
+            for (uint ii = 0; ii < HD8; ++ii) {
+                *(device float2 *)(pp + 8u * ii + fn) = rm_frag_get(lo[ii]);
+            }
+            if (fn == 0u) { pp[HD] = m; pp[HD + 1u] = l; }
+        }
+        return;
+    }
+    if (row_live) {
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        #pragma unroll
+        for (uint ii = 0; ii < HD8; ++ii) {
+            const float2 o = rm_frag_get(lo[ii]) * inv;
+            const ulong idx = ((ulong)t * n_heads + h) * HD + 8u * ii + fn;
+            *(device float2 *)(out + idx) = o;
+            if (xh_on != 0u) { *(device half2 *)(xh + idx) = half2(o); }
+        }
+    }
+}
+
+// ROW_SPLIT's merge: one threadgroup a (head, row), a thread a dim. out = sum_s o_s w_s / sum_s l_s w_s
+// with w_s = exp2(m_s - max_s m_s); the half mirror too when the op would have written it.
+kernel void imparo_attention_rows_combine(
+    device const float * part [[buffer(0)]], device float * out [[buffer(1)]],
+    constant uint & head_dim  [[buffer(2)]], constant uint & n_heads [[buffer(3)]],
+    constant uint & slices    [[buffer(4)]], device half * xh [[buffer(5)]],
+    constant uint & xh_on     [[buffer(6)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 tid3  [[thread_position_in_threadgroup]],
+    uint3 tcnt3 [[threads_per_threadgroup]])
+{
+    const uint h = tgid.x, t = tgid.y, stride = head_dim + 2u;
+    device const float * pb = part + ((ulong)t * n_heads + h) * slices * stride;
+    float mx = -INFINITY;
+    for (uint s = 0; s < slices; ++s) { mx = max(mx, pb[s * stride + head_dim]); }
+    float den = 0.0f;
+    if (mx != -INFINITY) {
+        for (uint s = 0; s < slices; ++s) {
+            den += exp2(pb[s * stride + head_dim] - mx) * pb[s * stride + head_dim + 1u];
+        }
+    }
+    const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+    const ulong o0 = ((ulong)t * n_heads + h) * head_dim;
+    for (uint i = tid3.x; i < head_dim; i += tcnt3.x) {
+        float acc = 0.0f;
+        if (mx != -INFINITY) {
+            for (uint s = 0; s < slices; ++s) {
+                acc += exp2(pb[s * stride + head_dim] - mx) * pb[s * stride + i];
+            }
+        }
+        const float o = acc * inv;
+        out[o0 + i] = o;
+        if (xh_on != 0u) { xh[o0 + i] = half(o); }
+    }
+}
+
+#define IMPARO_FARS_KERNEL(NAME, HD_N, KVW_N)                                                 \
+kernel void NAME(                                                                          \
+    device const float * q      [[buffer(0)]],                                             \
+    device const half  * kc     [[buffer(1)]],                                             \
+    device const half  * vc     [[buffer(2)]],                                             \
+    device float       * out    [[buffer(3)]],                                             \
+    constant uint & n_heads     [[buffer(4)]],                                             \
+    constant uint & n_kv        [[buffer(5)]],                                             \
+    constant uint & kv_width    [[buffer(6)]],                                             \
+    constant uint & start_pos   [[buffer(7)]],                                             \
+    constant uint & window      [[buffer(8)]],                                             \
+    constant uint & ring_mask   [[buffer(9)]],                                             \
+    constant uint & n_tok       [[buffer(10)]],                                            \
+    device half        * xh     [[buffer(11)]],                                            \
+    constant uint & xh_on       [[buffer(12)]],                                            \
+    device const uint  * pt     [[buffer(13)]],                                            \
+    constant float & scale      [[buffer(14)]],                                            \
+    device const uint  * layout [[buffer(15), function_constant(ROW_LAYOUT)]],             \
+    constant uint & row_reach   [[buffer(16), function_constant(ROW_LAYOUT)]],             \
+    constant uint & row_key_lo  [[buffer(17), function_constant(ROW_LAYOUT)]],             \
+    device float       * part   [[buffer(18), function_constant(ROW_SPLIT)]],              \
+    constant uint & row_chunk   [[buffer(19), function_constant(ROW_SPLIT)]],              \
+    threadgroup half * shared   [[threadgroup(0)]],                                        \
+    uint3 tgid  [[threadgroup_position_in_grid]],                                          \
+    uint3 tpg   [[threadgroups_per_grid]],                                                 \
+    uint3 tid3  [[thread_position_in_threadgroup]],                                        \
+    uint  lane  [[thread_index_in_simdgroup]],                                             \
+    uint  sgid  [[simdgroup_index_in_threadgroup]])                                        \
+{                                                                                          \
+    device const uint * lay = nullptr;                                                     \
+    uint reach = 0u, key_lo = 0u;                                                          \
+    if (ROW_LAYOUT) { lay = layout; reach = row_reach; key_lo = row_key_lo; }              \
+    device float * pp = nullptr;                                                           \
+    uint chunk = 0u;                                                                       \
+    if (ROW_SPLIT) { pp = part; chunk = row_chunk; }                                       \
+    attention_prefill_fars_body<HD_N, KVW_N>(q, kc, vc, out, n_heads, n_kv, kv_width,       \
+        start_pos, window, ring_mask, pt, n_tok, scale, xh, xh_on, lay, reach, key_lo,     \
+        pp, tpg.z, chunk, shared, tgid, tid3.x, lane, sgid);                               \
+}
+
+#if IMPARO_HD0 && (IMPARO_HD0 <= 128)
+IMPARO_FARS_KERNEL(imparo_attention_prefill_fars_s0, IMPARO_HD0, IMPARO_KVW0)
+#endif
 #if IMPARO_HD0 && (IMPARO_HD0 <= 128)
 #if IMPARO_FA_ALL || (IMPARO_FA_NSG0 == 1)
 IMPARO_FA_KERNEL(imparo_attention_prefill_fa_s0_n1, IMPARO_HD0, 8, 64, 1, IMPARO_KVW0)
@@ -7649,7 +9499,14 @@ kernel void imparo_attention_decode_fd_t(
     for (uint j = 0; j < HQ; ++j) { lmax[j] = -INFINITY; }
     for (uint s = s0 + tid; s < s1; s += tcount) {
         const uint ps = kv_slot(lo + s, ring_mask, pt);
-        device const half4 * k4 = (device const half4 *)(kc + (ulong)ps * kvw + kvh * HD);
+        // PROBE (IMPARO_ATTN_SKIP bit 32): read K at a CONTIGUOUS per-thread offset instead
+        // of at the position stride. The cache is position-major, so adjacent threads take
+        // adjacent positions and stride by kvw -- 1024 B on this model. The answer is WRONG
+        // under the probe (the wrong keys are scored) and only the time is read, which is
+        // what separates "the stride costs" from "the kernel is latency-bound anyway".
+        device const half4 * k4 = (ATTN_SKIP & 32u) != 0u
+            ? (device const half4 *)(kc + (ulong)(s - s0) * HD + kvh * HD)
+            : (device const half4 *)(kc + (ulong)ps * kvw + kvh * HD);
         float acc[HQ];
         for (uint j = 0; j < HQ; ++j) { acc[j] = 0.0f; }
         for (uint i = 0; i < HD4; ++i) {
@@ -7986,6 +9843,7 @@ kernel void imparo_attention_decode_vec_t(
     constant uint & start_pos [[buffer(8)]], constant uint & window [[buffer(9)]],
     constant uint & ring_mask [[buffer(10)]],
     device const uint * pt [[buffer(18)]],
+    constant CobRow * rows [[buffer(19), function_constant(COB_ROWS)]],
     threadgroup float * red [[threadgroup(0)]],   // (NSG / 2) x (HD + 2)
     uint3 tgid   [[threadgroup_position_in_grid]],
     uint  lane   [[thread_index_in_simdgroup]],
@@ -7997,7 +9855,9 @@ kernel void imparo_attention_decode_vec_t(
     (void)head_dim;
     const uint h = tgid.x, t = tgid.y;
     const uint kvh = h / (n_heads / n_kv);
-    const uint pos = start_pos + t;
+    uint pos = start_pos + t;
+    device const uint * table = pt;
+    if (COB_ROWS) { pos = rows[t].pos; table = rows[t].pt; }
     const uint lo = (window > 0u && pos + 1u > window) ? (pos + 1u - window) : 0u;
     const uint n = pos + 1u - lo;
 
@@ -8009,7 +9869,7 @@ kernel void imparo_attention_decode_vec_t(
     float m = -INFINITY, l = 0.0f;
     float o[DPL];
     for (uint i = 0; i < DPL; ++i) { o[i] = 0.0f; }
-    attn_span_online<HD, KVW>(kc, vc, kvw, kvh, lo, n, sgid, NSG, ring_mask, pt, lane, qr, m, l, o);
+    attn_span_online<HD, KVW>(kc, vc, kvw, kvh, lo, n, sgid, NSG, ring_mask, table, lane, qr, m, l, o);
     // ---- merge the simdgroups in two rounds over NSG/2 slots of (o, m, l): the upper half
     // hands its state to the lower half, then simdgroups 1.. hand theirs to simdgroup 0.
     // Half the slots keep the buffer inside the 32 KB threadgroup limit at 16 simdgroups
@@ -8034,7 +9894,7 @@ kernel void imparo_attention_decode_vec_t(
 template [[host_name("imparo_attention_decode_vec_s" #SLOT)]] kernel void imparo_attention_decode_vec_t<HDV, KVWV, 16u>( \
     device const float *, device const half *, device const half *, device float *, constant uint &, constant uint &, \
     constant uint &, constant uint &, constant uint &, constant uint &, constant uint &, \
-    device const uint *, threadgroup float *, uint3, uint, uint);
+    device const uint *, constant CobRow *, threadgroup float *, uint3, uint, uint);
 #if IMPARO_HD0 && (IMPARO_HD0 % 32 == 0)
 IMPARO_VEC_INST(0, IMPARO_HD0, IMPARO_KVW0)
 #endif
@@ -8043,36 +9903,133 @@ IMPARO_VEC_INST(1, IMPARO_HD1, IMPARO_KVW1)
 #endif
 #undef IMPARO_VEC_INST
 
+// THE COMBINE HAS TWO INDEPENDENT REDUNDANCIES and IMPARO_ATTN_COMB_STAGE prices them
+// SEPARATELY, because a change with two effects measured as one bundle hides whichever of
+// them is worthless:
+//
+//   0   the original: every thread rescans the per-slice headers from DEVICE memory, and
+//       calls exp(m - mx) once per slice in BOTH the denom loop and the accumulate loop
+//   1   the headers are staged in threadgroup memory once; the exp() calls stay per thread
+//   2   the weights are also computed once into that staging, so exp() runs `slices` times
+//       instead of 2 x slices x tcount
+//
+// All three produce the same bits: exp(m - mx) is deterministic, and no sum is reassociated.
+// THREADS PER OUTPUT DIM in the combine (IMPARO_ATTN_COMB_SPD). NEGATIVE, kept as the arm
+// that says so: SPD threads share a dim, each taking every SPD'th slice, with the partials
+// meeting in simd shuffles -- SPD times the threads and an SPD times shorter chain, against
+// a grid of n_heads x n_tok = 32 threadgroups (3.6 simdgroups a core on 18 cores) and a
+// `slices`-deep serial dependent accumulate. It reads -0.57% at 64 decode steps and +0.35%
+// at 160, which is the 64-step number being noise: at 17122 keys the run-to-run spread is
+// 3.6%, so a sub-1% effect needs >= 128 steps to have a sign at all.
+// Default 1. Bit-affecting when on (the accumulate splits into SPD partials).
+constant uint ATTN_COMB_SPD_FC [[function_constant(35)]];
+constant uint ATTN_COMB_SPD =
+    is_function_constant_defined(ATTN_COMB_SPD_FC) ? ATTN_COMB_SPD_FC : 1u;
+constant uint ATTN_COMB_STAGE_FC [[function_constant(33)]];
+constant uint ATTN_COMB_STAGE =
+    is_function_constant_defined(ATTN_COMB_STAGE_FC) ? ATTN_COMB_STAGE_FC : 2u;
+
 // Merge the split-KV slices' unnormalised partials onto a common maximum and normalise.
+//
+// THE PER-SLICE HEADER IS STAGED, and that is the whole design. Every thread needs the same
+// `slices` (max, sum) pairs and the same weight exp(m - mx) for every slice, and the loop that
+// produced them used to be written out per thread against DEVICE memory:
+//
+//   before   2 prologue scans x slices x tcount device loads, and one exp() per thread per
+//            slice in the main loop -- at 67 slices and 64 threads that is 8576 header loads
+//            of which 134 are distinct, and 4288 exponentials of which 67 are distinct
+//   after    the headers are staged once, cooperatively; the weights are computed once into
+//            the same threadgroup array; the main loop reads a weight instead of recomputing
+//            it and no longer re-reads m from device
+//
+// Bit-identical: exp(m - mx) is a deterministic function of values that do not change, so a
+// staged weight equals the one the inner loop used to compute, and no sum is reassociated --
+// mx, denom and acc keep their original order.
 kernel void imparo_attention_decode_combine(
     device const float * part [[buffer(0)]], device float * out [[buffer(1)]],
     constant uint & head_dim [[buffer(2)]], constant uint & n_heads [[buffer(3)]],
     constant uint & slices   [[buffer(4)]],
+    threadgroup float * hdr [[threadgroup(0)]],     // slices x (weight, sum)
     uint3 tgid  [[threadgroup_position_in_grid]],
     uint3 tid3  [[thread_position_in_threadgroup]],
     uint3 tcnt3 [[threads_per_threadgroup]])
 {
     const uint tid = tid3.x, tcount = tcnt3.x;
     const uint h = tgid.x, t = tgid.y;
-    device const float * pb = part + (ulong)(t * n_heads + h) * slices * (head_dim + 2u);
+    const uint stride = head_dim + 2u;
+    device const float * pb = part + (ulong)(t * n_heads + h) * slices * stride;
+
+    device float * o = out + ((ulong)t * n_heads + h) * head_dim;
+
+    if (ATTN_COMB_STAGE == 0u) {
+        float mx = -INFINITY;
+        for (uint sp = 0; sp < slices; ++sp) { mx = max(mx, pb[sp * stride + head_dim]); }
+        float denom = 0.0f;
+        for (uint sp = 0; sp < slices; ++sp) {
+            const float m = pb[sp * stride + head_dim];
+            denom += exp(m - mx) * pb[sp * stride + head_dim + 1u];
+        }
+        const float inv = 1.0f / denom;
+        for (uint i = tid; i < head_dim; i += tcount) {
+            float acc = 0.0f;
+            for (uint sp = 0; sp < slices; ++sp) {
+                const float m = pb[sp * stride + head_dim];
+                acc += exp(m - mx) * pb[sp * stride + i];
+            }
+            o[i] = acc * inv;
+        }
+        return;
+    }
+
+    for (uint sp = tid; sp < slices; sp += tcount) {
+        hdr[sp * 2u]      = pb[sp * stride + head_dim];
+        hdr[sp * 2u + 1u] = pb[sp * stride + head_dim + 1u];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float mx = -INFINITY;
-    for (uint sp = 0; sp < slices; ++sp) { mx = max(mx, pb[sp * (head_dim + 2u) + head_dim]); }
+    for (uint sp = 0; sp < slices; ++sp) { mx = max(mx, hdr[sp * 2u]); }
+
+    // Arm 2 only: the weight replaces the max in place, ONCE, and everything downstream reads
+    // it. Ordering the conversion before `denom` is what removes the second bank of exp()
+    // calls as well as the accumulate loop's.
+    if (ATTN_COMB_STAGE >= 2u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint sp = tid; sp < slices; sp += tcount) { hdr[sp * 2u] = exp(hdr[sp * 2u] - mx); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     float denom = 0.0f;
     for (uint sp = 0; sp < slices; ++sp) {
-        const float m = pb[sp * (head_dim + 2u) + head_dim];
-        denom += exp(m - mx) * pb[sp * (head_dim + 2u) + head_dim + 1u];
+        const float w = (ATTN_COMB_STAGE >= 2u) ? hdr[sp * 2u] : exp(hdr[sp * 2u] - mx);
+        denom += w * hdr[sp * 2u + 1u];
     }
     const float inv = 1.0f / denom;
 
-    device float * o = out + ((ulong)t * n_heads + h) * head_dim;
-    for (uint i = tid; i < head_dim; i += tcount) {
-        float acc = 0.0f;
-        for (uint sp = 0; sp < slices; ++sp) {
-            const float m = pb[sp * (head_dim + 2u) + head_dim];
-            acc += exp(m - mx) * pb[sp * (head_dim + 2u) + i];
+    if (ATTN_COMB_SPD <= 1u) {
+        for (uint i = tid; i < head_dim; i += tcount) {
+            float acc = 0.0f;
+            for (uint sp = 0; sp < slices; ++sp) {
+                const float w = (ATTN_COMB_STAGE >= 2u) ? hdr[sp * 2u] : exp(hdr[sp * 2u] - mx);
+                acc += w * pb[sp * stride + i];
+            }
+            o[i] = acc * inv;
         }
-        o[i] = acc * inv;
+        return;
+    }
+    // SPD threads a dim. They are CONSECUTIVE lanes, so the join is a simd shuffle and needs
+    // no threadgroup memory and no barrier; SPD is a power of two no greater than 32, so the
+    // group never straddles two simdgroups.
+    const uint pslot = tid % ATTN_COMB_SPD, d0 = tid / ATTN_COMB_SPD;
+    const uint dstep = tcount / ATTN_COMB_SPD;
+    for (uint i = d0; i < head_dim; i += dstep) {
+        float acc = 0.0f;
+        for (uint sp = pslot; sp < slices; sp += ATTN_COMB_SPD) {
+            const float w = (ATTN_COMB_STAGE >= 2u) ? hdr[sp * 2u] : exp(hdr[sp * 2u] - mx);
+            acc += w * pb[sp * stride + i];
+        }
+        for (uint m2 = 1u; m2 < ATTN_COMB_SPD; m2 <<= 1) { acc += simd_shuffle_xor(acc, m2); }
+        if (pslot == 0u) { o[i] = acc * inv; }
     }
 }
 
@@ -8376,6 +10333,18 @@ inline void shortconv_step_body(
                                   min(kern - 1u, SHORTCONV_MAX_HISTORY), ch);
 }
 
+// Co-batched (COB_ROWS): grid row t is a conversation's token, its source and output at row t,
+// its history in its own state (rows[t]).
+template <uint FORM>
+inline void shortconv_step_rows(
+    device const float * src, device const float * cw, device float * out, uint width,
+    uint kern, constant CobRow * rows, uint2 gid)
+{
+    const uint t = gid.y;
+    shortconv_step_body<FORM>(src + (ulong)t * conv_src_stride<FORM>(width), cw, rows[t].state,
+                              out + (ulong)t * width, width, kern, rows[t].state_out, gid.x);
+}
+
 kernel void imparo_shortconv_step(
     device const float * bcx   [[buffer(0)]],
     device const float * cw    [[buffer(1)]],
@@ -8384,9 +10353,14 @@ kernel void imparo_shortconv_step(
     constant uint & width      [[buffer(4)]],
     constant uint & kern       [[buffer(5)]],
     device float       * state_out [[buffer(6)]],
-    uint ch [[thread_position_in_grid]])
+    constant CobRow * rows [[buffer(7), function_constant(COB_ROWS)]],
+    uint2 gid [[thread_position_in_grid]])
 {
-    shortconv_step_body<CONV_GATED>(bcx, cw, state, out, width, kern, state_out, ch);
+    if (COB_ROWS) {
+        shortconv_step_rows<CONV_GATED>(bcx, cw, out, width, kern, rows, gid);
+    } else {
+        shortconv_step_body<CONV_GATED>(bcx, cw, state, out, width, kern, state_out, gid.x);
+    }
 }
 
 // The PLAIN form's twin. qwen35's gated delta-net conv is `CONV_PLAIN_SILU`, and without
@@ -8401,9 +10375,14 @@ kernel void imparo_shortconv_step_plain(
     constant uint & width      [[buffer(4)]],
     constant uint & kern       [[buffer(5)]],
     device float       * state_out [[buffer(6)]],
-    uint ch [[thread_position_in_grid]])
+    constant CobRow * rows [[buffer(7), function_constant(COB_ROWS)]],
+    uint2 gid [[thread_position_in_grid]])
 {
-    shortconv_step_body<CONV_PLAIN_SILU>(src, cw, state, out, width, kern, state_out, ch);
+    if (COB_ROWS) {
+        shortconv_step_rows<CONV_PLAIN_SILU>(src, cw, out, width, kern, rows, gid);
+    } else {
+        shortconv_step_body<CONV_PLAIN_SILU>(src, cw, state, out, width, kern, state_out, gid.x);
+    }
 }
 
 // SEPARATE in and out, which is what lets the same kernel serve two jobs:
@@ -8461,6 +10440,115 @@ kernel void imparo_causal_conv_state_plain(
     uint ch [[thread_position_in_grid]])
 {
     causal_conv_state_body<CONV_PLAIN_SILU>(src, state_in, state_out, width, kern, n_tok, ch);
+}
+
+// ROW-LAYOUT CONVOLUTION (a tree verify). The value `back` steps up row t's own path is a batch
+// row while the path stays in the batch and the committed state once it leaves (state slot
+// history + depth - back, the slot the chain body reads), so a chain layout reads exactly what
+// causal_conv_body reads, in the same tap order.
+template <uint FORM>
+inline float conv_rows_value(device const float * src, device const float * state,
+                             device const uint * layout, uint width, uint stride,
+                             uint history, uint t, uint back, uint ch) {
+    const uint depth = layout[t * ROW_LAYOUT_WORDS + 1u];
+    if (back > depth) {
+        return state[(history + depth - back) * width + ch];
+    }
+    const uint row = back == 0u ? t : layout[t * ROW_LAYOUT_WORDS + 3u + back];
+    return conv_value<FORM>(src, width, (ulong)row * stride, ch);
+}
+
+// Outputs only: tap k of row t reads the value history - k steps up its path. The state is
+// read, never advanced -- conv_row_inputs keeps each row's input for the commit.
+template <uint FORM>
+inline void causal_conv_rows_body(
+    device const float * src, device const float * cw, device const float * state,
+    device float * out, uint width, uint kern, uint n_tok,
+    device half * outh, uint xh_on, device const uint * layout, uint gid)
+{
+    if (gid >= n_tok * width) { return; }
+    const uint t = gid / width, ch = gid % width;
+    const uint history = kern - 1u;
+    const uint stride = conv_src_stride<FORM>(width);
+    float acc = 0.0f;
+    for (uint k = 0; k < kern; ++k) {
+        const float v = conv_rows_value<FORM>(src, state, layout, width, stride, history, t,
+                                              history - k, ch);
+        acc += cw[ch * kern + k] * v;
+    }
+    const float v = conv_epilogue<FORM>(src, width, (ulong)t * stride, ch, acc);
+    out[(ulong)t * width + ch] = v;
+    if (xh_on != 0u) { outh[(ulong)t * width + ch] = half(v); }
+}
+
+kernel void imparo_causal_conv_rows_gated(
+    device const float * src    [[buffer(0)]],
+    device const float * cw     [[buffer(1)]],
+    device const float * state  [[buffer(2)]],
+    device float * out          [[buffer(3)]],
+    constant uint & width       [[buffer(4)]],
+    constant uint & kern        [[buffer(5)]],
+    constant uint & n_tok       [[buffer(6)]],
+    device half * outh          [[buffer(7)]],
+    constant uint & xh_on       [[buffer(8)]],
+    device const uint * layout  [[buffer(9)]],
+    uint gid [[thread_position_in_grid]])
+{
+    causal_conv_rows_body<CONV_GATED>(src, cw, state, out, width, kern, n_tok, outh, xh_on,
+                                      layout, gid);
+}
+
+kernel void imparo_causal_conv_rows_plain(
+    device const float * src    [[buffer(0)]],
+    device const float * cw     [[buffer(1)]],
+    device const float * state  [[buffer(2)]],
+    device float * out          [[buffer(3)]],
+    constant uint & width       [[buffer(4)]],
+    constant uint & kern        [[buffer(5)]],
+    constant uint & n_tok       [[buffer(6)]],
+    device half * outh          [[buffer(7)]],
+    constant uint & xh_on       [[buffer(8)]],
+    device const uint * layout  [[buffer(9)]],
+    uint gid [[thread_position_in_grid]])
+{
+    causal_conv_rows_body<CONV_PLAIN_SILU>(src, cw, state, out, width, kern, n_tok, outh, xh_on,
+                                           layout, gid);
+}
+
+// Each batch row's input to the window: the value causal_conv_body shifts into the state for
+// that row, written at row * row_elems. A tree commit rebuilds the accepted path's window from
+// these rows, so no row keeps a whole window.
+template <uint FORM>
+inline void conv_row_inputs_body(
+    device const float * src, device float * inputs, uint width, uint row_elems, uint n_tok,
+    uint gid)
+{
+    if (gid >= n_tok * width) { return; }
+    const uint t = gid / width, ch = gid % width;
+    inputs[(ulong)t * row_elems + ch] =
+        conv_value<FORM>(src, width, (ulong)t * conv_src_stride<FORM>(width), ch);
+}
+
+kernel void imparo_conv_row_inputs_gated(
+    device const float * src    [[buffer(0)]],
+    device float * inputs       [[buffer(1)]],
+    constant uint & width       [[buffer(2)]],
+    constant uint & row_elems   [[buffer(3)]],
+    constant uint & n_tok       [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    conv_row_inputs_body<CONV_GATED>(src, inputs, width, row_elems, n_tok, gid);
+}
+
+kernel void imparo_conv_row_inputs_plain(
+    device const float * src    [[buffer(0)]],
+    device float * inputs       [[buffer(1)]],
+    constant uint & width       [[buffer(2)]],
+    constant uint & row_elems   [[buffer(3)]],
+    constant uint & n_tok       [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    conv_row_inputs_body<CONV_PLAIN_SILU>(src, inputs, width, row_elems, n_tok, gid);
 }
 
 // THE GATED DELTA RULE. `imparo_cpu::ops::delta_net` is the oracle this is checked
@@ -8581,20 +10669,35 @@ kernel void imparo_delta_net(
     // NO matrix -- a conversation adopting another's prefix ran from zeros.
     device float * snap         [[buffer(15)]],
     constant uint & snap_row    [[buffer(16)]],
-    uint h    [[threadgroup_position_in_grid]],
+    // CO-BATCHED ROWS (COB_ROWS): grid row tg.y is a conversation's single token. Its q/k/v,
+    // alpha, beta, output and gate sit at that row of their buffers, and its matrix lives in its
+    // OWN slot's state, a different Metal buffer per row -- so those two addresses come from the
+    // table rather than from a binding. `snap` and `snap_row` are not used in this form.
+    constant CobRow * rows [[buffer(17), function_constant(COB_ROWS)]],
+    uint2 tg  [[threadgroup_position_in_grid]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
+    const uint h = tg.x;
     if (h >= v_heads) { return; }
     const uint kw = k_heads * DKD;                       // Q width, and K width
     const uint qkv_width = 2u * kw + v_heads * DVD;
+    // This row's view of the step. Without COB_ROWS the row is 0 and every pointer is its binding.
+    const uint crow = COB_ROWS ? tg.y : 0u;
+    device const float * qkv_r   = qkv   + (ulong)crow * qkv_width;
+    device const float * alpha_r = alpha + (ulong)crow * v_heads;
+    device const float * beta_r  = beta  + (ulong)crow * v_heads;
+    device float       * out_r   = out   + (ulong)crow * v_heads * DVD;
+    device float       * gate_r  = gate  + (ulong)crow * v_heads * DVD;
+    device const float * st_in   = COB_ROWS ? (device const float *)rows[crow].state : state;
+    device float       * st_out  = COB_ROWS ? rows[crow].state_out : state_out;
     // KEY HEAD MAPPING: the reference widens Q and K with a repeat, and a repeat TILES,
     // so value head h reads key head h % k_heads. A grouped-query attention in the same
     // model uses h / group; the two genuinely differ.
     const uint kb = (h % k_heads) * DKD;
     const uint vb = h * DVD;
-    device const float * S = state + (ulong)h * DVD * DKD;
-    device float * S_out = state_out + (ulong)h * DVD * DKD;
+    device const float * S = st_in + (ulong)h * DVD * DKD;
+    device float * S_out = st_out + (ulong)h * DVD * DKD;
 
     threadgroup float tq[DSTAGE * DKD];
     threadgroup float tk[DSTAGE * DKD];
@@ -8642,9 +10745,9 @@ kernel void imparo_delta_net(
         // Every `simd_sum` below is reached by all 32 lanes of its simdgroup.
         for (uint slot = slot0; slot < tn; slot += slot_stride) {
             const uint t = t0 + slot;
-            device const float * row = qkv + (ulong)t * qkv_width;
+            device const float * qrow = qkv_r + (ulong)t * qkv_width;
             if (role == 0u || role == 1u) {
-                device const float * src = row + (role == 0u ? kb : kw + kb);
+                device const float * src = qrow + (role == 0u ? kb : kw + kb);
                 float sq = 0.0f;
                 for (uint c = 0u; c < DCOLS; ++c) {
                     const uint i = lane * DCOLS + c;
@@ -8665,16 +10768,16 @@ kernel void imparo_delta_net(
                     }
                 }
             } else if (role == 2u) {
-                device const float * src = row + 2u * kw + vb;
+                device const float * src = qrow + 2u * kw + vb;
                 for (uint c = 0u; c < DCOLS; ++c) {
                     const uint i = lane * DCOLS + c;
                     if (i < DVD) { tv[slot * DVD + i] = src[i]; }
                 }
             } else if (lane == 0u) {
                 // `wa` is already -exp(A_log), so this is the NEGATIVE log decay.
-                const float g = wa[h] * imparo_softplus_f(alpha[(ulong)t * v_heads + h] + wdt[h]);
+                const float g = wa[h] * imparo_softplus_f(alpha_r[(ulong)t * v_heads + h] + wdt[h]);
                 tsc[slot * 2u + 0u] = exp(g);
-                tsc[slot * 2u + 1u] = imparo_sigmoid_f(beta[(ulong)t * v_heads + h]);
+                tsc[slot * 2u + 1u] = imparo_sigmoid_f(beta_r[(ulong)t * v_heads + h]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -8722,7 +10825,7 @@ kernel void imparo_delta_net(
                     const uint j = sg + r * DELTA_SGS;
                     if (j < DVD) {
                         if (fuse_epi) { tout_w[tt * DVD + j] = acc[r]; }
-                        else { out[(ulong)(t0 + tt) * v_heads * DVD + vb + j] = acc[r]; }
+                        else { out_r[(ulong)(t0 + tt) * v_heads * DVD + vb + j] = acc[r]; }
                     }
                 }
             }
@@ -8744,7 +10847,7 @@ kernel void imparo_delta_net(
                 const float o = simd_sum(proj);
                 if (lane == 0u && j < DVD) {
                     if (fuse_epi) { tout_w[tt * DVD + j] = o; }
-                    else { out[(ulong)(t0 + tt) * v_heads * DVD + vb + j] = o; }
+                    else { out_r[(ulong)(t0 + tt) * v_heads * DVD + vb + j] = o; }
                 }
             }
 #endif
@@ -8800,7 +10903,7 @@ kernel void imparo_delta_net(
                 }
                 const float inv = rsqrt(simd_sum(dot(core, core)) / float(DVD) + eps);
                 if (i0 < DVD) {
-                    device float * grow = gate + (ulong)(t0 + slot) * v_heads * DVD + vb;
+                    device float * grow = gate_r + (ulong)(t0 + slot) * v_heads * DVD + vb;
                     const float4 w = float4(nrm[i0], nrm[i0 + 1u],
                                             nrm[i0 + 2u], nrm[i0 + 3u]);
                     const float4 normed = core * inv * w;
@@ -8822,6 +10925,168 @@ kernel void imparo_delta_net(
             const uint i = lane * DCOLS + c;
             if (j < DVD && i < DKD) { S_out[(ulong)j * DKD + i] = s[r][c]; }
         }
+    }
+}
+
+// THE GATED DELTA RULE OVER A DRAFT TREE: a verify's read-only form (design 7.2). The rows are
+// the tree's nodes depth-first, so every node follows its parent and the rows in between are
+// its parent's earlier subtrees. S0, the state before the verify, is read and never written.
+// Each node's output is what `imparo_delta_net` returns for it run along the node's own path
+// from S0, in the same arithmetic.
+//
+// A THREAD WALKS THE TREE WITH ITS STATE BLOCK IN REGISTERS, as the serial kernel walks tokens:
+// a node whose parent is the row before it continues from the block as it stands, so a chain
+// runs exactly the serial kernel's loop. A later child -- a node whose parent is further back
+// -- starts from the block its parent left, which the thread copied into `kept`, by depth, when
+// that parent finished; the host marks the rows with more than one child (`keep_lo` / `keep_hi`,
+// bit t for row t), and only those are copied. The host refuses a layout that is not depth-first
+// or reaches DTREE_DEPTH.
+//
+// NOT THE MASKED SOLVE (each u from S0 k, S0 q and the key products with every ancestor), and
+// NOT EVERY DEPTH'S BLOCK IN THREAD MEMORY: built first, they measured 1122 and 309 us per
+// dispatch for a 16-node tree, where the serial kernel takes 98 over 16 rows
+// (docs/evidence/dspark/2026-09-15-step6-gdn-tree-kernel.md).
+#ifndef IMPARO_DELTA_TREE_DEPTH
+#define IMPARO_DELTA_TREE_DEPTH 16
+#endif
+constant uint DTREE_DEPTH = IMPARO_DELTA_TREE_DEPTH;
+
+kernel void imparo_delta_net_tree(
+    device const float * qkv    [[buffer(0)]],
+    device const float * alpha  [[buffer(1)]],
+    device const float * beta   [[buffer(2)]],
+    device const float * wa     [[buffer(3)]],
+    device const float * wdt    [[buffer(4)]],
+    device const float * state  [[buffer(5)]],
+    device float * out          [[buffer(6)]],
+    constant uint & k_heads     [[buffer(7)]],
+    constant uint & v_heads     [[buffer(8)]],
+    constant uint & n_tok       [[buffer(9)]],
+    constant float & eps        [[buffer(10)]],
+    device const uint * layout  [[buffer(11)]],
+    constant uint & keep_lo     [[buffer(12)]],
+    constant uint & keep_hi     [[buffer(13)]],
+    uint h    [[threadgroup_position_in_grid]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    if (h >= v_heads) { return; }
+    const uint kw = k_heads * DKD;                       // Q width, and K width
+    const uint qkv_width = 2u * kw + v_heads * DVD;
+    const uint kb = (h % k_heads) * DKD;                 // the serial kernel's key head mapping
+    const uint vb = h * DVD;
+    device const float * S = state + (ulong)h * DVD * DKD;
+
+    threadgroup float tq[DSTAGE * DKD];
+    threadgroup float tk[DSTAGE * DKD];
+    threadgroup float tv[DSTAGE * DVD];
+    threadgroup float tsc[DSTAGE * 2];                   // decay, beta
+    threadgroup uint  tdep[DSTAGE];                      // depth
+
+    float s[DROWS][DCOLS];
+    for (uint r = 0u; r < DROWS; ++r) {
+        const uint j = sg + r * DELTA_SGS;
+        for (uint c = 0u; c < DCOLS; ++c) {
+            const uint i = lane * DCOLS + c;
+            s[r][c] = (j < DVD && i < DKD) ? S[(ulong)j * DKD + i] : 0.0f;
+        }
+    }
+    float kept[DTREE_DEPTH + 1][DROWS][DCOLS];
+    uint prev_d = 0u;
+
+    const float qscale = 1.0f / sqrt(float(DKD));
+    const uint slot0 = sg / 4u, role = sg % 4u, slot_stride = DELTA_SGS / 4u;
+    for (uint t0 = 0u; t0 < n_tok; t0 += DSTAGE) {
+        const uint tn = min(DSTAGE, n_tok - t0);
+        // STAGE the group as the serial kernel does, each node's depth beside its gates.
+        for (uint slot = slot0; slot < tn; slot += slot_stride) {
+            const uint t = t0 + slot;
+            device const float * row = qkv + (ulong)t * qkv_width;
+            if (role == 0u || role == 1u) {
+                device const float * src = row + (role == 0u ? kb : kw + kb);
+                float sq = 0.0f;
+                for (uint c = 0u; c < DCOLS; ++c) {
+                    const uint i = lane * DCOLS + c;
+                    const float x = i < DKD ? src[i] : 0.0f;
+                    sq += x * x;
+                }
+                const float inv = 1.0f / max(sqrt(simd_sum(sq)), eps);
+                for (uint c = 0u; c < DCOLS; ++c) {
+                    const uint i = lane * DCOLS + c;
+                    if (i < DKD) {
+                        const float v = src[i] * inv;
+                        if (role == 0u) { tq[slot * DKD + i] = v * qscale; }
+                        else            { tk[slot * DKD + i] = v; }
+                    }
+                }
+            } else if (role == 2u) {
+                device const float * src = row + 2u * kw + vb;
+                for (uint c = 0u; c < DCOLS; ++c) {
+                    const uint i = lane * DCOLS + c;
+                    if (i < DVD) { tv[slot * DVD + i] = src[i]; }
+                }
+            } else if (lane == 0u) {
+                const float g = wa[h] * imparo_softplus_f(alpha[(ulong)t * v_heads + h] + wdt[h]);
+                tsc[slot * 2u + 0u] = exp(g);
+                tsc[slot * 2u + 1u] = imparo_sigmoid_f(beta[(ulong)t * v_heads + h]);
+                tdep[slot] = layout[(ulong)t * ROW_LAYOUT_WORDS + 1u];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint tt = 0u; tt < tn; ++tt) {
+            const uint t = t0 + tt;
+            const float decay = tsc[tt * 2u + 0u], bt = tsc[tt * 2u + 1u];
+            const uint d = min(tdep[tt], DTREE_DEPTH - 1u);   // inside `kept` whatever the layout
+            // A later child starts from its parent's kept block; the root and a first child
+            // continue from the block as it stands.
+            if (t > 0u && d != prev_d + 1u) {
+                for (uint r = 0u; r < DROWS; ++r) {
+                    for (uint c = 0u; c < DCOLS; ++c) { s[r][c] = kept[d][r][c]; }
+                }
+            }
+            float kv[DCOLS], qv[DCOLS];
+            for (uint c = 0u; c < DCOLS; ++c) {
+                const uint i = lane * DCOLS + c;
+                kv[c] = i < DKD ? tk[tt * DKD + i] : 0.0f;
+                qv[c] = i < DKD ? tq[tt * DKD + i] : 0.0f;
+            }
+            // The serial kernel's recurrence (its IMPARO_DELTA_PIPE form), unchanged.
+            float acc[DROWS];
+            for (uint r = 0u; r < DROWS; ++r) {
+                acc[r] = 0.0f;
+                for (uint c = 0u; c < DCOLS; ++c) {
+                    s[r][c] *= decay;
+                    acc[r] += s[r][c] * kv[c];
+                }
+            }
+            for (uint r = 0u; r < DROWS; ++r) { acc[r] = simd_sum(acc[r]); }
+            for (uint r = 0u; r < DROWS; ++r) {
+                const uint j = sg + r * DELTA_SGS;
+                const float dl = ((j < DVD ? tv[tt * DVD + j] : 0.0f) - acc[r]) * bt;
+                acc[r] = 0.0f;
+                for (uint c = 0u; c < DCOLS; ++c) {
+                    s[r][c] += kv[c] * dl;
+                    acc[r] += s[r][c] * qv[c];
+                }
+            }
+            for (uint r = 0u; r < DROWS; ++r) { acc[r] = simd_sum(acc[r]); }
+            if (lane == 0u) {
+                for (uint r = 0u; r < DROWS; ++r) {
+                    const uint j = sg + r * DELTA_SGS;
+                    if (j < DVD) { out[(ulong)t * v_heads * DVD + vb + j] = acc[r]; }
+                }
+            }
+            const uint keep = t < 32u ? (keep_lo >> t) & 1u : (keep_hi >> (t - 32u)) & 1u;
+            if (keep != 0u) {
+                for (uint r = 0u; r < DROWS; ++r) {
+                    for (uint c = 0u; c < DCOLS; ++c) { kept[d + 1u][r][c] = s[r][c]; }
+                }
+            }
+            prev_d = d;
+        }
+        // The staging arrays are rewritten by the next group.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -8853,6 +11118,20 @@ kernel void imparo_copy_strided(
     const uint i = gid.x, r = gid.y;
     if (i >= width) { return; }
     dst[(ulong)r * width + i] = src[(ulong)r * src_stride + src_off + i];
+}
+
+// `dst[r * dst_stride + dst_off + i] = src[r * width + i]` -- the inverse of
+// imparo_copy_strided: contiguous rows written into ONE sub-block of every row. A drafter's
+// feature taps put each tapped layer's residual beside the other taps' with it.
+kernel void imparo_scatter_strided(
+    device float * dst [[buffer(0)]], device const float * src [[buffer(1)]],
+    constant uint & width [[buffer(2)]], constant uint & dst_off [[buffer(3)]],
+    constant uint & dst_stride [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint i = gid.x, r = gid.y;
+    if (i >= width) { return; }
+    dst[(ulong)r * dst_stride + dst_off + i] = src[(ulong)r * width + i];
 }
 
 kernel void imparo_act_mul(
@@ -9065,6 +11344,284 @@ kernel void imparo_argmax_feed(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0u) { tokens[0] = bi[0]; pick[pick_off] = bi[0]; }
+}
+
+// THE K LARGEST ENTRIES OF EACH ROW (the drafter's candidates), in two dispatches with no
+// threadgroup memory and no barriers. Pass one: every chunk of every row keeps its best k in a
+// working list past the output. Pass two: each row merges its chunks' lists in chunk order.
+// Larger values first; among equal values the smaller index first, the rule of imparo_argmax.
+// Both passes hold it the same way: a value enters a full list only when it beats the list's
+// last entry, and it lands behind every entry it does not beat, so an equal value that came
+// later -- a larger index -- stays behind.
+// The list capacity. imparo_metal.mm holds it too and refuses a larger k.
+#define TOP_K_ROWS_MAX 64u
+
+struct imparo_top_k_args {
+    uint width;    // floats per row
+    uint rows;
+    uint k;
+    uint chunk;    // floats per chunk
+    uint chunks;   // chunks per row
+};
+
+// Admits (v, i) to a list of n entries kept larger first; returns the new count.
+static inline uint top_k_admit(thread float * lv, thread uint * li, uint n, uint k,
+                               float v, uint i) {
+    if (n == k && !(v > lv[k - 1u])) { return n; }
+    uint p = n < k ? n : k - 1u;
+    while (p > 0u && lv[p - 1u] < v) {
+        lv[p] = lv[p - 1u];
+        li[p] = li[p - 1u];
+        p -= 1u;
+    }
+    lv[p] = v;
+    li[p] = i;
+    return n < k ? n + 1u : n;
+}
+
+// The destination, in elements: ids [rows * k], values [rows * k], then the lists' ids
+// [rows * chunks * k] and values [rows * chunks * k]. An empty list slot holds id 0xffffffff.
+kernel void imparo_top_k_chunks(
+    device const float * src [[buffer(0)]],
+    device uint * ids        [[buffer(1)]],
+    device float * vals      [[buffer(2)]],
+    constant imparo_top_k_args & a [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x;
+    const uint r = gid.y;
+    const uint lo = c * a.chunk;
+    const uint hi = min(lo + a.chunk, a.width);
+    float lv[TOP_K_ROWS_MAX];
+    uint  li[TOP_K_ROWS_MAX];
+    uint n = 0u;
+    const ulong row = (ulong)r * a.width;
+    for (uint i = lo; i < hi; i++) {
+        n = top_k_admit(lv, li, n, a.k, src[row + i], i);
+    }
+    const ulong out = (ulong)a.rows * a.k;
+    const ulong lists = out * a.chunks;
+    const ulong at = ((ulong)r * a.chunks + c) * a.k;
+    for (uint j = 0u; j < a.k; j++) {
+        ids[2ul * out + at + j]          = j < n ? li[j] : 0xffffffffu;
+        vals[2ul * out + lists + at + j] = j < n ? lv[j] : -INFINITY;
+    }
+}
+
+kernel void imparo_top_k_merge(
+    device uint * ids   [[buffer(0)]],
+    device float * vals [[buffer(1)]],
+    constant imparo_top_k_args & a [[buffer(2)]],
+    uint r [[thread_position_in_grid]])
+{
+    float lv[TOP_K_ROWS_MAX];
+    uint  li[TOP_K_ROWS_MAX];
+    uint n = 0u;
+    const ulong out = (ulong)a.rows * a.k;
+    const ulong lists = out * a.chunks;
+    for (uint c = 0u; c < a.chunks; c++) {
+        const ulong at = ((ulong)r * a.chunks + c) * a.k;
+        for (uint j = 0u; j < a.k; j++) {
+            const uint i = ids[2ul * out + at + j];
+            const float v = vals[2ul * out + lists + at + j];
+            // A list is sorted: past an empty slot or a refused value nothing enters.
+            if (i == 0xffffffffu || (n == a.k && !(v > lv[a.k - 1u]))) { break; }
+            n = top_k_admit(lv, li, n, a.k, v, i);
+        }
+    }
+    for (uint j = 0u; j < a.k; j++) {
+        ids[(ulong)r * a.k + j]        = j < n ? li[j] : 0xffffffffu;
+        vals[out + (ulong)r * a.k + j] = j < n ? lv[j] : -INFINITY;
+    }
+}
+
+// THE K LARGEST ENTRIES OF EACH ROW AT K <= 8: the passes, layout and order of
+// imparo_top_k_chunks and imparo_top_k_merge, with the working list in eight named slots instead
+// of 64-entry thread arrays. A value that does not enter costs its own load and one compare with
+// the eighth slot, and the merge loads an id only for a value that enters. The array-list passes
+// took 0.47 ms and 0.09 ms for 9 x 128000 at K = 8
+// (docs/evidence/dspark/2026-09-15-step3f-candidates-lfm25.md).
+#define TOP_K_EMPTY 0xffffffffu
+
+struct top8_list {
+    float v0, v1, v2, v3, v4, v5, v6, v7;
+    uint  i0, i1, i2, i3, i4, i5, i6, i7;
+};
+
+inline __attribute__((always_inline)) top8_list top8_empty() {
+    top8_list t;
+    t.v0 = t.v1 = t.v2 = t.v3 = t.v4 = t.v5 = t.v6 = t.v7 = -INFINITY;
+    t.i0 = t.i1 = t.i2 = t.i3 = t.i4 = t.i5 = t.i6 = t.i7 = TOP_K_EMPTY;
+    return t;
+}
+
+// One slot of an insertion. The travelling entry (x, xi) takes the slot when the slot is empty or
+// x beats it, and once it has taken one, every later slot moves down by one. An equal value does
+// not take the slot, so equal values must arrive smaller id first.
+inline __attribute__((always_inline)) void top8_slot(thread float & v, thread uint & i,
+                                                     thread float & x, thread uint & xi,
+                                                     thread bool & moved) {
+    const bool take = moved || i == TOP_K_EMPTY || x > v;
+    const float tv = v;
+    const uint ti = i;
+    v = take ? x : v;
+    i = take ? xi : i;
+    x = take ? tv : x;
+    xi = take ? ti : xi;
+    moved = take;
+}
+
+inline __attribute__((always_inline)) void top8_insert(thread top8_list & t, float x, uint xi) {
+    bool moved = false;
+    top8_slot(t.v0, t.i0, x, xi, moved);
+    top8_slot(t.v1, t.i1, x, xi, moved);
+    top8_slot(t.v2, t.i2, x, xi, moved);
+    top8_slot(t.v3, t.i3, x, xi, moved);
+    top8_slot(t.v4, t.i4, x, xi, moved);
+    top8_slot(t.v5, t.i5, x, xi, moved);
+    top8_slot(t.v6, t.i6, x, xi, moved);
+    top8_slot(t.v7, t.i7, x, xi, moved);
+}
+
+// The list's first k entries: ids from ids[at], values from vals[vat].
+inline __attribute__((always_inline)) void top8_write(thread const top8_list & t, uint k,
+                                                      device uint * ids, ulong at,
+                                                      device float * vals, ulong vat) {
+    const float v[8] = {t.v0, t.v1, t.v2, t.v3, t.v4, t.v5, t.v6, t.v7};
+    const uint i[8] = {t.i0, t.i1, t.i2, t.i3, t.i4, t.i5, t.i6, t.i7};
+    for (uint j = 0u; j < k; j++) {
+        ids[at + j] = i[j];
+        vals[vat + j] = v[j];
+    }
+}
+
+kernel void imparo_top_k8_chunks(
+    device const float * src [[buffer(0)]],
+    device uint * ids        [[buffer(1)]],
+    device float * vals      [[buffer(2)]],
+    constant imparo_top_k_args & a [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x;
+    const uint r = gid.y;
+    const uint lo = c * a.chunk;
+    const uint hi = min(lo + a.chunk, a.width);
+    const ulong row = (ulong)r * a.width;
+    top8_list t = top8_empty();
+    for (uint i = lo; i < hi; i++) {
+        const float x = src[row + i];
+        if (t.i7 != TOP_K_EMPTY && !(x > t.v7)) { continue; }
+        top8_insert(t, x, i);
+    }
+    const ulong out = (ulong)a.rows * a.k;
+    const ulong lists = out * a.chunks;
+    const ulong at = ((ulong)r * a.chunks + c) * a.k;
+    top8_write(t, a.k, ids, 2ul * out + at, vals, 2ul * out + lists + at);
+}
+
+// ONE PASS, for a row narrow enough that splitting it costs more than it saves. The two-pass
+// form exists because a wide row wants many threads on it: chunk threads each scan a slice,
+// then one thread merges their lists. A 32-expert router picking 4 gives chunks=3 -- a
+// three-thread dispatch and a one-thread dispatch, both pure launch -- and a routed layer
+// runs this every token. This is the chunk scan over the WHOLE row, writing straight to the
+// merge's output slots, so the result is the same list by the same insertion order.
+kernel void imparo_top_k8_one(
+    device const float * src [[buffer(0)]],
+    device uint * ids        [[buffer(1)]],
+    device float * vals      [[buffer(2)]],
+    constant imparo_top_k_args & a [[buffer(3)]],
+    uint r [[thread_position_in_grid]])
+{
+    if (r >= a.rows) { return; }
+    const ulong row = (ulong)r * a.width;
+    top8_list t = top8_empty();
+    for (uint i = 0u; i < a.width; i++) {
+        const float x = src[row + i];
+        if (t.i7 != TOP_K_EMPTY && !(x > t.v7)) { continue; }
+        top8_insert(t, x, i);
+    }
+    top8_write(t, a.k, ids, (ulong)r * a.k, vals, (ulong)a.rows * a.k + (ulong)r * a.k);
+}
+
+kernel void imparo_top_k8_merge(
+    device uint * ids   [[buffer(0)]],
+    device float * vals [[buffer(1)]],
+    constant imparo_top_k_args & a [[buffer(2)]],
+    uint r [[thread_position_in_grid]])
+{
+    const ulong out = (ulong)a.rows * a.k;
+    const ulong lists = out * a.chunks;
+    top8_list t = top8_empty();
+    for (uint c = 0u; c < a.chunks; c++) {
+        const ulong at = ((ulong)r * a.chunks + c) * a.k;
+        for (uint j = 0u; j < a.k; j++) {
+            // A list is sorted: past a value the full list refuses nothing enters, and an empty
+            // slot ends the list.
+            const float v = vals[2ul * out + lists + at + j];
+            if (t.i7 != TOP_K_EMPTY && !(v > t.v7)) { break; }
+            const uint i = ids[2ul * out + at + j];
+            if (i == TOP_K_EMPTY) { break; }
+            top8_insert(t, v, i);
+        }
+    }
+    top8_write(t, a.k, ids, (ulong)r * a.k, vals, out + (ulong)r * a.k);
+}
+
+// ONE LOGISTIC OUTPUT PER ROW (the drafter's confidence head), in two passes over dst:
+//   blocks  dst[dst_off + rows + r * blocks + c] = block c's sum of weight x input in index order,
+//           a block being LOGISTIC_BLOCK entries of a, then of b
+//   finish  dst[dst_off + r] = sigmoid(the row's block sums in block order, then the bias)
+// One thread per row over all a_width + b_width products took 0.2 ms at 9 x 2304
+// (docs/evidence/dspark/2026-09-15-step3f-candidates-lfm25.md); the blocks spread those products
+// over many threads. imparo_metal.mm holds LOGISTIC_BLOCK too.
+#define LOGISTIC_BLOCK 64u
+
+struct imparo_logistic_args {
+    uint a_width;
+    uint b_width;
+    uint w_off;
+    uint dst_off;
+    uint rows;
+    uint a_blocks;   // blocks over a; the rest are over b
+    uint blocks;
+};
+
+kernel void imparo_logistic_blocks(
+    device const float * a [[buffer(0)]],
+    device const float * b [[buffer(1)]],
+    device const float * w [[buffer(2)]],
+    device float * dst     [[buffer(3)]],
+    constant imparo_logistic_args & p [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x;
+    const uint r = gid.y;
+    const bool in_a = c < p.a_blocks;
+    const uint width = in_a ? p.a_width : p.b_width;
+    const uint lo = (in_a ? c : c - p.a_blocks) * LOGISTIC_BLOCK;
+    const uint hi = min(lo + LOGISTIC_BLOCK, width);
+    const ulong src = (ulong)r * width;
+    const ulong wb = (ulong)p.w_off + (in_a ? 0u : p.a_width);
+    float z = 0.0f;
+    if (in_a) {
+        for (uint j = lo; j < hi; j++) { z += w[wb + j] * a[src + j]; }
+    } else {
+        for (uint j = lo; j < hi; j++) { z += w[wb + j] * b[src + j]; }
+    }
+    dst[(ulong)p.dst_off + p.rows + (ulong)r * p.blocks + c] = z;
+}
+
+kernel void imparo_logistic_finish(
+    device const float * w [[buffer(0)]],
+    device float * dst     [[buffer(1)]],
+    constant imparo_logistic_args & p [[buffer(2)]],
+    uint r [[thread_position_in_grid]])
+{
+    const ulong part = (ulong)p.dst_off + p.rows + (ulong)r * p.blocks;
+    float z = 0.0f;
+    for (uint c = 0u; c < p.blocks; c++) { z += dst[part + c]; }
+    z += w[(ulong)p.w_off + p.a_width + p.b_width];
+    dst[(ulong)p.dst_off + r] = 1.0f / (1.0f + exp(-z));
 }
 
 // per-layer path: y[t*ple + i] = (proj[t*W + l*ple + i] + emb[i]*embscale) * combscale
@@ -9323,6 +11880,1231 @@ kernel void imparo_blk_gemv(
 #if IMPARO_BLK_GEMV_STRIDE
     }
 #endif
+}
+
+// THE DECODE-ROWS FORM OF imparo_blk_gemv, for a co-batched step's rows on the fast route. The
+// kernel above loops the tokens outermost, so each extra row decodes every weight again and reads
+// it again: two rows of Qwen3.8-27B cost two lone decodes. Here each sub-block is decoded once
+// and multiplied into every token's activations.
+//
+// ONE WEIGHT ROW PER LANE. A threadgroup covers 32 weight rows, lane l owning row 32 * tgid + l;
+// simdgroup s takes the row's sub-blocks s, s + nsg, ..., so the threadgroup's simdgroups work
+// through the same blocks together, and their sums meet once, in threadgroup memory, in
+// simdgroup order. All 32 lanes of a simdgroup multiply the same activations at the same time,
+// so an activation read is one read for the simdgroup, straight from the buffer, and the loop has
+// no barrier. (Contiguous slices, one per simdgroup, took 146.0 ms at 2 rows with the
+// multiply-adds skipped, these 116.6: the rows' weight lines are shared while the simdgroups
+// are near each other. The whole kernel moved under 1% either way: 132.6 -> 131.5 ms at 2 rows,
+// 156.0 -> 156.5 at 3. The matrix-unit rows kernel below takes its sub-blocks the same way.)
+//
+// It replaced a split that gave each lane one sub-block of two rows (Qwen3.8-27B, M3 Pro,
+// projections a step). There every lane needed its own activations of every token -- 2 bytes
+// of threadgroup memory per weight per row, about 205 GB a step at 4 rows -- and each
+// 1024-value round met at two barriers, so the weight reads and the multiply-adds ran one after
+// the other: 287.6 ms at 4 rows, 186.9 with no weight reads, 110.6 with no multiply-adds. This
+// split: 132.6 / 156.0 / 178.8 / 282.1 ms at 2 / 3 / 4 / 8 rows, where the old one took
+// 154.4 / - / 287.6 / 402.7 and the GEMM takes 199.1 / 199.3 / 199.5 / 200.4
+// (docs/evidence/cobatch/2026-09-19-27b-rows-lane.md).
+//
+// Every loop over tokens runs to a compile-time count and is unrolled, with a guard where fewer
+// tokens are live: a loop that ends on the runtime n_tok indexes the accumulators at run time
+// (2 rows cost 179.1 ms instead of 154.5 in the old split).
+//
+// Each (row, token) sums its simdgroup's sub-blocks in order and the simdgroups in order -- the
+// same every run, but not the one-row kernel's order, so a row differs from its lone decode in
+// the last bits (tests/blk_decode_rows.rs). The exact route keeps the one-row kernel per row;
+// this one serves the fast route, whose rows must pick what their lone decodes pick.
+//
+// BLK_ROWS_TOK (function constant 39): the tokens a pipeline holds, 2, 4 or 8. A step with
+// fewer (3 rows on the 4-token form) passes n_tok, and the tokens past it are neither read nor
+// stored. The accumulators are sized by the widest form; a narrower form's loops end at its
+// constant, so the entries past it are never touched.
+constant uint BLK_ROWS_TOK_FC [[function_constant(39)]];
+constant uint BLK_ROWS_TOK = is_function_constant_defined(BLK_ROWS_TOK_FC) ? BLK_ROWS_TOK_FC : 2u;
+#define BLK_ROWS_MAX_TOK 8u
+// DIAGNOSTIC, 0 in every served pipeline (IMPARO_BLK_ROWS_SKIP): bit 0 drops the weight decode
+// and its loads (the values are constants), bit 1 the activation loads (1), bit 2 the 32
+// multiply-adds (one product) -- each skipped part's time is the difference. Wrong numbers on
+// purpose.
+constant uint BLK_ROWS_SKIP_FC [[function_constant(40)]];
+constant uint BLK_ROWS_SKIP = is_function_constant_defined(BLK_ROWS_SKIP_FC) ? BLK_ROWS_SKIP_FC : 0u;
+
+kernel void imparo_blk_gemv_rows(
+    device const uchar * weights [[buffer(0)]],
+    device const float * x       [[buffer(1)]],
+    device float       * y       [[buffer(2)]],
+    constant ulong & w_offset [[buffer(3)]], constant uint & n_in [[buffer(4)]],
+    constant uint & n_out    [[buffer(5)]], constant uint & n_tok [[buffer(6)]],
+    constant uint & src_row  [[buffer(7)]],
+    constant uint & epilogue [[buffer(13)]],
+    threadgroup float * red [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
+{
+    // No early return: every simdgroup meets the barrier. A lane past n_out decodes row
+    // n_out - 1 again and is never stored.
+    const uint row = tgid.x * 32u + lane;
+    const uint rr = min(row, n_out - 1u);
+
+    const uint sub_per_block = tm_block_elems() / 32u;
+    const uint bb = tm_block_bytes();
+    const uint sc_bytes = tm_scale_bytes();
+    const uint pay_bytes = bb - sc_bytes;
+    const uint blocks = n_in / tm_block_elems();
+    const uint subs = n_in / 32u;
+    const uint so = tm_scale_src_off();
+    // The row's first block; a tile-major unit holds one block of TM_UNIT_ROWS rows.
+    const uint unit_bytes = TM_UNIT_ROWS * bb;
+    const uint slot = rr % TM_UNIT_ROWS;
+    device const uchar * rbase = WFMT_ROW
+        ? weights + w_offset + (ulong)rr * blocks * bb
+        : weights + w_offset + (ulong)(rr / TM_UNIT_ROWS) * blocks * unit_bytes;
+    float acc[BLK_ROWS_MAX_TOK];
+    #pragma unroll
+    for (uint t = 0u; t < BLK_ROWS_TOK; ++t) { acc[t] = 0.0f; }
+    for (uint sb = sgid; sb < subs; sb += nsg) {
+        const uint blk = sb / sub_per_block, sub = sb % sub_per_block;
+        device const uchar * sc;
+        device const uchar * pay;
+        if (WFMT_ROW) {
+            device const uchar * b = rbase + blk * bb;
+            sc  = b + so;
+            pay = b + (so == 0u ? sc_bytes : 0u);
+        } else {
+            device const uchar * u = rbase + blk * unit_bytes;
+            sc  = u + slot * sc_bytes;
+            pay = u + TM_UNIT_ROWS * sc_bytes + slot * pay_bytes;
+        }
+        float v[32];
+        if (BLK_ROWS_SKIP & 1u) {
+            for (uint j = 0u; j < 32u; ++j) { v[j] = 1.0f + float(sub + j + lane); }
+        } else {
+            tm_sub32(sc, pay, sub, v, !WFMT_ROW);
+        }
+        #pragma unroll
+        for (uint t = 0u; t < BLK_ROWS_TOK; ++t) {
+            if (t >= n_tok) { continue; }
+            // The same address in every lane: one read for the simdgroup.
+            device const float4 * xt =
+                (device const float4 *)(x + (ulong)(src_row + t) * n_in + sb * 32u);
+            float part = 0.0f;
+            #pragma unroll
+            for (uint m = 0u; m < 8u; ++m) {
+                const float4 q = (BLK_ROWS_SKIP & 2u) ? float4(1.0f) : xt[m];
+                if (BLK_ROWS_SKIP & 4u) {
+                    if (m == 0u) { part = v[t] * q.x; }
+                    continue;
+                }
+                part += v[4u * m] * q.x;
+                part += v[4u * m + 1u] * q.y;
+                part += v[4u * m + 2u] * q.z;
+                part += v[4u * m + 3u] * q.w;
+            }
+            acc[t] += part;
+        }
+    }
+    // The simdgroups meet: simdgroup s's sums at red[s][t][lane], added in s order.
+    #pragma unroll
+    for (uint t = 0u; t < BLK_ROWS_TOK; ++t) {
+        red[(sgid * BLK_ROWS_TOK + t) * 32u + lane] = acc[t];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = sgid; t < n_tok; t += nsg) {
+        float total = 0.0f;
+        for (uint s = 0u; s < nsg; ++s) { total += red[(s * BLK_ROWS_TOK + t) * 32u + lane]; }
+        if (row < n_out) {
+            device float * dst = y + (ulong)t * n_out + row;
+            *dst = epilogue ? (imparo_act_f(*dst) * total) : total;
+        }
+    }
+}
+
+// THE BLOCK FORMATS' ROWS ON THE SIMDGROUP MATRIX UNIT, for a co-batched step's rows on the fast
+// route (up to blk_rows_mma_max, 8 at most: one 8-token column). The Q8_0 / Q4_0 rows matmul's form:
+// a threadgroup takes BLK_MMA_TILES 8-row weight units and its simdgroups split the 32-value
+// sub-blocks. Per sub-block a lane decodes only the eight values it holds in the four 8x8 weight
+// fragments (`tm_run8`, in the format's K order) and reads the activations in the same order, so
+// each unit's W[8 x 32] . X[8 x 32]^T is four products straight from registers -- no tile, no
+// barrier in the loop. The values are the brick's floats, fully decoded, so the products add up
+// across sub-blocks with no scale step and a row keeps float accuracy (tests/brick_rows.rs pins
+// every fetched value to tm_sub32's bits). Token columns past n_tok read the last live row and are
+// not stored.
+//
+// Qwen3.8-27B (M3 Pro), projections a step at 2 / 4 / 8 rows: 123.8 / 125.1 / 126.8 ms (126.9 /
+// 128.4 / 130.0 before Q4_K and Q5_K took sub-block pairs), where the form that staged 32 rows x
+// 32 decoded floats in threadgroup memory took 170-171 from 4 to 8 and the row-per-lane GEMV 131.4
+// at 2 rows (one row: 108.4). In the co-batched step, before the pairs, the 2-row case tied with
+// that GEMV (138.7 against 138.5 ms) and 3 to 8 rows ran 13-20% faster than before; the pairs
+// took 2 / 4 rows to 135.2 / 143.2 (docs/evidence/cobatch/2026-09-20-27b-rows-no-tile.md). Two units a threadgroup share each
+// activation fetch (153.8 -> 143.4 ms at 4 rows; four units 158.1); 8 simdgroups (4: 133.1, 16:
+// 132.5). A scalar form with K split over the lanes and 8 rows a lane lost at every row count
+// (134.7 / 175.8 / 257.5 at 2 / 3 / 4 rows).
+constant uint BLK_MMA_TILES_FC [[function_constant(43)]];
+constant uint BLK_MMA_TILES = is_function_constant_defined(BLK_MMA_TILES_FC) ? BLK_MMA_TILES_FC : 2u;
+// The token-fragment loops of the rows matmul: a constant trip count (the template's TF), fully
+// unrolled so the per-fragment arrays stay in registers.
+#define BLK_TF_UNROLL _Pragma("clang loop unroll(full)")
+#define BLK_MMA_MAX_TILES 4u
+// DIAGNOSTIC, 0 in every served pipeline (IMPARO_BLK_MMA_SKIP): bit 0 drops the matrix products
+// (the sums take the fragments' elements instead), bit 1 the weight fetch (values from the lane
+// and the sub-block, no weight byte read), bit 2 the activation loads. Wrong numbers on purpose.
+// THE ACTIVATIONS AS HALF: the mirror the norms already dual-write beside the floats, when it
+// covers this step's rows. The same values rounded once, in half the bytes and one load where the
+// float path takes two. The prefill GEMM and the co-batched GEMM above eight rows read the same
+// mirror, so this makes 2..8 rows agree with them rather than adding a rounding of its own; the
+// exact route keeps float activations.
+// TWO ENTRY POINTS OVER ONE BODY: the template argument is gone before the AIR exists, so
+// imparo_blk_rows_mma carries no half code at all and compiles as it did before this arm. (A
+// function constant may fold as cleanly; it was not re-measured after the brackets below were
+// fixed, and this form needs no such argument.)
+// THE OFFSET IS PASTED, NOT PARENTHESISED: `x + xo0 + sb * 32u` lets the compiler hoist the row
+// base and walk a constant stride, while `x + (xo0 + sb * 32u)` makes it add two 64-bit values at
+// every load. That one pair of brackets cost the FLOAT path 2.4 ms a step -- 123.4 against 121.1
+// at 2 rows, with the half path switched off -- and was the whole of a regression first blamed on
+// the arm's presence.
+#define BLK_MMA_X4(off) (XHALF ? float4(*((device const half4 *)(xh + off))) \
+                               : *((device const float4 *)(x + off)))
+constant uint BLK_MMA_SKIP_FC [[function_constant(44)]];
+constant uint BLK_MMA_SKIP = is_function_constant_defined(BLK_MMA_SKIP_FC) ? BLK_MMA_SKIP_FC : 0u;
+
+// ROUTED: the rows this computes are WORK ROWS of one expert, so a row's activations live
+// at perm[row] and not at row. That is the only difference -- two offsets below -- and it is
+// why the routed feed-forward does not need a kernel of its own. The template argument is
+// gone before the AIR exists, so imparo_blk_rows_mma still compiles with no routed code in
+// it, the same reason the half mirror is a template argument and not a function constant.
+// PAIR: two weight stacks in ONE K loop, `act(x . w) * (x . w2)` written once.
+//
+// TWO ACCUMULATORS, NOT TWO PASSES. Running the body twice and multiplying the second
+// result into the first works and is bit-identical, but it is SLOWER than the two
+// dispatches it replaces (+0.76% on a 128-step decode, measured): two dispatches of
+// independent work overlap under concurrent dispatch, and a barrier between two passes of
+// one threadgroup does not. This form has no barrier between the stacks -- every
+// activation fragment feeds both -- so it removes a dispatch AND halves the activation
+// loads instead of trading the overlap away.
+template <bool XHALF, bool ROUTED, bool PAIR, uint TF = 1u>
+static inline __attribute__((always_inline)) void blk_rows_mma_body(
+    device const uchar * weights, device const float * x, device float * y,
+    device const half * xh, device const uint * perm, uint src_work_rows,
+    constant uint & n_in, constant uint & n_out, uint n_tok,
+    // BY VALUE, not `constant uint &`: the routed pair below hands the gate projection a
+    // literal 0 and the up projection the caller's flag, and a literal has no constant-space
+    // address. The function is always_inline, so a value and a reference generate the same AIR.
+    uint src_row, uint epilogue, ulong w_offset, ulong w_offset2,
+    threadgroup float * partial,
+    uint3 tgid, uint lane, uint sgid, uint nsg)
+{
+    // 1 when there is one stack, so every `s` loop below unrolls away and the single-stack
+    // kernels compile to what they compiled to before the pair existed.
+    constexpr uint NS = PAIR ? 2u : 1u;
+    const uint g0 = tgid.x * BLK_MMA_TILES;              // the threadgroup's first 8-row unit
+    if (g0 * TM_UNIT_ROWS >= n_out || n_tok == 0u) { return; }
+    // The 8x8 layout MLX's steel GEMM stores by (BaseMMAFrag::get_coord): lane holds row fr and
+    // the two columns fc, fc + 1; q is its pair of columns.
+    const uint qd = lane / 4u;
+    const uint fr = (qd & 4u) + ((lane / 2u) % 4u);
+    const uint fc = (qd & 2u) * 2u + (lane % 2u) * 2u;
+    const uint q = fc / 2u;
+    const uint spb = tm_block_elems() / 32u;
+    const uint bb = tm_block_bytes();
+    const uint scb = tm_scale_bytes();
+    const uint payb = bb - scb;
+    const uint blocks = n_in / tm_block_elems();
+    const uint subs = n_in / 32u;
+    const uint so = tm_scale_src_off();
+    const uint unit = TM_UNIT_ROWS * bb;
+    // Row fr of each unit: its row-major blocks, or its unit's blocks (slot fr) in tile-major.
+    // A row-major tensor's last unit may be short; its missing rows read the last row.
+    device const uchar * base[2][BLK_MMA_MAX_TILES];
+    #pragma unroll
+    for (uint s = 0; s < NS; ++s) {
+        const ulong wo = (s == 0u) ? w_offset : w_offset2;
+        #pragma unroll
+        for (uint u = 0; u < BLK_MMA_TILES; ++u) {
+            const uint r = min((g0 + u) * TM_UNIT_ROWS + fr, n_out - 1u);
+            base[s][u] = WFMT_ROW ? weights + wo + (ulong)r * blocks * bb
+                                  : weights + wo + (ulong)(r / TM_UNIT_ROWS) * blocks * unit;
+        }
+    }
+    // The activations' k for slot fr of fragment f is k0 + f in either order.
+    const uint k0 = tm_run_order() == 1u ? ((fr & 1u) != 0u ? 14u + 2u * fr : 2u * fr) : 4u * fr;
+    const uint last = n_tok - 1u;
+    // THE ONE ROUTED DIFFERENCE. A work row's activations are the TOKEN's, at perm[row] --
+    // except on the down projection, whose input already has one row per work row.
+    // TF TOKEN FRAGMENTS of 8 rows: fragment tf holds rows 8 tf + fc and 8 tf + fc + 1, and every
+    // weight fragment decoded below multiplies all of them -- one weight read for up to 8 TF rows.
+    ulong xo0[TF], xo1[TF];
+    BLK_TF_UNROLL
+    for (uint tf = 0; tf < TF; ++tf) {
+        const uint w0 = src_row + min(8u * tf + fc, last);
+        const uint w1 = src_row + min(8u * tf + fc + 1u, last);
+        const uint a0 = (ROUTED && src_work_rows == 0u) ? perm[w0] : w0;
+        const uint a1 = (ROUTED && src_work_rows == 0u) ? perm[w1] : w1;
+        xo0[tf] = (ulong)a0 * n_in + k0;
+        xo1[tf] = (ulong)a1 * n_in + k0;
+    }
+    simdgroup_float8x8 acc[TF][2][BLK_MMA_MAX_TILES];
+    float2 skip_acc[TF][2][BLK_MMA_MAX_TILES];
+    BLK_TF_UNROLL
+    for (uint tf = 0; tf < TF; ++tf) {
+    #pragma unroll
+    for (uint s = 0; s < NS; ++s) {
+        #pragma unroll
+        for (uint u = 0; u < BLK_MMA_TILES; ++u) {
+            acc[tf][s][u] = simdgroup_float8x8(0.0f);
+            skip_acc[tf][s][u] = float2(0.0f);
+        }
+    }
+    }
+    // A HALF-BLOCK A STEP (Q4_K, Q5_K, Q3_K): four sub-blocks, their four scales unpacked from the
+    // header words together instead of once a run -- the packed six-bit fields cost 4.85 ms a step
+    // at 2 rows when each run unpacks its own, and this takes 2.9 of it with no change to the
+    // bytes on disk. The tail below serves a row whose sub-blocks are not a multiple of four (no
+    // served shape has one).
+    if (tm_run_quads()) {
+        for (uint qb = sgid; 4u * qb < subs; qb += nsg) {
+            const uint sb0 = 4u * qb;
+            const uint blk = sb0 / spb, sub0 = sb0 % spb;
+            float4 qsa[2][BLK_MMA_MAX_TILES], qsb[2][BLK_MMA_MAX_TILES];
+            device const uchar * scu[2][BLK_MMA_MAX_TILES];
+            device const uchar * payu[2][BLK_MMA_MAX_TILES];
+            #pragma unroll
+            for (uint s = 0; s < NS; ++s) {
+            #pragma unroll
+            for (uint u = 0; u < BLK_MMA_TILES; ++u) {
+                if (WFMT_ROW) {
+                    device const uchar * b = base[s][u] + (ulong)blk * bb;
+                    scu[s][u]  = b + so;
+                    payu[s][u] = b + (so == 0u ? scb : 0u);
+                } else {
+                    device const uchar * un = base[s][u] + (ulong)blk * unit;
+                    scu[s][u]  = un + fr * scb;
+                    payu[s][u] = un + TM_UNIT_ROWS * scb + fr * payb;
+                }
+                tm_quad_scales(scu[s][u], sub0, q, qsa[s][u], qsb[s][u]);
+            }
+            }
+            #pragma unroll
+            for (uint i = 0; i < 4u; i += (tm_run_pairs() ? 2u : 1u)) {
+                const uint sb = sb0 + i;
+                simdgroup_float8x8 xm0[TF][4], xm1[TF][4];
+                BLK_TF_UNROLL
+                for (uint tf = 0; tf < TF; ++tf) {
+                float4 xa0, xa1, xb0, xb1;
+                if (BLK_MMA_SKIP & 4u) {
+                    xa0 = float4(float(sb + lane));
+                    xa1 = float4(float(sb) * 0.5f);
+                    xb0 = xa0 + 1.0f;
+                    xb1 = xa1 + 1.0f;
+                } else {
+                    xa0 = BLK_MMA_X4(xo0[tf] + sb * 32u);
+                    xa1 = BLK_MMA_X4(xo1[tf] + sb * 32u);
+                    xb0 = tm_run_pairs() ? BLK_MMA_X4(xo0[tf] + sb * 32u + 32u) : float4(0.0f);
+                    xb1 = tm_run_pairs() ? BLK_MMA_X4(xo1[tf] + sb * 32u + 32u) : float4(0.0f);
+                }
+                #pragma unroll
+                for (uint f = 0; f < 4u; ++f) {
+                    rm_frag_set(xm0[tf][f], xa0[f], xa1[f]);
+                    rm_frag_set(xm1[tf][f], xb0[f], xb1[f]);
+                }
+                }
+                #pragma unroll
+                for (uint s = 0; s < NS; ++s) {
+                #pragma unroll
+                for (uint u = 0; u < BLK_MMA_TILES; ++u) {
+                    float4 lo0, hi0, lo1, hi1;
+                    if (BLK_MMA_SKIP & 2u) {
+                        lo0 = float4(float(lane + u), float(sb), float(sub0 + i + lane), 1.0f);
+                        hi0 = float4(float(sb + u), float(lane), 2.0f, float(sub0));
+                        lo1 = lo0 + 1.0f;
+                        hi1 = hi0 + 1.0f;
+                    } else if (tm_run_pairs()) {
+                        tm_run8_pair_q(qsa[s][u], qsb[s][u], i, payu[s][u], sub0 + i, q,
+                                       lo0, hi0, lo1, hi1);
+                    } else {
+                        tm_run8_q(qsa[s][u], qsb[s][u], i, payu[s][u], sub0 + i, q, !WFMT_ROW,
+                                  lo0, hi0);
+                        lo1 = float4(0.0f);
+                        hi1 = float4(0.0f);
+                    }
+                    simdgroup_float8x8 wm0[4], wm1[4];
+                    #pragma unroll
+                    for (uint f = 0; f < 4u; ++f) {
+                        rm_frag_set(wm0[f], lo0[f], hi0[f]);
+                        rm_frag_set(wm1[f], lo1[f], hi1[f]);
+                    }
+                    if (BLK_MMA_SKIP & 1u) {
+                        BLK_TF_UNROLL
+                        for (uint tf = 0; tf < TF; ++tf) {
+                        #pragma unroll
+                        for (uint f = 0; f < 4u; ++f) {
+                            skip_acc[tf][s][u] += rm_frag_get(wm0[f]) * rm_frag_get(xm0[tf][f]);
+                            if (tm_run_pairs()) {
+                                skip_acc[tf][s][u] += rm_frag_get(wm1[f]) * rm_frag_get(xm1[tf][f]);
+                            }
+                        }
+                        }
+                        continue;
+                    }
+                    BLK_TF_UNROLL
+                    for (uint tf = 0; tf < TF; ++tf) {
+                    #pragma unroll
+                    for (uint f = 0; f < 4u; ++f) {
+                        simdgroup_multiply_accumulate(acc[tf][s][u], wm0[f], xm0[tf][f], acc[tf][s][u]);
+                    }
+                    if (tm_run_pairs()) {
+                        #pragma unroll
+                        for (uint f = 0; f < 4u; ++f) {
+                            simdgroup_multiply_accumulate(acc[tf][s][u], wm1[f], xm1[tf][f], acc[tf][s][u]);
+                        }
+                    }
+                    }
+                }
+                }
+            }
+        }
+        // The sub-blocks past the last whole half-block, one at a time.
+        for (uint sb = (subs & ~3u) + sgid; sb < subs; sb += nsg) {
+            const uint blk = sb / spb, sub = sb % spb;
+            simdgroup_float8x8 xm[TF][4];
+            BLK_TF_UNROLL
+            for (uint tf = 0; tf < TF; ++tf) {
+                const float4 xa0 = BLK_MMA_X4(xo0[tf] + sb * 32u);
+                const float4 xa1 = BLK_MMA_X4(xo1[tf] + sb * 32u);
+                #pragma unroll
+                for (uint f = 0; f < 4u; ++f) { rm_frag_set(xm[tf][f], xa0[f], xa1[f]); }
+            }
+            #pragma unroll
+            for (uint s = 0; s < NS; ++s) {
+            #pragma unroll
+            for (uint u = 0; u < BLK_MMA_TILES; ++u) {
+                device const uchar * sc;
+                device const uchar * pay;
+                if (WFMT_ROW) {
+                    device const uchar * b = base[s][u] + (ulong)blk * bb;
+                    sc  = b + so;
+                    pay = b + (so == 0u ? scb : 0u);
+                } else {
+                    device const uchar * un = base[s][u] + (ulong)blk * unit;
+                    sc  = un + fr * scb;
+                    pay = un + TM_UNIT_ROWS * scb + fr * payb;
+                }
+                float4 lo, hi;
+                tm_run8(sc, pay, sub, q, !WFMT_ROW, lo, hi);
+                simdgroup_float8x8 wm[4];
+                #pragma unroll
+                for (uint f = 0; f < 4u; ++f) { rm_frag_set(wm[f], lo[f], hi[f]); }
+                BLK_TF_UNROLL
+                for (uint tf = 0; tf < TF; ++tf) {
+                #pragma unroll
+                for (uint f = 0; f < 4u; ++f) {
+                    simdgroup_multiply_accumulate(acc[tf][s][u], wm[f], xm[tf][f], acc[tf][s][u]);
+                }
+                }
+            }
+            }
+        }
+    } else if (tm_run_pairs()) {
+        for (uint pb = sgid; 2u * pb < subs; pb += nsg) {
+            const uint sb0 = 2u * pb;
+            const uint blk = sb0 / spb, sub0 = sb0 % spb;
+            simdgroup_float8x8 xm0[TF][4], xm1[TF][4];
+            BLK_TF_UNROLL
+            for (uint tf = 0; tf < TF; ++tf) {
+            float4 xa0, xa1, xb0, xb1;
+            if (BLK_MMA_SKIP & 4u) {
+                xa0 = float4(float(sb0 + lane));
+                xa1 = float4(float(sb0) * 0.5f);
+                xb0 = float4(float(sb0 + 1u + lane));
+                xb1 = float4(float(sb0 + 1u) * 0.5f);
+            } else {
+                xa0 = BLK_MMA_X4(xo0[tf] + sb0 * 32u);
+                xa1 = BLK_MMA_X4(xo1[tf] + sb0 * 32u);
+                xb0 = BLK_MMA_X4(xo0[tf] + sb0 * 32u + 32u);
+                xb1 = BLK_MMA_X4(xo1[tf] + sb0 * 32u + 32u);
+            }
+            #pragma unroll
+            for (uint f = 0; f < 4u; ++f) {
+                rm_frag_set(xm0[tf][f], xa0[f], xa1[f]);
+                rm_frag_set(xm1[tf][f], xb0[f], xb1[f]);
+            }
+            }
+            #pragma unroll
+            for (uint s = 0; s < NS; ++s) {
+            #pragma unroll
+            for (uint u = 0; u < BLK_MMA_TILES; ++u) {
+                device const uchar * sc;
+                device const uchar * pay;
+                if (WFMT_ROW) {
+                    device const uchar * b = base[s][u] + (ulong)blk * bb;
+                    sc  = b + so;
+                    pay = b + (so == 0u ? scb : 0u);
+                } else {
+                    device const uchar * un = base[s][u] + (ulong)blk * unit;
+                    sc  = un + fr * scb;
+                    pay = un + TM_UNIT_ROWS * scb + fr * payb;
+                }
+                float4 lo0, hi0, lo1, hi1;
+                if (BLK_MMA_SKIP & 2u) {
+                    lo0 = float4(float(lane + u), float(sb0), float(sub0 + lane), 1.0f);
+                    hi0 = float4(float(sb0 + u), float(lane), 2.0f, float(sub0));
+                    lo1 = lo0 + 1.0f;
+                    hi1 = hi0 + 1.0f;
+                } else {
+                    tm_run8_pair(sc, pay, sub0, q, lo0, hi0, lo1, hi1);
+                }
+                simdgroup_float8x8 wm0[4], wm1[4];
+                #pragma unroll
+                for (uint f = 0; f < 4u; ++f) {
+                    rm_frag_set(wm0[f], lo0[f], hi0[f]);
+                    rm_frag_set(wm1[f], lo1[f], hi1[f]);
+                }
+                if (BLK_MMA_SKIP & 1u) {
+                    BLK_TF_UNROLL
+                    for (uint tf = 0; tf < TF; ++tf) {
+                    #pragma unroll
+                    for (uint f = 0; f < 4u; ++f) {
+                        skip_acc[tf][s][u] += rm_frag_get(wm0[f]) * rm_frag_get(xm0[tf][f])
+                                            + rm_frag_get(wm1[f]) * rm_frag_get(xm1[tf][f]);
+                    }
+                    }
+                    continue;
+                }
+                BLK_TF_UNROLL
+                for (uint tf = 0; tf < TF; ++tf) {
+                #pragma unroll
+                for (uint f = 0; f < 4u; ++f) {
+                    simdgroup_multiply_accumulate(acc[tf][s][u], wm0[f], xm0[tf][f], acc[tf][s][u]);
+                }
+                #pragma unroll
+                for (uint f = 0; f < 4u; ++f) {
+                    simdgroup_multiply_accumulate(acc[tf][s][u], wm1[f], xm1[tf][f], acc[tf][s][u]);
+                }
+                }
+            }
+            }
+        }
+    } else {
+        for (uint sb = sgid; sb < subs; sb += nsg) {
+            const uint blk = sb / spb, sub = sb % spb;
+            simdgroup_float8x8 xm[TF][4];
+            BLK_TF_UNROLL
+            for (uint tf = 0; tf < TF; ++tf) {
+            float4 xa0, xa1;
+            if (BLK_MMA_SKIP & 4u) {
+                xa0 = float4(float(sb + lane));
+                xa1 = float4(float(sb) * 0.5f);
+            } else {
+                xa0 = BLK_MMA_X4(xo0[tf] + sb * 32u);
+                xa1 = BLK_MMA_X4(xo1[tf] + sb * 32u);
+            }
+            #pragma unroll
+            for (uint f = 0; f < 4u; ++f) { rm_frag_set(xm[tf][f], xa0[f], xa1[f]); }
+            }
+            #pragma unroll
+            for (uint sk = 0; sk < NS; ++sk) {
+            #pragma unroll
+            for (uint u = 0; u < BLK_MMA_TILES; ++u) {
+                device const uchar * sc;
+                device const uchar * pay;
+                if (WFMT_ROW) {
+                    device const uchar * b = base[sk][u] + (ulong)blk * bb;
+                    sc  = b + so;
+                    pay = b + (so == 0u ? scb : 0u);
+                } else {
+                    device const uchar * un = base[sk][u] + (ulong)blk * unit;
+                    sc  = un + fr * scb;
+                    pay = un + TM_UNIT_ROWS * scb + fr * payb;
+                }
+                float4 lo, hi;
+                if (BLK_MMA_SKIP & 2u) {
+                    lo = float4(float(lane + u), float(sb), float(sub + lane), 1.0f);
+                    hi = float4(float(sb + u), float(lane), 2.0f, float(sub));
+                } else {
+                    tm_run8(sc, pay, sub, q, !WFMT_ROW, lo, hi);
+                }
+                simdgroup_float8x8 wm[4];
+                #pragma unroll
+                for (uint f = 0; f < 4u; ++f) { rm_frag_set(wm[f], lo[f], hi[f]); }
+                if (BLK_MMA_SKIP & 1u) {
+                    BLK_TF_UNROLL
+                    for (uint tf = 0; tf < TF; ++tf) {
+                    #pragma unroll
+                    for (uint f = 0; f < 4u; ++f) {
+                        skip_acc[tf][sk][u] += rm_frag_get(wm[f]) * rm_frag_get(xm[tf][f]);
+                    }
+                    }
+                    continue;
+                }
+                BLK_TF_UNROLL
+                for (uint tf = 0; tf < TF; ++tf) {
+                #pragma unroll
+                for (uint f = 0; f < 4u; ++f) {
+                    simdgroup_multiply_accumulate(acc[tf][sk][u], wm[f], xm[tf][f], acc[tf][sk][u]);
+                }
+                }
+            }
+            }
+        }
+    }
+    if (BLK_MMA_SKIP & 1u) {
+        BLK_TF_UNROLL
+        for (uint tf = 0; tf < TF; ++tf) {
+        #pragma unroll
+        for (uint s = 0; s < NS; ++s) {
+            #pragma unroll
+            for (uint u = 0; u < BLK_MMA_TILES; ++u) {
+                rm_frag_set(acc[tf][s][u], skip_acc[tf][s][u].x, skip_acc[tf][s][u].y);
+            }
+        }
+        }
+    }
+    // The simdgroups' sums through threadgroup memory, added in simdgroup order: 64 floats a unit.
+    // THE SECOND STACK'S SUMS SIT AFTER EVERY SIMDGROUP'S FIRST, so the read below walks the
+    // same stride for both and the single-stack layout is untouched.
+    // A simdgroup's sums for fragment tf sit after its sums for the fragments before it.
+    const uint per_frag = BLK_MMA_TILES * 64u;
+    const uint per_sg = TF * per_frag;
+    const uint stack_span = nsg * per_sg;
+    BLK_TF_UNROLL
+    for (uint tf = 0; tf < TF; ++tf) {
+    #pragma unroll
+    for (uint s = 0; s < NS; ++s) {
+        #pragma unroll
+        for (uint u = 0; u < BLK_MMA_TILES; ++u) {
+            threadgroup float * o =
+                partial + s * stack_span + sgid * per_sg + tf * per_frag + u * 64u + fr * 8u + fc;
+            const float2 e = rm_frag_get(acc[tf][s][u]);
+            o[0] = e.x;
+            o[1] = e.y;
+        }
+    }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = sgid * 32u + lane; i < per_sg; i += nsg * 32u) {
+        const uint j = i % per_frag;
+        const uint u = j / 64u, row = (j / 8u) % 8u, tok = 8u * (i / per_frag) + j % 8u;
+        const uint orow = (g0 + u) * TM_UNIT_ROWS + row;
+        if (tok >= n_tok || orow >= n_out) { continue; }
+        float total = 0.0f;
+        for (uint s = 0; s < nsg; ++s) { total += partial[s * per_sg + i]; }
+        device float * dst = y + (ulong)tok * n_out + orow;
+        if (PAIR) {
+            // The second stack's own sum, added in the same simdgroup order. The product is
+            // imparo_act_mul's expression over the two values the three dispatches wrote to
+            // device memory, so the row is bit-identical to them.
+            float total2 = 0.0f;
+            for (uint s = 0; s < nsg; ++s) { total2 += partial[stack_span + s * per_sg + i]; }
+            *dst = epilogue ? (imparo_act_f(total) * total2) : total;
+        } else {
+            *dst = epilogue ? (imparo_act_f(*dst) * total) : total;
+        }
+    }
+}
+// THE HALF HANDOFF. The staged GEMM rounds its activation tile to half in threadgroup memory,
+// so a source that already holds half(the float) -- the norm's mirror of the FFN input, or
+// the pair's own half output -- gives the same tile at half the device bytes. SRC_HALF reads
+// the activation rows as half; DST_HALF writes the tile's result as half (the pair's
+// act(gate) * up, which the down projection only ever stages as half).
+constant bool MOE_ST_SRC_HALF_FC [[function_constant(61)]];
+constant bool MOE_ST_SRC_HALF = is_function_constant_defined(MOE_ST_SRC_HALF_FC) && MOE_ST_SRC_HALF_FC;
+constant bool MOE_ST_DST_HALF_FC [[function_constant(62)]];
+constant bool MOE_ST_DST_HALF = is_function_constant_defined(MOE_ST_DST_HALF_FC) && MOE_ST_DST_HALF_FC;
+
+
+// One (row, sub-block) of the weight tile into ws, EIGHT VALUES AT A TIME (tm_run8, the
+// decoder the block-rows kernel uses, bit-exact against tm_sub32): at most eight decoded
+// floats are live, where a whole sub-block held 32 registers beside the accumulators. At a
+// 5955-token prefill: gate|up pair 1640 -> 1624 ms (Q4_K_M), 1617 -> 1607 (Q4_0); the down
+// projection 818 -> 810 on Q4_0, a tie on Q4_K_M.
+// Full unrolls in the routed staged GEMM, not the "#pragma unroll" hint: at a 17115-token
+// prefill the pair 4529 -> 4476 ms and the down projection 2340 -> 2320 (Q4_0: 4496 -> 4441,
+// 2281 -> 2256), same bits.
+#define MOE_ST_UNROLL _Pragma("clang loop unroll(full)")
+template <uint ROW_TILES>
+static inline __attribute__((always_inline)) void moe_st_stage_sub(
+    threadgroup half * wt, device const uchar * sc, device const uchar * pay, uint sub,
+    uint sc_, uint rr) {
+    // Q6_K TILE-MAJOR: the sub-block's 32 low-bit and 32 high-bit bytes as four 16-byte words
+    // and its two scales, loaded once for the four runs; each value is tm_run8_t's expression.
+    // Down projection at a 17115-token prefill -0.5..-0.8%, same bits; the same form for Q4_K
+    // tied.
+    const bool Q6W = WFMT == WF_Q6_K && !WFMT_ROW;
+    uint4 q6l0 = 0u, q6l1 = 0u, q6h0 = 0u, q6h1 = 0u;
+    float q6ds0 = 0.0f, q6ds1 = 0.0f;
+    const uint q6c = sub & 3u;
+    if (Q6W) {
+        const uint n = sub >> 2;
+        const half d = as_type<half>((ushort)(sc[16] | (sc[17] << 8)));
+        device const char * s8 = (device const char *)sc + n * 8u;
+        q6ds0 = float(d) * float((int)s8[2u * q6c]);
+        q6ds1 = float(d) * float((int)s8[2u * q6c + 1u]);
+        device const uint4 * l4 = (device const uint4 *)(pay + n * 64u + (q6c & 1u) * 32u);
+        device const uint4 * h4 = (device const uint4 *)(pay + 128u + n * 32u);
+        q6l0 = l4[0]; q6l1 = l4[1]; q6h0 = h4[0]; q6h1 = h4[1];
+    }
+    MOE_ST_UNROLL
+    for (uint q = 0; q < 4u; ++q) {
+        float4 lo, hi;
+        if (Q6W) {
+            const float ds = (q >> 1) == 0u ? q6ds0 : q6ds1;
+            const float cc = -32.0f * ds;
+            const uint shift = 2u * q6c, shift4 = (q6c >= 2u) ? 4u : 0u;
+            const uint4 lq = (q >> 1) == 0u ? q6l0 : q6l1, hq = (q >> 1) == 0u ? q6h0 : q6h1;
+            const uint2 lw = (q & 1u) == 0u ? lq.xy : lq.zw, hw = (q & 1u) == 0u ? hq.xy : hq.zw;
+            const uchar4 a = as_type<uchar4>(((lw.x >> shift4) & 0x0F0F0F0Fu)
+                                           | (((hw.x >> shift) & 0x03030303u) << 4));
+            const uchar4 b = as_type<uchar4>(((lw.y >> shift4) & 0x0F0F0F0Fu)
+                                           | (((hw.y >> shift) & 0x03030303u) << 4));
+            lo = float4(fma(ds, float(a.x), cc), fma(ds, float(a.y), cc),
+                        fma(ds, float(a.z), cc), fma(ds, float(a.w), cc));
+            hi = float4(fma(ds, float(b.x), cc), fma(ds, float(b.y), cc),
+                        fma(ds, float(b.z), cc), fma(ds, float(b.w), cc));
+        } else {
+            tm_run8(sc, pay, sub, q, !WFMT_ROW, lo, hi);
+        }
+        // THE RUN'S K POSITIONS ARE THE FORMAT'S (tm_run_order): order 0 is k 8q .. 8q+7,
+        // order 1 (the nibble formats) k 4q .. 4q+3 then 16+4q .. 16+4q+3. Treating every run
+        // as eight consecutive positions put Q4_0's values at the wrong K.
+        const bool o1 = tm_run_order() == 1u;
+        const uint klo = sc_ * 32u + (o1 ? 4u * q : 8u * q);
+        const uint khi = sc_ * 32u + (o1 ? 16u + 4u * q : 8u * q + 4u);
+        MOE_ST_UNROLL
+        for (uint i = 0; i < 4u; ++i) {
+            const uint k0 = klo + i, k1 = khi + i;
+            wt[((k0 / 8u) * ROW_TILES + rr / 8u) * 64u + (k0 % 8u) * 8u + rr % 8u] = half(lo[i]);
+            wt[((k1 / 8u) * ROW_TILES + rr / 8u) * 64u + (k1 % 8u) * 8u + rr % 8u] = half(hi[i]);
+        }
+    }
+}
+
+// THE ROUTED FEED-FORWARD AS A STAGED GEMM -- the design k-quants never had.
+//
+// WHY THIS EXISTS. This engine has two prefill GEMM designs. st_gemm stages BOTH operands as
+// half in threadgroup memory and is the default for Q8_0 because it wins; rt_gemm keeps the
+// weights staged and the activations in a register prefetch, and it is the ONLY design a
+// k-quant has. Measured on Q8_0 at one expert's shape, where the two can be switched with
+// IMPARO_Q8_DESIGN:
+//
+//     rows        staged   register-tiled   ratio
+//       64       0.1547         0.2522      1.63x
+//      128       0.2861         0.3572      1.25x
+//      512       0.7777         0.8716      1.12x
+//
+// The staged design wins MOST at the thin shapes, and a routed layer is nothing but thin
+// shapes: 2048 work rows over 32 experts is 64 rows each. So every k-quant routed matmul --
+// 78.9% of a 512-token prefill chunk on LFM2.5-8B-A1B -- runs the losing design today.
+//
+// THE SHAPE. One threadgroup owns ROWS output rows x TOKENS work rows OF ONE EXPERT and walks
+// K at a time. The weight tile is dequantised into threadgroup memory through the same brick
+// decoder every other kernel uses, so this adds no format knowledge; the activation tile is
+// gathered through perm, because a work row's activations are its TOKEN's.
+//
+// THE GRID IS HOST-COMPUTABLE AND NEEDS NO SYNC. A token never picks the same expert twice,
+// so an expert holds at most n_tok work rows: ceil(n_tok / TOKENS) token groups covers any
+// routing. A group past its expert's segment reads seg and returns, which is what llama.cpp's
+// mul_mm_id does with tpe[e] and what vLLM does with expert_ids == -1.
+// THE SHAPE IS A TEMPLATE, and the names below are its instantiations, so a shape is swept
+// by picking a kernel and not by rebuilding. ROWS x TOKENS is the output tile of ONE expert,
+// K is what one chunk stages, and (RT_SG, TT_SG) is how a simdgroup's share of the tile is
+// cut -- RT_SG * TT_SG accumulators per simdgroup, NSG simdgroups covering the whole tile.
+// ONE PASS of the staged routed GEMM over a K chunk: stage the weight tile of `wsrc` rows
+// rbase .. rbase + ROWS (and, on the first pass, the activation tile), then multiply it into
+// `acc`. A function called once per pass with a NAMED accumulator array, not a loop over an
+// array of them: a pass loop indexing acc[p] left the index dynamic, the accumulators went to
+// memory, and the kernel ran 2.8x slower with the same bits.
+// The k loop over a staged tile for the first LIVE_TT of a simdgroup's TT_SG token fragments.
+template <uint K, uint ROW_TILES, uint TOK_TILES, uint RT_SG, uint TT_SG, uint LIVE_TT>
+static inline __attribute__((always_inline)) void moe_st_mma(
+    thread simdgroup_float8x8 * acc, threadgroup half * ws, threadgroup half * as,
+    uint row_tile0, uint tok_tile0)
+{
+    MOE_ST_UNROLL
+    for (uint kk = 0; kk < K; kk += 8u) {
+        simdgroup_half8x8 wm[RT_SG];
+        simdgroup_half8x8 am[LIVE_TT];
+        // A THREADGROUP BARRIER IS NOT ENOUGH BEFORE simdgroup_load FROM THREADGROUP MEMORY.
+        // st_gemm carries the same fence (Q8_MMA_FENCE) around these loads. Without it this
+        // kernel read the tile while it was still being written: the output varied run to run
+        // by whole logits. Once a staged tile (kk == 0) instead of every k-step measured +2.2%
+        // SLOWER; no fence at all +3.4% (2026-09-24).
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        MOE_ST_UNROLL
+        for (uint ri = 0; ri < RT_SG; ++ri) {
+            simdgroup_load(wm[ri], ws + ((kk / 8u) * ROW_TILES + row_tile0 + ri) * 64u, 8u);
+        }
+        MOE_ST_UNROLL
+        for (uint ti = 0; ti < LIVE_TT; ++ti) {
+            simdgroup_load(am[ti], as + ((kk / 8u) * TOK_TILES + tok_tile0 + ti) * 64u, 8u);
+        }
+        MOE_ST_UNROLL
+        for (uint ti = 0; ti < LIVE_TT; ++ti) {
+            MOE_ST_UNROLL
+            for (uint ri = 0; ri < RT_SG; ++ri) {
+                simdgroup_multiply_accumulate(acc[ti * RT_SG + ri], am[ti], wm[ri],
+                                              acc[ti * RT_SG + ri]);
+            }
+        }
+    }
+}
+
+template <uint ROWS, uint TOKENS, uint K, uint NSG, uint RT_SG, uint TT_SG>
+static inline __attribute__((always_inline)) void moe_st_pass(
+    thread simdgroup_float8x8 * acc, bool stage_act, device const uchar * wsrc, ulong wb,
+    uint rbase, uint c00, device const float * x, threadgroup half * ws, threadgroup half * as,
+    threadgroup ulong * abase, uint n_out, uint spb, uint bb, uint scb, uint payb, uint blocks,
+    uint so, ulong unit, uint tid, uint row_tile0, uint tok_tile0, uint ntok)
+{
+    constexpr uint THREADS   = NSG * 32u;
+    constexpr uint ROW_TILES = ROWS / 8u;
+    constexpr uint TOK_TILES = TOKENS / 8u;
+    constexpr uint subs_chk  = K / 32u;              // sub-blocks of K one row stages
+    // ---- the weight tile, dequantised once per (row, sub-block) ------------------------
+    // One work item per (row, sub-block): ROWS * subs_chk == the thread count at the shipped
+    // shape, so no thread idles in the staging that every multiply waits on.
+    for (uint it = tid; it < ROWS * subs_chk; it += THREADS) {
+        const uint rr  = it / subs_chk;
+        const uint sc_ = it % subs_chk;
+        const uint sb  = (c00 / 32u) + sc_;             // this row's sub-block index
+        const uint blk = sb / spb, sub = sb % spb;
+        // Clamped rather than branched: an out-of-range row stages a duplicate and the
+        // write-back masks it, so the tile's shape never depends on the edge.
+        const uint rsrc = min(rbase + rr, n_out - 1u);
+        device const uchar * sc;
+        device const uchar * pay;
+        if (WFMT_ROW) {
+            device const uchar * bk = wsrc + wb + ((ulong)rsrc * blocks + blk) * bb;
+            sc  = bk + so;
+            pay = bk + (so == 0u ? scb : 0u);
+        } else {
+            device const uchar * un =
+                wsrc + wb + ((ulong)(rsrc / TM_UNIT_ROWS) * blocks + blk) * unit;
+            const uint slot = rsrc % TM_UNIT_ROWS;
+            sc  = un + slot * scb;
+            pay = un + TM_UNIT_ROWS * scb + slot * payb;
+        }
+        // FLOAT INTERMEDIATES, ONE ROUNDING AT THE END: the dequant runs in float and the
+        // half appears only on the store, which is the rule every other decode here follows.
+        moe_st_stage_sub<ROW_TILES>(ws, sc, pay, sub, sc_, rr);
+    }
+    // ---- the activation tile, once a K chunk, from the resolved bases ------------------
+    // n_in, c00 and the k span are all multiples of four, so every one of these is a 16-byte
+    // aligned float4 rather than four scalar loads.
+    if (stage_act) {
+        static_assert((TOKENS * (K / 4u)) % THREADS == 0u, "the activation tile divides");
+        MOE_ST_UNROLL
+        for (uint f = 0; f < (TOKENS * (K / 4u)) / THREADS; ++f) {
+            const uint it = tid + f * THREADS;
+            const uint tt = it / (K / 4u);
+            const uint k4 = (it % (K / 4u)) * 4u;
+            // TOKEN-MAJOR WITHIN THE TILE, which is what the left operand of `am * wm` has to
+            // be: am is A[token][k] and wm is W[k][row]. The weight tile is k-major because it
+            // is the RIGHT operand. Staging this one k-major too -- which it was -- transposes
+            // A and computes a different product. st_gemm stages the same two orientations.
+            threadgroup half * at = as + ((k4 / 8u) * TOK_TILES + (tt / 8u)) * 64u
+                                  + (tt % 8u) * 8u + (k4 % 8u);
+            if (MOE_ST_SRC_HALF) {
+                *(threadgroup half4 *)at =
+                    *(device const half4 *)((device const half *)x + abase[tt] + c00 + k4);
+                continue;
+            }
+            const float4 xv = *(device const float4 *)(x + abase[tt] + c00 + k4);
+            *(threadgroup half4 *)at = half4(xv);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // A SIMDGROUP WHOSE TOKEN ROWS ARE ALL PAST THE EXPERT'S LAST WORK ROW STORES NOTHING, so
+    // it skips the multiply -- decided once a pass, uniform across the simdgroup. An expert's
+    // last tile is on average half padding: pair 1614 -> 1590 ms, down 836 -> 821, prefill
+    // 3819 -> 3780 ms at 5955 tokens (Q4_K_M), bits identical. With it, 64-token tiles still
+    // lose (down 903 / 856 with two row blocks, pair 1635).
+    // ONE WHOSE SECOND TOKEN FRAGMENT IS DEAD runs the one-fragment loop: pair 4492 -> 4459,
+    // down 2317 -> 2300 ms at 17115 tokens (Q4_0 alike), bits identical. The choice is ONE
+    // branch before two loops of constant trip count; the same test inside the loop cost 10%,
+    // and a bound written `kk < (sg_live ? K : 0u)` ran as slow as the loop with its unroll
+    // disabled (pair 1722 against 1569 at 5955 tokens).
+    const bool sg_live = tok_tile0 * 8u < ntok;
+    const bool tail1 = TT_SG > 1u && sg_live && (tok_tile0 + 1u) * 8u >= ntok;
+    if (tail1) {
+        moe_st_mma<K, ROW_TILES, TOK_TILES, RT_SG, TT_SG, 1u>(acc, ws, as, row_tile0, tok_tile0);
+    } else if (sg_live) {
+        moe_st_mma<K, ROW_TILES, TOK_TILES, RT_SG, TT_SG, TT_SG>(acc, ws, as, row_tile0, tok_tile0);
+    }
+    // The next pass restages ws (and the next chunk as): every read of them ends here.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// One row block's result straight from its fragments (MLX steel's store_result): each lane
+// writes its two elements of every 8x8 tile to device memory, masked by row. `u` is the up
+// stack's accumulators when paired -- act(gate) * up in registers, the expression
+// imparo_act_mul evaluates over the same two floats -- and ignored otherwise.
+template <uint RT_SG, uint TT_SG, bool PAIR>
+static inline __attribute__((always_inline)) void moe_st_store_block(
+    thread simdgroup_float8x8 * g, thread simdgroup_float8x8 * u, uint rowoff, uint nrows,
+    device float * y, uint n_out, uint c0, uint r0, uint ntok, uint row_tile0, uint tok_tile0,
+    uint lane)
+{
+    const uint qid = lane / 4u;
+    const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
+    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+    MOE_ST_UNROLL
+    for (uint ti = 0; ti < TT_SG; ++ti) {
+        const uint tt = (tok_tile0 + ti) * 8u + fm;
+        if (tt >= ntok) { continue; }
+        MOE_ST_UNROLL
+        for (uint ri = 0; ri < RT_SG; ++ri) {
+            const uint rr = rowoff + (row_tile0 + ri) * 8u + fn;
+            float2 v = rm_frag_get(g[ti * RT_SG + ri]);
+            if (PAIR) {
+                const float2 uv = rm_frag_get(u[ti * RT_SG + ri]);
+                v = float2(imparo_act_f(v.x) * uv.x, imparo_act_f(v.y) * uv.y);
+            }
+            const ulong o = (ulong)(c0 + tt) * n_out + r0 + rr;
+            if (rr + 1u < nrows) {
+                if (MOE_ST_DST_HALF) { *(device half2 *)((device half *)y + o) = half2(v); }
+                else                 { *(device float2 *)(y + o) = v; }
+            } else if (rr < nrows) {
+                if (MOE_ST_DST_HALF) { ((device half *)y)[o] = half(v.x); }
+                else                 { y[o] = v.x; }
+            }
+        }
+    }
+}
+
+// RB: the single projection over RB (1 or 2) row blocks a threadgroup, the pair's loop with
+// the next ROWS rows of the same weight in place of the up stack. The activation tile is
+// staged once for RB * ROWS rows, as the pair stages it once for gate and up.
+template <uint ROWS, uint TOKENS, uint K, uint NSG, uint RT_SG, uint TT_SG,
+          bool PAIR = false, uint RB = 1u>
+static inline __attribute__((always_inline)) void moe_st_gemm_body(
+    device const uchar * weights, device const uchar * weights2, device const float * x,
+    device float * y, device const uint * perm, device const uint * seg,
+    constant ulong & w_offset, constant ulong & w_offset2, constant ulong & expert_stride,
+    constant uint & n_in, constant uint & n_out, constant uint & src_work_rows,
+    constant uint & n_expert,
+    threadgroup half * shared, uint3 tgid, uint tid, uint sgid, uint lane)
+{
+    constexpr uint THREADS   = NSG * 32u;
+    constexpr uint ROW_TILES = ROWS / 8u;
+    constexpr uint TOK_TILES = TOKENS / 8u;
+    constexpr uint K_TILES   = K / 8u;
+    static_assert(ROW_TILES * TOK_TILES == NSG * RT_SG * TT_SG,
+                  "the simdgroups must cover the output tile exactly, once");
+    // The grid spans ACTIVE experts (moe_plan's compacted tail), not all n_expert.
+    if (tgid.z >= seg[n_expert + 1u]) { return; }
+    const uint e  = seg[n_expert + 2u + tgid.z];
+    const uint lo = seg[e];
+    const uint hi = seg[e + 1u];
+    const uint c0 = lo + tgid.y * TOKENS;      // this group's first work row
+    if (c0 >= hi) { return; }                          // past this expert: a launch, nothing else
+    const uint ntok = min(TOKENS, hi - c0);
+    const uint r0   = tgid.x * ROWS * RB;
+    if (r0 >= n_out) { return; }
+    const uint nrow = min(ROWS, n_out - r0);
+
+    // ONE THREADGROUP BUFFER, PARTITIONED HERE. Three separate [[threadgroup(n)]] bindings
+    // is the obvious way to say "these never alias", and it is the assumption this kernel
+    // raced under; one buffer with offsets this file can check removes the question.
+    //   ws     K_TILES * ROW_TILES * 64 halves   the weight tile
+    //   as     K_TILES * TOK_TILES * 64 halves   the activation tile
+    //   abase  TOKENS ulongs                     (8-byte aligned: the tiles are whole tiles)
+    // The result leaves from the fragments (below), so nothing is spilled here.
+    // ONE WEIGHT TILE, STAGED TWICE when paired. Staging gate and up side by side doubled
+    // the buffer to 20480 B and cost more occupancy than the fused activation saved
+    // (+5.66% measured). Restaging the SAME tile for the up pass keeps the threadgroup
+    // budget identical to the single-projection shape, and the activation tile is still
+    // staged once for both.
+    constexpr uint STAGE_H = K_TILES * (ROW_TILES + TOK_TILES) * 64u;   // halves
+    threadgroup half * ws = shared;
+    threadgroup half * as = shared + K_TILES * ROW_TILES * 64u;
+    threadgroup ulong * abase = (threadgroup ulong *)(shared + STAGE_H);
+    // THE WORK ROWS' ACTIVATION BASES, RESOLVED ONCE. A work row's token is fixed for the
+    // whole kernel, so perm belongs before the K loop -- reading it per staged element cost
+    // 2048 lookups a chunk and made this kernel twice the rows kernel it replaces.
+    for (uint t = tid; t < TOKENS; t += THREADS) {
+        const uint w = c0 + min(t, ntok - 1u);
+        abase[t] = (ulong)((src_work_rows != 0u) ? w : perm[w]) * n_in;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // The simdgroups tile the output: ROW_TILES / RT_SG of them across the rows.
+    constexpr uint SG_COLS = ROW_TILES / RT_SG;
+    const uint row_tile0 = (sgid % SG_COLS) * RT_SG;
+    const uint tok_tile0 = (sgid / SG_COLS) * TT_SG;
+    // ONE NAMED ACCUMULATOR ARRAY A PASS (see moe_st_pass): pass 0 is the gate (or the only)
+    // stack's first row block, pass 1 the up stack when paired, else the second row block.
+    // TWO PASSES AT MOST: 16 fragments a simdgroup fit in registers, 32 do not -- the pair
+    // over two row blocks read 7330 ms against 1612 at a 5955-token prefill (Q4_K_M), four
+    // row blocks of the down projection 3554 against 840; three row blocks (24) ran 874.
+    constexpr uint NP = (PAIR ? 2u : 1u) * RB;
+    constexpr uint F  = TT_SG * RT_SG;
+    static_assert(NP >= 1u && NP <= 2u, "two accumulator sets fit in registers; more spill");
+    simdgroup_float8x8 acc0[F], acc1[NP > 1u ? F : 1u];
+    MOE_ST_UNROLL
+    for (uint i = 0; i < F; ++i) {
+        acc0[i] = simdgroup_float8x8(0.0f);
+        if (NP > 1u) { acc1[i] = simdgroup_float8x8(0.0f); }
+    }
+
+    const uint  spb      = tm_block_elems() / 32u;      // 32-value sub-blocks per block
+    const uint  bb       = tm_block_bytes();
+    const uint  scb      = tm_scale_bytes();
+    const uint  payb     = bb - scb;
+    const uint  blocks   = n_in / tm_block_elems();
+    const uint  so       = tm_scale_src_off();
+    const ulong unit     = (ulong)TM_UNIT_ROWS * bb;
+    const ulong wbase    = w_offset + (ulong)e * expert_stride;
+    const ulong wbase2   = w_offset2 + (ulong)e * expert_stride;
+
+    for (uint c00 = 0; c00 < n_in; c00 += K) {
+        // Pass p's rows and stack: unpaired, block p; paired, block p / 2, gate then up.
+        #define MOE_ST_PASS(ACC, P)                                                             \
+            moe_st_pass<ROWS, TOKENS, K, NSG, RT_SG, TT_SG>(                                    \
+                ACC, (P) == 0u, (PAIR && ((P) % 2u) == 1u) ? weights2 : weights,                \
+                (PAIR && ((P) % 2u) == 1u) ? wbase2 : wbase,                                    \
+                r0 + (PAIR ? (P) / 2u : (P)) * ROWS, c00, x, ws, as, abase, n_out, spb, bb,     \
+                scb, payb, blocks, so, unit, tid, row_tile0, tok_tile0, ntok)
+        MOE_ST_PASS(acc0, 0u);
+        if (NP > 1u) { MOE_ST_PASS(acc1, 1u); }
+        #undef MOE_ST_PASS
+    }
+
+    // ---- THE RESULT STRAIGHT FROM THE FRAGMENTS, one row block at a time -------------------
+    // A threadgroup spill and a coalesced copy-out measured a tie against this, and RB > 1 has
+    // row blocks the spill never held.
+    const uint nrows = min(RB * ROWS, n_out - r0);
+    #define MOE_ST_STORE(G, U, B)                                                               \
+        moe_st_store_block<RT_SG, TT_SG, PAIR>(G, U, (B) * ROWS, nrows, y, n_out, c0, r0, ntok, \
+                                               row_tile0, tok_tile0, lane)
+    if (PAIR) {
+        MOE_ST_STORE(acc0, acc1, 0u);
+    } else {
+        MOE_ST_STORE(acc0, acc0, 0u);
+        if (RB > 1u) { MOE_ST_STORE(acc1, acc1, 1u); }
+    }
+    #undef MOE_ST_STORE
+}
+
+// The shapes this ships. A kernel cannot be a template in Metal, so these are the names --
+// the same form IMPARO_RT_KERNEL uses for the register-tiled GEMM.
+#define IMPARO_MOE_ST_KERNEL(NAME, R_, T_, K_, NSG_, RT_, TT_, PAIR_, RB_)                  \
+kernel void NAME(                                                                           \
+    device const uchar * weights [[buffer(0)]],                                             \
+    device const float * x       [[buffer(1)]],                                             \
+    device float       * y       [[buffer(2)]],                                             \
+    device const uint  * perm    [[buffer(3)]],                                             \
+    device const uint  * seg     [[buffer(4)]],                                             \
+    constant ulong & w_offset      [[buffer(5)]],                                           \
+    constant ulong & expert_stride [[buffer(6)]],                                           \
+    constant uint  & n_in          [[buffer(7)]],                                           \
+    constant uint  & n_out         [[buffer(8)]],                                           \
+    constant uint  & src_work_rows [[buffer(9)]],                                           \
+    constant uint  & n_expert      [[buffer(14)]],                                          \
+    constant ulong & w_offset2     [[buffer(15)]],                                          \
+    device const uchar * weights2  [[buffer(16)]],                                          \
+    threadgroup half  * shared [[threadgroup(0)]],                                          \
+    uint3 tgid [[threadgroup_position_in_grid]],                                            \
+    uint3 tid3 [[thread_position_in_threadgroup]],                                          \
+    uint sgid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])  \
+{                                                                                           \
+    moe_st_gemm_body<R_, T_, K_, NSG_, RT_, TT_, PAIR_, RB_>(                               \
+        weights, weights2, x, y, perm, seg, w_offset, w_offset2, expert_stride, n_in, n_out,\
+        src_work_rows, n_expert, shared, tgid, tid3.x, sgid, lane);                         \
+}
+// THE DOWN PROJECTION'S SHAPE: two 64-row blocks a threadgroup over one staged activation
+// tile, the pair's loop with the next 64 rows in place of the up stack. At a 5955-token
+// prefill (Q4_K_M) the down projection took 868 ms on the one-block shape and 839 on this,
+// bit-identical. MLX's own shape at a 2048-token chunk -- 64 work rows x 64 rows x K 64 on 4
+// simdgroups of 4x4 fragments (gather_qmm_rhs) -- took 947 here, the 64-token one 937.
+IMPARO_MOE_ST_KERNEL(imparo_moe_st_gemm_r2,    64u, 32u, 64u, 4u, 4u, 2u, false, 2u)
+// GATE, UP AND THE ACTIVATION IN ONE STAGED DISPATCH. The weight tile is restaged for the up
+// pass rather than held twice, so the paired shape costs the single one's threadgroup memory.
+//
+// THE SHAPE WAS SWEPT AT THE 2048-TOKEN CHUNK (bracket's 5955-token prompt, prefill wall,
+// 2026-09-24) and this one wins: a 64-token pair on 8 simdgroups +2.6%; 4x4 fragments a
+// simdgroup 3-4x slower (32 accumulators a thread); 16 work rows x 32 rows x K 32 on 2
+// simdgroups (MLX's gather_qmm_rhs shape for few rows an expert, not the one it runs at this
+// chunk) +8.2%; 32 rows x 32 tokens x K 32 +16%; 64 x 16 x 32 +8.2%; K 32 at this tile
+// +3.9%. Most of the kernel's time is the multiply loop, not the weight decode. Against MLX
+// at a 2048-token chunk the pair is 25.7 ms, MLX's gate + up + activation 26.1.
+IMPARO_MOE_ST_KERNEL(imparo_moe_st_gemm_pair, 64u, 32u, 64u, 4u, 4u, 2u, true, 1u)
+// NARROW CHUNKS (under 32 tokens, the verify batch and a resumed tail): 8 tokens a tile, so a
+// chunk of a few work rows an expert is not paid for as 32. Same per-element arithmetic as
+// the wide shape -- half operands, K in the same 8-wide steps in the same order -- so a
+// position's result does not depend on which shape its chunk took.
+IMPARO_MOE_ST_KERNEL(imparo_moe_st_gemm_n8,       64u, 8u, 64u, 2u, 4u, 1u, false, 1u)
+IMPARO_MOE_ST_KERNEL(imparo_moe_st_gemm_pair_n8,  64u, 8u, 64u, 2u, 4u, 1u, true, 1u)
+
+// THE ROUTED FEED-FORWARD ON THE MATRIX UNIT. One threadgroup owns
+// TM_UNIT_ROWS * BLK_MMA_TILES output rows of ONE expert and walks that expert's segment
+// eight work rows at a time -- the same eight imparo_moe_grouped holds, but as an 8x8
+// fragment, so one activation fetch feeds every output row of the tile.
+//
+// WHY, IN ONE NUMBER. imparo_moe_grouped gives one output row to one simdgroup, so every
+// activation value it loads feeds exactly one dot product and is read again for each of the
+// n_out output rows:
+//
+//     each activation value is read     activation bytes a 512-token chunk   B per MAC
+//     imparo_moe_grouped   n_out = 1792            1.94 TB                     3.9
+//     a 64-wide tile       n_out/64 = 28             31 GB                     0.06
+//
+// against 496 GMAC of routed work and a 16 MB working set. Measured on LFM2.5-8B-A1B: the
+// scalar kernel prefills at 109 tok/s where llama.cpp does 1390 on the same file, and
+// IMPARO_MOE_SKIP=2 puts 88% of the chunk in those reads.
+//
+// The eight work rows are NOT eight consecutive activation rows -- they are eight of this
+// expert's picks -- which the body handles by reading perm[row]. Everything else, the quad
+// scales, the pair loads, the fragment order, the simdgroup reduction, is the rows matmul's.
+kernel void imparo_moe_grouped_mma(
+    device const uchar * weights [[buffer(0)]],
+    device const float * x       [[buffer(1)]],
+    device float       * y       [[buffer(2)]],
+    device const uint  * perm    [[buffer(3)]],
+    device const uint  * seg     [[buffer(4)]],
+    constant ulong & w_offset      [[buffer(5)]],
+    constant ulong & expert_stride [[buffer(6)]],
+    constant uint  & n_in          [[buffer(7)]],
+    constant uint  & n_out         [[buffer(8)]],
+    constant uint  & src_work_rows [[buffer(9)]],
+    constant uint  & epilogue      [[buffer(13)]],
+    constant uint  & n_expert      [[buffer(14)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
+{
+    // THE GRID SPANS ACTIVE EXPERTS. It used to span all n_expert and let the empty ones
+    // return on seg, which at decode is 28 of every 32 expert groups -- about 207k empty
+    // threadgroups a token across 66 routed dispatches.
+    if (tgid.y >= seg[n_expert + 1u]) { return; }
+    const uint e = seg[n_expert + 2u + tgid.y];
+    const uint lo = seg[e];
+    const uint hi = seg[e + 1u];
+    if (lo >= hi) { return; }   // kept: a compacted entry is non-empty, this costs nothing
+    const ulong wbase = w_offset + (ulong)e * expert_stride;
+    // EIGHT, because eight is the fragment's token side -- not TM_UNIT_ROWS, which is the
+    // weight side and happens to equal it. Two different eights.
+    for (uint c = lo; c < hi; c += 8u) {
+        const uint live = min(8u, hi - c);
+        blk_rows_mma_body<false, true, false>(weights, x, y + (ulong)c * n_out,
+                                       (device const half *)nullptr, perm, src_work_rows,
+                                       n_in, n_out, live, c, epilogue, wbase, 0ul,
+                                       partial, tgid, lane, sgid, nsg);
+        // `partial` is written by every simdgroup and read by every simdgroup inside the
+        // body, so the next group's writes would race this group's reads without this.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// GATE, UP AND THE ACTIVATION AS ONE ROUTED DISPATCH.
+//
+// gate and up read the SAME normalised hidden state and neither is an input to the other --
+// `h = act(gate(x)) * up(x)` -- so running them in one kernel is a GRID MERGE and not a fold:
+// it introduces no dependency the three dispatches did not have. That is the difference from
+// folding act_mul into the up projection alone, which WOULD make up wait for gate.
+//
+//   was    gate -> G        up -> U       act_mul(G, U) -> G      3 dispatches
+//   now    gate, up, act(gate)*up -> G                            1
+//
+// ONE K LOOP, TWO ACCUMULATORS -- not two passes. Two passes over the body with a barrier
+// between them is also bit-identical and measured SLOWER than the three dispatches (+0.76%
+// on a 128-step decode): two independent dispatches overlap under concurrent dispatch, and
+// two passes of one threadgroup do not. Here every activation fragment feeds both stacks
+// before it is dropped, so the pair removes two dispatches AND halves the activation loads.
+//
+// Bit-identical to the three dispatches: each stack accumulates in the order it did as its
+// own dispatch, and `imparo_act_f(gate) * up` is imparo_act_mul's expression over the two
+// values those dispatches wrote.
+kernel void imparo_moe_grouped_mma_pair(
+    device const uchar * weights [[buffer(0)]],
+    device const float * x       [[buffer(1)]],
+    device float       * y       [[buffer(2)]],
+    device const uint  * perm    [[buffer(3)]],
+    device const uint  * seg     [[buffer(4)]],
+    constant ulong & w_offset      [[buffer(5)]],
+    constant ulong & expert_stride [[buffer(6)]],
+    constant uint  & n_in          [[buffer(7)]],
+    constant uint  & n_out         [[buffer(8)]],
+    constant uint  & src_work_rows [[buffer(9)]],
+    constant uint  & epilogue      [[buffer(13)]],
+    constant uint  & n_expert      [[buffer(14)]],
+    constant ulong & up_offset     [[buffer(15)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
+{
+    if (tgid.y >= seg[n_expert + 1u]) { return; }
+    const uint e = seg[n_expert + 2u + tgid.y];
+    const uint lo = seg[e];
+    const uint hi = seg[e + 1u];
+    if (lo >= hi) { return; }
+    const ulong gbase = w_offset  + (ulong)e * expert_stride;
+    const ulong ubase = up_offset + (ulong)e * expert_stride;
+    for (uint c = lo; c < hi; c += 8u) {
+        const uint live = min(8u, hi - c);
+        blk_rows_mma_body<false, true, true>(weights, x, y + (ulong)c * n_out,
+                                       (device const half *)nullptr, perm, src_work_rows,
+                                       n_in, n_out, live, c, epilogue, gbase, ubase,
+                                       partial, tgid, lane, sgid, nsg);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// The rows matmul AS SERVED: float activations. Every fast-route pick builds this pipeline.
+kernel void imparo_blk_rows_mma(
+    device const uchar * weights [[buffer(0)]],
+    device const float * x       [[buffer(1)]],
+    device float       * y       [[buffer(2)]],
+    constant ulong & w_offset [[buffer(3)]], constant uint & n_in [[buffer(4)]],
+    constant uint & n_out    [[buffer(5)]], constant uint & n_tok [[buffer(6)]],
+    constant uint & src_row  [[buffer(7)]],
+    constant uint & epilogue [[buffer(13)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
+{
+    blk_rows_mma_body<false, false, false>(weights, x, y, (device const half *)nullptr,
+                                    (device const uint *)nullptr, 1u, n_in, n_out, n_tok,
+                                    src_row, epilogue, w_offset, 0ul,
+                                    partial, tgid, lane, sgid, nsg);
+}
+
+// TWO TOKEN FRAGMENTS (9..16 rows): each weight fragment decoded once for both, so the weights are
+// read once for up to 16 rows. Float activations; each row's sums are the 8-row kernel's.
+kernel void imparo_blk_rows_mma_t2(
+    device const uchar * weights [[buffer(0)]],
+    device const float * x       [[buffer(1)]],
+    device float       * y       [[buffer(2)]],
+    constant ulong & w_offset [[buffer(3)]], constant uint & n_in [[buffer(4)]],
+    constant uint & n_out    [[buffer(5)]], constant uint & n_tok [[buffer(6)]],
+    constant uint & src_row  [[buffer(7)]],
+    constant uint & epilogue [[buffer(13)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
+{
+    blk_rows_mma_body<false, false, false, 2u>(weights, x, y, (device const half *)nullptr,
+                                    (device const uint *)nullptr, 1u, n_in, n_out, n_tok,
+                                    src_row, epilogue, w_offset, 0ul,
+                                    partial, tgid, lane, sgid, nsg);
+}
+
+// The same body over the half mirror at buffer 14, bound only when it covers this step's rows.
+kernel void imparo_blk_rows_mma_xh(
+    device const uchar * weights [[buffer(0)]],
+    device const float * x       [[buffer(1)]],
+    device float       * y       [[buffer(2)]],
+    constant ulong & w_offset [[buffer(3)]], constant uint & n_in [[buffer(4)]],
+    constant uint & n_out    [[buffer(5)]], constant uint & n_tok [[buffer(6)]],
+    constant uint & src_row  [[buffer(7)]],
+    constant uint & epilogue [[buffer(13)]],
+    device const half  * xh      [[buffer(14)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
+{
+    blk_rows_mma_body<true, false, false>(weights, x, y, xh, (device const uint *)nullptr, 1u,
+                                   n_in, n_out, n_tok,
+                                   src_row, epilogue, w_offset, 0ul,
+                                   partial, tgid, lane, sgid, nsg);
 }
 
 // Row gather for a ROW-MAJOR block format: one row of the embedding table per token.
@@ -9917,6 +13699,594 @@ inline float mega_q4_row_partial_tg(device const uchar * row, threadgroup const 
 // (rounded normalised values before the add) lives in a free device scratch row instead of
 // threadgroup memory, so the dispatch's threadgroup-memory footprint stays small and its
 // residency is not reduced.
+// ---- MIXTURE OF EXPERTS ----------------------------------------------------------------
+//
+// A routed feed-forward picks `k` of `n_expert` experts PER TOKEN, so the one thing the rest
+// of this file never needs appears here: a matmul whose weight matrix is chosen per row.
+// llama.cpp calls it MUL_MAT_ID. Four kernels, and the shape of the middle two is the whole
+// design:
+//
+//   imparo_moe_gate      router scores -> probabilities, and probabilities + bias -> the
+//                        scores the pick reads. THE BIAS SELECTS AND DOES NOT WEIGH: the
+//                        weights come from the UNBIASED probabilities (llama.cpp says so at
+//                        the line that does it), and mixing the two silently runs the wrong
+//                        experts with plausible text as the only symptom.
+//   imparo_moe_plan      a counting sort of the n_tok * k (token, slot) pairs BY EXPERT, in
+//                        one threadgroup: positions from threadgroup atomics, a 32-entry
+//                        prefix sum, then the scatter. It produces `perm` (work row -> token),
+//                        `wgt` (its routing weight), `seg` (each expert's half-open range) and
+//                        `inv` ((token, slot) -> work row, which the combine reads back).
+//   imparo_moe_grouped   the matmul. A threadgroup owns one expert and one output row, decodes
+//                        each weight sub-block ONCE, and multiplies it into up to MOE_ROWS of
+//                        that expert's work rows -- the reuse that makes this affordable.
+//                        WHERE ITS INPUT ROW LIVES IS AN ARGUMENT: the gate and up
+//                        projections read the token's activations, so work row w reads
+//                        `perm[w]` and nothing is gathered into a staging buffer first; the
+//                        down projection reads what the gate and up just wrote, which is
+//                        already one row per WORK ROW, so it reads row w itself. Taking
+//                        `perm[w]` there reads another token's hidden state -- a wrong answer
+//                        that still looks like an answer.
+//   imparo_moe_combine   sums a token's k weighted rows in slot order. NOT float atomics: an
+//                        atomic accumulation orders itself differently every run and this
+//                        engine's determinism gate would fail on the next step.
+//
+// The expert stack is a 3-D tensor and the tile-major transform refuses 3-D, so these read
+// ROW-MAJOR blocks -- the same brick (`tm_sub32`) the row-major GEMV reads -- with expert e's
+// matrix at `w_offset + e * expert_stride`.
+constant uint MOE_ROWS = 8u;          // work rows one pass of the grouped matmul holds
+
+// DIAGNOSTIC, 0 in every served pipeline (IMPARO_MOE_SKIP). Prices the grouped matmul's
+// parts by difference, the way IMPARO_BLK_ROWS_SKIP prices the decode-rows GEMV's:
+//   bit 0  the weight decode and its loads are gone (v[] gets a cheap sequence)
+//   bit 1  the activation row is not read at all (the products run on v[] alone)
+//   bit 2  the 32 products become one (7 of the 8 float4 loads go with them)
+// At 0 the code below is exactly what shipped before this constant existed, so the
+// baseline arm does not move: a branch that never runs still costs, which is why this is
+constant uint MOE_SKIP_FC [[function_constant(45)]];
+constant uint MOE_SKIP = is_function_constant_defined(MOE_SKIP_FC) ? MOE_SKIP_FC : 0u;
+
+// THE ACTIVATION ROW, ONCE PER THREADGROUP INSTEAD OF ONCE PER OUTPUT ROW (1 on, 0 off,
+// IMPARO_MOE_STAGE). Every simdgroup in a threadgroup reads the SAME activation: lane L
+// of each one wants sub-block L of the same work row, because the activation depends on
+// (work row, sub-block) and not on the output row a simdgroup owns. Unstaged, that is
+// eight identical load streams, and IMPARO_MOE_SKIP=2 prices them at 4121 ms of a 4700 ms
+// 512-token prefill chunk -- 88%.
+//
+// So one threadgroup loads each work row's K-slice once into threadgroup memory and all
+// MOE_GROUPED_SGS simdgroups read it there. STAGE_ROWS work rows at a time, 32 lanes x 32
+// floats each = 16 KiB, which leaves room for a second threadgroup on a core; the weight
+// decode stays OUTSIDE the staging rounds, so it still runs once per (output row, K-step)
+// and the MOE_ROWS weight reuse is untouched.
+//
+// Lane L still sums its own sub-blocks in the same order, so a row's value is bit-identical
+// to the unstaged kernel's. That is what makes this an A/B and not a new answer.
+// MEASURED NEGATIVE, so it is OFF (LFM2.5-8B-A1B, M3 Pro, 2026-09-21): a 512-token prefill
+// chunk 4785 -> 4090 ms (-14.5%), and a decode step 14.7 -> 22.9 ms (+56%) for the barriers
+// at live == 1. THE REASON, and it is the useful part: IMPARO_MOE_SKIP=4 keeps one float4
+// load of eight and costs 745 ms against the full kernel's 4700, so the time follows the
+// NUMBER OF LOADS, not the bytes. Staging moves the loads nearer; it does not remove any.
+// A simdgroup still issues 32 reads per (output row, work row, sub-block). What removes
+// loads is more arithmetic per loaded value -- the matrix unit, as in imparo_blk_rows_mma.
+constant uint MOE_STAGE_FC [[function_constant(46)]];
+constant uint MOE_STAGE = is_function_constant_defined(MOE_STAGE_FC) ? MOE_STAGE_FC : 0u;
+constant uint MOE_STAGE_ROWS = 4u;
+#define MOE_STAGE_FLOATS (MOE_STAGE_ROWS * 1024u)
+#define MOE_MAX_EXPERTS 256u
+#define MOE_MAX_K 8u
+
+kernel void imparo_moe_gate(
+    device const uchar * weights [[buffer(0)]],
+    device const float * scores  [[buffer(1)]],
+    device float       * probs   [[buffer(2)]],
+    device float       * sel     [[buffer(3)]],
+    constant uint & n_expert [[buffer(4)]],
+    constant uint & gating   [[buffer(5)]],   // 0 softmax, 1 sigmoid
+    constant ulong & bias_off [[buffer(6)]],  // IMPARO_NO_WEIGHT when the file has none
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+    uint tcount [[threads_per_threadgroup]])
+{
+    device const float * s = scores + (ulong)tg * n_expert;
+    device float * p = probs + (ulong)tg * n_expert;
+    device float * q = sel   + (ulong)tg * n_expert;
+    if (gating == 0u) {
+        // ONE THREAD, so the sum has one order. n_expert is 32 here; a tree reduction would
+        // buy nothing and would make the result depend on the threadgroup width.
+        if (tid == 0u) {
+            float m = -INFINITY;
+            for (uint e = 0u; e < n_expert; ++e) { m = max(m, s[e]); }
+            float sum = 0.0f;
+            for (uint e = 0u; e < n_expert; ++e) { const float v = exp(s[e] - m); p[e] = v; sum += v; }
+            for (uint e = 0u; e < n_expert; ++e) { p[e] = p[e] / sum; }
+        }
+    } else {
+        for (uint e = tid; e < n_expert; e += tcount) { p[e] = 1.0f / (1.0f + exp(-s[e])); }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    device const float * bias = (device const float *)(weights + bias_off);
+    const bool has_bias = bias_off != IMPARO_NO_WEIGHT;
+    for (uint e = tid; e < n_expert; e += tcount) {
+        q[e] = p[e] + (has_bias ? bias[e] : 0.0f);
+    }
+}
+
+kernel void imparo_moe_plan(
+    device const uint  * topk  [[buffer(0)]],   // [n_tok * k] expert ids, top_k_rows' layout
+    device const float * probs [[buffer(1)]],   // [n_tok, n_expert] UNBIASED
+    device uint  * perm        [[buffer(2)]],
+    device float * wgt         [[buffer(3)]],
+    device uint  * seg         [[buffer(4)]],   // [n_expert + 1]
+    device uint  * inv         [[buffer(5)]],   // [n_tok * k]
+    constant uint & n_tok     [[buffer(6)]],
+    constant uint & n_expert  [[buffer(7)]],
+    constant uint & k         [[buffer(8)]],
+    constant uint & normalise [[buffer(9)]],
+    constant float & scale    [[buffer(10)]],
+    uint tid [[thread_position_in_threadgroup]], uint tcount [[threads_per_threadgroup]])
+{
+    threadgroup atomic_uint count[MOE_MAX_EXPERTS];
+    threadgroup uint base[MOE_MAX_EXPERTS];
+    for (uint e = tid; e < n_expert; e += tcount) {
+        atomic_store_explicit(&count[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each token's position WITHIN its expert's segment. Parked in `inv` so a thread can serve
+    // many tokens without holding a register per token.
+    for (uint t = tid; t < n_tok; t += tcount) {
+        for (uint j = 0u; j < k; ++j) {
+            const uint e = topk[t * k + j];
+            inv[t * k + j] = (e < n_expert)
+                ? atomic_fetch_add_explicit(&count[e], 1u, memory_order_relaxed)
+                : 0u;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        // THE ACTIVE EXPERTS, COMPACTED, in the tail of the same buffer:
+        //   seg[0 .. n_expert]          segment offsets, as before
+        //   seg[n_expert + 1]           how many experts hold a work row
+        //   seg[n_expert + 2 + i]       the i-th of them, ascending
+        // A token picks k DISTINCT experts, so at most min(n_expert, n_tok * k) can be
+        // active -- a bound the host knows without reading this back, which is what lets
+        // it size the grid by the active count instead of by n_expert.
+        uint run = 0u;
+        uint nact = 0u;
+        for (uint e = 0u; e < n_expert; ++e) {
+            base[e] = run;
+            seg[e] = run;
+            const uint c = atomic_load_explicit(&count[e], memory_order_relaxed);
+            if (c != 0u) { seg[n_expert + 2u + nact] = e; nact += 1u; }
+            run += c;
+        }
+        seg[n_expert] = run;
+        seg[n_expert + 1u] = nact;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = tid; t < n_tok; t += tcount) {
+        device const float * p = probs + (ulong)t * n_expert;
+        // The picked weights, renormalised over the k picks when the architecture says so.
+        // The clamp is the reference's: the smallest normal half, so a row of zeros divides
+        // by that rather than by zero.
+        float sum = 0.0f;
+        for (uint j = 0u; j < k; ++j) {
+            const uint e = topk[t * k + j];
+            sum += (e < n_expert) ? p[e] : 0.0f;
+        }
+        const float denom = (normalise != 0u) ? max(sum, 6.103515625e-5f) : 1.0f;
+        for (uint j = 0u; j < k; ++j) {
+            const uint e = topk[t * k + j];
+            if (e >= n_expert) { continue; }
+            const uint dst = base[e] + inv[t * k + j];
+            perm[dst] = t;
+            wgt[dst] = (p[e] / denom) * scale;
+            inv[t * k + j] = dst;
+        }
+    }
+}
+
+// THE WHOLE ROUTE IN ONE DISPATCH: gate, the pick, and the plan.
+//
+//   was   moe_gate -> top_k_rows -> moe_plan                         3 dispatches
+//   now   imparo_moe_route                                           1
+//
+// ONE THREADGROUP, because the plan already needs one -- its counting sort takes positions
+// from threadgroup atomics and bases from a single prefix sum over them, so it cannot span
+// threadgroups anyway. The gate and the pick are folded INTO that threadgroup rather than
+// the other way round, and the two dispatches they cost disappear with them.
+//
+// This is a fold of ALREADY DEPENDENT work, which is the only kind worth folding: the pick
+// reads what the gate wrote and the plan reads what the pick wrote, so no dispatch that
+// could have overlapped is being serialised. It is also the one fold in the routed layer
+// with NO weight stream to disturb -- the three kernels together read one n_expert-wide row
+// per token and nothing else.
+//
+// Bit-identical to the three by construction: each phase is the body of the kernel it
+// replaces, in the same order, over the same buffers. The gate's softmax stays ONE THREAD
+// per token so its sum keeps one order, and the pick stays the one-pass top-8 list.
+//
+// THE GRID IS THE COST. At one token this threadgroup does a few hundred operations; at a
+// 512-token prefill chunk the gate alone would be 512 softmaxes on one core where the split
+// form spreads them over every core. So the host admits this only below a token threshold.
+kernel void imparo_moe_route(
+    device const uchar * weights   [[buffer(0)]],
+    device const float * scores    [[buffer(1)]],
+    device float       * probs     [[buffer(2)]],
+    device float       * sel       [[buffer(3)]],
+    device uint        * topk_ids  [[buffer(4)]],
+    device float       * topk_vals [[buffer(5)]],   // the same buffer as topk_ids
+    device uint        * perm      [[buffer(6)]],
+    device float       * wgt       [[buffer(7)]],
+    device uint        * seg       [[buffer(8)]],
+    device uint        * inv       [[buffer(9)]],
+    constant uint  & n_tok     [[buffer(10)]],
+    constant uint  & n_expert  [[buffer(11)]],
+    constant uint  & k         [[buffer(12)]],
+    constant uint  & gating    [[buffer(13)]],
+    constant ulong & bias_off  [[buffer(14)]],
+    constant uint  & normalise [[buffer(15)]],
+    constant float & scale     [[buffer(16)]],
+    uint tid [[thread_position_in_threadgroup]], uint tcount [[threads_per_threadgroup]])
+{
+    // ---- 1. the gate: scores -> probabilities -------------------------------------------
+    // ONE THREAD A TOKEN for softmax, so the sum has one order -- imparo_moe_gate gives the
+    // token a threadgroup and lets its thread 0 do this; here the token is the thread.
+    for (uint t = tid; t < n_tok; t += tcount) {
+        device const float * s = scores + (ulong)t * n_expert;
+        device float * p = probs + (ulong)t * n_expert;
+        if (gating == 0u) {
+            float m = -INFINITY;
+            for (uint e = 0u; e < n_expert; ++e) { m = max(m, s[e]); }
+            float sum = 0.0f;
+            for (uint e = 0u; e < n_expert; ++e) { const float v = exp(s[e] - m); p[e] = v; sum += v; }
+            for (uint e = 0u; e < n_expert; ++e) { p[e] = p[e] / sum; }
+        } else {
+            for (uint e = 0u; e < n_expert; ++e) { p[e] = 1.0f / (1.0f + exp(-s[e])); }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ---- 2. the pick reads probabilities PLUS the file's bias ---------------------------
+    // THE BIAS SELECTS AND DOES NOT WEIGH: the weights below come from the unbiased
+    // probabilities, which is why `sel` is a second buffer and not `probs` overwritten.
+    device const float * bias = (device const float *)(weights + bias_off);
+    const bool has_bias = bias_off != IMPARO_NO_WEIGHT;
+    for (uint i = tid; i < n_tok * n_expert; i += tcount) {
+        sel[i] = probs[i] + (has_bias ? bias[i % n_expert] : 0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ---- 3. the top-k pick, the one-pass list -------------------------------------------
+    for (uint r = tid; r < n_tok; r += tcount) {
+        const ulong row = (ulong)r * n_expert;
+        top8_list t = top8_empty();
+        for (uint i = 0u; i < n_expert; i++) {
+            const float x = sel[row + i];
+            if (t.i7 != TOP_K_EMPTY && !(x > t.v7)) { continue; }
+            top8_insert(t, x, i);
+        }
+        top8_write(t, k, topk_ids, (ulong)r * k, topk_vals,
+                   (ulong)n_tok * k + (ulong)r * k);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ---- 4. the plan: a counting sort of the (token, slot) pairs BY EXPERT ---------------
+    threadgroup atomic_uint count[MOE_MAX_EXPERTS];
+    threadgroup uint base[MOE_MAX_EXPERTS];
+    for (uint e = tid; e < n_expert; e += tcount) {
+        atomic_store_explicit(&count[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = tid; t < n_tok; t += tcount) {
+        for (uint j = 0u; j < k; ++j) {
+            const uint e = topk_ids[t * k + j];
+            inv[t * k + j] = (e < n_expert)
+                ? atomic_fetch_add_explicit(&count[e], 1u, memory_order_relaxed)
+                : 0u;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint run = 0u;
+        uint nact = 0u;
+        for (uint e = 0u; e < n_expert; ++e) {
+            base[e] = run;
+            seg[e] = run;
+            const uint c = atomic_load_explicit(&count[e], memory_order_relaxed);
+            if (c != 0u) { seg[n_expert + 2u + nact] = e; nact += 1u; }
+            run += c;
+        }
+        seg[n_expert] = run;
+        seg[n_expert + 1u] = nact;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = tid; t < n_tok; t += tcount) {
+        device const float * p = probs + (ulong)t * n_expert;
+        float sum = 0.0f;
+        for (uint j = 0u; j < k; ++j) {
+            const uint e = topk_ids[t * k + j];
+            sum += (e < n_expert) ? p[e] : 0.0f;
+        }
+        const float denom = (normalise != 0u) ? max(sum, 6.103515625e-5f) : 1.0f;
+        for (uint j = 0u; j < k; ++j) {
+            const uint e = topk_ids[t * k + j];
+            if (e >= n_expert) { continue; }
+            const uint dst = base[e] + inv[t * k + j];
+            perm[dst] = t;
+            wgt[dst] = (p[e] / denom) * scale;
+            inv[t * k + j] = dst;
+        }
+    }
+}
+
+kernel void imparo_moe_grouped(
+    device const uchar * weights [[buffer(0)]],
+    device const float * x       [[buffer(1)]],
+    device float       * y       [[buffer(2)]],
+    device const uint  * perm    [[buffer(3)]],
+    device const uint  * seg     [[buffer(4)]],
+    constant ulong & w_offset      [[buffer(5)]],
+    constant ulong & expert_stride [[buffer(6)]],
+    constant uint  & n_in          [[buffer(7)]],
+    constant uint  & n_out         [[buffer(8)]],
+    // 0: work row w reads activation row `perm[w]` (a token). 1: it reads row w.
+    constant uint  & src_work_rows [[buffer(9)]],
+    constant uint  & n_expert      [[buffer(14)]],
+    threadgroup float * xstage [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]])
+{
+    // THE GRID SPANS ACTIVE EXPERTS, NOT ALL OF THEM. moe_plan compacted the ones that
+    // hold a work row into seg's tail, so a decode step -- 4 work rows over 32 experts --
+    // launches 4 expert groups and not 32.
+    if (tgid.y >= seg[n_expert + 1u]) { return; }
+    const uint e = seg[n_expert + 2u + tgid.y];
+    const uint lo = seg[e];
+    const uint hi = seg[e + 1u];
+    if (lo >= hi) { return; }                       // an expert no token picked costs nothing
+    const uint r = tgid.x * nsg + sgid;             // this simdgroup's output row
+    // NOT `return`: the staged path has threadgroup barriers, and a simdgroup that left
+    // early would hang the ones that stayed. n_out is a multiple of MOE_GROUPED_SGS on
+    // every routed tensor this serves, so no simdgroup is idle today -- but a kernel whose
+    // correctness depends on that is a hang waiting for the next model.
+    const bool row_live = (r < n_out);
+    if (!row_live && MOE_STAGE == 0u) { return; }
+
+    const uint sub_per_block = tm_block_elems() / 32u;
+    const uint bb = tm_block_bytes();
+    const uint sc_bytes = tm_scale_bytes();
+    const uint pay_bytes = bb - sc_bytes;
+    const uint blocks = n_in / tm_block_elems();
+    const uint subs = n_in / 32u;
+    const uint so = tm_scale_src_off();
+    const ulong wbase = w_offset + (ulong)e * expert_stride;
+
+    const uint tid = sgid * 32u + lane;
+    const uint tcount = nsg * 32u;
+
+    for (uint c = lo; c < hi; c += MOE_ROWS) {
+        const uint live = min(MOE_ROWS, hi - c);
+        float acc[MOE_ROWS];
+        for (uint i = 0u; i < MOE_ROWS; ++i) { acc[i] = 0.0f; }
+        if (MOE_STAGE != 0u) {
+        // ONE K-STEP: the 32 sub-blocks this threadgroup's lanes hold at once, lane L
+        // owning sub-block t0 + L exactly as the unstaged loop does.
+        for (uint t0 = 0u; t0 < subs; t0 += 32u) {
+            const uint sb = t0 + lane;
+            const bool sb_live = (sb < subs);
+            float v[32];
+            if (sb_live && row_live) {
+                const uint blk = sb / sub_per_block;
+                const uint sub = sb % sub_per_block;
+                device const uchar * b = weights + wbase + ((ulong)r * blocks + blk) * bb;
+                tm_sub32(b + so, b + (so == 0u ? sc_bytes : 0u), sub, v, false);
+            } else {
+                for (uint j = 0u; j < 32u; ++j) { v[j] = 0.0f; }
+            }
+            // The floats of this K-step that exist. Short on the last step when n_in is not
+            // a multiple of 1024 -- the down projection's 1792 is, with subs = 56.
+            const uint span = min(1024u, n_in - t0 * 32u);
+            for (uint base = 0u; base < MOE_ROWS; base += MOE_STAGE_ROWS) {
+                if (base >= live) { break; }   // uniform in the threadgroup: all break together
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint i = 0u; i < MOE_STAGE_ROWS; ++i) {
+                    const uint w = base + i;
+                    if (w >= live) { continue; }
+                    const uint arow = (src_work_rows != 0u) ? (c + w) : perm[c + w];
+                    device const float * src = x + (ulong)arow * n_in + (ulong)t0 * 32u;
+                    threadgroup float * dst = xstage + i * 1024u;
+                    for (uint q = tid; q < span; q += tcount) { dst[q] = src[q]; }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint i = 0u; i < MOE_STAGE_ROWS; ++i) {
+                    const uint w = base + i;
+                    if (w >= live || !sb_live) { continue; }
+                    // THE SAME FOUR-AT-A-TIME SUM the unstaged path runs. A plain j loop
+                    // would be a different order and a different contraction, and the row
+                    // would stop being bit-identical -- which is the whole point of the A/B.
+                    const threadgroup float4 * xv4 =
+                        (const threadgroup float4 *)(xstage + i * 1024u + lane * 32u);
+                    float part = 0.0f;
+                    for (uint j = 0u; j < 8u; ++j) {
+                        const float4 t = xv4[j];
+                        part += v[4u * j] * t.x + v[4u * j + 1u] * t.y
+                              + v[4u * j + 2u] * t.z + v[4u * j + 3u] * t.w;
+                    }
+                    acc[w] += part;
+                }
+            }
+        }
+        } else {
+        for (uint sb = lane; sb < subs; sb += 32u) {
+            const uint blk = sb / sub_per_block;
+            const uint sub = sb % sub_per_block;
+            float v[32];
+            // The block's two pointers, named once so both the dequantising fetch and the
+            // deferred one can take them.
+            device const uchar * sc_p;
+            device const uchar * pay_p;
+            if (WFMT_ROW) {
+                device const uchar * b = weights + wbase + ((ulong)r * blocks + blk) * bb;
+                sc_p  = b + so;
+                pay_p = b + (so == 0u ? sc_bytes : 0u);
+            } else {
+                // TILE-MAJOR, the layout 91% of an MoE file's bytes are in after the load-time
+                // repack. A unit is TM_UNIT_ROWS rows: its scale headers first, then its
+                // payload rows -- the same addressing imparo_blk_gemv uses, so this kernel no
+                // longer has to refuse the stack it is actually given.
+                const ulong unit = ((ulong)(r / TM_UNIT_ROWS) * blocks + blk)
+                                 * (ulong)(TM_UNIT_ROWS * bb);
+                const uint slot = r % TM_UNIT_ROWS;
+                sc_p  = weights + wbase + unit + (ulong)slot * sc_bytes;
+                pay_p = weights + wbase + unit + (ulong)TM_UNIT_ROWS * sc_bytes
+                      + (ulong)slot * pay_bytes;
+            }
+            if ((MOE_SKIP & 1u) != 0u) {
+                for (uint j = 0u; j < 32u; ++j) { v[j] = float(j) * 0.01f; }
+            } else {
+                // A row-major block is not 16-byte aligned for every format, so the flag
+                // follows the layout.
+                tm_sub32(sc_p, pay_p, sub, v, !WFMT_ROW);
+            }
+            // THE REUSE. One decode, every work row of this expert in this pass.
+            for (uint i = 0u; i < MOE_ROWS; ++i) {
+                if (i >= live) { continue; }        // a compile-time loop with a guard: a
+                                                    // runtime bound would index acc at run time
+                const uint arow = (src_work_rows != 0u) ? (c + i) : perm[c + i];
+                float part = 0.0f;
+                if ((MOE_SKIP & 2u) != 0u) {
+                    for (uint j = 0u; j < 32u; ++j) { part += v[j]; }
+                } else {
+                    device const float4 * xs4 =
+                        (device const float4 *)(x + (ulong)arow * n_in + sb * 32u);
+                    if ((MOE_SKIP & 4u) != 0u) {
+                        part = v[0] * xs4[0].x;
+                    } else {
+                        for (uint j = 0u; j < 8u; ++j) {
+                            const float4 t = xs4[j];
+                            part += v[4u * j] * t.x + v[4u * j + 1u] * t.y
+                                  + v[4u * j + 2u] * t.z + v[4u * j + 3u] * t.w;
+                        }
+                    }
+                }
+                acc[i] += part;
+            }
+        }
+        }
+        for (uint i = 0u; i < MOE_ROWS; ++i) {
+            const float total = simd_sum(acc[i]);
+            if (lane == 0u && i < live && row_live) { y[(ulong)(c + i) * n_out + r] = total; }
+        }
+    }
+}
+
+kernel void imparo_moe_combine(
+    device const float * ydown [[buffer(0)]],
+    device const float * wgt   [[buffer(1)]],
+    device const uint  * inv   [[buffer(2)]],
+    device float       * out   [[buffer(3)]],
+    constant uint & n_embd [[buffer(4)]],
+    constant uint & k      [[buffer(5)]],
+    // How many threadgroups share one token's embedding. The grid is flattened into x:
+    // Metal wants every grid-position attribute scalar or all the same vector width, and
+    // the rest of this kernel's are scalar.
+    constant uint & chunks [[buffer(6)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+    uint tcount [[threads_per_threadgroup]])
+{
+    const uint tok = tg / chunks, chunk = tg % chunks;
+    device float * o = out + (ulong)tok * n_embd;
+    device const uint * rows = inv + (ulong)tok * k;
+    // THE EMBEDDING SPLIT ACROSS THREADGROUPS. Every output element is an independent sum,
+    // so one threadgroup per token left 2048 of them on ONE core: at decode the grid was a
+    // single threadgroup, reading 40 KB in 12.5 us. The sum order per element is the slot
+    // order either way, so this moves no bit.
+    for (uint d = chunk * tcount + tid; d < n_embd; d += tcount * chunks) {
+        // SLOT ORDER, every run. The k picks are summed in the order the router ranked them,
+        // which is what makes a routed layer reproduce itself bit for bit.
+        float s = 0.0f;
+        for (uint j = 0u; j < k; ++j) {
+            const uint row = rows[j];
+            s += wgt[row] * ydown[(ulong)row * n_embd + d];
+        }
+        o[d] = s;
+    }
+}
+
+// THE COMBINE FOLDED INTO THE NEXT NORM. A routed layer ends with the combine writing each
+// token's weighted sum O, and the next block's norm reading it straight back to add it to the
+// residual (imparo_rms_norm's pre-add mode): 16 MB written and read again per 2048-token
+// chunk, and a dispatch. Here the norm forms that sum itself.
+//
+// THE SAME FLOATS AS THE TWO KERNELS: O is the combine's slot-order sum (`c += w * y`, the
+// combine's expression per element), t = resid + O as in the pre-add sum pass, the squares
+// summed in the same strided order and reduced by the same rms_finish, and the scale pass's
+// `t * inv * w`. The residual is written in the sum pass and re-read by the thread that wrote
+// it, so the combine is not recomputed. The float row and its half mirror are both written,
+// as the norm writes them (skipping the float store once woke a visibility wobble; see
+// imparo_rms_norm).
+kernel void imparo_moe_combine_add_rms_norm(
+    device const uchar * weights [[buffer(0)]],
+    device float       * x       [[buffer(1)]],
+    constant ulong & w_offset [[buffer(2)]], constant uint & width [[buffer(3)]],
+    constant float & eps      [[buffer(4)]], constant uint & n_row [[buffer(5)]],
+    device float       * resid   [[buffer(8)]],
+    device const float * ydown   [[buffer(10)]],
+    device half        * xh      [[buffer(11)]], constant uint & xh_on [[buffer(12)]],
+    device const float * wgt     [[buffer(13)]],
+    device const uint  * inv_rows [[buffer(14)]],
+    constant uint & k [[buffer(15)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 tid3  [[thread_position_in_threadgroup]],
+    uint3 tcnt3 [[threads_per_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]],
+    uint  nsg   [[simdgroups_per_threadgroup]])
+{
+    const uint r = tgid.x;
+    if (r >= n_row) { return; }
+    const uint tid = tid3.x, tcount = tcnt3.x;
+    const uint w4 = width / 4u;
+    device float4 * r4 = (device float4 *)(resid + (ulong)r * width);
+    device const uint * rows = inv_rows + (ulong)r * k;
+    float sq = 0.0f;
+    // k == 0: THE RESIDUAL ALONE, already holding resid + O (a mixer's output projection
+    // added into it, RT_RESID). t is read, not re-added: `x + 0.0f` would turn a -0.0 into
+    // +0.0, which the two-step form never does.
+    for (uint i = tid; i < w4; i += tcount) {
+        if (k == 0u) {
+            const float4 t = r4[i];
+            sq += dot(t, t);
+            continue;
+        }
+        float4 c = float4(0.0f);
+        for (uint j = 0u; j < k; ++j) {
+            const uint row = rows[j];
+            c += wgt[row] * ((device const float4 *)(ydown + (ulong)row * width))[i];
+        }
+        const float4 t = r4[i] + c;
+        r4[i] = t;
+        sq += dot(t, t);
+    }
+    sq = simd_sum(sq);
+    float inv;
+    if (nsg == 1u) {
+        inv = rsqrt(simd_broadcast_first(sq) / float(width) + eps);
+    } else {
+        if (lane == 0) { partial[sgid] = sq; }
+        inv = rms_finish(nsg, width, eps, partial, lane, sgid, false);
+    }
+    device float4 * row4 = (device float4 *)(x + (ulong)r * width);
+    device const float4 * w4p = (device const float4 *)(weights + w_offset);
+    device half4 * x4 = (device half4 *)(xh + (ulong)r * width);
+    for (uint i = tid; i < w4; i += tcount) {
+        const float4 v = r4[i] * inv * w4p[i];
+        row4[i] = v;
+        if (xh_on != 0u) { x4[i] = half4(v); }
+    }
+}
+
 #if __METAL_VERSION__ >= 320
 // THE BLOCK'S ENTRY AND EXIT (shared by every composed kernel; task #158 step 1).
 // mega_enter: true = leave. Uniform across the threadgroup by broadcast through `flag`. The
@@ -10920,6 +15290,266 @@ inline __attribute__((always_inline)) void q35_ph_tail(MEGA_PH_ARGS) {
 }
 
 // The qwen35 kernel is emitted from its program: see the marker below.
+
+// ===================================================================================
+// LFM2-MOE: the fourth architecture. Its ROUTED feed-forward is the part of a decode token
+// the dispatch path runs as a chain of seven dependent dispatches (residual + FFN norm,
+// router, route, gate and up, the activation, down, the combine), and the chain's barriers
+// are 16% of the token (docs/moe-decode-attribution.md). Here it is three phases and two
+// grid barriers. What is new against the other programs:
+//
+//   the ROUTE IS FORMED BY EVERY THREADGROUP   from the router's rows, one thread, in the
+//                                              dispatch path's order -- the same inputs in
+//                                              the same order give every threadgroup the
+//                                              same experts, so no barrier publishes them
+//   an EXPERT IS A BASE ADDRESS                a stack converts to tile-major slice by slice,
+//                                              so expert e's units start at e * stride
+//   THE COMBINE LIVES IN THE DOWN PHASE        an output unit sums its k experts' rows in
+//                                              slot order, the combine kernel's order, and
+//                                              adds the residual; no buffer of k rows exists
+
+// Experts the route's threadgroup scratch holds probabilities for (the host refuses more).
+constant uint L2M_MAX_EXPERTS = 256u;
+
+// The route at one token into threadgroup memory: `p` = n_expert probabilities, then k ids
+// (as uint bits) and k weights -- imparo_moe_route's arithmetic at n_tok = 1, and every
+// threadgroup forms it from the same scores in the same order, so every threadgroup picks the
+// same experts and weighs them the same.
+//
+// ONE SIMDGROUP, a lane per expert, for the sigmoid gate: each probability is its own
+// expression, so the lane computes the serial kernel's bits. The pick is k rounds of "the
+// largest remaining value, the smallest id among equals" -- the order the one-pass list gives
+// (an equal value never displaces an earlier id) -- and the k-term weight sum stays on lane 0
+// in slot order. The serial form was ONE thread walking the experts while the threadgroup
+// waited: 12 us a routed layer, 0.26 ms a token (priced by skipping the route). Softmax keeps
+// the serial walk, because a lane-parallel sum would reorder its additions.
+inline void l2m_route_tg(device const float * s, threadgroup float * p, threadgroup uint * ids,
+                         threadgroup float * wts, uint n_e, uint k, uint gating,
+                         device const float * bias, bool has_bias, bool normalise, float scale,
+                         uint tid, uint sgid, uint lane) {
+    if (gating == 0u) {
+        if (tid == 0u) {
+            float m = -INFINITY;
+            for (uint e = 0u; e < n_e; ++e) { m = max(m, s[e]); }
+            float sum = 0.0f;
+            for (uint e = 0u; e < n_e; ++e) { const float v = exp(s[e] - m); p[e] = v; sum += v; }
+            for (uint e = 0u; e < n_e; ++e) { p[e] = p[e] / sum; }
+        }
+    } else if (sgid == 0u) {
+        for (uint e = lane; e < n_e; e += 32u) { p[e] = 1.0f / (1.0f + exp(-s[e])); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0u) {
+        // THE BIAS SELECTS AND DOES NOT WEIGH, as on the dispatch path. A lane holds the
+        // experts lane, lane + 32, ...; `taken` marks the ones already picked.
+        uint taken = 0u;
+        uint pick[MOE_MAX_K];
+        for (uint j = 0u; j < k; ++j) {
+            float best = -INFINITY;
+            uint best_e = TOP_K_EMPTY;
+            for (uint i = 0u, e = lane; e < n_e; ++i, e += 32u) {
+                if ((taken >> i) & 1u) { continue; }
+                const float x = p[e] + (has_bias ? bias[e] : 0.0f);
+                if (best_e == TOP_K_EMPTY || x > best) { best = x; best_e = e; }
+            }
+            const float top = simd_max(best_e == TOP_K_EMPTY ? -INFINITY : best);
+            const uint e_top = simd_min((best_e != TOP_K_EMPTY && best == top) ? best_e : TOP_K_EMPTY);
+            pick[j] = e_top;
+            if (best_e == e_top && e_top != TOP_K_EMPTY) { taken |= 1u << ((e_top - lane) / 32u); }
+        }
+        if (lane == 0u) {
+            float sum = 0.0f;
+            for (uint j = 0u; j < k; ++j) { sum += (pick[j] < n_e) ? p[pick[j]] : 0.0f; }
+            const float denom = normalise ? max(sum, 6.103515625e-5f) : 1.0f;
+            for (uint j = 0u; j < k; ++j) {
+                const uint e = pick[j];
+                // An empty slot (fewer experts than k, which the host refuses) weighs nothing
+                // and reads expert 0's rows rather than an address past the stack.
+                ids[j] = (e < n_e) ? e : 0u;
+                wts[j] = (e < n_e) ? (p[e] / denom) * scale : 0.0f;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// One projection of the k picked experts, units strided over the grid's simdgroups: unit `un`
+// is expert slot un / upe, unit un % upe of that expert's slice. `epi` makes the write-back
+// y = act(y) * total, the gated pair's second half (the q35 tail's rule: unit un belongs to
+// simdgroup un % sg_total in both passes, so each simdgroup reads back only what it wrote).
+template <uint F>
+inline void l2m_experts_t(device const uchar * w, ulong stride, threadgroup const uint * ids,
+                          threadgroup const float * x, device float * y, uint n_in, uint n_ff,
+                          uint k, bool epi, uint sg_global, uint sg_total, uint lane) {
+    const uint blocks = n_in / tm_block_elems_t<F>();
+    const uint upe = n_ff / TM_UNIT_ROWS;
+    const uint units = k * upe;
+    for (uint un = sg_global; un < units; un += sg_total) {
+        const uint j = un / upe, lu = un - j * upe;
+        float acc[TM_UNIT_ROWS];
+        mega_blk_unit<F, threadgroup const float *>(w + (ulong)ids[j] * stride, blocks, lu, x, acc, lane);
+        for (uint r = 0u; r < TM_UNIT_ROWS; ++r) {
+            const float total = simd_sum(acc[r]);
+            if (lane == 0u) {
+                device float * slot = y + (ulong)j * n_ff + lu * TM_UNIT_ROWS + r;
+                *slot = epi ? (imparo_act_f(*slot) * total) : total;
+            }
+        }
+    }
+}
+inline void l2m_experts(uint fmt, device const uchar * w, ulong stride, threadgroup const uint * ids,
+                        threadgroup const float * x, device float * y, uint n_in, uint n_ff,
+                        uint k, bool epi, uint sg_global, uint sg_total, uint lane) {
+    TM_BY_FORMAT(fmt, l2m_experts_t<FMT>(w, stride, ids, x, y, n_in, n_ff, k, epi,
+                                         sg_global, sg_total, lane); return;)
+}
+
+// The down projection of the k picked experts and the combine: output unit `un` (8 rows of
+// n_embd) sums w_j * row_j . g_j over the k experts, then x = (x + o) + s, the residual the
+// dispatch path forms in two adds, in the same order.
+//
+// THE k EXPERTS' SUB-BLOCKS ARE ONE LANE-STRIDED SPACE, each part weighed by its expert as it
+// is added: a unit's k * n_ff / 32 sub-blocks then fill every lane. One expert at a time --
+// the combine kernel's order, `s += wgt * ydown` per expert -- ran n_ff = 1792 as 56
+// sub-blocks, two rounds of 32 lanes with the second a quarter idle. Decode 10.635 / 10.651
+// -> 10.486 / 10.469 ms a token at 5955 keys (Q4_K_M; Q4_0 10.108 -> 10.055). Not
+// bit-equal to the dispatch path's combine any more: cpu_agree reads it no further from the
+// CPU backend (0.157072 against 0.157228 on Q4_K_M, 0.364016 against 0.363910 on Q4_0).
+//
+// The activation stays in DEVICE memory, read by every lane per sub-block. Staging each
+// expert's row in the threadgroup's memory first was built and measured SLOWER (the down
+// phase 1.90 -> 2.08 ms a token at 5962 keys): each stage is a load-then-barrier pause the
+// unit-major loop overlaps with its weight loads.
+template <uint F>
+inline void l2m_down_t(device const uchar * w, ulong stride, threadgroup const uint * ids,
+                       threadgroup const float * wts, device const float * g, device float * x,
+                       device const float * o, uint n_ff, uint n_embd, uint k,
+                       uint sg_global, uint sg_total, uint lane) {
+    const uint blocks = n_ff / tm_block_elems_t<F>();
+    const uint units = n_embd / TM_UNIT_ROWS;
+    const uint sub_per_block = tm_block_elems_t<F>() / 32u;
+    const uint bb = tm_block_bytes_t<F>();
+    const uint sc_bytes = tm_scale_bytes_t<F>();
+    const uint pay_bytes = bb - sc_bytes;
+    const uint subs = blocks * sub_per_block;
+    for (uint un = sg_global; un < units; un += sg_total) {
+        float sl[TM_UNIT_ROWS];
+        for (uint r = 0u; r < TM_UNIT_ROWS; ++r) { sl[r] = 0.0f; }
+        for (uint it = lane; it < k * subs; it += 32u) {
+            const uint j = it / subs, sb = it - j * subs;
+            const uint blk = sb / sub_per_block, sub = sb % sub_per_block;
+            device const uchar * ub = w + (ulong)ids[j] * stride
+                                    + ((ulong)un * blocks + blk) * (ulong)(TM_UNIT_ROWS * bb);
+            device const uchar * pay0 = ub + (ulong)TM_UNIT_ROWS * sc_bytes;
+            device const float * xs = g + (ulong)j * n_ff + sb * 32u;
+            float xv[32];
+            for (uint jj = 0u; jj < 32u; ++jj) { xv[jj] = xs[jj]; }
+            const float wj = wts[j];
+            for (uint r = 0u; r < TM_UNIT_ROWS; ++r) {
+                float v[32];
+                tm_sub32_t<F, float>(ub + (ulong)r * sc_bytes, pay0 + (ulong)r * pay_bytes,
+                                     sub, v, true);
+                float part = 0.0f;
+                for (uint jj = 0u; jj < 32u; ++jj) { part += v[jj] * xv[jj]; }
+                sl[r] += wj * part;
+            }
+        }
+        float s[TM_UNIT_ROWS];
+        for (uint r = 0u; r < TM_UNIT_ROWS; ++r) { s[r] = simd_sum(sl[r]); }
+        if (lane == 0u) {
+            for (uint r = 0u; r < TM_UNIT_ROWS; ++r) {
+                const uint row = un * TM_UNIT_ROWS + r;
+                x[row] = (x[row] + o[row]) + s[r];
+            }
+        }
+    }
+}
+inline void l2m_down(uint fmt, device const uchar * w, ulong stride, threadgroup const uint * ids,
+                     threadgroup const float * wts, device const float * g, device float * x,
+                     device const float * o, uint n_ff, uint n_embd, uint k,
+                     uint sg_global, uint sg_total, uint lane) {
+    TM_BY_FORMAT(fmt, l2m_down_t<FMT>(w, stride, ids, wts, g, x, o, n_ff, n_embd, k,
+                                      sg_global, sg_total, lane); return;)
+}
+
+// The route's threadgroup scratch, after the row: n_expert probabilities, k ids, k weights.
+#define L2M_ROUTE_P   ((threadgroup float *)xn + ent.u[L2M_U_N_EMBD])
+#define L2M_ROUTE_IDS ((threadgroup uint *)(L2M_ROUTE_P + ent.u[L2M_U_N_EXPERT]))
+#define L2M_ROUTE_W   (L2M_ROUTE_P + ent.u[L2M_U_N_EXPERT] + MOE_MAX_K)
+
+// R0 (every threadgroup): xn = rms(x + o) * w_fn.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2m_ph_ffn_norm(MEGA_PH_ARGS) {
+    mega_tg_sum(xn, (device const float *)ent.ptr[L2M_X], (device const float *)ent.ptr[L2M_O], w4, tid, tcount);
+    mega_norm_tg(xn, ent.ptr[L2M_W_FN], ent.off[L2M_O_FN_OFF], ent.u[L2M_U_N_EMBD], ent.f[L2M_F_EPS],
+                 ent.u[L2M_U_NORM_T], partial, tid, tcount, lane, sgid, nsg);
+}
+// R1: the router's rows (F32, row-major), dealt round the threadgroups, each row split over
+// ALL of its threadgroup's threads -- one float4 a thread at n_embd 2048 -- and reduced
+// through `partial`. One simdgroup a row left 32 simdgroups streaming 8 KB each while the
+// rest of the grid waited at the barrier: 8 us a routed layer (priced by skipping the rows).
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2m_ph_router(MEGA_PH_ARGS) {
+    const uint n_e = ent.u[L2M_U_N_EXPERT];
+    const uint n_tg = ent.u[L2M_U_N_TG];
+    device const float4 * wr = (device const float4 *)(ent.ptr[L2M_W_ROUTER] + ent.off[L2M_O_ROUTER_OFF]);
+    device float * scores = (device float *)ent.ptr[L2M_SCORES];
+    for (uint r = tgid; r < n_e; r += n_tg) {
+        device const float4 * row = wr + (ulong)r * w4;
+        float acc = 0.0f;
+        for (uint i = tid; i < w4; i += tcount) { acc += dot(row[i], xn[i]); }
+        acc = simd_sum(acc);
+        if (lane == 0u) { partial[sgid] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            float t = 0.0f;
+            for (uint g = 0u; g < nsg; ++g) { t += partial[g]; }
+            scores[r] = t;
+        }
+        // `partial` is the next row's.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+// R2 (every threadgroup): the route, then the k experts' gate and up units.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2m_ph_gated(MEGA_PH_ARGS) {
+    const uint k = ent.u[L2M_U_K];
+    l2m_route_tg((device const float *)ent.ptr[L2M_SCORES], L2M_ROUTE_P, L2M_ROUTE_IDS, L2M_ROUTE_W,
+                 ent.u[L2M_U_N_EXPERT], k, ent.u[L2M_U_GATING],
+                 (device const float *)(ent.ptr[L2M_W_BIAS] + ent.off[L2M_O_BIAS_OFF]),
+                 ent.u[L2M_U_HAS_BIAS] != 0u, ent.u[L2M_U_NORMALISE] != 0u, ent.f[L2M_F_W_SCALE], tid, sgid, lane);
+    threadgroup const float * xs = (threadgroup const float *)xn;
+    device float * g = (device float *)ent.ptr[L2M_G];
+    l2m_experts(ent.u[L2M_U_F_GATE], ent.ptr[L2M_W_GATE] + ent.off[L2M_O_GATE_OFF], ent.u[L2M_U_STRIDE_GATE],
+                L2M_ROUTE_IDS, xs, g, ent.u[L2M_U_N_EMBD], ent.u[L2M_U_N_FF], k, false, sg_global, sg_total, lane);
+    l2m_experts(ent.u[L2M_U_F_UP], ent.ptr[L2M_W_UP] + ent.off[L2M_O_UP_OFF], ent.u[L2M_U_STRIDE_UP],
+                L2M_ROUTE_IDS, xs, g, ent.u[L2M_U_N_EMBD], ent.u[L2M_U_N_FF], k, true, sg_global, sg_total, lane);
+}
+// R3: the k experts' down units summed in slot order, and the residual.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2m_ph_down(MEGA_PH_ARGS) {
+    l2m_down(ent.u[L2M_U_F_DOWN], ent.ptr[L2M_W_DOWN] + ent.off[L2M_O_DOWN_OFF], ent.u[L2M_U_STRIDE_DOWN],
+             L2M_ROUTE_IDS, L2M_ROUTE_W, (device const float *)ent.ptr[L2M_G], (device float *)ent.ptr[L2M_X],
+             (device const float *)ent.ptr[L2M_O], ent.u[L2M_U_N_FF], ent.u[L2M_U_N_EMBD], ent.u[L2M_U_K],
+             sg_global, sg_total, lane);
+}
+
+// R4 (every threadgroup, after the grid barrier that ends R3): the NEXT layer's operator norm
+// of the finished x -- the mega norm brick, whose reduction and scale are imparo_rms_norm's --
+// and threadgroup t writes its slice of cur.
+template <uint HD, uint KVW>
+inline __attribute__((always_inline)) void l2m_ph_next_norm(MEGA_PH_ARGS) {
+    mega_tg_load(xn, (device const float *)ent.ptr[L2M_X], w4, tid, tcount);
+    mega_norm_tg(xn, ent.ptr[L2M_W_NEXT], ent.off[L2M_O_NEXT_OFF], ent.u[L2M_U_N_EMBD], ent.f[L2M_F_EPS],
+                 ent.u[L2M_U_NORM_T], partial, tid, tcount, lane, sgid, nsg);
+    const uint n_tg = ent.u[L2M_U_N_TG];
+    const uint per = (w4 + n_tg - 1u) / n_tg;
+    const uint lo = tgid * per, hi = min(lo + per, w4);
+    device float4 * c4 = (device float4 *)ent.ptr[L2M_CUR];
+    for (uint i = lo + tid; i < hi; i += tcount) { c4[i] = xn[i]; }
+}
+
+// The lfm2moe kernel is emitted from its program: see the marker below.
 
 // @@MEGA_KERNELS@@
 #endif

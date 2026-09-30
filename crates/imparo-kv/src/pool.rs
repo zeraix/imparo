@@ -18,12 +18,13 @@ use crate::resident::{
     DemotionPlan, EvictedResidency, HostResidency, PlacementLifecycle, PromotionPlan,
     ResidentProbe, UnitPlacement, UnitResidency,
 };
-use crate::state::KvDelta;
+use crate::state::{KvDelta, UnitLayout};
+use crate::store::UnitPiece;
 use crate::tenant::PoolTenant;
 use crate::{
     ConversationId, KvState, Manifest, ResidentKv, Store, UnitId, grid_tokens,
 };
-use imparo_backend::{Backend, KvHostHandle, KvTransferSpan, PoolAddressing};
+use imparo_backend::{Backend, KvHostHandle, KvRange, KvTransferSpan, PoolAddressing};
 
 // The kv_* pool methods are defaults on this trait, not inherent methods.
 
@@ -88,6 +89,10 @@ pub struct ConvState {
     /// The boundary the on-disk copy of this conversation describes, 0 for none.
     /// Re-committing the same one is pure I/O for no new durability.
     committed_at: usize,
+    /// Where the conversation's tip stood at its last commit. A boundary is not a tip:
+    /// the tip runs past the boundary by the reply's decoded tokens, so "the tip has
+    /// not moved since" needs the tip itself.
+    committed_tip: usize,
     /// The boundaries this conversation already has on disk, shallowest first. Kept so a
     /// later commit can name them again without rewriting them, and so a restart can
     /// rewind to any of them rather than only the newest.
@@ -115,6 +120,9 @@ pub struct ConvState {
     /// One captured pre-generation resume point for the current request. Unlike
     /// a user-turn boundary, this does not consume the turn-history budget.
     prompt_anchor: Option<CkptKey>,
+    /// The prefixes of this conversation's last queued commit. While the writer still
+    /// has them in flight the disk copy is incomplete, and residency is not released.
+    committing: Vec<crate::PrefixHash>,
 }
 
 pub struct PoolMode {
@@ -137,18 +145,41 @@ pub struct PoolMode {
     /// retained set is larger than this: every root also needs the ancestors that carry
     /// it back a whole window (`cap_ckpts`).
     disk_ckpt_cap: usize,
+    /// The occupant of the SELECTED slot: the conversation whose block tables and recurrent
+    /// state are the ones the one-row paths read. With one slot this is the whole story.
     pub active: Option<String>,
+    /// The selected slot, and every other slot's occupant (docs/continuous-batching.md,
+    /// section 5, "Several conversations on the device at once"). The selected slot's entry
+    /// is always None: its occupant is `active`. `select_slot` swaps the two.
+    slot: usize,
+    slot_occupants: Vec<Option<String>>,
+    /// Pages one slot's own state takes (`set_slot_pages`): its rings and recurrent buffers,
+    /// device memory the tier holds outside its blocks.
+    slot_pages: usize,
+    /// Slots other than 0 holding their buffers, each charged `slot_pages` withheld pages
+    /// (`charge_slot`). Slot 0's state is the load's, counted by the fit.
+    charged_slots: BTreeSet<usize>,
+    /// Conversations with a request running. Eviction, the release at a switch and the idle
+    /// trim never drop one of these.
+    pinned: BTreeSet<String>,
+    /// Conversations whose request is parked, waiting to resume at the page boundary it left
+    /// at (docs/continuous-batching.md, section 5), with the request's prompt anchor, which a
+    /// switch-in does not carry. Still in flight, but not pinned: their pages may be dropped,
+    /// their stream being on disk.
+    parked: BTreeMap<String, Option<CkptKey>>,
     layers: Vec<u32>,
     /// Ring slack (min over windowed layers of ring - window): how far behind
     /// `filled` a boundary can lag and still be captured from the rings.
     slack: usize,
     /// Conversations by recency of use, newest last (the release keep-set).
     recent: Vec<String>,
-    /// Bytes of RETAINED conversation KV allowed at rest, beyond the incoming
-    /// conversation (which is always kept). Newest-first until the budget runs
-    /// out. IMPARO_KV_RESIDENT_MB, default 64 -- at q4 that keeps roughly two
-    /// long conversations resident, at f16 one.
-    resident_budget: usize,
+    /// Bytes of RETAINED conversation KV a switch keeps beyond the incoming conversation,
+    /// newest first, when IMPARO_KV_RESIDENT_MB names it. Unnamed, the retained KV and the
+    /// incoming prompt fit one context together (`context_blocks`).
+    resident_budget: Option<usize>,
+    /// Blocks one conversation at the configured context holds: the KV the fit reserves
+    /// beside the weights, and all a switch leaves resident.
+    context_blocks: usize,
     /// Full-attention layer strides (k, v) for page-advise math.
     strides: BTreeMap<u32, (usize, usize)>,
     /// Backend supplied by the active tenant. Cached only as the lower-crate
@@ -177,7 +208,8 @@ pub struct PoolMode {
     /// Which conversation each windowed REGION currently holds. A windowed layer keeps
     /// one ring per region, so a conversation whose region still names it can be resumed
     /// without restoring its window at all -- the bytes never left. One region is the
-    /// single-ring layout, where only the active conversation qualifies.
+    /// single-ring layout, where only the active conversation qualifies. With co-batched
+    /// slots each slot has its own rings, so the entry is per slot (`claim_region`).
     regions: Vec<Option<String>>,
 }
 
@@ -211,6 +243,31 @@ fn log_host_event(event: &str, units: usize, bytes: u64, spans: usize) {
         return;
     }
     eprintln!("[imparo] kv Host {event}: units={units} bytes={bytes} spans={spans}");
+}
+
+/// Where a disk restore puts rows. Production delegates to Backend; tests read into
+/// their own memory, through both the lent and the staged route.
+trait KvRowSink {
+    fn lend(
+        &self,
+        ranges: &[KvRange],
+        with: &mut dyn FnMut(&mut [&mut [u8]]) -> Result<(), String>,
+    ) -> Option<Result<(), String>>;
+    fn write(&self, r: &KvRange, src: &[u8]);
+}
+
+impl<T: Backend + ?Sized> KvRowSink for T {
+    fn lend(
+        &self,
+        ranges: &[KvRange],
+        with: &mut dyn FnMut(&mut [&mut [u8]]) -> Result<(), String>,
+    ) -> Option<Result<(), String>> {
+        self.lend_kv_ranges(ranges, with)
+    }
+
+    fn write(&self, r: &KvRange, src: &[u8]) {
+        self.write_kv_bytes(r.layer, r.is_v, r.off, src);
+    }
 }
 
 /// Narrow mover seam: production delegates to Backend while tests can prove
@@ -262,11 +319,13 @@ impl<T: Backend + ?Sized> KvHostMover for T {
 
 impl PoolMode {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addressing: PoolAddressing,
         host_capacity_bytes: Option<u64>,
         layers: Vec<u32>,
         capacity_blocks: u32,
+        context_blocks: usize,
         slack: usize,
         strides: BTreeMap<u32, (usize, usize)>,
         root: crate::ConfigRoot,
@@ -286,8 +345,7 @@ impl PoolMode {
         let resident_budget = std::env::var("IMPARO_KV_RESIDENT_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64)
-            .saturating_mul(1 << 20);
+            .map(|mb| mb.saturating_mul(1 << 20));
         Self {
             resident: ResidentKv::new(&layers, capacity_blocks),
             addressing,
@@ -298,10 +356,17 @@ impl PoolMode {
             ckpt_cap,
             disk_ckpt_cap,
             active: None,
+            slot: 0,
+            slot_occupants: vec![None],
+            slot_pages: 0,
+            charged_slots: BTreeSet::new(),
+            pinned: BTreeSet::new(),
+            parked: BTreeMap::new(),
             layers,
             slack,
             recent: Vec::new(),
             resident_budget,
+            context_blocks,
             root,
             strides,
             backend: None,
@@ -315,19 +380,96 @@ impl PoolMode {
     ///
     /// Assigned by name rather than allocated: a collision costs the restore that every
     /// switch pays today, so the only bookkeeping is who wrote a region last.
+    ///
+    /// With one region per layer every slot's windows are that region of the slot's own
+    /// rings (the backend holds a ring set per slot), so the entry kept is the SELECTED
+    /// slot's: a conversation back in the slot it left finds its windows there, and one in
+    /// another slot does not. `Workflow::set_slots` refuses several regions beside slots.
     fn claim_region(&mut self, label: &str) -> (usize, bool) {
         let n = self.regions.len().max(1);
-        let r = if n == 1 {
-            0
+        let (entry, r) = if crate::resident::window_regions() == 1 {
+            (self.slot, 0)
         } else {
             let h = label.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |a, b| {
                 (a ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
             });
-            (h % n as u64) as usize
+            let r = (h % n as u64) as usize;
+            (r, r)
         };
-        let ours = self.regions[r].as_deref() == Some(label);
-        self.regions[r] = Some(label.to_string());
+        if self.regions.len() <= entry {
+            self.regions.resize(entry + 1, None);
+        }
+        let ours = self.regions[entry].as_deref() == Some(label);
+        self.regions[entry] = Some(label.to_string());
         (r, ours)
+    }
+
+    /// Slot `s` gave its buffers back (`Backend::release_slot`): the windows its rings held
+    /// are gone, so no conversation may resume from them, and the pages its state was
+    /// charged go back to the tier.
+    pub fn slot_released(&mut self, s: usize) {
+        if crate::resident::window_regions() == 1 {
+            if let Some(e) = self.regions.get_mut(s) {
+                *e = None;
+            }
+        }
+        if self.charged_slots.remove(&s) {
+            // Shrinking what is held back always succeeds.
+            let _ = self
+                .resident
+                .set_withheld_units(self.charged_slots.len() * self.slot_pages);
+        }
+    }
+
+    /// Pages one slot's own state takes: its window rings and recurrent buffers, bytes the
+    /// device holds outside the tier's blocks, in pages of this pool (`page_bytes`).
+    pub fn set_slot_pages(&mut self, pages: usize) {
+        self.slot_pages = pages;
+    }
+
+    /// Bytes of one page across every pooled layer: the unit a slot's state is charged in.
+    #[must_use]
+    pub fn page_bytes(&self) -> usize {
+        self.unit_bytes()
+    }
+
+    /// Makes room for slot `s`'s own state before its buffers are made: the pages it takes
+    /// are withheld from the tier, dropping idle conversations' pages (their turns are on
+    /// disk) when the free ones fall short. False, with nothing withheld, when conversations
+    /// running or occupying a slot hold the rest: the device cannot hold another slot's state
+    /// now. Slot 0, a slot already charged, and a state of no pages take nothing.
+    ///
+    /// # Errors
+    /// On a disk failure while dropping a conversation.
+    pub fn charge_slot(&mut self, s: usize, keep: &str) -> Result<bool, String> {
+        if s == 0 || self.slot_pages == 0 || self.charged_slots.contains(&s) {
+            return Ok(true);
+        }
+        let want = (self.charged_slots.len() + 1) * self.slot_pages;
+        loop {
+            if self.resident.set_withheld_units(want) {
+                self.charged_slots.insert(s);
+                return Ok(true);
+            }
+            let evicted = self.resident.evict_unreferenced();
+            let evicted_count = self.release_evicted(evicted)?;
+            self.drain_lifecycle();
+            if evicted_count != 0 {
+                continue;
+            }
+            let held = self.held_labels();
+            let spare = |c: &ConversationId| c.0 == keep || held.contains(&c.0);
+            if let Some(dropped) = self.resident.drop_lru_conversation(&spare) {
+                let victim = dropped.conversation.0;
+                self.release_evicted(dropped.evicted)?;
+                let tail = self.convs.remove(&victim).map_or_else(Vec::new, |c| c.tail);
+                self.recent.retain(|l| l != &victim);
+                self.vacate_everywhere(&victim);
+                self.release_unsealed(tail);
+                continue;
+            }
+            return Ok(false);
+        }
     }
 
     /// Whether this conversation's windows are live on the device right now.
@@ -338,8 +480,17 @@ impl PoolMode {
         if self.active.as_deref() == Some(label) {
             return true;
         }
-        self.regions.len() > 1
-            && self.regions.iter().any(|h| h.as_deref() == Some(label))
+        // Only the rings bound now can be read: with one region per layer those are the
+        // selected slot's own (one entry per slot once a second slot was used), with several
+        // regions the one the conversation claimed.
+        if crate::resident::window_regions() == 1 {
+            return self.slot_occupants.len() > 1
+                && self
+                    .regions
+                    .get(self.slot)
+                    .is_some_and(|h| h.as_deref() == Some(label));
+        }
+        self.regions.iter().any(|h| h.as_deref() == Some(label))
     }
 
     /// Page-advise one placement's blocks (release or reuse).
@@ -692,6 +843,227 @@ impl PoolMode {
         self.recent.push(label.to_string());
     }
 
+    /// Make slot `s` the selected one: its occupant becomes `active`, and the occupant of the
+    /// slot selected until now waits in that slot. The caller selects the same slot on the
+    /// model first, so the tables and the recurrent state the pool reads and writes from here
+    /// are this slot's.
+    pub fn select_slot(&mut self, s: usize) {
+        if s == self.slot {
+            return;
+        }
+        let n = s.max(self.slot) + 1;
+        if self.slot_occupants.len() < n {
+            self.slot_occupants.resize(n, None);
+        }
+        self.slot_occupants[self.slot] = self.active.take();
+        self.active = self.slot_occupants[s].take();
+        self.slot = s;
+    }
+
+    /// The selected slot's occupant leaves it: switched out -- its recurrent state saved
+    /// from this slot, its turn written through -- and the slot left empty. Nothing to do
+    /// for an empty slot.
+    ///
+    /// # Errors
+    /// Returns an error on disk I/O failure; the slot is left empty either way.
+    pub fn leave_slot<T: PoolTenant + ?Sized>(
+        &mut self,
+        model: &T,
+        store: Option<&Store>,
+        disk: Option<&crate::disk::DiskQueue>,
+    ) -> Result<(), String> {
+        let Some(label) = self.active.take() else {
+            return Ok(());
+        };
+        self.switch_out(model, store, disk, &label)
+    }
+
+    /// Pages a new request could have (docs/continuous-batching.md, section 4): the tier's
+    /// capacity less the pages of the conversations running or occupying a slot. Every
+    /// other conversation's pages can be dropped, its turns being on disk.
+    #[must_use]
+    pub fn obtainable_units(&self) -> usize {
+        let mut held: BTreeSet<UnitId> = BTreeSet::new();
+        let mut tails = 0;
+        for label in self.held_labels() {
+            if let Some(units) = self.resident.pool.conversation(&cid(&label)) {
+                held.extend(units.iter().copied().filter(|&u| {
+                    matches!(self.resident.residency(u), Some(UnitResidency::Device(_)))
+                }));
+            }
+            tails += self.convs.get(&label).map_or(0, |c| c.tail.len());
+        }
+        let capacity =
+            self.resident.capacity_blocks() as usize / crate::resident::UNIT_BLOCKS;
+        // The pages the slots' own state is charged are no more obtainable than a running
+        // conversation's.
+        capacity.saturating_sub(held.len() + tails + self.resident.withheld_units())
+    }
+
+    /// Parks the selected slot's running conversation (docs/continuous-batching.md,
+    /// section 5). `stream` is every token with a KV row and ends on a page boundary, where
+    /// the conversation's recurrent state is a checkpoint: the stream is sealed and written
+    /// through, the conversation is unpinned and leaves the slot, and its pages can be
+    /// dropped. `resume_parked` brings it back exactly there.
+    ///
+    /// # Errors
+    /// When the selected slot does not hold `label`, the stream does not end on the grid,
+    /// or the write-through fails.
+    pub fn park<T: PoolTenant + ?Sized>(
+        &mut self,
+        model: &T,
+        store: Option<&Store>,
+        disk: Option<&crate::disk::DiskQueue>,
+        label: &str,
+        stream: Vec<u32>,
+    ) -> Result<(), String> {
+        if self.active.as_deref() != Some(label) {
+            return Err(format!("kv pool: {label} is not the selected slot's"));
+        }
+        if stream.is_empty() || stream.len() % grid_tokens() != 0 {
+            return Err(format!("kv pool: park at {} is off the grid", stream.len()));
+        }
+        let hashes = crate::unit_ids(&self.root, &stream);
+        self.end(label, stream, &hashes)?;
+        self.unpin(label);
+        let anchor = self.convs.get(label).and_then(|c| c.prompt_anchor);
+        self.parked.insert(label.to_string(), anchor);
+        self.leave_slot(model, store, disk)
+    }
+
+    /// Brings the parked conversation `label` into the selected slot at exactly the end of
+    /// `stream`, where it was parked: its KV and its recurrent state as they were then, with
+    /// nothing left to forward. `upper` bounds the room it gets past that point.
+    ///
+    /// # Errors
+    /// When the pool cannot restore that exact point.
+    pub fn resume_parked<T: PoolTenant + ?Sized>(
+        &mut self,
+        model: &mut T,
+        store: Option<&Store>,
+        disk: Option<&crate::disk::DiskQueue>,
+        label: &str,
+        stream: &[u32],
+        upper: usize,
+        keyless: bool,
+    ) -> Result<(), String> {
+        // Its own state coming back, not a client continuing a stored conversation: nothing
+        // it restores from may be superseded, which is the rule `new_conversation` sets.
+        let at = self.begin_to(
+            model,
+            store,
+            disk,
+            label,
+            stream,
+            upper,
+            keyless,
+            true,
+            stream.len(),
+        )?;
+        if at == stream.len() {
+            // The request's prompt anchor, which the next turn may resume at: the switch-in
+            // made the conversation's record afresh without it.
+            let anchor = self.parked.remove(label).flatten();
+            if let Some(c) = self.convs.get_mut(label) {
+                c.prompt_anchor = anchor;
+            }
+            Ok(())
+        } else {
+            Err(format!(
+                "kv pool: {label} parked at {} came back at {at}",
+                stream.len()
+            ))
+        }
+    }
+
+    /// A request is running for `label`: eviction, the release at a switch and the idle trim
+    /// leave it alone until `unpin`.
+    pub fn pin(&mut self, label: &str) {
+        self.pinned.insert(label.to_string());
+    }
+
+    /// No request is in flight for `label` any more: not running, not parked.
+    pub fn unpin(&mut self, label: &str) {
+        self.pinned.remove(label);
+        self.parked.remove(label);
+    }
+
+    /// A request is in flight for `label`: running (pinned) or parked.
+    #[must_use]
+    pub fn is_running(&self, label: &str) -> bool {
+        self.pinned.contains(label) || self.parked.contains_key(label)
+    }
+
+    #[must_use]
+    pub fn is_pinned(&self, label: &str) -> bool {
+        self.pinned.contains(label)
+    }
+
+    /// The selected slot.
+    #[must_use]
+    pub fn selected_slot(&self) -> usize {
+        self.slot
+    }
+
+    /// Slot `s`'s occupant; the selected slot's is `active`.
+    #[must_use]
+    pub fn occupant(&self, s: usize) -> Option<&str> {
+        if s == self.slot {
+            self.active.as_deref()
+        } else {
+            self.slot_occupants.get(s).and_then(Option::as_deref)
+        }
+    }
+
+    /// The slot `label` occupies, selected or not.
+    #[must_use]
+    pub fn slot_of(&self, label: &str) -> Option<usize> {
+        if self.active.as_deref() == Some(label) {
+            return Some(self.slot);
+        }
+        self.slot_occupants
+            .iter()
+            .position(|o| o.as_deref() == Some(label))
+    }
+
+    /// Whether `label` occupies a slot other than the selected one.
+    fn in_other_slot(&self, label: &str) -> bool {
+        self.slot_occupants
+            .iter()
+            .any(|o| o.as_deref() == Some(label))
+    }
+
+    /// Whether `label` must survive whatever the selected slot does: a request is running
+    /// for it, or it occupies another slot.
+    fn held_elsewhere(&self, label: &str) -> bool {
+        self.pinned.contains(label) || self.in_other_slot(label)
+    }
+
+    /// Every conversation `held_elsewhere` names.
+    fn held_labels(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.pinned.iter().cloned().collect();
+        for o in self.slot_occupants.iter().flatten() {
+            if !out.contains(o) {
+                out.push(o.clone());
+            }
+        }
+        out
+    }
+
+    /// A conversation that left the pool occupies no slot and has nothing running.
+    fn vacate_everywhere(&mut self, label: &str) {
+        if self.active.as_deref() == Some(label) {
+            self.active = None;
+        }
+        for o in &mut self.slot_occupants {
+            if o.as_deref() == Some(label) {
+                *o = None;
+            }
+        }
+        self.pinned.remove(label);
+        self.parked.remove(label);
+    }
+
     fn remember_delta(
         &mut self,
         tip: UnitHash,
@@ -701,6 +1073,15 @@ impl PoolMode {
         turn: bool,
     ) {
         let key = (tip, delta.boundary);
+        // A user message starting here is a fact about the position, not about which
+        // capture got here last. The reply-end snapshot lands on the same boundary as the
+        // turn's branch point whenever the reply ends in the same 64-token block, and
+        // overwriting the flag made the next commit drop that turn from the manifest:
+        //
+        //   Wrong: branch at 512 (turn) -> reply ends at 575, snapshot at 512 (step)
+        //          -> manifest names 512 as a step -> next turn's commit drops it
+        //   Right: the snapshot keeps the turn flag -> 512 stays on disk for a sibling
+        let turn = turn || self.window_ckpts.get(&key).is_some_and(|e| e.turn);
         self.ckpt_order.retain(|h| *h != key);
         self.ckpt_order.push(key);
         self.window_ckpts.insert(
@@ -933,20 +1314,13 @@ impl PoolMode {
         mover: &M,
         host: &HostResidency,
     ) -> Result<Vec<u8>, String> {
+        // The Host copy holds each layer's K rows then its V rows, layer after layer in
+        // stride order; the blob is read into straight from it, one copy.
         let raw_len = usize::try_from(host.bytes())
             .map_err(|_| "kv pool: Host unit exceeds addressable memory".to_string())?;
-        let mut raw = vec![0_u8; raw_len];
-        mover
-            .host_read(host.handle(), 0, &mut raw)
-            .map_err(|code| format!("kv pool: Host unit read failed ({code})"))?;
+        let mut at = Vec::with_capacity(self.strides.len());
         let mut cursor = 0_usize;
-        let mut state = KvState {
-            boundary: grid_tokens(),
-            full: Vec::with_capacity(self.strides.len()),
-            window: Vec::new(),
-            recurrent: Vec::new(),
-        };
-        for (&layer, &(k_stride, v_stride)) in &self.strides {
+        for &(k_stride, v_stride) in self.strides.values() {
             let k_len = grid_tokens()
                 .checked_mul(k_stride)
                 .ok_or_else(|| "kv pool: canonical K length overflow".to_string())?;
@@ -959,27 +1333,30 @@ impl PoolMode {
             let v_end = k_end
                 .checked_add(v_len)
                 .ok_or_else(|| "kv pool: canonical V offset overflow".to_string())?;
-            if v_end > raw.len() {
-                return Err("kv pool: Host unit is shorter than its geometry".into());
-            }
-            state.full.push(crate::KvLayerState {
-                layer,
-                base_pos: 0,
-                positions: grid_tokens(),
-                k: raw[cursor..k_end].to_vec(),
-                v: raw[k_end..v_end].to_vec(),
-            });
+            at.push((cursor as u64, k_end as u64));
             cursor = v_end;
         }
-        if cursor != raw.len() {
+        if cursor > raw_len {
+            return Err("kv pool: Host unit is shorter than its geometry".into());
+        }
+        if cursor != raw_len {
             return Err("kv pool: Host unit is longer than its geometry".into());
         }
-        crate::state::unit_blobs_at(&state, &[grid_tokens()])
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                "kv pool: canonical Host unit encoding produced no blob".to_string()
-            })
+        let layout = UnitLayout {
+            from: 0,
+            to: grid_tokens(),
+            layers: self
+                .strides
+                .iter()
+                .map(|(&layer, &(k, v))| (layer, k, v))
+                .collect(),
+        };
+        layout.blob(|li, is_v, rows| {
+            let off = if is_v { at[li].1 } else { at[li].0 };
+            mover
+                .host_read(host.handle(), off, rows)
+                .map_err(|code| format!("kv pool: Host unit read failed ({code})"))
+        })
     }
 
     /// Evict the oldest idle Host-only ownership to Disk. Every fallible read and
@@ -996,7 +1373,10 @@ impl PoolMode {
             return Ok(false);
         };
         for label in self.recent.clone() {
-            if label == keep || self.active.as_deref() == Some(label.as_str()) {
+            if label == keep
+                || self.active.as_deref() == Some(label.as_str())
+                || self.held_elsewhere(&label)
+            {
                 continue;
             }
             let Some(units) = self.resident.pool.conversation(&cid(&label)) else {
@@ -1116,7 +1496,10 @@ impl PoolMode {
             .copied()
             .collect();
         for label in self.recent.clone() {
-            if label == keep || self.active.as_deref() == Some(label.as_str()) {
+            if label == keep
+                || self.active.as_deref() == Some(label.as_str())
+                || self.held_elsewhere(&label)
+            {
                 continue;
             }
             let Some(units) = self.resident.pool.conversation(&cid(&label)) else {
@@ -1182,15 +1565,17 @@ impl PoolMode {
                             .into(),
                     );
                 }
-                if let Some(dropped) = self.resident.drop_lru_conversation(&cid(keep)) {
+                // Never a conversation running or waiting in another slot: that one's
+                // state is live on the device.
+                let held = self.held_labels();
+                let spare = |c: &ConversationId| c.0 == keep || held.contains(&c.0);
+                if let Some(dropped) = self.resident.drop_lru_conversation(&spare) {
                     let victim = dropped.conversation.0;
                     self.release_evicted(dropped.evicted)?;
                     let tail =
                         self.convs.remove(&victim).map_or_else(Vec::new, |c| c.tail);
                     self.recent.retain(|l| l != &victim);
-                    if self.active.as_deref() == Some(victim.as_str()) {
-                        self.active = None;
-                    }
+                    self.vacate_everywhere(&victim);
                     self.release_unsealed(tail);
                     // Shared-address behavior remains the existing drop path.
                     continue;
@@ -1230,7 +1615,6 @@ impl PoolMode {
     ///
     /// # Errors
     /// Returns an error when the pool cannot fit the request even after eviction.
-    #[allow(clippy::too_many_lines)]
     pub fn begin<T: PoolTenant + ?Sized>(
         &mut self,
         model: &mut T,
@@ -1250,12 +1634,51 @@ impl PoolMode {
         // tip looks like from here.
         new_conversation: bool,
     ) -> Result<usize, String> {
-        self.backend = model.backend();
-        self.shape = crate::CheckpointShape::of(&model.kv_state_geometry());
         // Choose the actual restart boundary BEFORE installing attention and
         // recurrent state. Rounding the returned position in the caller would
         // leave the device at another position (513 input: restore512/run448).
         let resume_limit = crate::identity::resume_point(ids.len(), ids.len());
+        self.begin_to(
+            model,
+            store,
+            disk,
+            label,
+            ids,
+            upper,
+            keyless,
+            new_conversation,
+            resume_limit,
+        )
+    }
+
+    /// `begin`, restoring no further than `resume_limit`: a multiple of the grid at most
+    /// `ids.len()`.
+    #[allow(clippy::too_many_lines)]
+    fn begin_to<T: PoolTenant + ?Sized>(
+        &mut self,
+        model: &mut T,
+        store: Option<&Store>,
+        disk: Option<&crate::disk::DiskQueue>,
+        label: &str,
+        ids: &[u32],
+        upper: usize,
+        keyless: bool,
+        new_conversation: bool,
+        resume_limit: usize,
+    ) -> Result<usize, String> {
+        // One conversation, one slot: a second request for a conversation that occupies
+        // another slot would give it two states. And a slot whose occupant is running is
+        // not free to take.
+        if self.in_other_slot(label) {
+            return Err(format!("kv pool: {label} occupies another slot"));
+        }
+        if let Some(out) = self.active.as_deref().filter(|out| *out != label) {
+            if self.pinned.contains(out) {
+                return Err(format!("kv pool: this slot's {out} is running"));
+            }
+        }
+        self.backend = model.backend();
+        self.shape = crate::CheckpointShape::of(&model.kv_state_geometry());
         // Two views of this prompt, both from its tokens: `grid` is prefix(p) at every
         // multiple of grid_tokens(), which is what a stored boundary is matched against;
         // `hashes` is the resident tiling's ids, which is what residency is keyed on.
@@ -1324,6 +1747,8 @@ impl PoolMode {
                             let more =
                                 self.alloc_units(need_units, label, store, disk)?;
                             self.convs.get_mut(label).unwrap().tail.extend(more);
+                            model
+                                .kv_commit_blocks(self.resident.high_water() as usize)?;
                         }
                         let tail = self.convs[label].tail.clone();
                         let _ = self.probe(&cid(label), hashes)?;
@@ -1379,21 +1804,61 @@ impl PoolMode {
         }
         let k = k_at / grid_tokens();
         if crate::log_on() {
+            // The leading unit ids on both sides: a resident_hit of 0 either means the prompt's
+            // first unit no longer matches the stored chain, or the index lost units it had.
+            let head = |hs: &[UnitHash]| -> String {
+                hs.iter()
+                    .take(3)
+                    .map(|h| format!("{:02x}{:02x}", h.0[0], h.0[1]))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let stored = self
+                .convs
+                .get(label)
+                .map_or(String::new(), |c| head(&c.hashes));
+            let stored_units = self.convs.get(label).map_or(0, |c| c.hashes.len());
             eprintln!(
-                "[imparo] kv begin {label}: prompt_units={} resident_hit={} ckpts={:?} chose={k_at}",
+                "[imparo] kv begin {label}: prompt_units={} resident_hit={} ckpts={:?} chose={k_at} \
+                 prompt_head=[{}] stored_head=[{stored}] stored_units={stored_units} tip_before={tip_before}",
                 hashes.len(),
                 hit.indexed_units,
-                self.window_ckpts.keys().map(|k| k.1).collect::<Vec<_>>()
+                self.window_ckpts.keys().map(|k| k.1).collect::<Vec<_>>(),
+                head(hashes)
             );
         }
 
         // Disk can be deeper than residency (restart, evicted content): restore
         // INTO the pool if its committed chain extends past k.
-        let mut from_disk: Option<(Manifest, Vec<Vec<u8>>, Vec<Vec<u8>>)> = None;
+        let mut from_disk: Option<(Manifest, Vec<Vec<u8>>)> = None;
         // The manifest a restore stood on: its path, whether its label was
         // content-derived, and the boundaries it named. A keyless one this conversation
         // goes on to cover is superseded at the next commit -- see `commit_to_disk`.
         let mut adopted_from: Option<(PathBuf, bool)> = None;
+        // Where a disk restore spends its time, for the `kv restore:` line.
+        let t_lookup = std::time::Instant::now();
+        let mut lookup_ms = 0.0_f64;
+        // A manifest this prompt could stand on may still be on its way to disk: the
+        // writer runs behind the requests by design, and the resident copy may already
+        // be gone. Looking now would find an older state or none, and prefilling again
+        // costs seconds where the write has milliseconds left. Only a commit that
+        // reaches past the resident checkpoint is worth the wait -- `grid[i]` is the
+        // prefix at `(i + 1) * grid`, so those are the prefixes from `k_at` on.
+        //
+        //   Wrong:   queue commit -> drop residency -> look up (nothing) -> prefill 4.6k tokens
+        //   Right:   queue commit -> drop residency -> wait for that commit -> look up -> read
+        let deeper = grid.get(k_at / grid_tokens()..).unwrap_or(&[]);
+        if let Some(waited) = disk.and_then(|dq| dq.wait_for_commits(deeper)) {
+            if crate::log_on() {
+                eprintln!(
+                    "[imparo] kv disk: waited {:.1} ms for a commit this prompt shares",
+                    waited.as_secs_f64() * 1e3
+                );
+            }
+        }
+        if let Some(t) = crate::disk_probe() {
+            eprintln!("[imparo] kv disk probe {t:.1}: {label} looks the store up");
+        }
         if let Some(st) = store {
             if st.best_match(&grid).is_none() && crate::log_on() {
                 // How far the stored chain and this prompt agree. A partial match means
@@ -1427,8 +1892,7 @@ impl PoolMode {
             // every conversation whose last turn is being re-asked -- adopts nothing, even
             // when its system prompt and tools match to the token ("agrees for 4 of its 5
             // units, so nothing is adoptable").
-            type Candidate =
-                (usize, crate::Manifest, Vec<Vec<u8>>, Vec<Vec<u8>>, PathBuf);
+            type Candidate = (usize, crate::Manifest, Vec<Vec<u8>>, PathBuf);
             let mut best: Option<Candidate> = None;
             let shape = crate::CheckpointShape::of(&model.kv_state_geometry());
             for (mpath, m, agree) in st.prefix_matches(&grid) {
@@ -1481,13 +1945,11 @@ impl PoolMode {
                             continue;
                         }
                     }
-                    let Some(u) = m.cuts[..units]
-                        .iter()
-                        .map(|c| st.get_unit(&c.unit))
-                        .collect::<Option<Vec<Vec<u8>>>>()
-                    else {
+                    // Only that the extents exist: their rows are read once a boundary is
+                    // chosen, and then only the units not already resident.
+                    if !m.cuts[..units].iter().all(|c| st.has_unit(&c.unit)) {
                         continue;
-                    };
+                    }
                     // The link and everything below it, newest first: the assemble walks
                     // down until the window is covered. A store written before links has
                     // one whole-window blob, which reads back as an anchor.
@@ -1525,10 +1987,11 @@ impl PoolMode {
                         ckpts: m.ckpts.clone(),
                         keyless: m.keyless,
                     };
-                    best = Some((b, chosen, u, chain, mpath.clone()));
+                    best = Some((b, chosen, chain, mpath.clone()));
                 }
             }
-            if let Some((b, m, u, chain, mpath)) = best {
+            if let Some((b, m, chain, mpath)) = best {
+                lookup_ms = t_lookup.elapsed().as_secs_f64() * 1e3;
                 if crate::log_on() {
                     eprintln!("[imparo] kv disk: restoring at boundary {b}");
                 }
@@ -1537,7 +2000,7 @@ impl PoolMode {
                 // caller sets `new_conversation` when the client asked for a fork, and
                 // then nothing is adopted for replacement.
                 adopted_from = Some((mpath, m.keyless));
-                from_disk = Some((m, u, chain));
+                from_disk = Some((m, chain));
             } else if crate::log_on() {
                 // WHY none of them fit, not just that none did. Each boundary is refused
                 // for exactly one of four reasons and they mean different things: too
@@ -1603,7 +2066,7 @@ impl PoolMode {
             .unwrap_or_default();
         let restored_cuts = cuts_for_switch_in(
             &prior_cuts,
-            from_disk.as_ref().map(|(manifest, _, _)| manifest),
+            from_disk.as_ref().map(|(manifest, _)| manifest),
         );
         // (tip, link, sub-unit tail tokens) for every link a disk restore assembled from,
         // so the resident chain can be rebuilt from it -- see the comment at the fill.
@@ -1624,7 +2087,7 @@ impl PoolMode {
             usize,
             Option<KvState>,
             Vec<crate::KvLayerState>,
-        ) = if let Some((manifest, unit_bytes, chain_blobs)) = from_disk {
+        ) = if let Some((manifest, chain_blobs)) = from_disk {
             // DISK extents and RESIDENT units are different counts. The manifest's
             // extents end where requests ended; residency holds one entry per grid
             // step. What
@@ -1636,16 +2099,31 @@ impl PoolMode {
             let resident_ids = &hashes[..n];
             let boundary = manifest.boundary as usize;
             restored_ckpts.clone_from(&manifest.ckpts);
-            // adopt what is already resident among the manifest's units; the
-            // rest gets fresh blocks and a table-aware write-in
-            let resident_hit = self.probe(&cid(label), resident_ids)?.indexed_units;
-            let missing = n - resident_hit;
-            let fresh = self.alloc_units(missing, label, store, disk)?;
+            // The chain is parsed and checked before any block is taken for this restore.
             let links: Vec<crate::KvDelta> = chain_blobs
                 .iter()
                 .map(|b| crate::state::delta_from_blob(b))
                 .collect::<Result<_, _>>()?;
             let refs: Vec<&crate::KvDelta> = links.iter().collect();
+            let newest = *refs.first().ok_or("checkpoint chain is empty")?;
+            // Where the newest link counts its tail from, which is where the extents must
+            // reach. An EMPTY tail means the cut IS the boundary.
+            let unit_end = newest
+                .tail
+                .first()
+                .map_or(newest.boundary, |ls| ls.base_pos);
+            if unit_end != reach {
+                return Err(format!(
+                    "the extents reach {reach}, the checkpoint counts its tail from {unit_end}"
+                ));
+            }
+            // The BOUNDED geometry, the same view the resident chain assembles
+            // against: a delta covers a window, not a whole context.
+            let wgeom = crate::state::bounded_geometry(&model.kv_state_geometry());
+            let t_asm = std::time::Instant::now();
+            let chained = crate::state::assemble_chain(&wgeom, &refs)
+                .ok_or("checkpoint chain does not reach back a whole window")?;
+            let asm_ms = t_asm.elapsed().as_secs_f64() * 1e3;
             // The links this restore just parsed ARE the resident chain, and dropping
             // them made the next commit re-capture a whole window: `matching_ckpts`
             // found nothing, so the fallback wrote an anchor (21.0 MiB on E4B f16)
@@ -1666,41 +2144,60 @@ impl PoolMode {
                 })
                 .collect();
             restored_links.sort_by_key(|(_, d, _)| d.boundary);
-            // The BOUNDED geometry, the same view the resident chain assembles
-            // against: a delta covers a window, not a whole context.
-            let wgeom = crate::state::bounded_geometry(&model.kv_state_geometry());
-            let state =
-                crate::state::state_from_units_and_chain(&unit_bytes, &wgeom, &refs)?;
-            // write the missing units' bytes into their blocks
+            // adopt what is already resident among the manifest's units; the
+            // rest gets fresh blocks, and only their rows are read from disk
+            let resident_hit = self.probe(&cid(label), resident_ids)?.indexed_units;
+            let missing = n - resident_hit;
+            let fresh = self.alloc_units(missing, label, store, disk)?;
+            if let Err(e) = model.kv_commit_blocks(self.resident.high_water() as usize)
+            {
+                self.release_unsealed(fresh);
+                return Err(e);
+            }
             let be = model.backend().ok_or("no backend")?;
-            for (i, pl) in fresh.iter().enumerate() {
-                let u = resident_hit + i;
-                for ls in &state.full {
-                    let stride = ls.k.len() / ls.positions;
-                    let vstride = ls.v.len() / ls.positions;
-                    let Some(&blk) = pl.get(&ls.layer) else {
-                        continue;
-                    };
-                    {
-                        // One extent's rows into one page. The OFFSET already said
-                        // `grid_tokens()` while the LENGTH said 64 -- agreeing only
-                        // because the grid takes its value from the page. Both say it.
-                        let n = grid_tokens();
-                        let pos0 = u * n;
-                        be.write_kv_bytes(
-                            ls.layer,
-                            false,
-                            (blk as usize * page_cells() * stride) as u64,
-                            &ls.k[pos0 * stride..(pos0 + n) * stride],
-                        );
-                        be.write_kv_bytes(
-                            ls.layer,
-                            true,
-                            (blk as usize * page_cells() * vstride) as u64,
-                            &ls.v[pos0 * vstride..(pos0 + n) * vstride],
-                        );
-                    }
+            // The file order of an extent's layers: the full-attention layers of the
+            // geometry, as `read_unit_canonical` writes them.
+            let layers: Vec<(u32, usize, usize)> = model
+                .kv_state_geometry()
+                .iter()
+                .filter(|g| matches!(g.kind, crate::StateKind::Full))
+                .map(|g| (g.layer, g.k_stride, g.v_stride))
+                .collect();
+            let st = store.ok_or("kv restore: no store")?;
+            let t_read = std::time::Instant::now();
+            let (leftover, reads) = match read_extent_rows(
+                st,
+                be,
+                &layers,
+                &manifest.cuts,
+                resident_hit,
+                n,
+                boundary,
+                &fresh,
+                &newest.tail,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.release_unsealed(fresh);
+                    return Err(e);
                 }
+            };
+            if crate::log_on() {
+                eprintln!(
+                    "[imparo] kv restore: lookup {lookup_ms:.2} ms, chain {asm_ms:.2} ms, rows \
+{:.2} ms ({} extent files, {} reads, {:.1} MiB, {}); units {} read + {resident_hit} \
+already resident",
+                    t_read.elapsed().as_secs_f64() * 1e3,
+                    reads.files,
+                    reads.reads,
+                    reads.bytes as f64 / (1u64 << 20) as f64,
+                    if reads.lent {
+                        "read into the blocks"
+                    } else {
+                        "staged, then written"
+                    },
+                    fresh.len()
+                );
             }
             // seal the written units under their manifest hashes
             for (i, pl) in fresh.into_iter().enumerate() {
@@ -1709,33 +2206,16 @@ impl PoolMode {
             }
             // Duplicate placement frees must be advised before any later reuse.
             self.drain_lifecycle();
-            // Rows above the last whole unit: the checkpoint carried them, and
-            // they go into this conversation's OWN tail blocks below -- there is
-            // no unit for them to be part of.
-            let lo = n * grid_tokens();
-            let leftover: Vec<crate::KvLayerState> = state
-                .full
-                .iter()
-                .filter(|_| boundary > lo)
-                .map(|ls| {
-                    let (ks, vs) =
-                        (ls.k.len() / ls.positions, ls.v.len() / ls.positions);
-                    crate::KvLayerState {
-                        layer: ls.layer,
-                        base_pos: lo,
-                        positions: boundary - lo,
-                        k: ls.k[lo * ks..boundary * ks].to_vec(),
-                        v: ls.v[lo * vs..boundary * vs].to_vec(),
-                    }
-                })
-                .collect();
+            // `leftover`: the rows above the last whole unit. The checkpoint and the last
+            // extent carried them, and they go into this conversation's OWN tail blocks
+            // below -- there is no unit for them to be part of.
             let windows = KvState {
-                boundary: state.boundary,
+                boundary: chained.boundary,
                 full: Vec::new(),
-                window: state.window,
+                window: chained.window,
                 // Carried through: a checkpoint that dropped it would restore a
                 // recurrent model with a zero convolution history.
-                recurrent: state.recurrent,
+                recurrent: chained.recurrent,
             };
             // Keyed on the resident unit the boundary sits in. `n` can be 0 when
             // the manifest's extents do not reach a whole tile, and there is then
@@ -1784,6 +2264,10 @@ impl PoolMode {
         // tail for everything beyond the sealed resume boundary
         let need_units = upper.div_ceil(grid_tokens()) - resume_units;
         let tail = self.alloc_units(need_units, label, store, disk)?;
+        if let Err(e) = model.kv_commit_blocks(self.resident.high_water() as usize) {
+            self.release_unsealed(tail);
+            return Err(e);
+        }
         // The checkpoint's own rows above the last extent go into the
         // FIRST tail unit -- this conversation's blocks, not the donor's.
         if !tail_rows.is_empty() {
@@ -1861,6 +2345,7 @@ impl PoolMode {
                 // conversation that will spill them); nothing to write for them
                 spilled_units: resume_units,
                 committed_at: 0,
+                committed_tip: 0,
                 // What this conversation has on disk survives a switch-in. A restore
                 // learns it from the manifest; an adoption from resident blocks restores
                 // nothing and must NOT forget -- dropping the list here made every commit
@@ -1890,6 +2375,7 @@ impl PoolMode {
                 // adoption from resident blocks carries the previous note forward.
                 recur_note: prior_note,
                 prompt_anchor: None,
+                committing: Vec::new(),
             },
         );
         // General-path rewind/restore replaces its old unsealed tail. Those
@@ -1946,13 +2432,32 @@ impl PoolMode {
             sealed_placements.push((hashes_full[c.sealed_units], pl));
             c.sealed_units += 1;
         }
+        // What decode grew past this request's rows goes back -- the pages a step's lookahead
+        // took (`grow_room`) -- so between requests a conversation holds only the blocks it
+        // wrote. The block holding position `filled` stays: a discarded pipelined step may
+        // still write it.
+        let keep = (filled + 1)
+            .div_ceil(grid_tokens())
+            .saturating_sub(c.sealed_units);
+        let spare = if c.tail.len() > keep {
+            c.tail.split_off(keep)
+        } else {
+            Vec::new()
+        };
         c.tokens = final_tokens;
         c.hashes = hashes_full[..sealed_target].to_vec();
-        // THE DISK CUT: where this request ended, snapped to the grid a resume can
-        // land on. One extent per request, so a turn writes the rows it produced and
-        // no row is written twice. Cuts at or above it are this stream's no longer --
-        // a rewind replaced the tokens there.
-        let cut = crate::identity::resume_point(filled, filled);
+        // THE DISK CUT: the last grid point this request's stream reached. One extent per
+        // request, so a turn writes the rows it produced and no row is written twice.
+        // Cuts at or above it are this stream's no longer -- a rewind replaced the tokens
+        // there.
+        //
+        // Not `resume_point(filled, filled)`: its two-token margin put the cut one grid
+        // point BELOW the stream whenever the stream ended 0 or 1 tokens past a grid line.
+        // A recurrent model's state is kept at the last grid point decode crossed, so the
+        // reply-end checkpoint there had no state and was dropped, and the next request
+        // re-ran the whole reply. The margin protects nothing the lookup does not: a
+        // checkpoint is used only by a prompt whose prefix hash matches through it.
+        let cut = filled / grid_tokens() * grid_tokens();
         c.cuts.retain(|&p| p < cut);
         // THE OTHER CUT is the branch point, recorded by `note_branch` / `note_ckpt`
         // where a user message starts, so that every sealed boundary is also an extent
@@ -1992,8 +2497,11 @@ impl PoolMode {
         // the tail rule, because the extents already carry those rows. Cut and
         // checkpoint land together: that is the whole point of cutting here.
         let boundary = cut;
-        if boundary > 0 && sealed_target > 0 {
-            let tip = hashes_full[sealed_target - 1];
+        // The key names the prefix AT the boundary -- the unit that ends there, which is what
+        // `matching_ckpts` compares.
+        let units = boundary / grid_tokens();
+        if units > 0 {
+            let tip = hashes_full[units - 1];
             let tokens = self
                 .convs
                 .get(label)
@@ -2031,7 +2539,61 @@ impl PoolMode {
             }
         }
         self.active = Some(label.to_string());
+        self.release_unsealed(spare);
         Ok(())
+    }
+
+    /// Positions a conversation's blocks cover: its resident units and its tail.
+    #[must_use]
+    pub fn room(&self, label: &str) -> usize {
+        let held = self
+            .resident
+            .pool
+            .conversation(&cid(label))
+            .map_or(0, <[UnitId]>::len)
+            + self.convs.get(label).map_or(0, |c| c.tail.len());
+        held * grid_tokens()
+    }
+
+    /// Extend a conversation's tail with the pages that cover `positions`, commit the device
+    /// storage before anything writes them, and install the longer table. A request does not
+    /// reserve its budget up front: decode asks for a page as it reaches it
+    /// (docs/memory-tiers-and-fit.md section 12.4), so a conversation holds no page nothing
+    /// writes yet, and a pool with one page left gives it. Returns the positions now covered.
+    ///
+    /// # Errors
+    /// When the tier cannot supply the blocks, or the device cannot commit them.
+    pub fn grow_room<T: PoolTenant + ?Sized>(
+        &mut self,
+        model: &mut T,
+        label: &str,
+        positions: usize,
+        store: Option<&Store>,
+        disk: Option<&crate::disk::DiskQueue>,
+    ) -> Result<usize, String> {
+        let have = self.room(label);
+        if positions <= have {
+            return Ok(have);
+        }
+        if !self.convs.contains_key(label) {
+            return Err(format!("kv pool: no conversation {label} to grow"));
+        }
+        let need = (positions - have).div_ceil(grid_tokens());
+        let more = self.alloc_units(need, label, store, disk)?;
+        if let Err(e) = model.kv_commit_blocks(self.resident.high_water() as usize) {
+            self.release_unsealed(more);
+            return Err(e);
+        }
+        let tail = {
+            let c = self
+                .convs
+                .get_mut(label)
+                .ok_or_else(|| format!("kv pool: {label} vanished while growing"))?;
+            c.tail.extend(more);
+            c.tail.clone()
+        };
+        self.apply_tables(model, label, &tail)?;
+        Ok(self.room(label))
     }
 
     /// Capture `label`'s pending checkpoints from the rings (valid: nothing has
@@ -2138,7 +2700,7 @@ impl PoolMode {
         let newest_cut = cut_at.last().copied().unwrap_or(0);
         if spilled == sealed
             && newest_cut <= c.committed_at
-            && c.committed_at == model.kv_runtime().filled
+            && c.committed_tip == model.kv_runtime().filled
         {
             return Ok(false);
         }
@@ -2414,6 +2976,9 @@ impl PoolMode {
                 .into_iter()
                 .collect();
             dq.commit(label, m, blobs, at[..units].to_vec(), superseded.clone())?;
+            if let Some(t) = crate::disk_probe() {
+                eprintln!("[imparo] kv disk probe {t:.1}: {label} queued its commit");
+            }
             if !superseded.is_empty() {
                 if let Some(c) = self.convs.get_mut(label) {
                     c.adopted = None;
@@ -2427,7 +2992,9 @@ conversation restored from"
             }
             if let Some(c) = self.convs.get_mut(label) {
                 c.committed_at = boundary;
+                c.committed_tip = model.kv_runtime().filled;
                 c.disk_ckpts = kept;
+                c.committing = at[..units].to_vec();
             }
             if crate::log_on() {
                 eprintln!(
@@ -2451,11 +3018,14 @@ conversation restored from"
         unit_bytes(&self.strides)
     }
 
-    /// Drop device residency for conversations outside the keep-set (the
-    /// incoming one, always, plus the most recent others whose units fit the
-    /// resident-bytes budget) and hand the freed block pages back to the OS.
-    /// Everything dropped was spilled at its own switch-out, so the disk
-    /// restore path serves any return visit.
+    /// At a switch, drop device residency for conversations outside the keep-set: the
+    /// incoming one, always, plus the most recent others while their blocks fit. Unless
+    /// IMPARO_KV_RESIDENT_MB names a budget, what fits is one context: the incoming
+    /// prompt's blocks and the retained ones together within `context_blocks`, so the KV
+    /// left resident is never more than the one context the fit reserves for it. A block
+    /// the incoming prompt shares with a retained conversation (a common preamble), or two
+    /// retained ones share, counts once. Everything dropped was spilled at its own
+    /// switch-out, so the disk restore path serves any return visit.
     fn release_idle<T: PoolTenant + ?Sized>(
         &mut self,
         _model: &T,
@@ -2465,19 +3035,47 @@ conversation restored from"
         disk: Option<&crate::disk::DiskQueue>,
     ) -> Result<(), String> {
         let mut keep: Vec<String> = vec![incoming.to_string()];
+        // Conversations running or waiting in another slot stay whatever the budget says.
+        for held in self.held_labels() {
+            if !keep.contains(&held) {
+                keep.push(held);
+            }
+        }
         let ub = self.unit_bytes().max(1);
-        let mut budget = self.resident_budget;
+        // The incoming prompt's full blocks plus the one its remainder and first generated
+        // tokens go into.
+        let mut room = self.resident_budget.map_or_else(
+            || {
+                self.context_blocks
+                    .saturating_sub(incoming_hashes.len() + 1)
+            },
+            |bytes| bytes / ub,
+        );
+        let mut held: BTreeSet<UnitId> = self
+            .resident
+            .prepare_probe(incoming_hashes)
+            .map(|plan| plan.indexed.into_iter().collect())
+            .unwrap_or_default();
         for l in self.recent.iter().rev() {
             if keep.contains(l) {
                 continue;
             }
-            let cost = self.convs.get(l).map_or(0, |c| c.sealed_units) * ub;
-            if cost > budget {
+            let units = self.resident.pool.conversation(&cid(l)).unwrap_or(&[]);
+            let tail = self.convs.get(l).map_or(0, |c| c.tail.len());
+            let cost = units.iter().filter(|u| !held.contains(u)).count() + tail;
+            if cost > room {
                 break; // newest-first: once one no longer fits, stop retaining
             }
-            budget -= cost;
+            room -= cost;
+            held.extend(units.iter().copied());
             keep.push(l.clone());
         }
+        // A conversation whose commit is still on its way to disk leaves like any other:
+        // the rows went into the file image before the commit was queued, and a return
+        // visit that shares the commit waits for it to land, then reads it back. Keeping
+        // its blocks over the budget instead put the next conversation's blocks above them
+        // and the storage never shrank back (544 MiB committed for two 17k-token
+        // conversations where one fits, the base build holding 320 MiB).
         let drop: Vec<String> = self
             .convs
             .keys()
@@ -2541,21 +3139,35 @@ conversation restored from"
             }
         } else {
             // Unified/shared behavior is intentionally unchanged: no Host API call.
-            for label in &drop {
-                let tail = self
-                    .convs
-                    .remove(label)
-                    .map_or_else(Vec::new, |conv| conv.tail);
-                self.release_unsealed(tail);
-                let evicted = self.resident.forget(&cid(label));
-                self.release_evicted(evicted)?;
-                self.recent.retain(|recent| recent != label);
-                if self.active.as_deref() == Some(label.as_str()) {
-                    self.active = None;
-                }
-            }
-            self.drain_lifecycle();
+            self.forget_shared(&drop)?;
         }
+        self.release_unreferenced_and_ckpts(&keep)
+    }
+
+    /// Forget each of `labels` on shared addressing: its tail goes back, its sealed units
+    /// lose this conversation's reference, and a unit no one references is released.
+    fn forget_shared(&mut self, labels: &[String]) -> Result<(), String> {
+        for label in labels {
+            let tail = self
+                .convs
+                .remove(label)
+                .map_or_else(Vec::new, |conv| conv.tail);
+            self.release_unsealed(tail);
+            let evicted = self.resident.forget(&cid(label));
+            self.release_evicted(evicted)?;
+            self.recent.retain(|recent| recent != label);
+            self.vacate_everywhere(label);
+        }
+        self.drain_lifecycle();
+        Ok(())
+    }
+
+    /// After conversations left: release the units no one references, and the window
+    /// checkpoints no conversation in `keep` can reach.
+    fn release_unreferenced_and_ckpts(
+        &mut self,
+        keep: &[String],
+    ) -> Result<(), String> {
         // This used to advise each returned Device placement directly, beside the
         // queue. `evict_unreferenced` releases through `release_placement`, which
         // ALREADY queues a Free for the same placement, so anything it reclaims here
@@ -2570,7 +3182,7 @@ conversation restored from"
         // Checkpoints reachable from kept conversations stay; the rest are on
         // disk (their conv's spill) or re-capturable, so their RAM goes too.
         let mut reach: BTreeSet<CkptKey> = BTreeSet::new();
-        for l in &keep {
+        for l in keep {
             let Some(c) = self.convs.get(l.as_str()) else {
                 continue;
             };
@@ -2598,6 +3210,51 @@ conversation restored from"
         self.ckpt_order.retain(|h| reach.contains(h));
         self.window_ckpts.retain(|h, _| reach.contains(h));
         Ok(())
+    }
+
+    /// Release every idle conversation's blocks and give the memory back to the system.
+    ///
+    /// A switch leaves up to one context resident (`release_idle`); this gives that back
+    /// too. The server calls it between requests, when it has been idle for the backend's
+    /// release window (only with a disk tier: the KV is there, written through at each
+    /// turn's end) or the system reports memory pressure. Every conversation leaves, a
+    /// commit still on its way to disk included (its rows are in the file image; a return
+    /// waits for it to land). Then the device storage shrinks to one step, so the pages
+    /// above go back.
+    ///
+    /// ```text
+    /// busy:  A, B, C resident -> a switch keeps them all -> a return to A costs nothing
+    /// idle:  window passes (or memory pressure) -> A, B, C leave -> storage shrinks
+    /// back:  A's next request reads A's units from disk straight into fresh blocks
+    /// ```
+    ///
+    /// # Errors
+    /// When the device cannot shrink its storage; the conversations have left either way.
+    pub fn trim<T: PoolTenant + ?Sized>(
+        &mut self,
+        model: &mut T,
+    ) -> Result<Trimmed, String> {
+        let blocks_before = self.resident.high_water();
+        let conversations_before = self.convs.len();
+        if self.addressing == PoolAddressing::Shared {
+            // Everything but a conversation running or waiting in another slot.
+            let held = self.held_labels();
+            let all: Vec<String> = self
+                .convs
+                .keys()
+                .filter(|l| !held.contains(l))
+                .cloned()
+                .collect();
+            self.forget_shared(&all)?;
+            self.release_unreferenced_and_ckpts(&held)?;
+        }
+        let blocks_after = self.resident.high_water();
+        model.kv_release_blocks(blocks_after as usize)?;
+        Ok(Trimmed {
+            conversations: conversations_before - self.convs.len(),
+            blocks_before,
+            blocks_after,
+        })
     }
 
     /// Canonical unit blob (same format as kv_io's unit_blobs) read from the
@@ -2717,12 +3374,16 @@ conversation restored from"
         }
     }
 
-    /// One stored extent's rows, read off the device and framed as a unit blob.
+    /// One stored extent's rows, read off the device into the unit blob.
     ///
     /// `[lo, hi)` in absolute positions, both on the 64 grid. Extents end where
     /// requests ended, so this reads a block RANGE rather than a fixed tile -- and
     /// `tail` is needed because a request commonly ends above the last sealed unit,
     /// in blocks the conversation holds but has not sealed.
+    ///
+    /// The rows go from the device straight into their place in the file image: the one
+    /// copy an asynchronous write needs, because the blocks may be reused before the
+    /// writer reaches them.
     fn read_unit_canonical(
         &self,
         conv: &ConversationId,
@@ -2741,46 +3402,42 @@ conversation restored from"
         // Write-through of ONE unit's full-attention rows; nothing here is a
         // conversation checkpoint, so it carries no recurrent state.
         let (b0, b1) = (lo / page, hi / page);
-        let rows = hi.checked_sub(lo)?;
-        let mut state = KvState {
-            boundary: hi,
-            full: Vec::new(),
-            window: Vec::new(),
-            recurrent: Vec::new(),
+        hi.checked_sub(lo)?;
+        // Every layer's placement first: one that is missing (evicted mid-flight) means
+        // no write-through, before any row is read.
+        let tables: Vec<Vec<u32>> = full
+            .iter()
+            .map(|g| {
+                self.resident
+                    .table_for(conv, g.layer, tail)
+                    .ok()
+                    .filter(|t| t.len() >= b1)
+                    .map(|t| t[b0..b1].to_vec())
+            })
+            .collect::<Option<_>>()?;
+        let layout = UnitLayout {
+            from: lo,
+            to: hi,
+            layers: full
+                .iter()
+                .map(|g| (g.layer, g.k_stride, g.v_stride))
+                .collect(),
         };
-        for g in full {
-            let table = self.resident.table_for(conv, g.layer, tail).ok()?;
-            if table.len() < b1 {
-                return None; // placement missing (evicted mid-flight): skip write-through
-            }
-            let blocks = &table[b0..b1];
-            let mut k = vec![0u8; rows * g.k_stride];
-            let mut v = vec![0u8; rows * g.v_stride];
-            for (bi, &blk) in blocks.iter().enumerate() {
-                be.read_kv_bytes(
-                    g.layer,
-                    false,
-                    (blk as usize * page * g.k_stride) as u64,
-                    &mut k[bi * page * g.k_stride..(bi + 1) * page * g.k_stride],
-                );
-                be.read_kv_bytes(
-                    g.layer,
-                    true,
-                    (blk as usize * page * g.v_stride) as u64,
-                    &mut v[bi * page * g.v_stride..(bi + 1) * page * g.v_stride],
-                );
-            }
-            state.full.push(crate::KvLayerState {
-                layer: g.layer,
-                base_pos: lo,
-                positions: rows,
-                k,
-                v,
-            });
-        }
-        crate::state::unit_blobs_at(&state, &[hi])
-            .into_iter()
-            .next()
+        layout
+            .blob(|li, is_v, rows| {
+                let g = full[li];
+                let stride = if is_v { g.v_stride } else { g.k_stride };
+                for (bi, &blk) in tables[li].iter().enumerate() {
+                    be.read_kv_bytes(
+                        g.layer,
+                        is_v,
+                        (blk as usize * page * stride) as u64,
+                        &mut rows[bi * page * stride..(bi + 1) * page * stride],
+                    );
+                }
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .ok()
     }
 
     /// Free blocks on the first full-attention layer (all layers allocate in
@@ -2792,8 +3449,10 @@ conversation restored from"
             .map_or(0, |&l| self.resident.free_blocks(l))
     }
 
-    /// Preserve the already-noted recurrent state before decode can overwrite it.
-    /// Only snapshot models are supported: no window delta or ancestor is inferred.
+    /// Keep the prompt anchor (`anchor`, the prompt's last usable grid boundary) as the next
+    /// turn's resume point. A model with recurrent state keeps the state the prefill already
+    /// noted there, before decode can overwrite it; a model without one keeps the KV units
+    /// alone. Only snapshot models are supported: no window delta or ancestor is inferred.
     /// At most one extra durable anchor is retained for this conversation's request.
     pub fn note_prompt_checkpoint<T: PoolTenant + ?Sized>(
         &mut self,
@@ -2801,12 +3460,17 @@ conversation restored from"
         label: &str,
         hashes: &[UnitHash],
         ids: &[u32],
+        anchor: usize,
     ) -> Option<usize> {
         self.convs.get_mut(label)?.prompt_anchor = None;
         if !matches!(self.shape, crate::CheckpointShape::Snapshots) {
             return None;
         }
-        let (boundary, bytes) = model.kv_recurrent_note()?;
+        let (boundary, bytes) = if model.recurrent_elems() > 0 {
+            model.kv_recurrent_note()?
+        } else {
+            (anchor, Vec::new())
+        };
         let boundary = prompt_replay_boundary(
             model.recurrent_elems(),
             model.kv_runtime().filled,
@@ -3044,9 +3708,7 @@ conversation restored from"
             let evicted = self.resident.forget(&cid(label));
             self.release_evicted(evicted)?;
             self.recent.retain(|recent| recent != label);
-            if self.active.as_deref() == Some(label.as_str()) {
-                self.active = None;
-            }
+            self.vacate_everywhere(label);
         }
         self.drain_lifecycle();
         Ok(())
@@ -3138,6 +3800,376 @@ fn transfer_spans_for_demotions(
     Ok(spans)
 }
 
+/// What `trim` released, for the server's log line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Trimmed {
+    /// Conversations that left the device.
+    pub conversations: usize,
+    /// One past the highest block in use, before and after.
+    pub blocks_before: u32,
+    pub blocks_after: u32,
+}
+
+/// What a disk restore read from its extent files, for the `kv restore:` line.
+#[derive(Default)]
+struct ExtentReads {
+    files: usize,
+    reads: usize,
+    bytes: u64,
+    /// The backend lent its storage, so the file read was the whole transfer.
+    lent: bool,
+}
+
+/// Reads a disk restore's full-attention rows from its extent files.
+///
+/// Rows of the whole units from `first` to `n` go from the files straight into the blocks
+/// `fresh` placed them in: one scatter read per run of wanted bytes, so an extent needed
+/// whole is one sweep of its file. Units below `first` are resident, and nothing of
+/// theirs is read. The rows above the last whole unit, `[n * grid, boundary)`, come back
+/// as host rows for the conversation's own tail blocks; the checkpoint's `tail` supplies
+/// the part above the last extent.
+///
+/// ```text
+///   extent file:  head | L0 head | L0 K rows | L0 V rows | L1 head | L1 K rows | ...
+///   checked:      each file's length before it is read, every header byte after
+/// ```
+///
+/// `layers` is the file order: (layer, K stride, V stride). A backend whose KV storage
+/// the host cannot address gets the rows through `write_kv_bytes`, from buffers read the
+/// same way, after the headers check -- one copy more.
+#[allow(clippy::too_many_arguments)]
+fn read_extent_rows<K: KvRowSink + ?Sized>(
+    st: &Store,
+    kv: &K,
+    layers: &[(u32, usize, usize)],
+    cuts: &[crate::store::Cut],
+    first: usize,
+    n: usize,
+    boundary: usize,
+    fresh: &[UnitPlacement],
+    tail: &[crate::KvLayerState],
+) -> Result<(Vec<crate::KvLayerState>, ExtentReads), String> {
+    let grid = grid_tokens();
+    let page = page_cells();
+    let lo = first * grid;
+    let top = n * grid;
+    let reach = cuts.last().map_or(0, |c| c.end as usize);
+    if top > reach || reach > boundary || first + fresh.len() != n {
+        return Err(format!(
+            "kv restore: units [{first}, {n}) with {} placements, extents to {reach}, \
+             boundary {boundary}",
+            fresh.len()
+        ));
+    }
+    // The extents holding a row at or above `lo`, each with the layout its file must have.
+    let mut extents: Vec<(UnitHash, UnitLayout)> = Vec::new();
+    let mut from = 0;
+    for c in cuts {
+        let to = c.end as usize;
+        if to > lo {
+            extents.push((
+                c.unit,
+                UnitLayout {
+                    from,
+                    to,
+                    layers: layers.to_vec(),
+                },
+            ));
+        }
+        from = to;
+    }
+    // One KV range per fresh unit, layer and side, in that order.
+    let mut ranges = Vec::with_capacity(fresh.len() * layers.len() * 2);
+    for pl in fresh {
+        for &(layer, ks, vs) in layers {
+            let blk = *pl.get(&layer).ok_or_else(|| {
+                format!("kv restore: a fresh unit has no block on layer {layer}")
+            })? as usize;
+            for (is_v, stride) in [(false, ks), (true, vs)] {
+                ranges.push(KvRange {
+                    layer,
+                    is_v,
+                    off: (blk * page * stride) as u64,
+                    len: grid * stride,
+                });
+            }
+        }
+    }
+    // The rows above the last whole unit, per layer: `[top, reach)` from the files, the
+    // rest from the checkpoint's tail.
+    let mut above: Vec<(Vec<u8>, Vec<u8>)> = layers
+        .iter()
+        .map(|&(_, ks, vs)| {
+            (
+                vec![0; (boundary - top) * ks],
+                vec![0; (boundary - top) * vs],
+            )
+        })
+        .collect();
+    let mut heads: Vec<Vec<u8>> = extents
+        .iter()
+        .map(|(_, l)| {
+            vec![
+                0;
+                UnitLayout::HEAD_BYTES + l.layers.len() * UnitLayout::LAYER_HEAD_BYTES
+            ]
+        })
+        .collect();
+    let mut reads = ExtentReads {
+        files: extents.len(),
+        ..ExtentReads::default()
+    };
+    // Every file opened and its length checked before any block is lent.
+    let files: Vec<crate::store::UnitFile> = extents
+        .iter()
+        .map(|(unit, l)| st.open_unit(unit, l.file_len()))
+        .collect::<Result<_, _>>()?;
+    let mut lent = false;
+    let staged = {
+        let mut read_all = |blocks: &mut [&mut [u8]]| -> Result<(), String> {
+            let mut pieces: Vec<Vec<UnitPiece<'_>>> =
+                extents.iter().map(|_| Vec::new()).collect();
+            for ((_, l), (head, p)) in
+                extents.iter().zip(heads.iter_mut().zip(pieces.iter_mut()))
+            {
+                let (file_head, mut rest) = head.split_at_mut(UnitLayout::HEAD_BYTES);
+                p.push(UnitPiece {
+                    at: 0,
+                    dst: file_head,
+                });
+                for li in 0..l.layers.len() {
+                    let (one, r) = std::mem::take(&mut rest)
+                        .split_at_mut(UnitLayout::LAYER_HEAD_BYTES);
+                    p.push(UnitPiece {
+                        at: l.layer_head_at(li),
+                        dst: one,
+                    });
+                    rest = r;
+                }
+            }
+            // `blocks` in the order `ranges` was built: unit, layer, side.
+            let mut slots = blocks.iter_mut();
+            for u in first..n {
+                for (li, &(_, ks, vs)) in layers.iter().enumerate() {
+                    for (is_v, stride) in [(false, ks), (true, vs)] {
+                        let dst = std::mem::take(
+                            slots
+                                .next()
+                                .ok_or("kv restore: fewer lent ranges than asked")?,
+                        );
+                        place(&extents, li, is_v, stride, u * grid, dst, &mut pieces)?;
+                    }
+                }
+            }
+            for (li, (k, v)) in above.iter_mut().enumerate() {
+                let (_, ks, vs) = layers[li];
+                place(
+                    &extents,
+                    li,
+                    false,
+                    ks,
+                    top,
+                    &mut k[..(reach - top) * ks],
+                    &mut pieces,
+                )?;
+                place(
+                    &extents,
+                    li,
+                    true,
+                    vs,
+                    top,
+                    &mut v[..(reach - top) * vs],
+                    &mut pieces,
+                )?;
+            }
+            reads.bytes = pieces.iter().flatten().map(|p| p.dst.len() as u64).sum();
+            reads.reads = read_in_parallel(&files, pieces)?;
+            Ok(())
+        };
+        if let Some(r) = kv.lend(&ranges, &mut read_all) {
+            r?;
+            lent = true;
+            None
+        } else {
+            let mut staged: Vec<Vec<u8>> =
+                ranges.iter().map(|r| vec![0; r.len]).collect();
+            let mut slices: Vec<&mut [u8]> =
+                staged.iter_mut().map(Vec::as_mut_slice).collect();
+            read_all(&mut slices)?;
+            Some(staged)
+        }
+    };
+    // The rows are where they belong; dropping the files' cached pages is not on the
+    // restore's path.
+    std::thread::spawn(move || {
+        files.iter().for_each(crate::store::UnitFile::drop_cached);
+    });
+    for ((unit, l), head) in extents.iter().zip(&heads) {
+        let mut want = l.head();
+        for li in 0..l.layers.len() {
+            want.extend_from_slice(&l.layer_head(li));
+        }
+        if *head != want {
+            return Err(format!(
+                "kv restore: extent {} is not in the layout this build writes",
+                unit.hex()
+            ));
+        }
+    }
+    reads.lent = lent;
+    if let Some(staged) = staged {
+        for (r, bytes) in ranges.iter().zip(&staged) {
+            kv.write(r, bytes);
+        }
+    }
+    if boundary == top {
+        return Ok((Vec::new(), reads));
+    }
+    if let Some(t) = tail.iter().find(|t| !layers.iter().any(|l| l.0 == t.layer)) {
+        return Err(format!(
+            "checkpoint tail names layer {}, the units do not",
+            t.layer
+        ));
+    }
+    let mut out = Vec::with_capacity(layers.len());
+    for (&(layer, ks, vs), (mut k, mut v)) in layers.iter().zip(above) {
+        if boundary > reach {
+            let t = tail
+                .iter()
+                .find(|t| t.layer == layer)
+                .filter(|t| {
+                    t.base_pos == reach
+                        && t.k.len() == (boundary - reach) * ks
+                        && t.v.len() == (boundary - reach) * vs
+                })
+                .ok_or_else(|| {
+                    format!("checkpoint tail does not hold layer {layer}'s rows [{reach}, {boundary})")
+                })?;
+            k[(reach - top) * ks..].copy_from_slice(&t.k);
+            v[(reach - top) * vs..].copy_from_slice(&t.v);
+        }
+        out.push(crate::KvLayerState {
+            layer,
+            base_pos: top,
+            positions: boundary - top,
+            k,
+            v,
+        });
+    }
+    Ok((out, reads))
+}
+
+/// How many threads read a restore's extent files at once.
+///
+/// A single sweep leaves the SSD with one request in flight. Measured on an M3 Pro, 72 MiB
+/// of a cold extent (0.5 s after its write) in per-block pieces: 23-29 ms with one reader,
+/// 19-20 ms with two, 16-19 ms with four, 20-22 ms with eight.
+const READERS: usize = 4;
+
+/// The least a reader is given: below it a thread costs more than the overlap wins back
+/// (4 MiB reads in ~1.5 ms at the measured single-reader rate; a spawn is ~0.03 ms).
+const READ_PART_MIN: u64 = 4 << 20;
+
+/// Reads each file's pieces with up to `READERS` threads, each sweeping its own stretch
+/// of one file. Returns how many scatter reads it took.
+fn read_in_parallel(
+    files: &[crate::store::UnitFile],
+    per_file: Vec<Vec<UnitPiece<'_>>>,
+) -> Result<usize, String> {
+    let total: u64 = per_file.iter().flatten().map(|p| p.dst.len() as u64).sum();
+    let readers = (total / READ_PART_MIN).clamp(1, READERS as u64) as usize;
+    let target = total.div_ceil(readers as u64).max(1);
+    // Parts of about `target` bytes, each a stretch of one file in file order.
+    let mut parts: Vec<(usize, Vec<UnitPiece<'_>>)> = Vec::new();
+    for (f, mut pieces) in per_file.into_iter().enumerate() {
+        pieces.sort_by_key(|p| p.at);
+        let mut cur = Vec::new();
+        let mut bytes = 0_u64;
+        for p in pieces {
+            bytes += p.dst.len() as u64;
+            cur.push(p);
+            if bytes >= target {
+                parts.push((f, std::mem::take(&mut cur)));
+                bytes = 0;
+            }
+        }
+        if !cur.is_empty() {
+            parts.push((f, cur));
+        }
+    }
+    if readers == 1 || parts.len() == 1 {
+        let mut n = 0;
+        for (f, mut part) in parts {
+            n += files[f].read(&mut part)?;
+        }
+        return Ok(n);
+    }
+    let mut buckets: Vec<Vec<(usize, Vec<UnitPiece<'_>>)>> =
+        (0..readers).map(|_| Vec::new()).collect();
+    for (i, part) in parts.into_iter().enumerate() {
+        buckets[i % readers].push(part);
+    }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = buckets
+            .into_iter()
+            .map(|bucket| {
+                s.spawn(move || {
+                    let mut n = 0;
+                    for (f, mut part) in bucket {
+                        n += files[f].read(&mut part)?;
+                    }
+                    Ok::<usize, String>(n)
+                })
+            })
+            .collect();
+        let mut n = 0;
+        for h in handles {
+            n += h
+                .join()
+                .map_err(|_| "kv restore: a reader thread panicked".to_string())??;
+        }
+        Ok(n)
+    })
+}
+
+/// Splits `dst` -- layer `li`'s K or V rows from position `p0` on, `stride` bytes each --
+/// into pieces of the extent files that hold them.
+fn place<'a>(
+    extents: &[(UnitHash, UnitLayout)],
+    li: usize,
+    is_v: bool,
+    stride: usize,
+    p0: usize,
+    mut dst: &'a mut [u8],
+    pieces: &mut [Vec<UnitPiece<'a>>],
+) -> Result<(), String> {
+    let mut p = p0;
+    for (e, (_, l)) in extents.iter().enumerate() {
+        if dst.is_empty() {
+            break;
+        }
+        if l.to <= p {
+            continue;
+        }
+        if l.from > p {
+            return Err(format!("kv restore: no extent holds position {p}"));
+        }
+        let rows = (l.to - p).min(dst.len() / stride);
+        let (here, rest) = std::mem::take(&mut dst).split_at_mut(rows * stride);
+        pieces[e].push(UnitPiece {
+            at: l.row_at(li, is_v, p),
+            dst: here,
+        });
+        dst = rest;
+        p += rows;
+    }
+    if dst.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("kv restore: rows from {p} lie past the extents"))
+    }
+}
+
 /// Bytes one RESIDENT unit occupies across the full-attention layers, both sides.
 ///
 /// The unit is a grid step, so this counts `grid_tokens()` rows -- not the 256-token
@@ -3206,8 +4238,7 @@ fn prompt_replay_boundary(
     bytes: usize,
     grid: usize,
 ) -> Option<usize> {
-    (recurrent_elems > 0
-        && filled == prompt
+    (filled == prompt
         && boundary > 0
         && boundary <= prompt.saturating_sub(2)
         && grid > 0
@@ -3454,6 +4485,7 @@ mod lifecycle_tests {
             (capacity_units as u64 * grid_tokens() as u64 * 8).into(),
             vec![3],
             capacity_units * UNIT_BLOCKS as u32,
+            capacity_units as usize * UNIT_BLOCKS,
             0,
             strides,
             crate::ConfigRoot::new(b"model", (1, 1), b"geometry"),
@@ -3601,12 +4633,14 @@ mod lifecycle_tests {
                 pending: Vec::new(),
                 spilled_units: 1,
                 committed_at: grid_tokens(),
+                committed_tip: 0,
                 cuts: Vec::new(),
                 disk_ckpts: Vec::new(),
                 keyless: false,
                 adopted: None,
                 recur_note: None,
                 prompt_anchor: None,
+                committing: Vec::new(),
             },
         );
         mode.recent.push(label.to_string());
@@ -3712,6 +4746,277 @@ mod lifecycle_tests {
         drop(disk);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A test's KV memory: one byte vector per layer side, lent directly or written
+    /// through the staged route.
+    struct FakeKv {
+        lends: bool,
+        sides: std::cell::RefCell<BTreeMap<(u32, bool), Vec<u8>>>,
+    }
+
+    impl KvRowSink for FakeKv {
+        fn lend(
+            &self,
+            ranges: &[KvRange],
+            with: &mut dyn FnMut(&mut [&mut [u8]]) -> Result<(), String>,
+        ) -> Option<Result<(), String>> {
+            if !self.lends {
+                return None;
+            }
+            let mut sides = self.sides.borrow_mut();
+            // Split each side's memory into the lent ranges, in the order asked.
+            let mut order: Vec<usize> = (0..ranges.len()).collect();
+            order.sort_by_key(|&i| (ranges[i].layer, ranges[i].is_v, ranges[i].off));
+            let mut slots: Vec<Option<&mut [u8]>> =
+                (0..ranges.len()).map(|_| None).collect();
+            let mut rest: BTreeMap<(u32, bool), (u64, &mut [u8])> = sides
+                .iter_mut()
+                .map(|(k, v)| (*k, (0, v.as_mut_slice())))
+                .collect();
+            for i in order {
+                let r = ranges[i];
+                let (at, mem) = rest.remove(&(r.layer, r.is_v)).expect("known side");
+                let (_, from) = mem.split_at_mut((r.off - at) as usize);
+                let (mine, after) = from.split_at_mut(r.len);
+                slots[i] = Some(mine);
+                rest.insert((r.layer, r.is_v), (r.off + r.len as u64, after));
+            }
+            let mut lent: Vec<&mut [u8]> =
+                slots.into_iter().map(Option::unwrap).collect();
+            Some(with(&mut lent))
+        }
+
+        fn write(&self, r: &KvRange, src: &[u8]) {
+            let mut sides = self.sides.borrow_mut();
+            let mem = sides.get_mut(&(r.layer, r.is_v)).expect("known side");
+            mem[r.off as usize..r.off as usize + src.len()].copy_from_slice(src);
+        }
+    }
+
+    /// A disk restore puts each unit's rows straight into the block placed for it --
+    /// through the lent route and the staged one alike -- reads nothing of a unit already
+    /// resident, returns the rows above the last whole unit with the checkpoint's tail on
+    /// top, and refuses an extent whose header or length is not the layout's.
+    #[test]
+    fn a_restore_reads_each_unit_straight_into_its_block() {
+        let g = grid_tokens();
+        let page = page_cells();
+        let layers = [(2_u32, 6_usize, 10_usize), (5, 4, 4)];
+        // Four whole units in three extents, [0, g) [g, 3g) [3g, 4g), and a boundary 10
+        // rows above them whose rows the checkpoint's tail carries.
+        let (reach, boundary) = (4 * g, 4 * g + 10);
+        let row = |layer: u32, is_v: bool, p: usize, stride: usize| -> Vec<u8> {
+            (0..stride)
+                .map(|b| {
+                    (p * 31 + b * 7 + layer as usize * 3 + usize::from(is_v) * 101)
+                        as u8
+                })
+                .collect()
+        };
+        let rows =
+            |layer: u32, is_v: bool, lo: usize, hi: usize, stride: usize| -> Vec<u8> {
+                (lo..hi).flat_map(|p| row(layer, is_v, p, stride)).collect()
+            };
+        let state = KvState {
+            boundary: reach,
+            full: layers
+                .iter()
+                .map(|&(layer, ks, vs)| crate::KvLayerState {
+                    layer,
+                    base_pos: 0,
+                    positions: reach,
+                    k: rows(layer, false, 0, reach, ks),
+                    v: rows(layer, true, 0, reach, vs),
+                })
+                .collect(),
+            window: Vec::new(),
+            recurrent: Vec::new(),
+        };
+        let tail: Vec<crate::KvLayerState> = layers
+            .iter()
+            .map(|&(layer, ks, vs)| crate::KvLayerState {
+                layer,
+                base_pos: reach,
+                positions: boundary - reach,
+                k: rows(layer, false, reach, boundary, ks),
+                v: rows(layer, true, reach, boundary, vs),
+            })
+            .collect();
+        let dir = scratch("direct-restore");
+        let root = crate::ConfigRoot::new(b"model", (1, 1), b"geometry");
+        let store = Store::open(&dir, &root).unwrap();
+        let ends = [g, 3 * g, 4 * g];
+        let blobs = crate::state::unit_blobs_at(&state, &ends);
+        let cuts: Vec<crate::store::Cut> = ends
+            .iter()
+            .zip(&blobs)
+            .map(|(&end, blob)| crate::store::Cut {
+                end: end as u64,
+                unit: crate::store::blob_hash(blob),
+            })
+            .collect();
+        for (c, blob) in cuts.iter().zip(&blobs) {
+            store.put_unit(&c.unit, blob).unwrap();
+        }
+        // Unit 0 is resident; units 1..4 land in blocks out of order.
+        let blocks = [6_u32, 2, 9];
+        let fresh: Vec<UnitPlacement> = blocks
+            .iter()
+            .map(|&b| layers.iter().map(|&(l, ..)| (l, b)).collect())
+            .collect();
+        let untouched = 0xA5_u8;
+        for lends in [true, false] {
+            let kv = FakeKv {
+                lends,
+                sides: std::cell::RefCell::new(
+                    layers
+                        .iter()
+                        .flat_map(|&(l, ks, vs)| {
+                            [
+                                ((l, false), vec![untouched; 16 * page * ks]),
+                                ((l, true), vec![untouched; 16 * page * vs]),
+                            ]
+                        })
+                        .collect(),
+                ),
+            };
+            let (above, reads) = read_extent_rows(
+                &store, &kv, &layers, &cuts, 1, 4, boundary, &fresh, &tail,
+            )
+            .unwrap();
+            // The first extent holds only the resident unit: never opened.
+            assert_eq!(reads.files, 2, "lends={lends}");
+            let sides = kv.sides.borrow();
+            for (i, &b) in blocks.iter().enumerate() {
+                let u = 1 + i;
+                for &(layer, ks, vs) in &layers {
+                    for (is_v, stride) in [(false, ks), (true, vs)] {
+                        let mem = &sides[&(layer, is_v)];
+                        let at = b as usize * page * stride;
+                        assert!(
+                            mem[at..at + g * stride]
+                                == rows(layer, is_v, u * g, (u + 1) * g, stride)[..],
+                            "lends={lends} unit {u} layer {layer} v={is_v}"
+                        );
+                    }
+                }
+            }
+            // Nothing outside the three placed blocks was written.
+            for (&(layer, is_v), mem) in sides.iter() {
+                let stride = layers
+                    .iter()
+                    .find(|l| l.0 == layer)
+                    .map(|l| if is_v { l.2 } else { l.1 })
+                    .unwrap();
+                for blk in (0..16).filter(|b| !blocks.contains(&(*b as u32))) {
+                    let at = blk * page * stride;
+                    assert!(
+                        mem[at..at + page * stride].iter().all(|&x| x == untouched)
+                    );
+                }
+            }
+            // Above the last whole unit: the checkpoint's tail, as one run per layer.
+            assert_eq!(above.len(), layers.len());
+            for (ls, t) in above.iter().zip(&tail) {
+                assert_eq!(
+                    (ls.layer, ls.base_pos, ls.positions),
+                    (t.layer, reach, boundary - reach)
+                );
+                assert_eq!((&ls.k, &ls.v), (&t.k, &t.v));
+            }
+        }
+        // A header byte that is not the layout's refuses the restore.
+        let bad = store_path_of(&dir, &cuts[1].unit);
+        let mut bytes = std::fs::read(&bad).unwrap();
+        bytes[UnitLayout::HEAD_BYTES] ^= 1; // the first layer header's layer id
+        std::fs::write(&bad, &bytes).unwrap();
+        let kv = FakeKv {
+            lends: true,
+            sides: std::cell::RefCell::new(
+                layers
+                    .iter()
+                    .flat_map(|&(l, ks, vs)| {
+                        [
+                            ((l, false), vec![0; 16 * page * ks]),
+                            ((l, true), vec![0; 16 * page * vs]),
+                        ]
+                    })
+                    .collect(),
+            ),
+        };
+        let err = read_extent_rows(
+            &store, &kv, &layers, &cuts, 1, 4, boundary, &fresh, &tail,
+        )
+        .err()
+        .expect("a changed header must be refused");
+        assert!(err.contains("not in the layout"), "{err}");
+        // A file of another length is refused before anything is read into a block.
+        bytes.truncate(bytes.len() - 1);
+        std::fs::write(&bad, &bytes).unwrap();
+        let err = read_extent_rows(
+            &store, &kv, &layers, &cuts, 1, 4, boundary, &fresh, &tail,
+        )
+        .err()
+        .expect("a short file must be refused");
+        assert!(err.contains("where the layout says"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Several readers split one file into stretches and every byte still lands where
+    /// its piece says: 16 MiB in 64 KiB pieces, destinations in shuffled order, so each
+    /// reader sweeps its own part of the file into scattered memory.
+    #[test]
+    fn parallel_readers_put_every_byte_where_its_piece_says() {
+        let dir = scratch("parallel-read");
+        let root = crate::ConfigRoot::new(b"model", (1, 1), b"geometry");
+        let store = Store::open(&dir, &root).unwrap();
+        let len = 16_usize << 20;
+        let bytes: Vec<u8> = (0..len).map(|i| (i * 131 + i / 4099) as u8).collect();
+        let unit = crate::store::blob_hash(&bytes);
+        store.put_unit(&unit, &bytes).unwrap();
+        let file = store.open_unit(&unit, len as u64).unwrap();
+        let piece = 64 << 10;
+        let n = len / piece;
+        // Piece i of the file goes to slot (i * 7) % n of the destination.
+        let mut dest = vec![0_u8; len];
+        let mut slots: Vec<Option<&mut [u8]>> =
+            dest.chunks_mut(piece).map(Some).collect();
+        let pieces: Vec<UnitPiece<'_>> = (0..n)
+            .map(|i| UnitPiece {
+                at: (i * piece) as u64,
+                dst: slots[(i * 7) % n].take().unwrap(),
+            })
+            .collect();
+        let reads =
+            read_in_parallel(std::slice::from_ref(&file), vec![pieces]).unwrap();
+        assert_eq!(reads, READERS, "one sweep per reader");
+        for i in 0..n {
+            let at = ((i * 7) % n) * piece;
+            assert!(
+                dest[at..at + piece] == bytes[i * piece..(i + 1) * piece],
+                "piece {i}"
+            );
+        }
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The unit file a store keeps for `h`, found by name under `dir`.
+    fn store_path_of(dir: &std::path::Path, h: &UnitHash) -> std::path::PathBuf {
+        let want = h.hex();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.file_name().is_some_and(|n| n.to_string_lossy() == want) {
+                    return p;
+                }
+            }
+        }
+        panic!("no unit file {want} under {}", dir.display());
     }
 
     #[test]
@@ -3853,6 +5158,7 @@ mod lifecycle_tests {
             None,
             vec![3],
             UNIT_BLOCKS as u32,
+            UNIT_BLOCKS,
             0,
             strides,
             crate::ConfigRoot::new(b"model", (1, 1), b"geometry"),
@@ -3869,12 +5175,14 @@ mod lifecycle_tests {
                 pending: Vec::new(),
                 spilled_units: 0,
                 committed_at: 0,
+                committed_tip: 0,
                 cuts: Vec::new(),
                 disk_ckpts: Vec::new(),
                 keyless: false,
                 adopted: None,
                 recur_note: None,
                 prompt_anchor: None,
+                committing: Vec::new(),
             },
         );
 
@@ -3884,6 +5192,33 @@ mod lifecycle_tests {
             .alloc_units(1, "same", None, None)
             .expect("released tail must fit");
         assert_eq!(fresh, vec![old]);
+    }
+
+    /// What a new request could have: the capacity less the units and tail of every running
+    /// conversation. An idle conversation's units count, being droppable; so do a parked
+    /// one's, which is in flight but not held.
+    #[test]
+    fn obtainable_units_leave_out_what_running_conversations_hold() {
+        let mut mode = mode(PoolAddressing::Shared, 6);
+        let (_, run_hash) = seed(&mut mode, "run", 1);
+        seed(&mut mode, "idle", 2);
+        remember_sealed(&mut mode, "run", run_hash);
+        let tail = mode.resident.alloc_unit().expect("a tail unit");
+        mode.drain_lifecycle();
+        mode.convs.get_mut("run").unwrap().tail.push(tail);
+        assert_eq!(mode.obtainable_units(), 6);
+        mode.pin("run");
+        assert!(mode.is_running("run"));
+        assert_eq!(mode.obtainable_units(), 4);
+        // Parked: still in flight, and its pages obtainable.
+        mode.unpin("run");
+        mode.parked.insert("run".to_string(), None);
+        assert!(mode.is_running("run"));
+        assert!(!mode.is_pinned("run"));
+        assert_eq!(mode.obtainable_units(), 6);
+        // A request ending forgets the parked state too.
+        mode.unpin("run");
+        assert!(!mode.is_running("run"));
     }
 
     /// `release_idle` names a tenant in its signature and never reads it. Every
@@ -3970,6 +5305,7 @@ mod lifecycle_tests {
             None,
             vec![3],
             UNIT_BLOCKS as u32,
+            UNIT_BLOCKS,
             0,
             strides,
             crate::ConfigRoot::new(b"model", (1, 1), b"geometry"),
@@ -3987,6 +5323,7 @@ mod lifecycle_tests {
                 pending: Vec::new(),
                 spilled_units: 0,
                 committed_at: 0,
+                committed_tip: 0,
                 // A branch point recorded earlier in this turn.
                 cuts: vec![22 * g],
                 disk_ckpts: Vec::new(),
@@ -3994,10 +5331,11 @@ mod lifecycle_tests {
                 adopted: None,
                 recur_note: None,
                 prompt_anchor: None,
+                committing: Vec::new(),
             },
         );
         mode.end("c", vec![7; units * g], &hashes).unwrap();
-        let own_end = crate::identity::resume_point(units * g, units * g);
+        let own_end = units * g;
         let cuts = &mode.convs["c"].cuts;
         assert_eq!(
             cuts,
@@ -4005,6 +5343,66 @@ mod lifecycle_tests {
             "the branch, then this request's end"
         );
         assert!(cuts.windows(2).all(|w| w[0] < w[1]), "strictly ascending");
+    }
+
+    /// A stream that ends on a grid line leaves its reply-end checkpoint AT that line, keyed by
+    /// the unit that ends there, and the next prompt's lookup finds it. The cut used to keep two
+    /// tokens above it -- one unit lower, where a recurrent model keeps no state -- and its key
+    /// named the stream's last unit instead, so no lookup could find it either way.
+    #[test]
+    fn a_reply_end_checkpoint_on_a_grid_line_is_found_by_its_lookup() {
+        let g = grid_tokens();
+        let mut strides = BTreeMap::new();
+        strides.insert(3, (1, 1));
+        let mut mode = PoolMode::new(
+            PoolAddressing::Shared,
+            None,
+            vec![3],
+            UNIT_BLOCKS as u32,
+            UNIT_BLOCKS,
+            0,
+            strides,
+            crate::ConfigRoot::new(b"model", (1, 1), b"geometry"),
+        );
+        let units = 28;
+        let hashes: Vec<UnitHash> =
+            (0..units).map(|i| UnitHash([i as u8; 16])).collect();
+        mode.convs.insert(
+            "c".to_string(),
+            ConvState {
+                tokens: vec![7; units * g],
+                sealed_units: units,
+                tail: Vec::new(),
+                hashes: hashes.clone(),
+                pending: Vec::new(),
+                spilled_units: 0,
+                committed_at: 0,
+                committed_tip: 0,
+                cuts: Vec::new(),
+                disk_ckpts: Vec::new(),
+                keyless: false,
+                adopted: None,
+                recur_note: None,
+                prompt_anchor: None,
+                committing: Vec::new(),
+            },
+        );
+        let stream = vec![7; units * g];
+        mode.end("c", stream.clone(), &hashes).unwrap();
+        let cut = units * g;
+        assert_eq!(
+            mode.convs["c"].cuts,
+            vec![cut],
+            "the cut is the stream's grid line"
+        );
+        let mut next = stream;
+        next.extend([8, 9]);
+        let upto = crate::identity::resume_point(next.len(), next.len());
+        let found = mode.matching_ckpts(Some("c"), &hashes, &next, upto, units);
+        assert!(
+            found.contains(&(hashes[cut / g - 1], cut)),
+            "the reply-end checkpoint at {cut} is not found: {found:?}"
+        );
     }
 
     #[test]
@@ -4033,6 +5431,33 @@ mod lifecycle_tests {
         assert!(!pool.window_ckpts.contains_key(&(tip, 1472)));
     }
 
+    /// A user message starting at a position is a fact about the position: a later capture
+    /// landing on the same boundary (the reply-end snapshot, when the reply ends in the
+    /// branch point's block) keeps the turn flag, so the next commit keeps the turn.
+    #[test]
+    fn a_turn_start_survives_a_later_capture_at_the_same_boundary() {
+        let mut pool = mode(PoolAddressing::Shared, 4);
+        let tip = UnitHash([42; 16]);
+        let delta = |boundary| crate::KvDelta {
+            boundary,
+            from: 0,
+            window: Vec::new(),
+            tail: Vec::new(),
+            recurrent: vec![1; 4],
+        };
+        pool.remember_delta(tip, None, delta(512), Vec::new(), true);
+        pool.remember_delta(tip, None, delta(512), Vec::new(), false);
+        assert!(
+            pool.window_ckpts[&(tip, 512)].turn,
+            "the turn start stays a turn start"
+        );
+        pool.remember_delta(tip, None, delta(576), Vec::new(), false);
+        assert!(
+            !pool.window_ckpts[&(tip, 576)].turn,
+            "a step elsewhere stays a step"
+        );
+    }
+
     fn conv_holding(hash: UnitHash) -> ConvState {
         ConvState {
             tokens: vec![1],
@@ -4042,13 +5467,257 @@ mod lifecycle_tests {
             pending: Vec::new(),
             spilled_units: 0,
             committed_at: 0,
+            committed_tip: 0,
             cuts: Vec::new(),
             disk_ckpts: Vec::new(),
             keyless: false,
             adopted: None,
             recur_note: None,
             prompt_anchor: None,
+            committing: Vec::new(),
         }
+    }
+
+    /// A switch keeps the outgoing conversation while it and the incoming prompt fit one
+    /// context, and drops it when they do not. A named budget (IMPARO_KV_RESIDENT_MB)
+    /// replaces the context.
+    #[test]
+    fn a_switch_keeps_what_fits_one_context() {
+        let mut mode = mode(PoolAddressing::Shared, 4);
+        let (_unit, hash) = seed(&mut mode, "old", 1);
+        mode.convs.insert("old".to_string(), conv_holding(hash));
+        mode.recent.push("old".to_string());
+        let held = mode.resident.high_water();
+
+        // An empty incoming prompt takes one block; "old" holds one more: two fit two.
+        mode.context_blocks = 2;
+        mode.release_idle(&NoTenant, "new", &[], None, None)
+            .expect("release must succeed");
+        assert!(
+            mode.convs.contains_key("old"),
+            "it fits the context, so it stays"
+        );
+        assert_eq!(mode.resident.high_water(), held, "its blocks stay");
+
+        // A two-block incoming prompt leaves no room for it.
+        mode.release_idle(&NoTenant, "new", &[UnitHash([9; 16])], None, None)
+            .expect("release must succeed");
+        assert!(
+            !mode.convs.contains_key("old"),
+            "over one context, it leaves"
+        );
+    }
+
+    /// A block the incoming prompt shares with the outgoing conversation (a common
+    /// preamble) is counted once: the outgoing one costs only what it does not share.
+    #[test]
+    fn a_shared_preamble_counts_once() {
+        let mut mode = mode(PoolAddressing::Shared, 4);
+        let (_unit, hash) = seed(&mut mode, "old", 1);
+        mode.convs.insert("old".to_string(), conv_holding(hash));
+        mode.recent.push("old".to_string());
+        // The incoming prompt is that one block plus a partial one: two blocks, all the
+        // context there is, and "old" adds nothing the incoming prompt does not hold.
+        mode.context_blocks = 2;
+        mode.release_idle(&NoTenant, "new", &[hash], None, None)
+            .expect("release must succeed");
+        assert!(
+            mode.convs.contains_key("old"),
+            "its only block is the shared one"
+        );
+    }
+
+    /// A named budget replaces the context.
+    #[test]
+    fn a_named_budget_replaces_the_context() {
+        let mut mode = mode(PoolAddressing::Shared, 4);
+        let (_unit, hash) = seed(&mut mode, "old", 1);
+        mode.convs.insert("old".to_string(), conv_holding(hash));
+        mode.recent.push("old".to_string());
+        mode.context_blocks = 4;
+        mode.resident_budget = Some(0);
+        mode.release_idle(&NoTenant, "new", &[], None, None)
+            .expect("release must succeed");
+        assert!(
+            !mode.convs.contains_key("old"),
+            "a named budget of 0 keeps nothing"
+        );
+    }
+
+    /// `trim` releases every idle conversation and leaves no block in use, so the storage
+    /// can shrink to nothing above them.
+    #[test]
+    fn trim_releases_every_idle_conversation() {
+        let mut mode = mode(PoolAddressing::Shared, 4);
+        for (label, tag) in [("a", 1_u8), ("b", 2), ("c", 3)] {
+            let (_unit, hash) = seed(&mut mode, label, tag);
+            mode.convs.insert(label.to_string(), conv_holding(hash));
+            mode.recent.push(label.to_string());
+        }
+        mode.active = Some("c".to_string());
+        assert_eq!(mode.resident.high_water(), 3);
+
+        let t = mode.trim(&mut NoTenant).expect("trim must succeed");
+        assert_eq!(
+            t,
+            Trimmed {
+                conversations: 3,
+                blocks_before: 3,
+                blocks_after: 0,
+            }
+        );
+        assert!(mode.convs.is_empty());
+        assert!(mode.recent.is_empty());
+        assert_eq!(mode.active, None);
+        assert_eq!(mode.resident.free_blocks(3), 4);
+    }
+
+    /// Two slots (docs/continuous-batching.md, section 5): the conversation in the slot not
+    /// selected survives the release a switch makes in the selected one, whatever the
+    /// budget says; selecting its slot again makes it the active conversation.
+    #[test]
+    fn a_switch_in_one_slot_leaves_the_other_slots_conversation() {
+        let mut mode = mode(PoolAddressing::Shared, 4);
+        let (_unit, hash) = seed(&mut mode, "a", 1);
+        mode.convs.insert("a".to_string(), conv_holding(hash));
+        mode.recent.push("a".to_string());
+        mode.active = Some("a".to_string());
+        mode.resident_budget = Some(0);
+
+        mode.select_slot(1);
+        assert_eq!(mode.active, None, "slot 1 starts empty");
+        mode.release_idle(&NoTenant, "b", &[], None, None)
+            .expect("release must succeed");
+        assert!(mode.convs.contains_key("a"), "slot 0's occupant stays");
+
+        assert_eq!(mode.slot_of("a"), Some(0), "found in the slot it waits in");
+        assert_eq!(mode.occupant(0), Some("a"));
+        assert_eq!(mode.occupant(1), None);
+        assert_eq!(mode.selected_slot(), 1);
+
+        mode.select_slot(0);
+        assert_eq!(mode.active.as_deref(), Some("a"), "and is slot 0's again");
+        assert_eq!(
+            mode.slot_of("a"),
+            Some(0),
+            "found as the selected slot's too"
+        );
+        assert_eq!(mode.slot_of("b"), None);
+        // Out of every slot and not running, the same release drops it.
+        mode.active = None;
+        mode.release_idle(&NoTenant, "b", &[], None, None)
+            .expect("release must succeed");
+        assert!(
+            !mode.convs.contains_key("a"),
+            "idle and held nowhere, it leaves"
+        );
+    }
+
+    /// A running conversation is pinned: an allocation that would have dropped it as the
+    /// least recently used conversation fails instead.
+    #[test]
+    fn an_allocation_never_drops_a_pinned_conversation() {
+        let mut mode = mode(PoolAddressing::Shared, 1);
+        // Probed, so the allocator's last resort -- dropping the least recently used
+        // conversation -- can reach it.
+        mode.resident.probe(&cid("a"), &[]).unwrap();
+        let (_unit, hash) = seed(&mut mode, "a", 1);
+        mode.convs.insert("a".to_string(), conv_holding(hash));
+        mode.recent.push("a".to_string());
+
+        mode.pin("a");
+        assert!(
+            mode.alloc_units(1, "b", None, None).is_err(),
+            "the only block is the running conversation's"
+        );
+        assert!(mode.convs.contains_key("a"));
+
+        mode.unpin("a");
+        let got = mode
+            .alloc_units(1, "b", None, None)
+            .expect("once it has stopped running it can be dropped");
+        assert_eq!(got.len(), 1);
+        assert!(!mode.convs.contains_key("a"));
+    }
+
+    /// A slot's own state is charged in withheld pages: fewer are obtainable while it holds
+    /// them, an idle conversation's pages are dropped to make room, a running one's never,
+    /// and the release gives them back. Slot 0 is never charged.
+    #[test]
+    fn a_slot_state_is_charged_in_withheld_pages() {
+        let mut mode = mode(PoolAddressing::Shared, 4);
+        mode.set_slot_pages(2);
+        let free = mode.obtainable_units();
+        assert!(
+            mode.charge_slot(0, "x").unwrap(),
+            "slot 0's state is the load's"
+        );
+        assert_eq!(mode.obtainable_units(), free);
+        assert!(mode.charge_slot(1, "x").unwrap());
+        assert_eq!(mode.obtainable_units(), free - 2);
+        assert!(mode.charge_slot(1, "x").unwrap(), "charged once");
+        assert_eq!(mode.obtainable_units(), free - 2);
+
+        // An idle conversation on the two pages left: charging another slot drops it.
+        mode.resident.probe(&cid("a"), &[]).unwrap();
+        for tag in [1_u8, 2] {
+            let (_unit, hash) = seed(&mut mode, "a", tag);
+            mode.convs.insert("a".to_string(), conv_holding(hash));
+        }
+        mode.recent.push("a".to_string());
+        mode.pin("a");
+        assert!(
+            !mode.charge_slot(2, "x").unwrap(),
+            "a running conversation's pages stay"
+        );
+        assert!(mode.convs.contains_key("a"));
+        mode.unpin("a");
+        assert!(
+            mode.charge_slot(2, "x").unwrap(),
+            "an idle one's pages are dropped"
+        );
+        assert!(!mode.convs.contains_key("a"));
+        assert_eq!(mode.obtainable_units(), 0);
+
+        mode.slot_released(1);
+        mode.slot_released(2);
+        assert_eq!(mode.obtainable_units(), free);
+    }
+
+    /// The idle trim leaves a running conversation alone.
+    #[test]
+    fn trim_keeps_a_pinned_conversation() {
+        let mut mode = mode(PoolAddressing::Shared, 4);
+        for (label, tag) in [("a", 1_u8), ("b", 2)] {
+            let (_unit, hash) = seed(&mut mode, label, tag);
+            mode.convs.insert(label.to_string(), conv_holding(hash));
+            mode.recent.push(label.to_string());
+        }
+        mode.pin("a");
+        let t = mode.trim(&mut NoTenant).expect("trim must succeed");
+        assert_eq!(t.conversations, 1);
+        assert!(mode.convs.contains_key("a"), "running, it stays");
+        assert!(!mode.convs.contains_key("b"), "idle, it goes");
+    }
+
+    /// One conversation, one slot, and a running slot is not free: `begin` refuses both
+    /// before it touches the model or the pool.
+    #[test]
+    fn begin_refuses_a_second_slot_for_a_conversation_and_a_running_slot() {
+        let mut mode = mode(PoolAddressing::Shared, 4);
+        mode.active = Some("a".to_string());
+        mode.select_slot(1);
+        let err = mode
+            .begin(&mut NoTenant, None, None, "a", &[], 0, false, false)
+            .unwrap_err();
+        assert!(err.contains("another slot"), "{err}");
+
+        mode.select_slot(0);
+        mode.pin("a");
+        let err = mode
+            .begin(&mut NoTenant, None, None, "b", &[], 0, false, false)
+            .unwrap_err();
+        assert!(err.contains("running"), "{err}");
     }
 
     /// The contract `drain_lifecycle` states: one allocator transition, one backend
@@ -4062,7 +5731,7 @@ mod lifecycle_tests {
         mode.convs.insert("old".to_string(), conv_holding(hash));
         mode.recent.push("old".to_string());
         // Retain nothing beyond the incoming conversation, so "old" is dropped.
-        mode.resident_budget = 0;
+        mode.resident_budget = Some(0);
 
         let before = mode.advice_applied;
         mode.release_idle(&NoTenant, "new", &[], None, None)
@@ -4128,8 +5797,13 @@ mod tests {
             super::prompt_replay_boundary(4, 1518, 1518, 1472, 16, 64),
             Some(1472)
         );
+        // A model with no recurrent state anchors on its KV units alone: no bytes.
+        assert_eq!(
+            super::prompt_replay_boundary(0, 1518, 1518, 1472, 0, 64),
+            Some(1472)
+        );
         for (n, filled, prompt, at, bytes, grid) in [
-            (0, 1518, 1518, 1472, 0, 64),
+            (0, 1518, 1518, 1472, 16, 64),
             (4, 1536, 1518, 1472, 16, 64),
             (4, 1518, 1518, 1536, 16, 64),
             (4, 1518, 1518, 1473, 16, 64),

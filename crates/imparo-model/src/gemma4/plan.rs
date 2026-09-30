@@ -71,6 +71,18 @@ pub fn build(
                 "gemma4.expert_shared_feed_forward_length",
                 0,
             ),
+            // READ, NOT CHOSEN -- and nothing has checked them, because no gemma4 file
+            // in this tree declares experts and no workflow runs an MoE layer yet. The
+            // defaults are what a file that omits the key means, not a guess at Gemma's
+            // design.
+            gating: match u32_or(document, "gemma4.expert_gating_func", 1) {
+                2 => crate::ExpertGating::Sigmoid,
+                _ => crate::ExpertGating::Softmax,
+            },
+            normalise_weights: u32_or(document, "gemma4.expert_weights_norm", 0) != 0,
+            weights_scale: f32_opt(document, "gemma4.expert_weights_scale")
+                .unwrap_or(1.0),
+            expert_bias: document.tensor("blk.0.exp_probs_b.bias").is_some(),
         }
     } else {
         Ffn::Dense {
@@ -141,6 +153,7 @@ pub fn build(
         layers,
         decode_interleave: true,
         mega_decode: true,
+        drafter: None,
         output: OutputPlan {
             final_norm: true,
             logit_softcap: f32_opt(document, "gemma4.final_logit_softcapping"),

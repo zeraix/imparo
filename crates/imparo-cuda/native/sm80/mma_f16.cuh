@@ -9,6 +9,14 @@
 
 namespace imparo_sm80_mma {
 
+__device__ __forceinline__ __half2 movmatrix_transpose(__half2 value) {
+    int result;
+    const int bits = *reinterpret_cast<const int *>(&value);
+    asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;"
+        : "=r"(result) : "r"(bits));
+    return *reinterpret_cast<__half2 *>(&result);
+}
+
 struct Half16x8 {
     __half2 x[4];
 };

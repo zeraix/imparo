@@ -10,6 +10,8 @@
 [Design Rules](#design-rules) ·
 [Megakernel Decode](#megakernel-decode) ·
 [Performance](#performance) ·
+[SM86 Original vs Imparo](#sm86-original-runner-vs-imparo) ·
+[Bonsai CUDA Validation](#bonsai-cuda-validation) ·
 [Latest Updates](#latest-updates) ·
 [Quick Start](#quick-start) ·
 [Contributing](#contributing) ·
@@ -140,6 +142,106 @@ tok/s and imparo's lead over it.
 | LFM2 | 17123 | decode | **42.7** | 40.0 (+7%) | 40.8 (+5%) | 39.6 (+8%) |
 
 Ahead on every cell but one: LFM2's short-prompt decode ties oMLX (46.6 against 46.8).
+
+## SM86 original runner vs Imparo
+
+Here **original** means the reference runner without Imparo modifications: llama.cpp
+for E4B/LFM2 and the official Prism llama.cpp fork for Bonsai's PTQ format. Those
+runners retain their own optimizations. This is a comparison between engines,
+not a claim that the reference has all optimization disabled, and not the
+intermediate Imparo FFN A/B comparison.
+
+### E4B and LFM2
+
+RTX 3060 Laptop 6 GiB; latest available six-row matched comparison from
+2026-09-18. Speeds are token/s. Same input token IDs and 256 generated tokens;
+both engines enable speculation (E4B MTP, LFM2 DSpark). Two warm samples per
+engine in one fixed ABBA sequence; displayed values are arithmetic means.
+Imparo `37ff1f39`, llama.cpp `a2878d30` / build10909. These are retained
+measurements, **not reruns of the latest compatibility binary**. Cross-engine
+output text differs; output equivalence is not claimed.
+
+| Model | Input tokens | Original runner Prefill | Imparo Prefill | Original runner Decode | Imparo Decode | Complete request: original → Imparo (s) |
+|---|---:|---:|---:|---:|---:|---:|
+| E4B | 512 | 2282.90 | **3181.90** | 96.69 | **132.41** | 2.884 → **2.107** |
+| E4B | 6144 | 2117.11 | **3679.82** | 85.75 | **114.05** | 5.899 → **3.923** |
+| E4B | 16384 | 1930.89 | **3430.62** | 74.88 | **107.21** | 11.920 → **7.173** |
+| LFM2 | 512 | 3642.20 | **4498.64** | 145.58 | **206.21** | 1.905 → **1.375** |
+| LFM2 | 6144 | 3463.27 | **4304.80** | 131.78 | **160.83** | 3.732 → **3.028** |
+| LFM2 | 16384 | 3256.96 | **4069.69** | 106.78 | **139.04** | 7.443 → **5.884** |
+
+### Bonsai2-27B PTQ
+
+Only the official **46-input-token** short request has an existing original-runner
+measurement. Official baselines for 512/6144/16384 inputs have **not been measured**.
+At the user's request this documentation update runs no new benchmarks. Do not
+compare the 46-token row against a longer row or derive a speedup from them.
+
+| Input tokens | Original runner Prefill | Imparo Prefill | Original runner Decode | Imparo Decode | Original request (s) | Imparo request (s) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 46 | 12.92 | — | 1.201 | — | 50.219 | — |
+| 512 | Not measured | **88.72** | Not measured | **4.844** | Not measured | **32.016** |
+| 6144 | Not measured | **92.27** | Not measured | **3.986** | Not measured | **98.469** |
+| 16384 | Not measured | **87.72** | Not measured | **3.147** | Not measured | **227.156** |
+
+The official row is Prism `b10683-d8f26eec7`, automatic fit with 256 MiB margin,
+context 2048, batch 128, no speculation, 57 generated tokens. The optimized
+rows are measured Imparo `c4e3833f`, F16 KV, batch 128, no speculation, contexts
+768/6400/16640, and 128 generated tokens each (one cold observation per length).
+No latest-build Imparo result for the 46-token request is available. Final
+compatibility build `55cec6b5` has separate output/state/loading verification;
+these speed rows still belong to `c4e3833f`.
+
+[Recorded inputs, exact values and provenance](evidence/bonsai2-sm86-2026-09-19/original-vs-imparo.json)
+· [Full Bonsai validation and intermediate FFN A/B](docs/bonsai2-sm86-validation.md)
+
+## Bonsai CUDA validation
+
+**2026-09-19 · PR #14 branch results, not a public-main release.** Target:
+Ternary-Bonsai-2-27B PTQ1_0 on RTX 3060 Laptop 6 GiB (SM86), F16 KV,
+batch 128. **Not every optimization method has been experimentally tested.**
+Applicability review, a GPU prototype, full-model validation, and production
+admission are different evidence levels; the status below applies only to this model.
+
+| Method / route | What was actually verified |
+|---|---|
+| PTQ/BF16, Hadamard and grouped basis transforms | Adapted; independent numerical checks and full-model execution. These transforms are required model mathematics. |
+| Common placement, reserve, streaming and execution owners | Adapted and exercised in full requests; retains the existing architecture. |
+| DeltaNet, causal convolution, snapshots and restore | Adapted; output/state probes and full-model cold/split/reset evidence. |
+| HeadNorm/RoPE, last-position head and tail work elimination | Existing routes reused and observed; no isolated gain claimed for each one. |
+| Strided copies | GPU bitwise check and complete request A/B. |
+| PTQ Tensor Core FFN and non-FFN projections | Independent GPU checks; seven projection geometries and short/medium/long complete requests. M9–128; small-M/head/BF16 routes retain their own implementations. |
+| GQA6/D256 Decode and Prefill attention | Independent GPU checks and complete request comparisons; only the documented contiguous F16 domains. |
+| KV reservation, tuner/knob and receipt integration | Actual runtime selection and three request lengths verified; opt-in configuration, no global parameter sweep. |
+| Registered-host, two-slot weight prefetch | GPU numerical/reset checks and three-length A/B. Standalone long-context overall gain remains unproven and parked. |
+| Bounded PTQ→F16/cuBLAS FFN | Positive real-shape FFN small graph, then three-length full A/B; FP32 accumulation/output, bounded scratch, qualified SM86/M96–128 shapes only. |
+| Triton | Complete FFN small-graph prototype executed and numerical checks passed; register spilling and slower diagnostic timings led to retaining native CUDA. No full-model Triton integration or A/B. |
+| TensorRT | Import/environment check only. **No Bonsai TensorRT GPU compilation/performance experiment; no joint TensorRT–Triton experiment completed.** |
+| FlashInfer / Marlin | Source/mechanism and compatibility references. Existing native attention paths were adapted; neither library was integrated and benchmarked as a Bonsai PTQ backend. |
+| Alternative Q8 TM / W4A16 weight representations | Layout/math/memory applicability reviewed; no Bonsai full-model A/B. Bounded PTQ dequantization above is a separate tested implementation. |
+| Shared Hadamard reuse, extra RMS/Add or Delta/conv tail fusion | Reviewed and deferred; no independent Bonsai end-to-end gain measured. |
+| Split-K / Stream-K variants | Shape/CTA applicability reviewed; no new Bonsai performance experiment. Other models' gains are not inherited. |
+| CUDA Graph, full decoder mega-kernel and Program Pack | **Not adapted or benchmarked for Bonsai.** Recorded capture/integration blockers and measured bottlenecks informed deferral; this does not prove no future benefit. |
+| E4B cross-layer KV reuse / fixed E4B-LFM kernels | Not applicable to the current model semantics/shapes; no misleading cross-model gain claim. |
+| DSpark / MTP / tree verification | No compatible Bonsai drafter/state contract; not enabled or benchmarked for this model. |
+
+The [original-runner comparison above](#sm86-original-runner-vs-imparo) lists
+absolute speeds and missing original baselines. The separate [FFN A/B report](docs/bonsai2-sm86-validation.md)
+is an incremental comparison between two already optimized Imparo configurations;
+its earlier column must not be called original or unoptimized performance.
+The new provider requires source-built CUDA with cuBLAS; driver-only plugins
+do not support it.
+
+Admission uses independent numerical checks plus **limited quality non-regression**.
+The historical **4/6 absolute-quality failure remains recorded**. The new fixed
+64-token NLL check and state checks are not broad or long-context quality certification.
+E4B/LFM2 speculation OFF/ON compatibility checks also passed on the final build;
+those checks are not Bonsai speculation or new cross-engine performance results.
+
+See the [validation report](docs/bonsai2-sm86-validation.md),
+[portable results and runtime identities](evidence/bonsai2-sm86-2026-09-19/summary.json),
+[new-model selection workflow](docs/new-model-optimization.md), and
+[short handoff](handoff/sm86-optimization-toolchain.md).
 
 ## Latest Updates
 

@@ -14,9 +14,10 @@ use imparo_backend::BufId;
 
 use crate::ModelPlan;
 use crate::gpu_support::{
-    BufferRequirement, Placement, be, gprobe, gpu_probe_layer,
+    BufferRequirement, Placement, be, fuse_epilogue_enabled, gprobe, gpu_probe_layer,
     half_activation_mirror_requirements, kv_dequant_scratch_requirements, kvq_mask_on,
-    layer_skip_log, scores_needed, tail_align, tail_split, tail_split_min_rows,
+    layer_skip_log, scores_needed, should_fuse_epilogue, tail_align, tail_split,
+    tail_split_min_rows, trace_rows,
 };
 use crate::kv::{KvType, effective_workflow_kv_route, had_nrot, ring_mask};
 use crate::lfm2::Lfm2;
@@ -30,10 +31,32 @@ use crate::lfm2::workflow_cpu::MixerW;
 /// and PerLayer, which are gemma4's per-layer-embedding buffers.
 pub const BCX: BufId = BufId::Model0;
 
+#[doc(hidden)]
+pub use crate::window_history::enable_lfm_full_history_control;
+
 /// Admit optional device-owned layouts for LFM2 Down projections. The model
 /// supplies resolved offsets and shapes only; each backend decides whether the
 /// format is useful and unsupported backends preserve their established path.
 pub fn prepare_device(wf: &mut Lfm2) -> Result<(), String> {
+    // Explicit target preparation only: neither a process-wide native default
+    // nor a verification guard may change the independently owned DSpark draft.
+    if crate::lfm_retained_domain() != 0
+        || std::env::var("IMPARO_LAB_BATCH_INVARIANT_Q8_V1").as_deref() == Ok("1")
+    {
+        if std::env::var("IMPARO_LAB_VERIFY_M1_QUANT").as_deref() == Ok("1") {
+            return Err(
+                "BatchInvariantQ8V1 conflicts with the M1-quant diagnostic".into()
+            );
+        }
+        let admitted = be().prepare_batch_invariant_q8_v1().map_err(|rc| {
+            format!("target BatchInvariantQ8V1 preparation failed rc={rc}")
+        })?;
+        if !admitted {
+            return Err(
+                "target BatchInvariantQ8V1 is unsupported by this backend".into()
+            );
+        }
+    }
     if !be().quantized_weight_cache_enabled() {
         return Ok(());
     }
@@ -232,6 +255,44 @@ fn finite_history_tail(
     (start >= rows && start > 0).then_some((last_attention, start, rows))
 }
 
+#[cfg(feature = "cuda-speculative")]
+fn tree_graph_eligible(wf: &Lfm2, rows: u32, argmax: bool) -> bool {
+    // Match backend::active's static-CUDA composition, including its CPU opt-out.
+    // A feature flag or host_forward alone does not establish backend identity.
+    if rows != 16
+        || argmax
+        || wf.state.output_demand != crate::OutputDemand::RowArgmax
+        || wf.state.host_forward
+        || !crate::backend::gpu_requested_from_env()
+        || std::env::var("IMPARO_BACKEND").is_ok_and(|v| v == "cpu")
+        || wf.state.pipe.is_some()
+        || !wf.state.queued.is_empty()
+        || wf.state.recur_planes != 1
+        || wf.state.recur_plane != 0
+        || wf.state.recur_plane_next != 0
+        || wf.state.recur_snap.is_some()
+        || wf.state.verification_prefix_tokens != 0
+        || std::env::var_os("IMPARO_GPU_PROBE").is_some()
+        || gpu_probe_layer() != usize::MAX
+        || std::env::var_os("IMPARO_CUDA_PROFILE_FORWARD").is_some()
+    {
+        return false;
+    }
+    // Native replay republishes only DSpark's host feature metadata. An arbitrary
+    // observer cannot be skipped, even if a DSpark session also happens to exist.
+    wf.state.layer_outputs.as_ref().is_some_and(|capture| {
+        capture.attached()
+            && capture.active()
+            && !capture.layers.is_empty()
+            && capture.layers.windows(2).all(|pair| pair[0] < pair[1])
+            && capture
+                .layers
+                .last()
+                .is_some_and(|&layer| (layer as usize) < wf.plan.layers.len())
+            && capture.capture.is_native_dspark()
+    })
+}
+
 /// LFM2's layer graph on the device.
 ///
 /// ```text
@@ -260,6 +321,8 @@ pub fn batch(
     out: &mut Vec<f32>,
     argmax: bool,
 ) -> Result<(), String> {
+    let full_history_control =
+        crate::window_history::lfm_full_history_control_enabled();
     let c = wf.plan.config.clone();
     let kv_quant_route = effective_workflow_kv_route(
         &wf.plan,
@@ -283,7 +346,9 @@ pub fn batch(
     // of whether a feature subscriber is active. Otherwise attaching a drafter
     // changes the target's attention/FFN shapes before verification even begins.
     let post_layer_tail = b > 1
-        && std::env::var("IMPARO_LAB_CAPTURE_AWARE_PREFILL_TAIL").as_deref() == Ok("1");
+        && (crate::lfm_retained_domain() != 0
+            || std::env::var("IMPARO_LAB_CAPTURE_AWARE_PREFILL_TAIL").as_deref()
+                == Ok("1"));
     let row_argmax = wf.state.output_demand == crate::OutputDemand::RowArgmax;
     let greedy_return =
         wf.state.output_demand == crate::OutputDemand::GreedyVerification;
@@ -295,6 +360,26 @@ pub fn batch(
     {
         return Err(
             "device greedy verification requires admitted complete prefix state".into(),
+        );
+    }
+    if row_argmax && !be().supports_argmax_rows() {
+        return Err("row argmax is not served by this backend".into());
+    }
+    // A ROW-LAYOUT BATCH (a tree): positions, visibility and conv ancestors come from
+    // BufId::RowLayout. It keeps every row, reads an f16 cache, and writes each row's
+    // recurrent state aside instead of advancing the live one.
+    let row_layout = wf.state.row_layout;
+    if row_layout != 0
+        && (row_layout != b
+            || !all_logits
+            || KvType::k() != KvType::F16
+            || KvType::v() != KvType::F16
+            || wf.state.verification_prefix_tokens != 0
+            || wf.state.recur_snap.is_some())
+    {
+        return Err(
+            "a row-layout batch keeps every row, reads an f16 cache and takes no other snapshot"
+                .into(),
         );
     }
     let last_logits = wf.state.output_demand == crate::OutputDemand::LastToken;
@@ -323,6 +408,16 @@ pub fn batch(
     };
     let sp = u32::try_from(start_pos).map_err(|_| "start_pos too large")?;
     let recur = wf.plan.recurrent_layout();
+    // A tree forward keeps every node's input to each convolution window in RowInputs, where the
+    // commit reads them back.
+    let row_inputs = if row_layout != 0 {
+        Some(crate::verification::RowInputLayout::of(
+            &wf.plan,
+            &super::plan::conv_windows(&wf.plan),
+        )?)
+    } else {
+        None
+    };
     let act = wf.plan.layers[0].ffn.activation().epilogue();
     // Activation aliases and scratch ranges are planned for the live batch width.
     // Recurrent state and KV are allocated separately and survive this resize.
@@ -381,6 +476,28 @@ pub fn batch(
     if !pipe.is_some_and(|p| p.token_on_device) {
         be().write_u32(BufId::Tokens, 0, tokens);
     }
+    #[cfg(feature = "cuda-speculative")]
+    let (tree_graph_capture, tree_graph_flush) = if tree_graph_eligible(wf, b, argmax) {
+        // Preserve bounded-flush bookkeeping on both ordinary and replay paths.
+        // Static CUDA's flush is a no-op; a nonzero layer seat is still eligible.
+        let flush = crate::gpu_support::flush_layers_bounded(b, wf.plan.layers.len());
+        match unsafe { imparo_cuda::tree::graph_prepare()? } {
+            imparo_cuda::tree::TreeGraphSubmission::Ordinary => (None, Some(flush)),
+            imparo_cuda::tree::TreeGraphSubmission::Capture(capture) => {
+                (Some(capture), Some(flush))
+            }
+            imparo_cuda::tree::TreeGraphSubmission::Replayed => {
+                be().end()
+                    .map_err(|rc| format!("lfm2 tree graph replay failed rc={rc}"))?;
+                crate::gpu_support::prefill_region_ended();
+                out.resize(16, 0.0);
+                be().read(BufId::Tmp, 0, out);
+                return Ok(());
+            }
+        }
+    } else {
+        (None, None)
+    };
     let embd_kind = wkind(&wf.w.token_embd);
     let embd_off = wf.w.token_embd.offset as u64;
     let gathered = be().gather_rows(
@@ -422,6 +539,10 @@ pub fn batch(
     };
 
     let n_layers_total = wf.plan.layers.len();
+    #[cfg(feature = "cuda-speculative")]
+    let flush_every = tree_graph_flush
+        .unwrap_or_else(|| crate::gpu_support::flush_layers_bounded(b, n_layers_total));
+    #[cfg(not(feature = "cuda-speculative"))]
     let flush_every = crate::gpu_support::flush_layers_bounded(b, n_layers_total);
     let tail = if last_logits && !layer_outputs && !post_layer_tail && b >= 128 {
         tail_split(b, tail_align())
@@ -434,7 +555,8 @@ pub fn batch(
         } else {
             None
         };
-    let proposed_history_tail = if !all_logits
+    let proposed_history_tail = if !full_history_control
+        && !all_logits
         && (!layer_outputs || post_layer_tail)
         && gpu_probe_layer() == usize::MAX
     {
@@ -698,7 +820,22 @@ pub fn batch(
                     BufId::V,
                     b,
                 );
-                if li == gpu_probe_layer() {
+                if row_layout != 0 {
+                    // Each row ropes at its own layout position. The cache is f16 (checked
+                    // above), so there is no rotation; K is done here with Q.
+                    for (buf, norm, heads) in [
+                        (BufId::Q, q_norm.offset, n_head),
+                        (BufId::K, k_norm.offset, n_kv),
+                    ] {
+                        if !be().head_norm_rope_rows(
+                            buf, norm, hd, eps, heads, b, rope_dim, rope_base, None,
+                        ) {
+                            return Err(format!(
+                                "row-layout head norm and rope not served at layer {li}"
+                            ));
+                        }
+                    }
+                } else if li == gpu_probe_layer() {
                     // Preserve the individually observable operations on the requested
                     // probe layer. Other layers use the backend semantic fusion hook;
                     // its default implementation is this exact three-operation sequence.
@@ -753,7 +890,7 @@ pub fn batch(
                         ring,
                     );
                 if !direct_kv {
-                    if li != gpu_probe_layer() {
+                    if li != gpu_probe_layer() && row_layout == 0 {
                         be().head_norm_rope_hadamard(
                             BufId::K,
                             k_norm.offset,
@@ -864,21 +1001,42 @@ pub fn batch(
                         b = bt;
                     }
                 }
-                be().attention(
-                    li as u32,
-                    hd,
-                    n_head,
-                    n_kv,
-                    kw,
-                    sp,
-                    1.0 / (hd as f32).sqrt(),
-                    // LFM2.5 carries no sliding window. A file that set one would plan
-                    // Attention::Window, and this arm would not match it.
-                    0,
-                    b,
-                    scores_needed(sp, b, 0),
-                    ring,
-                );
+                if row_layout != 0 {
+                    if ring != 0
+                        || !be().attention_rows(
+                            li as u32,
+                            hd,
+                            n_head,
+                            n_kv,
+                            kw,
+                            sp,
+                            0,
+                            1.0 / (hd as f32).sqrt(),
+                            b,
+                            crate::verification::tree_float_q(),
+                        )
+                    {
+                        return Err(format!(
+                            "row-layout attention not served at layer {li}"
+                        ));
+                    }
+                } else {
+                    be().attention(
+                        li as u32,
+                        hd,
+                        n_head,
+                        n_kv,
+                        kw,
+                        sp,
+                        1.0 / (hd as f32).sqrt(),
+                        // LFM2.5 carries no sliding window. A file that set one would plan
+                        // Attention::Window, and this arm would not match it.
+                        0,
+                        b,
+                        scores_needed(sp, b, 0),
+                        ring,
+                    );
+                }
                 if KvType::v() != KvType::F16 {
                     be().hadamard(
                         BufId::Attn,
@@ -916,6 +1074,7 @@ pub fn batch(
                 let kern = u32::try_from(conv.w.len() / n_embd as usize)
                     .map_err(|_| "conv kernel width")?;
                 let projected_shortconv = plane_in == plane_out
+                    && row_layout == 0
                     && recurrent_snapshot.is_none()
                     && verification_prefix_tokens == 0
                     && std::env::var_os("IMPARO_GPU_PROBE").is_none()
@@ -946,50 +1105,86 @@ pub fn batch(
                         gprobe("conv.in_proj", BCX, 0, (3 * n_embd) as usize);
                         gprobe("conv.in_proj_full", BCX, 0, (b * 3 * n_embd) as usize);
                     }
-                    if let Some(k) = recurrent_snapshot {
-                        be().causal_conv_snapshot(
+                    if row_layout != 0 {
+                        // Each row reads its own path and the live state is only read. Each
+                        // row's input to the window goes aside to RowInputs for the commit.
+                        let inputs_off = row_inputs
+                            .as_ref()
+                            .and_then(|layout| layout.input_off(li))
+                            .ok_or_else(|| {
+                                format!("layer {li} has no row-input window")
+                            })?;
+                        let row_elems =
+                            row_inputs.as_ref().map_or(0, |layout| layout.row_elems);
+                        if !be().causal_conv_row_inputs(
                             imparo_backend::ConvForm::GatedBcx,
                             BCX,
+                            BufId::RowInputs,
+                            inputs_off,
+                            row_elems,
+                            n_embd,
+                            b,
+                        ) || !be().causal_conv_rows(
+                            imparo_backend::ConvForm::GatedBcx,
+                            BCX,
+                            conv.offset,
                             BufId::Recur,
                             r_off + plane_in,
-                            BufId::RecurSnap,
-                            r_off,
+                            BufId::Attn,
                             n_embd,
                             kern,
-                            k,
-                        );
-                    }
-                    if verification_prefix_tokens != 0 {
-                        for k in 1..b {
-                            let snap_off = ((u64::from(k) + 1)
-                                * verification_recurrent_elems
-                                + u64::from(r_off))
-                                as u32;
+                            b,
+                        ) {
+                            return Err(format!(
+                                "row-layout short convolution not served at layer {li}"
+                            ));
+                        }
+                    } else {
+                        if let Some(k) = recurrent_snapshot {
                             be().causal_conv_snapshot(
                                 imparo_backend::ConvForm::GatedBcx,
                                 BCX,
                                 BufId::Recur,
                                 r_off + plane_in,
                                 BufId::RecurSnap,
-                                snap_off,
+                                r_off,
                                 n_embd,
                                 kern,
                                 k,
                             );
                         }
+                        if verification_prefix_tokens != 0 {
+                            for k in 1..b {
+                                let snap_off = ((u64::from(k) + 1)
+                                    * verification_recurrent_elems
+                                    + u64::from(r_off))
+                                    as u32;
+                                be().causal_conv_snapshot(
+                                    imparo_backend::ConvForm::GatedBcx,
+                                    BCX,
+                                    BufId::Recur,
+                                    r_off + plane_in,
+                                    BufId::RecurSnap,
+                                    snap_off,
+                                    n_embd,
+                                    kern,
+                                    k,
+                                );
+                            }
+                        }
+                        be().causal_conv(
+                            imparo_backend::ConvForm::GatedBcx,
+                            BCX,
+                            conv.offset,
+                            BufId::Recur,
+                            r_off + plane_in,
+                            r_off + plane_out,
+                            BufId::Attn,
+                            n_embd,
+                            kern,
+                            b,
+                        );
                     }
-                    be().causal_conv(
-                        imparo_backend::ConvForm::GatedBcx,
-                        BCX,
-                        conv.offset,
-                        BufId::Recur,
-                        r_off + plane_in,
-                        r_off + plane_out,
-                        BufId::Attn,
-                        n_embd,
-                        kern,
-                        b,
-                    );
                 }
                 // ShortConv advances the recurrent state. On a non-final Prefill
                 // chunk, the last layer's out projection and FFN are dead once that
@@ -1386,17 +1581,11 @@ pub fn batch(
             .map_err(|rc| format!("lfm2 pipelined step failed rc={rc}"));
     }
     if row_argmax {
-        #[cfg(feature = "cuda-speculative")]
-        unsafe {
-            imparo_cuda::tree::argmax_rows(
-                BufId::Logits as u32,
-                BufId::Tmp as u32,
-                c.vocab_size,
-                b,
-            );
-        }
-        #[cfg(not(feature = "cuda-speculative"))]
-        return Err("row argmax requires the admitted CUDA adapter".into());
+        be().argmax_rows(BufId::Logits, BufId::Tmp, c.vocab_size, b);
+    }
+    #[cfg(feature = "cuda-speculative")]
+    if let Some(capture) = tree_graph_capture {
+        capture.finish()?;
     }
     if greedy_return {
         be().verify_greedy_and_restore(
@@ -1434,6 +1623,453 @@ pub fn batch(
     Ok(())
 }
 
+/// One co-batched decode step (docs/continuous-batching.md): row r decodes `rows[r].token` in
+/// slot `rows[r].slot` at `rows[r].pos`. The operations are the one-row dispatch path's, in its
+/// order. The projections, norms and FFN take all rows at once, on the step's route
+/// (`WorkflowState::row_route`, `Backend::set_decode_rows`): on the exact route every row gets
+/// the one-row decode's arithmetic, so its logits are bit-equal to its lone step on the dispatch
+/// path; on the fast route the backend picks the kernel for the row count. Each operation that
+/// touches one conversation's own state -- head norm and rope at the row's position, the KV
+/// store, attention over the row's cache, the convolution step on the row's slot -- is handed
+/// every row with its position and slot.
+///
+/// # Errors
+/// For a quantized cache, a backend without decode rows or a per-row operation, or a device
+/// failure.
+pub fn rows(
+    wf: &mut Lfm2,
+    rows: &[crate::DecodeRow],
+    logits: Option<&mut Vec<f32>>,
+    picks: &mut Vec<u32>,
+) -> Result<(), String> {
+    if KvType::k() != KvType::F16 || KvType::v() != KvType::F16 {
+        return Err("co-batched decode reads an f16 cache only".into());
+    }
+    if !be().supports_argmax_rows() {
+        return Err("co-batched decode needs a per-row argmax".into());
+    }
+    let b = u32::try_from(rows.len()).map_err(|_| "too many co-batched rows")?;
+    let most = be().decode_rows_max(wf.state.row_route);
+    if rows.len() > most {
+        return Err(format!(
+            "{} co-batched rows; the {:?} route serves at most {most}",
+            rows.len(),
+            wf.state.row_route
+        ));
+    }
+    // Every row's logits are live: the lm head writes one row per conversation.
+    wf.state.output_demand = crate::OutputDemand::AllTokens;
+    let fit = wf.gpu_fit_batch(rows.len());
+    wf.state.output_demand = crate::OutputDemand::LastToken;
+    fit?;
+    if !be().set_decode_rows(Some(wf.state.row_route)) {
+        return Err("the backend has no decode rows".into());
+    }
+    let encoded = encode_rows(wf, rows, b);
+    be().set_decode_rows(None);
+    encoded?;
+    let mut got = vec![0.0_f32; rows.len()];
+    be().read(BufId::Tmp, 0, &mut got);
+    picks.clear();
+    picks.extend(got.iter().map(|v| v.to_bits()));
+    if let Some(out) = logits {
+        out.resize(rows.len() * wf.plan.config.vocab_size as usize, 0.0);
+        be().read(BufId::Logits, 0, out);
+    }
+    Ok(())
+}
+
+/// The graph of [`rows`], ending with the per-row argmax in `BufId::Tmp`.
+fn encode_rows(wf: &Lfm2, rows: &[crate::DecodeRow], b: u32) -> Result<(), String> {
+    let c = &wf.plan.config;
+    let n_embd = c.n_embd;
+    let n_head = c.n_heads;
+    let n_kv = c.n_kv_heads;
+    let n_ff = c.n_ff;
+    let eps = c.norm_eps;
+    let wkind = |t: &imparo_gguf::weights::Tensor| {
+        imparo_gguf::weights::weight_kind(t.ggml_type).expect("validated at load")
+            as u32
+    };
+    let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
+    let pos: Vec<u32> = rows.iter().map(|r| r.pos).collect();
+    let slot_rows: Vec<imparo_backend::SlotRow> = rows
+        .iter()
+        .map(|r| imparo_backend::SlotRow {
+            slot: r.slot,
+            pos: r.pos,
+        })
+        .collect();
+    let recur = wf.plan.recurrent_layout();
+    let recur_elems = wf.plan.recurrent_elems();
+
+    be().begin_forward(false);
+    be().write_u32(BufId::Tokens, 0, &tokens);
+    let embd_kind = wkind(&wf.w.token_embd);
+    let embd_off = wf.w.token_embd.offset as u64;
+    if !be().gather_rows(
+        embd_kind,
+        embd_off,
+        n_embd,
+        c.vocab_size,
+        1.0,
+        BufId::X,
+        0,
+        BufId::Tokens,
+        b,
+    ) {
+        for (t, &tok) in tokens.iter().enumerate() {
+            be().row(
+                embd_kind,
+                embd_off,
+                n_embd,
+                tok,
+                1.0,
+                BufId::X,
+                t as u32 * n_embd,
+            );
+        }
+    }
+    trace_rows("embd", 0, BufId::X, b, n_embd);
+    let n_layers = wf.plan.layers.len();
+    // The decode seat: every row is a decode row.
+    let flush_every = crate::gpu_support::flush_layers_bounded(1, n_layers);
+    let mut operator_norm_ready = false;
+    for (li, (layer, &(r_off, _, _, _))) in
+        wf.plan.layers.iter().zip(recur.iter()).enumerate()
+    {
+        let lw = &wf.w.layers[li];
+        if !operator_norm_ready {
+            be().rms_norm_from(
+                BufId::Cur,
+                BufId::X,
+                lw.op_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+            );
+        }
+        trace_rows("opnorm", li, BufId::Cur, b, n_embd);
+        match (&lw.mixer, layer.attention) {
+            (
+                MixerW::Attention {
+                    q_norm,
+                    k_norm,
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                },
+                crate::Attention::Full {
+                    head_dim: hd,
+                    rope_base,
+                    rope_dim,
+                },
+            ) => {
+                let qw = n_head * hd;
+                let kw = n_kv * hd;
+                be().matmat(
+                    wkind(wq),
+                    wq.offset as u64,
+                    n_embd,
+                    qw,
+                    BufId::Cur,
+                    BufId::Q,
+                    b,
+                );
+                be().matmat(
+                    wkind(wk),
+                    wk.offset as u64,
+                    n_embd,
+                    kw,
+                    BufId::Cur,
+                    BufId::K,
+                    b,
+                );
+                be().matmat(
+                    wkind(wv),
+                    wv.offset as u64,
+                    n_embd,
+                    kw,
+                    BufId::Cur,
+                    BufId::V,
+                    b,
+                );
+                let ring = ring_mask(layer.attention, wf.state.kv_ring_batch);
+                let max_scores: Vec<u32> =
+                    pos.iter().map(|&p| scores_needed(p, 1, 0)).collect();
+                let served = be().head_norm_rope_at(
+                    BufId::Q,
+                    q_norm.offset,
+                    hd,
+                    eps,
+                    n_head,
+                    &pos,
+                    rope_dim,
+                    rope_base,
+                    None,
+                ) && be().head_norm_rope_at(
+                    BufId::K,
+                    k_norm.offset,
+                    hd,
+                    eps,
+                    n_kv,
+                    &pos,
+                    rope_dim,
+                    rope_base,
+                    None,
+                ) && be().kv_store_slot_rows(
+                    BufId::K,
+                    li as u32,
+                    kw,
+                    &slot_rows,
+                    false,
+                    ring,
+                ) && be().kv_store_slot_rows(
+                    BufId::V,
+                    li as u32,
+                    kw,
+                    &slot_rows,
+                    true,
+                    ring,
+                ) && be().attention_slot_rows(
+                    li as u32,
+                    hd,
+                    n_head,
+                    n_kv,
+                    kw,
+                    1.0 / (hd as f32).sqrt(),
+                    0,
+                    &slot_rows,
+                    &max_scores,
+                    ring,
+                );
+                if !served {
+                    return Err(format!(
+                        "co-batched attention not served at layer {li}"
+                    ));
+                }
+                be().matmat(
+                    wkind(wo),
+                    wo.offset as u64,
+                    qw,
+                    n_embd,
+                    BufId::Attn,
+                    BufId::O,
+                    b,
+                );
+            }
+            (
+                MixerW::ShortConv {
+                    conv,
+                    in_proj,
+                    out_proj,
+                },
+                crate::Attention::Recurrent { .. },
+            ) => {
+                let kern = u32::try_from(conv.w.len() / n_embd as usize)
+                    .map_err(|_| "conv kernel width")?;
+                be().matmat(
+                    wkind(in_proj),
+                    in_proj.offset as u64,
+                    n_embd,
+                    3 * n_embd,
+                    BufId::Cur,
+                    BCX,
+                    b,
+                );
+                trace_rows("in_proj", li, BCX, b, 3 * n_embd);
+                let conv_rows: Vec<imparo_backend::SlotStateRow> = rows
+                    .iter()
+                    .map(|r| imparo_backend::SlotStateRow {
+                        slot: r.slot,
+                        state_off: r_off + r.plane_in * recur_elems,
+                        state_out_off: r_off + r.plane_out * recur_elems,
+                    })
+                    .collect();
+                if !be().causal_conv_slot_rows(
+                    imparo_backend::ConvForm::GatedBcx,
+                    BCX,
+                    conv.offset,
+                    BufId::Recur,
+                    &conv_rows,
+                    BufId::Attn,
+                    n_embd,
+                    kern,
+                ) {
+                    return Err(format!(
+                        "co-batched convolution not served at layer {li}"
+                    ));
+                }
+                trace_rows("conv", li, BufId::Attn, b, n_embd);
+                be().matmat(
+                    wkind(out_proj),
+                    out_proj.offset as u64,
+                    n_embd,
+                    n_embd,
+                    BufId::Attn,
+                    BufId::O,
+                    b,
+                );
+            }
+            (_, a) => {
+                return Err(format!(
+                    "lfm2 layer {li}: plan says {a:?} but the weights resolved otherwise"
+                ));
+            }
+        }
+        trace_rows("mix", li, BufId::O, b, n_embd);
+        if !be().add_rms_norm(
+            BufId::Cur,
+            BufId::X,
+            BufId::O,
+            lw.ffn_norm.offset,
+            n_embd,
+            eps,
+            b,
+            n_embd,
+            0,
+        ) {
+            be().add(BufId::X, BufId::O, b * n_embd);
+            be().rms_norm_from(
+                BufId::Cur,
+                BufId::X,
+                lw.ffn_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+            );
+        }
+        let fused_ffn = be().ffn_gated_down(
+            wkind(&lw.ffn_gate),
+            lw.ffn_gate.offset as u64,
+            wkind(&lw.ffn_up),
+            lw.ffn_up.offset as u64,
+            wkind(&lw.ffn_down),
+            lw.ffn_down.offset as u64,
+            n_embd,
+            n_ff,
+            n_embd,
+            BufId::Cur,
+            BufId::G,
+            BufId::O,
+            b,
+        );
+        if !fused_ffn {
+            let fused_pair = be().matmat_gated(
+                wkind(&lw.ffn_gate),
+                lw.ffn_gate.offset as u64,
+                wkind(&lw.ffn_up),
+                lw.ffn_up.offset as u64,
+                n_embd,
+                n_ff,
+                BufId::Cur,
+                BufId::G,
+                BufId::U,
+                b,
+            );
+            if !fused_pair {
+                // No activation epilogue on the up projection: a one-row decode never fuses it.
+                be().matmat(
+                    wkind(&lw.ffn_gate),
+                    lw.ffn_gate.offset as u64,
+                    n_embd,
+                    n_ff,
+                    BufId::Cur,
+                    BufId::G,
+                    b,
+                );
+                be().matmat(
+                    wkind(&lw.ffn_up),
+                    lw.ffn_up.offset as u64,
+                    n_embd,
+                    n_ff,
+                    BufId::Cur,
+                    BufId::U,
+                    b,
+                );
+                be().act_mul(BufId::G, BufId::U, b * n_ff);
+            }
+            be().matmat(
+                wkind(&lw.ffn_down),
+                lw.ffn_down.offset as u64,
+                n_ff,
+                n_embd,
+                BufId::G,
+                BufId::O,
+                b,
+            );
+        }
+        operator_norm_ready = li + 1 < n_layers
+            && be().add_rms_norm(
+                BufId::Cur,
+                BufId::X,
+                BufId::O,
+                wf.w.layers[li + 1].op_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+            );
+        if !operator_norm_ready {
+            be().add(BufId::X, BufId::O, b * n_embd);
+        }
+        trace_rows("ffn", li, BufId::O, b, n_embd);
+        trace_rows("out", li, BufId::X, b, n_embd);
+        if flush_every > 0 && (li + 1) % flush_every == 0 && li + 1 < n_layers {
+            be().flush();
+        }
+    }
+    be().rms_norm(BufId::X, wf.w.output_norm.offset, n_embd, eps, b, n_embd, 0);
+    be().matmat_from(
+        embd_kind,
+        embd_off,
+        n_embd,
+        c.vocab_size,
+        BufId::X,
+        BufId::Logits,
+        b,
+        0,
+    );
+    if let Some(cap) = wf.plan.output.logit_softcap {
+        be().softcap(BufId::Logits, cap, b * c.vocab_size);
+    }
+    // A row whose step ends on a checkpoint boundary keeps its state there: its slot's
+    // snapshot twin takes a copy of the plane the step wrote, as a one-row decode's
+    // external snapshot does (`finish_decode_snapshot`).
+    if rows.iter().any(|r| r.snap) {
+        for r in rows.iter().filter(|r| r.snap) {
+            if !be().select_slot(r.slot) {
+                return Err(format!(
+                    "co-batched snapshot: slot {} not selected",
+                    r.slot
+                ));
+            }
+            be().copy_range(
+                BufId::RecurSnap,
+                0,
+                BufId::Recur,
+                r.plane_out * recur_elems,
+                recur_elems,
+            );
+        }
+        if !be().select_slot(wf.state.slot) {
+            return Err(format!(
+                "co-batched snapshot: slot {} not selected",
+                wf.state.slot
+            ));
+        }
+    }
+    be().argmax_rows(BufId::Logits, BufId::Tmp, c.vocab_size, b);
+    be().end()
+        .map_err(|rc| format!("lfm2 co-batched step failed rc={rc}"))
+}
+
 /// Preserve the boundary state only after all recurrent layers have advanced.
 /// Both a newly captured graph and a replay finish before this copy; no snapshot
 /// node can then overwrite the saved boundary during later unarmed replays.
@@ -1448,29 +2084,6 @@ fn finish_decode_snapshot(wf: &Lfm2, external: bool) -> Result<(), String> {
         .ok_or("LFM2 snapshot plane overflow")?;
     be().copy_range_after_forward(BufId::RecurSnap, 0, BufId::Recur, offset, n)
         .map_err(|rc| format!("LFM2 decode snapshot failed rc={rc}"))
-}
-
-fn should_fuse_epilogue(n_tok: u32, backend_supports_activation: bool) -> bool {
-    if !fuse_epilogue_enabled() {
-        return false;
-    }
-    n_tok > 1 && backend_supports_activation
-}
-
-/// IMPARO_FUSE_EPILOGUE=0 issues the two projections and a separate `act_mul` instead,
-/// which is what llama.cpp does (two `mul_mat`s and a GLU op).
-///
-/// The two are not the trade they look like. Fusing moves FEWER bytes -- the up
-/// projection reads the gate output and writes once, where the split path writes the up
-/// output, then reads both and writes again -- but on the Metal Q8 GEMM it forces the
-/// MASKED write-back for every one of those dispatches, because the predicate-free route
-/// requires `epilogue == 0`. That path spills the accumulators through threadgroup
-/// memory, barriers, and finishes with a SCALAR per-element read-modify-write where the
-/// unfused route ends in a vector `simdgroup_store`. Which side wins is a measurement,
-/// and it had never been made on this model.
-fn fuse_epilogue_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("IMPARO_FUSE_EPILOGUE").map_or(true, |v| v != "0"))
 }
 
 #[cfg(test)]
@@ -1528,6 +2141,52 @@ mod tests {
 
     /// LFM2.5-2.6B's real geometry, small enough to write down: 30 blocks, 8 attention at
     /// [2,5,9,13,17,21,24,27] and 22 recurrent, n_embd 2048, head_dim 64, l_cache 3.
+    #[test]
+    fn a_paired_drafters_caches_follow_the_targets() {
+        let target = plan();
+        let paired = ModelPlan {
+            drafter: Some(crate::DrafterPlan {
+                layers: 5,
+                kv_heads: 8,
+                head_dim: 64,
+                taps: vec![2, 9, 17, 21, 27],
+            }),
+            ..target.clone()
+        };
+        let (positions, capacity, ring_batch) = (1000, 4096, 512);
+        let bytes = crate::kv::kv_bytes_for(&paired, positions, capacity, ring_batch);
+        let layout = crate::kv::kv_layout_for(&paired, positions, capacity, ring_batch);
+        assert_eq!(paired.kv_layer_count(), 35);
+        assert_eq!((bytes.len(), layout.len()), (35, 35));
+        // The target's entries do not move.
+        assert_eq!(
+            bytes[..30],
+            crate::kv::kv_bytes_for(&target, positions, capacity, ring_batch)[..]
+        );
+        // Each drafter cache is sized as a target full-attention layer of the same width
+        // (8 KV heads x 64 in both).
+        let attention = target
+            .layers
+            .iter()
+            .find(|l| l.attention.is_attention())
+            .expect("LFM2 has attention layers")
+            .index as usize;
+        for index in 30..35 {
+            assert_eq!(bytes[index], bytes[attention]);
+            assert_eq!(layout[index].layer, index as u32);
+            assert_eq!(layout[index].logical_slots, layout[attention].logical_slots);
+            assert_eq!(layout[index].k_stride, layout[attention].k_stride);
+            assert_eq!(layout[index].v_stride, layout[attention].v_stride);
+        }
+        assert_eq!(
+            crate::kv::drafter_kv_bytes_per_token(&paired),
+            5 * (layout[attention].k_stride + layout[attention].v_stride)
+        );
+        assert_eq!(crate::kv::drafter_kv_bytes_per_token(&target), 0);
+        assert_eq!(paired.draft_feature_bytes(512), 512 * 5 * 2048 * 4);
+        assert_eq!(target.draft_feature_bytes(512), 0);
+    }
+
     fn plan() -> ModelPlan {
         let attention_at = [2u32, 5, 9, 13, 17, 21, 24, 27];
         let layers = (0..30u32)
@@ -1578,6 +2237,7 @@ mod tests {
             layers,
             decode_interleave: true,
             mega_decode: true,
+            drafter: None,
             output: OutputPlan {
                 final_norm: true,
                 logit_softcap: None,
@@ -1686,9 +2346,9 @@ mod tests {
 
     #[test]
     fn lfm2_fuses_only_when_the_backend_supports_silu() {
-        assert!(!super::should_fuse_epilogue(1, true));
-        assert!(!super::should_fuse_epilogue(128, false));
-        assert!(super::should_fuse_epilogue(128, true));
+        assert!(!crate::gpu_support::should_fuse_epilogue(1, true));
+        assert!(!crate::gpu_support::should_fuse_epilogue(128, false));
+        assert!(crate::gpu_support::should_fuse_epilogue(128, true));
     }
 
     #[test]
@@ -1706,6 +2366,43 @@ mod tests {
             )
             .len(),
             0
+        );
+    }
+
+    /// The pool's device tier from the fit's KV tier, on LFM2's geometry (8 pooled layers,
+    /// 1024-byte rows: one block is 1 MiB across the pooled layers, K and V).
+    #[test]
+    fn the_pool_tier_follows_the_kv_tier_and_never_drops_below_one_context() {
+        use crate::kv::pool_capacity_blocks;
+        let plan = plan();
+        let (ctx, batch) = (8192, 512);
+        let one_context = ctx / imparo_kv::page_cells();
+        let block: u64 = 8 * 2 * 64 * 1024;
+        let reserve = crate::placement::kv_reserve_bytes(&plan, ctx, batch);
+        // No tier: one conversation at the configured context.
+        assert_eq!(
+            pool_capacity_blocks(&plan, ctx, batch, None, None),
+            one_context
+        );
+        // A tier of exactly the reserve holds one context; ten blocks' worth more adds ten.
+        assert_eq!(
+            pool_capacity_blocks(&plan, ctx, batch, Some(reserve), None),
+            one_context
+        );
+        assert_eq!(
+            pool_capacity_blocks(&plan, ctx, batch, Some(reserve + 10 * block), None),
+            one_context + 10
+        );
+        // A tier smaller than the reserve still holds one context: the fit guarantees it.
+        assert_eq!(
+            pool_capacity_blocks(&plan, ctx, batch, Some(block), None),
+            one_context
+        );
+        // One layer side may not pass the largest view: 100 blocks of 64 KiB rows.
+        let (small_ctx, view) = (4096, 100 * 64 * 1024);
+        assert_eq!(
+            pool_capacity_blocks(&plan, small_ctx, batch, Some(1 << 40), Some(view)),
+            100
         );
     }
 }

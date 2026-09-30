@@ -58,6 +58,26 @@ pub trait PoolTenant {
     /// Install per-layer block tables, so reads follow the pool's placement.
     fn kv_apply_tables(&self, tables: &BTreeMap<u32, Vec<u32>>);
 
+    /// Make the device storage reach `blocks` blocks -- one past the highest block the pool
+    /// has handed out -- before anything writes them (docs/memory-tiers-and-fit.md
+    /// section 12). A tenant whose storage is sized once has nothing to do.
+    ///
+    /// # Errors
+    /// When the device cannot commit the storage.
+    fn kv_commit_blocks(&mut self, _blocks: usize) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Shrink the device storage to `blocks` blocks once the pool holds nothing above them
+    /// (`PoolMode::trim`), so the pages above go back to the system. A tenant whose
+    /// storage is sized once has nothing to give back.
+    ///
+    /// # Errors
+    /// When the device cannot replace its storage with the smaller one.
+    fn kv_release_blocks(&mut self, _blocks: usize) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Point the windowed rings at one region of the ring arena.
     fn kv_apply_region(&self, region: usize);
 

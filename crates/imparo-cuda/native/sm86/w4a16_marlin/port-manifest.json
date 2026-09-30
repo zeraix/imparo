@@ -1,0 +1,100 @@
+{
+  "status": "STATIC_PORT_READY_NOT_EXECUTED",
+  "scope": "frozen exact vLLM Marlin kernel + Driver API adapter; no arithmetic rebuild",
+  "source_commit": "2cf0a6915ce544dc493a0990f2ea38d81601128a",
+  "kernel_symbol": "_ZN6marlin6MarlinILl1125899906910725ELl1125899907892224ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb1ELi4ELi2ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+  "physical_m": 3,
+  "supported_shapes": [
+    {
+      "k": 2560,
+      "n": 20480,
+      "groups": 80
+    },
+    {
+      "k": 10240,
+      "n": 2560,
+      "groups": 320
+    }
+  ],
+  "grid": [
+    30,
+    1,
+    1
+  ],
+  "block": [
+    256,
+    1,
+    1
+  ],
+  "shared_bytes": "actual CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN; identical kernel final int argument",
+  "required_cache_bytes": 53248,
+  "reduce_bytes": 491520,
+  "locks_bytes": 120,
+  "lock_initialization": "zero before first use; successful same-stream launch resets; no per-launch memset in old path",
+  "reduce_initialization": "not required: first slice overwrites before later reduce reads",
+  "kernel_parameters": 20,
+  "python_extension_parameters": 19,
+  "compiled_resources": {
+    "registers": 96,
+    "stack_bytes": 32,
+    "static_shared": 0,
+    "local_reported": 0
+  },
+  "repack_cpu_check": {
+    "tile_elements": 1024,
+    "bijection_and_inverse": true,
+    "scale_transpose_involution": true,
+    "scope": "CPU coordinates only; no fresh GPU repack comparison"
+  },
+  "gpu_executed": false,
+  "compiled": false,
+  "limitations": [
+    "Caller must verify asset hash and prepare module outside capture in existing context/lifetime.",
+    "Caller owns aligned buffer capacities, weights permutation, M1 physical-M3 zero padding, Graph identities, error handling and quality verification.",
+    "Frozen image is SM80 code selected by installed wheel for SM86. Host dispatch and current package configuration were statically cross-checked; no new Windows execution proof."
+  ],
+  "artifact_sha256": {
+    "marlin_frozen.cuh": "81527db5416a5d51b7a0cd53b9d2bb58cf75e63d26a3d67c98be188094a1191e",
+    "permutation.cuh": "c9a0accc9fa2d6c12b5ba9a784d205214d9de93ddd6af2ce381510d0aefa86c1",
+    "_C_stable_libtorch.abi3.51.sm_80.cubin": "9521406b46b918c23450e6199ed973149c88fcb2e33e5a7d8348212f7694cf37",
+    "upstream/gptq_marlin_repack.cu": "ec4fa3049b33f3b7e80ab37b39c739695a9a8062cc71701275bf24d50953bc3f",
+    "upstream/LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "native_api": {
+    "initialize": "initialize(const char* cubin_path, int device, Kernel*) -> CUresult",
+    "launch": "launch(const Kernel&, CUdeviceptr A, B, S, C, Ctmp, locks, int K, int N, CUstream) -> CUresult",
+    "convert": "convert(const void* input, void* output, int K, int N, size_t norm_gap, bool pack, cudaStream_t) -> cudaError_t",
+    "driver": "LoadLibraryExW nvcuda.dll system32 + GetProcAddress, existing context, no link-time driver symbols",
+    "graph_identity": "Kernel.function; caller owns module lifetime",
+    "runtime_buffer_overload": "launch(const Kernel&, const void* A/B/S, void* C/Ctmp/locks, int K/N, CUstream) forwards exact address ABI"
+  },
+  "conversion": {
+    "largest_scratch_bytes": 29501440,
+    "gu_weight_bytes": 29491200,
+    "gu_norm_gap_bytes": 10240,
+    "down_bytes": 14745600,
+    "gap_copy": "cudaMemcpyAsync same stream, canonical middle <-> packed end",
+    "representation": "raw uint4 nibbles and uint16 scale bits, no floating arithmetic",
+    "separate_scratch_required": true,
+    "execution_proof": "not compiled or executed here"
+  },
+  "independent_static_review": {
+    "agent": "/root/v2_validation_runner/markov_numeric_family",
+    "blocking_findings": [],
+    "scope": [
+      "exact 20-argument ABI and pointer overload",
+      "fixed M3/groups/lda/grid/block/full optin shared",
+      "upstream pack_idx nibble inverse and scale bit permutation",
+      "canonical GU middle gap to packed end with disjoint full-range output"
+    ],
+    "gu_canonical_gap": [
+      14745600,
+      14755840
+    ],
+    "gu_packed_gap": [
+      29491200,
+      29501440
+    ],
+    "gpu_or_compile_proof": false
+  }
+}

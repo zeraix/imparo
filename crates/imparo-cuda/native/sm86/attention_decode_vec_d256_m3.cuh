@@ -2,6 +2,8 @@
 #include "../sm80/attention_decode_vec_d256.cuh"
 namespace imparo_sm80_d256_vec {
 // Packed K load/unpack is shared across three independent Q8 dot products.
+// Each query keeps its own initialized prefix and causal window. Slots outside
+// the producer prefix are zero-staged; no uninitialized KV row is read.
 __device__ __forceinline__ void dot_q4_q8_m3(const uint8_t* row,
  const int qi[3][kGqaHeads][64],const float2 ds[3][kGqaHeads][kQ4BlocksPerHead],
  unsigned warp,unsigned lane,float result[3]) {
@@ -25,7 +27,7 @@ __global__ __launch_bounds__(kThreads,1) void partial_q4_gqa4_m3(
     const uint32_t kvh = blockIdx.x / kWarps;
     const uint32_t partial = blockIdx.y;
     const uint32_t partial_count = gridDim.y;
-    if (start_pos < ring || start_pos > UINT32_MAX - 2 || n_kv == 0 || n_heads != n_kv * kGqaHeads || kvh >= n_kv
+    if (start_pos < kWindowSpan - 1 || start_pos > UINT32_MAX - 3 || n_kv == 0 || n_heads != n_kv * kGqaHeads || kvh >= n_kv
         || partial >= partial_count || partial_count == 0
         || partial_count > kMaxPartials
         || schedule_span != partial_count * kScheduleQuantum
@@ -38,7 +40,7 @@ __global__ __launch_bounds__(kThreads,1) void partial_q4_gqa4_m3(
  unsigned window_lo[3];
  #pragma unroll
  for(unsigned query=0;query<3;query++)window_lo[query]=start_pos+query+1-kWindowSpan;
- const unsigned valid_span=ring+1;
+ const unsigned loaded_span=min(start_pos+3,ring+1);
  __shared__ int q_i32[3][kGqaHeads][64];
  __shared__ float2 q_ds[3][kGqaHeads][kQ4BlocksPerHead];
  __shared__ float probabilities[3][kGqaHeads][32];
@@ -93,7 +95,7 @@ __global__ __launch_bounds__(kThreads,1) void partial_q4_gqa4_m3(
                 + (uint64_t(first_slot + row) * q4_blocks_per_row
                     + uint64_t(kvh) * kQ4BlocksPerHead) * 18
                 + uint64_t(chunk) * sizeof(uint4);
-            kv_tile[item] = *reinterpret_cast<const uint4 *>(src);
+            kv_tile[item] = first_slot + row < loaded_span ? *reinterpret_cast<const uint4 *>(src) : make_uint4(0,0,0,0);
         }
         __syncthreads();
 
@@ -104,7 +106,7 @@ __global__ __launch_bounds__(kThreads,1) void partial_q4_gqa4_m3(
   for(unsigned row=0;row<32;row++){
    unsigned slot=first_slot+row;bool valid[3];bool any=false;
    #pragma unroll
-   for(unsigned query=0;query<3;query++){unsigned pos=start_pos+query;unsigned logical=slot<valid_span?slot+((pos-slot)&~ring):0;valid[query]=slot<valid_span&&logical>=window_lo[query]&&logical<=pos;any|=valid[query];}
+   for(unsigned query=0;query<3;query++){unsigned pos=start_pos+query;unsigned valid_span=min(pos+1,ring+1);unsigned logical=slot<valid_span?slot+((pos-slot)&~ring):0;valid[query]=slot<valid_span&&logical>=window_lo[query]&&logical<=pos;any|=valid[query];}
    float scores[3]={};
    if(any)dot_q4_q8_m3(reinterpret_cast<const uint8_t*>(kv_tile+row*9),q_i32,q_ds,warp,lane,scores);
    #pragma unroll
@@ -117,7 +119,11 @@ __global__ __launch_bounds__(kThreads,1) void partial_q4_gqa4_m3(
    for(unsigned i=0;i<4;i++){numerator[query][i].x*=rescale;numerator[query][i].y*=rescale;}
    running_max[query]=next_max[query];
    float probability=score_owned[query]>-3.0e38F?expf(score_owned[query]-running_max[query]):0.f;
-   running_sum[query]=running_sum[query]*rescale+probability;probabilities[query][warp][lane]=probability;
+   // P3 must preserve partial_q4's separately rounded multiply and add.
+   // Keep the admitted saturated P4 arithmetic unchanged.
+   running_sum[query]=schedule_span==3*kScheduleQuantum
+       ? __fadd_rn(__fmul_rn(running_sum[query],rescale),probability)
+       : running_sum[query]*rescale+probability;probabilities[query][warp][lane]=probability;
   }
   __syncthreads();
         for (uint32_t item = threadIdx.y * 32 + lane;
@@ -128,7 +134,7 @@ __global__ __launch_bounds__(kThreads,1) void partial_q4_gqa4_m3(
                 + (uint64_t(first_slot + row) * q4_blocks_per_row
                     + uint64_t(kvh) * kQ4BlocksPerHead) * 18
                 + uint64_t(chunk) * sizeof(uint4);
-            kv_tile[item] = *reinterpret_cast<const uint4 *>(src);
+            kv_tile[item] = first_slot + row < loaded_span ? *reinterpret_cast<const uint4 *>(src) : make_uint4(0,0,0,0);
         }
         __syncthreads();
 
@@ -137,7 +143,7 @@ __global__ __launch_bounds__(kThreads,1) void partial_q4_gqa4_m3(
   for(unsigned row=0;row<32;row++){
    unsigned slot=first_slot+row;bool active[3];bool any=false;float p[3];
    #pragma unroll
-   for(unsigned query=0;query<3;query++){unsigned pos=start_pos+query;unsigned logical=slot<valid_span?slot+((pos-slot)&~ring):0;p[query]=probabilities[query][warp][row];active[query]=slot<valid_span&&logical>=window_lo[query]&&logical<=pos&&p[query]!=0.f;any|=active[query];}
+   for(unsigned query=0;query<3;query++){unsigned pos=start_pos+query;unsigned valid_span=min(pos+1,ring+1);unsigned logical=slot<valid_span?slot+((pos-slot)&~ring):0;p[query]=probabilities[query][warp][row];active[query]=slot<valid_span&&logical>=window_lo[query]&&logical<=pos&&p[query]!=0.f;any|=active[query];}
    if(any){const uint8_t*vrow=reinterpret_cast<const uint8_t*>(kv_tile+row*9);
     float2 v0=q4_float2(vrow,4*lane),v1=q4_float2(vrow,4*lane+2),v2=q4_float2(vrow,128+4*lane),v3=q4_float2(vrow,128+4*lane+2);
     #pragma unroll

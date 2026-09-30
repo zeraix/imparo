@@ -12,15 +12,21 @@ pub mod workflow_gpu;
 
 pub use plan::build;
 
-// What LFM2 contributes to the engine: FIVE rows.
+// What LFM2 contributes to the engine.
 crate::architecture!(Lfm2Arch => Lfm2 {
     weights:             workflow_cpu::ModelW,
     prepare:             workflow_cpu::prepare,
     batch_host:          workflow_cpu::batch,
     device_batch:        workflow_gpu::batch,
     device_prepare:      workflow_gpu::prepare_device,
+    device_rows:         workflow_gpu::rows,
     buffer_requirements: workflow_gpu::buffer_requirements,
-    device_all_logits: cfg!(any(feature = "cuda", feature = "cuda-dynamic")),
-    device_prefix_verification: cfg!(any(feature = "cuda", feature = "cuda-dynamic")),
+    conv_windows:        plan::conv_windows,
+    // Every device backend runs a verification through this batch: every row's logits (or
+    // one pick per row) and a ShortConv snapshot after each prefix. The CPU backend
+    // (`host_forward`) verifies one token at a time.
+    device_all_logits: true,
+    device_prefix_verification: true,
     device_greedy_verification: cfg!(feature = "cuda-speculative"),
+    row_layout_forward: true,
 });

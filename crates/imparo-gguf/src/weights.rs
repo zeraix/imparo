@@ -21,6 +21,9 @@ pub const GGML_F32: u32 = 0;
 pub const GGML_F16: u32 = 1;
 pub const GGML_Q4_0: u32 = 2;
 pub const GGML_Q8_0: u32 = 8;
+pub const GGML_BF16: u32 = 30;
+/// Prism-private ternary: 128 values in 28 bytes, fp16 scale at byte 26.
+pub const GGML_PTQ1_0: u32 = 143;
 /// IMPARO-PRIVATE type id: Q8_0 values in the tile-major layout `imparo-repack` writes
 /// (see docs/q8-tile-major-weights.md). GGUF's own ids stop far below 1000. Same bytes per
 /// 32 elements as Q8_0 (34), so a converted tensor keeps its size and offset; only the
@@ -152,6 +155,22 @@ pub struct TmRule {
     /// never applies; a file carrying such a kind is refused at load by a backend that
     /// does not serve it, never misread.
     pub readers: &'static [&'static str],
+    /// Backends that read `to` for an EXPERT STACK only -- a tensor of `n_expert` matrices
+    /// end to end -- on top of `readers`. Q4_0 is the case: its 2-D tensors keep a kernel
+    /// family of their own that reads row-major (E4B's), while a routed stack has no other
+    /// reader than the block-format brick, which reads tile-major best and is the only way
+    /// into the mega entry. So the stack converts and the matrix beside it does not.
+    pub stack_readers: &'static [&'static str],
+}
+
+impl TmRule {
+    /// Whether a load-time transform or the converter should write this rule for a tensor
+    /// of these dimensions: a rule with readers, or a stack whose format has stack readers.
+    #[must_use]
+    pub fn has_readers_for(&self, ne: &[u64]) -> bool {
+        let stacked = ne.len() == 3 && ne[2] > 1;
+        !self.readers.is_empty() || (stacked && !self.stack_readers.is_empty())
+    }
 }
 
 impl TmRule {
@@ -368,6 +387,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_Q4_0,
@@ -379,6 +399,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &[],
+        stack_readers: &["metal"],
     },
     TmRule {
         from: GGML_Q4_1,
@@ -391,6 +412,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 4)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_Q5_0,
@@ -403,6 +425,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_Q5_1,
@@ -414,6 +437,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 4)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_Q2_K,
@@ -426,6 +450,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 16), (80, 4)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_Q3_K,
@@ -438,6 +463,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(96, 14)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_Q4_K,
@@ -451,6 +477,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 16)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_Q5_K,
@@ -462,6 +489,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 16)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_Q6_K,
@@ -474,6 +502,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(192, 18)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_IQ4_NL,
@@ -485,6 +514,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_IQ3_S,
@@ -502,6 +532,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2), (106, 4)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_IQ4_XS,
@@ -514,6 +545,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 8)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_IQ2_XXS,
@@ -527,6 +559,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_IQ2_XS,
@@ -539,6 +572,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2), (66, 8)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_IQ2_S,
@@ -552,6 +586,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2), (66, 8), (74, 8)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_IQ3_XXS,
@@ -566,6 +601,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2), (66, 32)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_IQ1_S,
@@ -580,6 +616,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(0, 2)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
     TmRule {
         from: GGML_IQ1_M,
@@ -593,6 +630,7 @@ pub const TM_RULES: [TmRule; 19] = [
         scale_spans: &[(48, 8)],
         unit_rows: Q8_0_TM_UNIT_ROWS,
         readers: &["metal"],
+        stack_readers: &[],
     },
 ];
 
@@ -626,7 +664,20 @@ pub fn tm_applies(
     let Some(rule) = tm_rule_for(ggml_type) else {
         return Err("no tile-major rule for this type");
     };
-    if ne.len() != 2 && !(ne.len() > 2 && ne[2..].iter().all(|&d| d == 1)) {
+    // 2-D, or a STACK of 2-D matrices laid end to end -- an MoE expert tensor is
+    // `[n_in, n_out, n_expert]`, which is n_expert independent matrices, not a 3-D object.
+    // The transform is a permutation of bytes inside a unit of `unit_rows` rows, so as long
+    // as each slice's row count divides by that, transforming the stack as ONE tall matrix
+    // of `ne[1] * ne[2]` rows gives byte for byte what transforming each slice separately
+    // would: no unit ever straddles two experts. `convertible(ne[0], ne[1])` below is what
+    // checks that, because it tests the SLICE's rows, not the stack's.
+    //
+    // Refusing these was costing the routed matmul the whole layout: on LFM2.5-8B-A1B the
+    // stacks are 4446.8 MiB of the file's 4908.9, so 91% of the weights were read row-major
+    // by a matrix-unit kernel -- eight streams a unit, 1152 bytes apart, where tile-major
+    // gives one contiguous stream.
+    let stacked = ne.len() == 3 && ne[2] > 1;
+    if !stacked && ne.len() != 2 && !(ne.len() > 2 && ne[2..].iter().all(|&d| d == 1)) {
         return Err("not 2-D");
     }
     if ROW_MAJOR_ROLES.contains(&name) {
@@ -702,6 +753,9 @@ pub enum WeightKind {
     IQ1_S_TM = 36,
     IQ1_M = 37,
     IQ1_M_TM = 38,
+    /// Prism ternary, group 128; this is not upstream TQ1_0 (group 256).
+    PTQ1_0 = 39,
+    BF16 = 40,
 }
 
 /// Names of every type `weight_kind` accepts, for the error message that rejects the
@@ -767,6 +821,8 @@ const WEIGHT_KINDS: &[(u32, WeightKind)] = &[
     (GGML_IQ1_S_TM, WeightKind::IQ1_S_TM),
     (GGML_IQ1_M, WeightKind::IQ1_M),
     (GGML_IQ1_M_TM, WeightKind::IQ1_M_TM),
+    (GGML_PTQ1_0, WeightKind::PTQ1_0),
+    (GGML_BF16, WeightKind::BF16),
 ];
 
 /// Every tile-major rule must have a wire kind, or a backend cannot be told which layout
@@ -774,6 +830,24 @@ const WEIGHT_KINDS: &[(u32, WeightKind)] = &[
 #[cfg(test)]
 mod wire_kind_tests {
     use super::*;
+    #[test]
+    fn bonsai_types_have_distinct_stable_wire_and_layout() {
+        for (ggml, wire, elements, bytes) in
+            [(GGML_PTQ1_0, 39, 128, 28), (GGML_BF16, 40, 1, 2)]
+        {
+            assert_eq!(weight_kind(ggml).unwrap() as u32, wire);
+            assert_eq!(ggml_type_of_wire(wire), ggml);
+            let layout = crate::tensor_layout(ggml).unwrap();
+            assert_eq!(
+                (layout.block_elements, layout.block_bytes),
+                (elements, bytes)
+            );
+        }
+        assert_ne!(
+            crate::tensor_layout(GGML_PTQ1_0).unwrap().block_elements,
+            crate::tensor_layout(34).unwrap().block_elements
+        );
+    }
     #[test]
     fn every_tm_rule_has_a_wire_kind() {
         for rule in &TM_RULES {
@@ -873,13 +947,20 @@ fn map_file(
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        // SAFETY: fd is valid and open for reading; PROT_READ/MAP_PRIVATE is sound.
+        // SHARED, not PRIVATE. Metal wraps these pages in no-copy buffers, and a device that
+        // wires a shared mapping holds the page cache's own pages. A private mapping is
+        // copy-on-write, and wiring it for a device that may write copied every page into
+        // anonymous memory: the resident weights were held twice, and a slow tier's pages
+        // became memory the system can only swap, never drop
+        // (docs/evidence/bracket/2026-09-18-weights-shared-mapping.md). The file is open
+        // read-only, so this mapping can never be made writable.
+        // SAFETY: fd is valid and open for reading; PROT_READ/MAP_SHARED is sound.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ,
-                libc::MAP_PRIVATE,
+                libc::MAP_SHARED,
                 file.as_raw_fd(),
                 0,
             )
@@ -945,9 +1026,324 @@ fn map_file(
     }
 }
 
+/// Where a second file mapped after a model of `model_bytes` starts: the model's end rounded up
+/// to 16 KiB, or to the page size where that is larger. 16 KiB is the page size of Apple silicon,
+/// the largest-page hosts served, so the layout -- and every offset a paired drafter's tensors
+/// get -- is the same on every unix host.
+#[cfg(unix)]
+fn appended_offset(model_bytes: u64) -> u64 {
+    // SAFETY: sysconf reads a constant of the running system.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0);
+    let align = page.max(16384);
+    model_bytes.div_ceil(align) * align
+}
+
+/// Maps `model` at 0 and `extra` at `appended_offset(model's length)`, both read-only, as one
+/// range; the pages between the two read as zero. Returns the base, the range's length and the
+/// second file's offset.
+///
+/// One reservation of the whole range comes first, and each file then replaces its part of it
+/// (MAP_FIXED): the address range is the process's own before any file lands in it, so nothing
+/// else can be mapped between the two.
+#[cfg(unix)]
+fn map_files(
+    model: &std::fs::File,
+    extra: &std::fs::File,
+) -> Result<(*const u8, usize, u64), Box<dyn std::error::Error>> {
+    use std::os::unix::io::AsRawFd;
+    let model_len = model.metadata()?.len();
+    let extra_len = extra.metadata()?.len();
+    if model_len == 0 || extra_len == 0 {
+        return Err("empty file".into());
+    }
+    let offset = appended_offset(model_len);
+    let total = usize::try_from(
+        offset
+            .checked_add(extra_len)
+            .ok_or("mapping length overflows")?,
+    )?;
+    // SAFETY: an anonymous read-only reservation; nothing refers to it yet.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return Err("mmap: could not reserve the paired mapping".into());
+    }
+    for (file, len, at) in [(model, model_len, 0), (extra, extra_len, offset)] {
+        // Shared for the reason `map_file` gives.
+        // SAFETY: [at, at + len) lies inside the reservation above (`total` is the second
+        // file's end), which this function owns; MAP_FIXED replaces those reserved pages with
+        // the file's. On a failure the whole reservation goes, placed files included.
+        unsafe {
+            let want = base.cast::<u8>().add(at as usize).cast::<libc::c_void>();
+            let p = libc::mmap(
+                want,
+                len as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            );
+            if p != want {
+                libc::munmap(base, total);
+                return Err("mmap: could not place a file in the paired mapping".into());
+            }
+        }
+    }
+    Ok((base.cast::<u8>().cast_const(), total, offset))
+}
+
+// Placeholder replacement preserves v2's shared, read-only two-file mapping on
+// Windows 10 1803+. No composite file or private copy of the weights is created.
+// https://learn.microsoft.com/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile3
+#[cfg(windows)]
+mod paired_windows {
+    use std::{ffi::c_void, fs::File, os::windows::io::AsRawHandle, ptr::null_mut};
+    type Handle = *mut c_void;
+    const RELEASE: u32 = 0x8000;
+    const REPLACE: u32 = 0x4000;
+    const READONLY: u32 = 2;
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemInfo {
+        arch: u32,
+        page: u32,
+        min: Handle,
+        max: Handle,
+        mask: usize,
+        processors: u32,
+        processor_type: u32,
+        granularity: u32,
+        level: u16,
+        revision: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemInfo(info: *mut SystemInfo);
+        fn VirtualFree(base: Handle, size: usize, kind: u32) -> i32;
+        fn CreateFileMappingW(
+            file: Handle,
+            attrs: Handle,
+            protect: u32,
+            hi: u32,
+            lo: u32,
+            name: *const u16,
+        ) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn UnmapViewOfFile(base: *const c_void) -> i32;
+    }
+    #[link(name = "onecore")]
+    unsafe extern "system" {
+        fn VirtualAlloc2(
+            process: Handle,
+            base: Handle,
+            size: usize,
+            kind: u32,
+            protect: u32,
+            params: Handle,
+            count: u32,
+        ) -> Handle;
+        fn MapViewOfFile3(
+            mapping: Handle,
+            process: Handle,
+            base: Handle,
+            offset: u64,
+            size: usize,
+            kind: u32,
+            protect: u32,
+            params: Handle,
+            count: u32,
+        ) -> Handle;
+    }
+    pub(super) fn page_size() -> usize {
+        let mut info = SystemInfo::default();
+        // SAFETY: info has the documented SYSTEM_INFO layout and is writable.
+        unsafe { GetSystemInfo(&raw mut info) };
+        info.page as usize
+    }
+    fn round(n: usize, align: usize) -> std::io::Result<usize> {
+        if align == 0 {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        n.checked_add(align - 1)
+            .map(|v| v / align * align)
+            .ok_or_else(|| std::io::ErrorKind::InvalidInput.into())
+    }
+    struct Region {
+        base: Handle,
+        size: usize,
+        mapped: bool,
+    }
+    pub(super) struct Mapping {
+        pub(super) base: *const u8,
+        pub(super) len: usize,
+        pub(super) offset: u64,
+        regions: Vec<Region>,
+    }
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            for region in &self.regions {
+                // SAFETY: each disjoint region is owned once, either as a file
+                // view or as the placeholder remaining after a failed setup.
+                unsafe {
+                    if region.mapped {
+                        UnmapViewOfFile(region.base);
+                    } else {
+                        VirtualFree(region.base, 0, RELEASE);
+                    }
+                }
+            }
+        }
+    }
+    impl Mapping {
+        pub(super) fn open(
+            model: &File,
+            extra: &File,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let a = usize::try_from(model.metadata()?.len())?;
+            let b = usize::try_from(extra.metadata()?.len())?;
+            if a == 0 || b == 0 {
+                return Err("empty paired file".into());
+            }
+            let page = page_size();
+            let first = round(a, page)?;
+            let offset = round(a, page.max(16384))?;
+            let len = offset.checked_add(b).ok_or("mapping length overflows")?;
+            let total = round(len, page)?;
+            // SAFETY: reserve a fresh, inaccessible placeholder in this process.
+            let base = unsafe {
+                VirtualAlloc2(
+                    null_mut(),
+                    null_mut(),
+                    total,
+                    0x2000 | 0x40000,
+                    1,
+                    null_mut(),
+                    0,
+                )
+            };
+            if base.is_null() {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut result = Self {
+                base: base.cast(),
+                len,
+                offset: offset as u64,
+                regions: vec![Region {
+                    base,
+                    size: total,
+                    mapped: false,
+                }],
+            };
+            // Split at page boundaries. REPLACE removes the ordinary 64 KiB
+            // placement requirement, so even the small zero gap is fully mapped.
+            for cut in [first, offset] {
+                let i = result.regions.len() - 1;
+                let begin = (result.regions[i].base as usize) - base as usize;
+                if cut <= begin || cut >= total {
+                    continue;
+                }
+                let prefix = cut - begin;
+                let old_size = result.regions[i].size;
+                // SAFETY: split only the last placeholder that this owner holds.
+                if unsafe { VirtualFree(result.regions[i].base, prefix, RELEASE | 2) }
+                    == 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                result.regions[i].size = prefix;
+                result.regions.push(Region {
+                    base: base.wrapping_byte_add(cut),
+                    size: old_size - prefix,
+                    mapped: false,
+                });
+            }
+            for region in &mut result.regions {
+                let at = region.base as usize - base as usize;
+                let (handle, section_len) = if at == 0 {
+                    (model.as_raw_handle().cast(), 0_u64)
+                } else if at == offset {
+                    (extra.as_raw_handle().cast(), 0_u64)
+                } else {
+                    // A pagefile-backed READONLY section supplies zero gap pages.
+                    (usize::MAX as Handle, region.size as u64)
+                };
+                // SAFETY: valid read-only file handle (or pagefile sentinel), and
+                // exact owned placeholder. Every mapped section stays immutable.
+                let section = unsafe {
+                    CreateFileMappingW(
+                        handle,
+                        null_mut(),
+                        READONLY,
+                        (section_len >> 32) as u32,
+                        section_len as u32,
+                        std::ptr::null(),
+                    )
+                };
+                if section.is_null() {
+                    return Err(format!(
+                        "paired section at={at} size={}: {}",
+                        region.size,
+                        std::io::Error::last_os_error()
+                    )
+                    .into());
+                }
+                // The placeholder covers whole pages; the file view must name
+                // the actual bytes, not extend past EOF in the last partial page.
+                let view_len = if at == 0 {
+                    a
+                } else if at == offset {
+                    b
+                } else {
+                    region.size
+                };
+                let view = unsafe {
+                    MapViewOfFile3(
+                        section,
+                        usize::MAX as Handle,
+                        region.base,
+                        0,
+                        view_len,
+                        REPLACE,
+                        READONLY,
+                        null_mut(),
+                        0,
+                    )
+                };
+                let error = std::io::Error::last_os_error();
+                unsafe { CloseHandle(section) };
+                if view.is_null() {
+                    return Err(format!(
+                        "paired view at={at} size={}: {error}",
+                        region.size
+                    )
+                    .into());
+                }
+                region.mapped = true;
+            }
+            Ok(result)
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn map_files(
+    _model: &std::fs::File,
+    _extra: &std::fs::File,
+) -> Result<(*const u8, usize, u64), Box<dyn std::error::Error>> {
+    Err("paired file mapping is not supported on this OS".into())
+}
+
 fn unmap_file(base: *const u8, len: usize) {
     #[cfg(unix)]
-    // SAFETY: base/len came from a successful map_file and are unmapped exactly once.
+    // SAFETY: base/len came from a successful map_file or map_files and are unmapped once.
     unsafe {
         libc::munmap(base.cast_mut().cast::<libc::c_void>(), len);
     }
@@ -1017,10 +1413,24 @@ impl Drop for Mapping {
     }
 }
 
+/// A second file mapped after the model in the same range: a paired drafter
+/// (`Weights::open_with_appended`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Appended {
+    /// Where the file starts in the mapping.
+    pub offset: u64,
+    /// Its length.
+    pub bytes: u64,
+    pub path: PathBuf,
+}
+
 pub struct Weights {
     base: *const u8,
     len: usize,
     source_path: PathBuf,
+    appended: Option<Appended>,
+    #[cfg(windows)]
+    paired_mapping: Option<paired_windows::Mapping>,
     full_file_sha256: OnceLock<[u8; 32]>,
     pub tensors: BTreeMap<String, Tensor>,
     /// GPU dispatch is opt-in per run so the CPU path stays available as the oracle.
@@ -1057,6 +1467,59 @@ impl Weights {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len() as usize;
         let base = map_file(&file, len)?;
+        Ok(Self::index(document, base, len, path, None))
+    }
+
+    /// Maps the model at `path` and a paired drafter's file at `appended` as ONE read-only
+    /// range: the model at 0, the drafter from the first 16 KiB boundary past the model's end
+    /// (`appended()` says where), zeros between. Both are file mappings, so nothing is copied:
+    /// the engine addresses the drafter's tensors in the same mapping as the target's, as it
+    /// would in one file holding both.
+    ///
+    /// # Errors
+    /// When a file cannot be opened or mapped. Windows requires placeholder mapping
+    /// support (Windows 10 1803+); both views and the zero gap remain read-only.
+    pub fn open_with_appended(
+        document: &crate::Document,
+        path: &Path,
+        appended: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = std::fs::File::open(path)?;
+        let extra = std::fs::File::open(appended)?;
+        #[cfg(not(windows))]
+        let (base, len, offset) = map_files(&file, &extra)?;
+        #[cfg(windows)]
+        let paired = paired_windows::Mapping::open(&file, &extra)?;
+        #[cfg(windows)]
+        let (base, len, offset) = (paired.base, paired.len, paired.offset);
+        let bytes = extra.metadata()?.len();
+        #[allow(unused_mut)]
+        let mut result = Self::index(
+            document,
+            base,
+            len,
+            path,
+            Some(Appended {
+                offset,
+                bytes,
+                path: appended.to_path_buf(),
+            }),
+        );
+        #[cfg(windows)]
+        {
+            result.paired_mapping = Some(paired);
+        }
+        Ok(result)
+    }
+
+    /// Indexes `document`'s tensors over a mapping at `base`.
+    fn index(
+        document: &crate::Document,
+        base: *const u8,
+        len: usize,
+        path: &Path,
+        appended: Option<Appended>,
+    ) -> Self {
         let mut tensors = BTreeMap::new();
         for t in &document.tensors {
             let mut ne = [1_u64; 4];
@@ -1078,14 +1541,23 @@ impl Weights {
         // (imparo-model::backend + the bins/server), so this crate knows no backend
         // exists. The caller flips `gpu` via mark_gpu() after a backend's init_weights
         // succeeds.
-        Ok(Self {
+        Self {
             base,
             len,
             source_path: path.to_path_buf(),
+            appended,
+            #[cfg(windows)]
+            paired_mapping: None,
             full_file_sha256: OnceLock::new(),
             tensors,
             gpu: false,
-        })
+        }
+    }
+
+    /// The paired drafter's file in this mapping, when `open_with_appended` mapped one.
+    #[must_use]
+    pub fn appended(&self) -> Option<&Appended> {
+        self.appended.as_ref()
     }
 
     /// CPU-visible base of the weight mapping, for a backend's init_weights.
@@ -1098,7 +1570,18 @@ impl Weights {
     pub fn byte_len(&self) -> u64 {
         self.len as u64
     }
-    /// Path originally used to open this mapping.
+    /// Where the model's tensor data ends, which is its size: a paired drafter is mapped past
+    /// it, so the mapping's length is not. Keys the tune file.
+    #[must_use]
+    pub fn model_bytes(&self) -> u64 {
+        self.tensors
+            .values()
+            .map(|t| (t.offset as u64).saturating_add(t.bytes as u64))
+            .max()
+            .unwrap_or(0)
+    }
+    /// The model's file: the path this mapping was opened from. A paired drafter's file is
+    /// `appended()`.
     ///
     /// This is provenance for diagnostics and discovery, not a request to reopen the
     /// pathname: identity is computed from the mapping already held by `Weights`.
@@ -1107,7 +1590,7 @@ impl Weights {
         &self.source_path
     }
 
-    /// SHA-256 of every byte in the held GGUF mapping.
+    /// SHA-256 of every byte in the held GGUF mapping, a paired drafter's included.
     ///
     /// The first call touches the complete model and caches the result. Callers should
     /// therefore invoke it only after discovering a candidate tuned configuration that
@@ -1184,6 +1667,12 @@ impl Weights {
 
 impl Drop for Weights {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.paired_mapping.is_some() {
+            // The field owner releases both views and the read-only gap separately.
+            return;
+        }
+        // On Unix a paired mapping is released as one range.
         unmap_file(self.base, self.len);
     }
 }
@@ -1315,6 +1804,132 @@ mod identity_tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_paired_mapping_holds_both_files_with_zeros_between() {
+        let mut target = minimal_gguf(0x11);
+        target.resize(20_000, 0x5a);
+        let draft: Vec<u8> = (0..5_000_u32).map(|i| (i % 241) as u8).collect();
+        let (t, d) = (temp_model(&target), temp_model(&draft));
+        let document = crate::read(&t).unwrap();
+        let w = Weights::open_with_appended(&document, &t, &d).unwrap();
+        let a = w.appended().unwrap().clone();
+        // SAFETY: sysconf reads a constant of the running system.
+        #[cfg(unix)]
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        #[cfg(windows)]
+        let page = paired_windows::page_size() as u64;
+        assert_eq!(a.offset % 16384, 0, "{a:?}");
+        assert!(
+            a.offset >= 20_000 && a.offset - 20_000 < page.max(16384),
+            "{a:?}"
+        );
+        assert_eq!((a.bytes, a.path.as_path()), (5_000, d.as_path()));
+        assert_eq!(
+            (w.byte_len(), w.source_path()),
+            (a.offset + 5_000, t.as_path())
+        );
+        // SAFETY: the whole range is the live read-only mapping `w` holds.
+        let all =
+            unsafe { std::slice::from_raw_parts(w.base_ptr(), w.byte_len() as usize) };
+        assert_eq!(&all[..20_000], &target[..]);
+        assert!(all[20_000..a.offset as usize].iter().all(|&b| b == 0));
+        assert_eq!(&all[a.offset as usize..], &draft[..]);
+        let mut whole = target.clone();
+        whole.resize(a.offset as usize, 0);
+        whole.extend_from_slice(&draft);
+        assert_eq!(
+            w.full_file_sha256(),
+            <[u8; 32]>::from(Sha256::digest(&whole))
+        );
+        drop(w);
+        fs::remove_file(t).unwrap();
+        fs::remove_file(d).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paired_views_cover_aligned_tails_and_stay_readonly() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn VirtualProtect(
+                base: *mut core::ffi::c_void,
+                size: usize,
+                protect: u32,
+                old: *mut u32,
+            ) -> i32;
+        }
+        for (a, b) in [(1, 1), (4096, 4096), (16384, 4096), (65536, 33)] {
+            let left = vec![0x5a; a];
+            let right = vec![0xa5; b];
+            let (t, d) = (temp_model(&left), temp_model(&right));
+            let target = fs::File::open(&t).unwrap();
+            let draft = fs::File::open(&d).unwrap();
+            let mapping = paired_windows::Mapping::open(&target, &draft).unwrap();
+            let offset = mapping.offset as usize;
+            // SAFETY: the owner holds all readable pages in this complete range.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(mapping.base, mapping.len) };
+            assert_eq!(&bytes[..a], &left);
+            assert!(bytes[a..offset].iter().all(|&x| x == 0));
+            assert_eq!(&bytes[offset..], &right);
+            for at in [0, offset] {
+                let mut old = 0;
+                // SAFETY: test only permission escalation at mapped page starts.
+                // Restore on unexpected success before the assertion aborts.
+                let ptr = mapping.base.wrapping_add(at).cast_mut().cast();
+                let writable = unsafe { VirtualProtect(ptr, 1, 4, &raw mut old) };
+                if writable != 0 {
+                    unsafe { VirtualProtect(ptr, 1, old, &raw mut old) };
+                }
+                assert_eq!(writable, 0, "file mapping unexpectedly writable");
+            }
+            drop(mapping);
+            drop((target, draft));
+            fs::remove_file(t).unwrap();
+            fs::remove_file(d).unwrap();
+        }
+    }
+
+    /// A mapping that can be made writable is a private one, and a device wire of a private
+    /// mapping copies its pages (see `map_file`). Both the plain and the paired mapping must
+    /// refuse write access.
+    #[cfg(unix)]
+    #[test]
+    fn the_weight_mapping_can_never_be_made_writable() {
+        let mut target = minimal_gguf(0x11);
+        target.resize(20_000, 0x5a);
+        let draft = vec![7_u8; 5_000];
+        let (t, d) = (temp_model(&target), temp_model(&draft));
+        let document = crate::read(&t).unwrap();
+        let writable = |p: *const u8| {
+            // SAFETY: `p` is a page-aligned address inside a live mapping; on success the
+            // protection is put back before anything reads it.
+            unsafe {
+                let p = p.cast_mut().cast::<libc::c_void>();
+                let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                if libc::mprotect(p, page, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+                    libc::mprotect(p, page, libc::PROT_READ);
+                    return Ok(());
+                }
+                Err(std::io::Error::last_os_error().raw_os_error())
+            }
+        };
+        let plain = Weights::open(&t).unwrap();
+        assert_eq!(writable(plain.base_ptr()), Err(Some(libc::EACCES)));
+        let paired = Weights::open_with_appended(&document, &t, &d).unwrap();
+        let at = paired.appended().unwrap().offset as usize;
+        assert_eq!(writable(paired.base_ptr()), Err(Some(libc::EACCES)));
+        // SAFETY: `at` is inside the paired mapping, at the drafter's page-aligned start.
+        assert_eq!(
+            writable(unsafe { paired.base_ptr().add(at) }),
+            Err(Some(libc::EACCES))
+        );
+        drop((plain, paired));
+        fs::remove_file(t).unwrap();
+        fs::remove_file(d).unwrap();
+    }
+
     #[test]
     fn identity_covers_bytes_outside_the_parsed_directory() {
         let first_path = temp_model(&minimal_gguf(0x11));
@@ -1430,6 +2045,18 @@ mod tm_rule_tests {
         );
         assert!(tm_applies("token_embd.weight", GGML_Q8_0, &[2048, 65536]).is_err());
         assert!(tm_applies("blk.0.attn_norm.weight", GGML_F32, &[2048]).is_err());
+        // AN EXPERT STACK is n_expert 2-D matrices end to end, and converts when the SLICE
+        // does: 1792 rows is 224 units of 8, so no unit straddles two experts.
+        assert!(
+            tm_applies("blk.2.ffn_gate_exps.weight", GGML_Q4_K, &[2048, 1792, 32])
+                .is_ok()
+        );
+        // A slice whose rows do not divide the unit would put one unit across two experts,
+        // and every address past the first would be wrong.
+        assert!(
+            tm_applies("blk.2.ffn_gate_exps.weight", GGML_Q4_K, &[2048, 1790, 32])
+                .is_err()
+        );
         assert!(tm_applies("blk.0.x.weight", GGML_Q8_0, &[2048, 12]).is_err());
     }
 }

@@ -59,6 +59,8 @@ pub fn kv_reserve_bytes(plan: &ModelPlan, capacity: usize, max_batch: usize) -> 
         } as u64;
         bytes += rows * (g.k_stride as u64 + g.v_stride as u64);
     }
+    // A paired drafter's caches hold the whole context, as a full-attention layer's do.
+    bytes += capacity as u64 * crate::kv::drafter_kv_bytes_per_token(plan);
     // Negotiated planes + one boundary snapshot, from the same static backend
     // layout used by WorkflowState and the allocator. The requested model routes
     // alone can overstate the plane count on a fixed-state graph backend.
@@ -94,6 +96,10 @@ pub fn activation_reserve_bytes(
     let reqs = match arch {
         "gemma4" => crate::gemma4::workflow_gpu::buffer_requirements(plan, b, capacity),
         "lfm2" => crate::lfm2::workflow_gpu::buffer_requirements(plan, b, capacity),
+        "lfm2moe" => {
+            crate::lfm2moe::workflow_gpu::buffer_requirements(plan, b, capacity)
+        }
+        "qwen3" => crate::qwen3::workflow_gpu::buffer_requirements(plan, b, capacity),
         "qwen35" => crate::qwen35::workflow_gpu::buffer_requirements(plan, b, capacity),
         _ => {
             static SAID: std::sync::Once = std::sync::Once::new();
@@ -107,7 +113,10 @@ pub fn activation_reserve_bytes(
             Vec::new()
         }
     };
-    crate::gpu_support::layout_bytes(&reqs)
+    // A paired drafter's feature rows live in their own buffer, as wide as the widest forward.
+    let features = crate::backend::active()
+        .map_or(0, |be| be.page_round(plan.draft_feature_bytes(max_batch)));
+    crate::gpu_support::layout_bytes(&reqs) + features
 }
 
 /// The layer a tensor belongs to, from its GGUF name (`blk.N.…`), or None for a shared
@@ -124,13 +133,19 @@ pub fn layer_of(name: &str) -> Option<u32> {
 /// segment may cover padding. A page is far above any padding and far below any tensor.
 const MERGE_GAP: u64 = 64 << 10;
 
-fn merge_adjacent(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+/// Whether a span at `off` joins the segment ending at `end`: the gap between them is padding,
+/// and it does not hold `split`, where a paired drafter's file starts. The two files are two
+/// mappings, and a segment is one buffer: it never covers both.
+fn joins(end: u64, off: u64, split: Option<u64>) -> bool {
+    off >= end && off - end <= MERGE_GAP && !split.is_some_and(|b| end <= b && b <= off)
+}
+
+fn merge_adjacent(mut spans: Vec<(u64, u64)>, split: Option<u64>) -> Vec<(u64, u64)> {
     spans.sort_unstable();
     let mut out: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
     for (off, bytes) in spans {
         if let Some(last) = out.last_mut() {
-            let end = last.0 + last.1;
-            if off >= end && off - end <= MERGE_GAP {
+            if joins(last.0 + last.1, off, split) {
                 last.1 = off + bytes - last.0;
                 continue;
             }
@@ -176,7 +191,23 @@ pub fn fit(
     budget: TierBudget,
     policy: RowGatheredPolicy,
 ) -> WeightPlacement {
-    let mut shared: Vec<(u64, u64)> = Vec::new();
+    fit_with_appended(tensors, &[], n_layers, row_gathered, budget, policy)
+}
+
+/// [`fit`] with `appended` spans past the model's own tensors (a paired drafter's), placed
+/// with the shared tensors: fast, and counted against the budget before any layer.
+#[must_use]
+pub fn fit_with_appended(
+    tensors: &BTreeMap<String, Tensor>,
+    appended: &[(u64, u64)],
+    n_layers: u32,
+    row_gathered: &[&str],
+    budget: TierBudget,
+    policy: RowGatheredPolicy,
+) -> WeightPlacement {
+    // The drafter's file starts at or before its first span, and past every model tensor.
+    let split = appended.iter().map(|s| s.0).min();
+    let mut shared: Vec<(u64, u64)> = appended.to_vec();
     let mut row_gathered_spans: Vec<(u64, u64)> = Vec::new();
     let mut per_layer: BTreeMap<u32, Vec<(u64, u64)>> = BTreeMap::new();
     for (name, t) in tensors {
@@ -191,7 +222,7 @@ pub fn fit(
     }
     let mut segments: Vec<WeightSegment> = Vec::new();
     let mut fast_bytes: u64 = 0;
-    for (off, bytes) in merge_adjacent(shared) {
+    for (off, bytes) in merge_adjacent(shared, split) {
         fast_bytes += bytes;
         segments.push(WeightSegment {
             offset: off,
@@ -204,7 +235,20 @@ pub fn fit(
     let mut fast_layers = 0_u32;
     let mut overflowed = false;
     for (layer, spans) in per_layer {
-        let spans = merge_adjacent(spans);
+        let spans = merge_adjacent(spans, split);
+        // A block past the plan's layers (a multi-token-prediction head the plan drops) is
+        // never read: it takes no fast-tier room, and it is not slow tier either, whose
+        // presence changes how prefill buffers are cut.
+        if layer >= n_layers {
+            for (off, bytes) in spans {
+                segments.push(WeightSegment {
+                    offset: off,
+                    bytes,
+                    tier: WeightTier::Unread,
+                });
+            }
+            continue;
+        }
         let layer_bytes: u64 = spans.iter().map(|s| s.1).sum();
         if !overflowed && fast_bytes + layer_bytes <= budget.weight_budget {
             fast_bytes += layer_bytes;
@@ -230,7 +274,7 @@ pub fn fit(
     // Tables LAST: a table is bound only from what the fast tier has left after every
     // layer fitted, so it never pushes a layer into the slow tier. A staged table costs
     // the decode loop its host round trip; a bound one costs its bytes wired.
-    for (off, bytes) in merge_adjacent(row_gathered_spans) {
+    for (off, bytes) in merge_adjacent(row_gathered_spans, split) {
         let bind = policy == RowGatheredPolicy::BindIfFits
             && !overflowed
             && fast_bytes + bytes <= budget.weight_budget;
@@ -261,8 +305,7 @@ pub fn fit(
             let end = last.offset + last.bytes;
             if last.tier == WeightTier::Fast
                 && s.tier == WeightTier::Fast
-                && s.offset >= end
-                && s.offset - end <= MERGE_GAP
+                && joins(end, s.offset, split)
             {
                 last.bytes = s.offset + s.bytes - last.offset;
                 continue;
@@ -283,6 +326,7 @@ pub fn fit(
 #[must_use]
 pub fn plan_placement(
     tensors: &BTreeMap<String, Tensor>,
+    appended: &[(u64, u64)],
     plan: &ModelPlan,
     capacity: usize,
     max_batch: usize,
@@ -304,13 +348,46 @@ pub fn plan_placement(
         margin,
         weight_budget,
     };
-    fit(
+    fit_with_appended(
         tensors,
+        appended,
         plan.config.n_layers,
         plan.weight_residency.row_gathered,
         budget,
         configured_row_gathered_policy(),
     )
+}
+
+/// The fast tier's room for KV once the weights are placed: the budget less the fast-tier
+/// weights, the activations, the scratch and the margin (docs/memory-tiers-and-fit.md
+/// section 2). None when the budget is unknown.
+#[must_use]
+pub fn kv_tier_bytes(p: &WeightPlacement) -> Option<u64> {
+    let total = p.budget.total?;
+    let fast = p.bytes_in(|t| t == WeightTier::Fast);
+    Some(total.saturating_sub(
+        fast + p.budget.reserve_activations
+            + p.budget.reserve_scratch
+            + p.budget.margin,
+    ))
+}
+
+/// The KV tier of the loaded model's placement, for the pool to size its device tier from;
+/// 0 when none was set (no backend, an unknown budget, or a backend whose reservations are
+/// allocations). One model per process, as the backend itself is.
+static KV_TIER_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn set_kv_tier(bytes: u64) {
+    KV_TIER_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[must_use]
+pub(crate) fn kv_tier() -> Option<u64> {
+    match KV_TIER_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        b => Some(b),
+    }
 }
 
 /// One line at load: the decision and the arithmetic behind it. Always printed -- a model
@@ -320,14 +397,26 @@ pub fn describe(p: &WeightPlacement, capacity: usize, max_batch: usize) -> Strin
     let fast = p.bytes_in(|t| t == WeightTier::Fast);
     let slow = p.bytes_in(|t| matches!(t, WeightTier::Slow { .. }));
     let staged = p.bytes_in(|t| t == WeightTier::HostStaged);
+    let unread = p.bytes_in(|t| t == WeightTier::Unread);
     let b = &p.budget;
     let total = b
         .total
         .map_or_else(|| "unknown".to_string(), |t| format!("{:.0} MiB", mib(t)));
+    // Said only when there is some, so the line of a file without such blocks is unchanged.
+    let unread = if unread > 0 {
+        format!(
+            ", unread {:.0} MiB (blocks past the plan's {} layers)",
+            mib(unread),
+            p.total_layers
+        )
+    } else {
+        String::new()
+    };
     format!(
         "fit: fast tier {total}, reserve {:.0} MiB (kv {:.0} for ctx {capacity}, \
          activations {:.0} at batch {max_batch}, scratch {:.0}, margin {:.0}); \
-         fast tier {}/{} layers = {:.0} MiB, slow tier {:.0} MiB, host-staged rows {:.0} MiB",
+         fast tier {}/{} layers = {:.0} MiB, slow tier {:.0} MiB, host-staged rows {:.0} MiB\
+         {unread}",
         mib(b.reserve_kv + b.reserve_activations + b.reserve_scratch + b.margin),
         mib(b.reserve_kv),
         mib(b.reserve_activations),
@@ -374,6 +463,104 @@ mod tests {
             weight_budget,
             ..TierBudget::default()
         }
+    }
+
+    #[test]
+    fn appended_spans_are_fast_and_counted_before_layers() {
+        // A paired drafter's 300 bytes far past the model: fast whatever the budget, and
+        // the layers fit in what is left of it.
+        let far = 1_u64 << 40;
+        let p = fit_with_appended(
+            &table(),
+            &[(far, 300)],
+            4,
+            &["big.table"],
+            budget(800),
+            RowGatheredPolicy::BindIfFits,
+        );
+        assert_eq!(p.fast_layers, 4);
+        assert_eq!(p.bytes_in(|t| t == WeightTier::Fast), 750);
+        assert!(p.segments.iter().any(|s| {
+            s.tier == WeightTier::Fast
+                && s.offset <= far
+                && s.offset + s.bytes >= far + 300
+        }));
+        let p = fit_with_appended(
+            &table(),
+            &[(far, 300)],
+            4,
+            &["big.table"],
+            budget(500),
+            RowGatheredPolicy::BindIfFits,
+        );
+        assert_eq!(p.fast_layers, 1);
+    }
+
+    #[test]
+    fn blocks_past_the_plans_layers_are_unread() {
+        // A fifth block after the four the plan runs, as a Qwen3.8 file carries its
+        // multi-token-prediction head: no fast-tier room, no slow tier, the fast tier still one
+        // buffer, and the line counts the plan's layers only.
+        let mut t = table();
+        t.insert("blk.4.a.weight".into(), tensor(1450, 60));
+        t.insert("blk.4.b.weight".into(), tensor(1510, 40));
+        let p = fit(
+            &t,
+            4,
+            &["big.table"],
+            budget(u64::MAX),
+            RowGatheredPolicy::BindIfFits,
+        );
+        assert_eq!((p.fast_layers, p.total_layers), (4, 4));
+        assert_eq!(p.bytes_in(|t| t == WeightTier::Fast), 1450);
+        assert_eq!(p.bytes_in(|t| t == WeightTier::Unread), 100);
+        assert_eq!(p.bytes_in(|t| matches!(t, WeightTier::Slow { .. })), 0);
+        let fast: Vec<_> = p
+            .segments
+            .iter()
+            .filter(|s| s.tier == WeightTier::Fast)
+            .collect();
+        assert_eq!(fast.len(), 1);
+        assert_eq!((fast[0].offset, fast[0].bytes), (0, 1450));
+        assert!(describe(&p, 4096, 512).contains("fast tier 4/4 layers"));
+        assert!(
+            describe(&p, 4096, 512)
+                .contains("unread 0 MiB (blocks past the plan's 4 layers)")
+        );
+        // Streamed by a backend that streams what is not fast, so it is never copied.
+        assert!(
+            p.slow_spans()
+                .iter()
+                .any(|s| s.offset == 1450 && s.bytes == 100)
+        );
+        // Without such a block the line is unchanged.
+        let q = fit(
+            &table(),
+            4,
+            &["big.table"],
+            budget(u64::MAX),
+            RowGatheredPolicy::BindIfFits,
+        );
+        assert!(!describe(&q, 4096, 512).contains("unread"));
+    }
+
+    #[test]
+    fn no_segment_spans_the_target_and_its_paired_drafter() {
+        // The table ends at 1450; a drafter mapped from the next 16 KiB boundary, its first
+        // tensor right at the start. The gap is far below the merge distance, but the two are
+        // different files: one segment over both would be one buffer over two mappings.
+        let at = 16_384_u64;
+        let p = fit_with_appended(
+            &table(),
+            &[(at, 300), (at + 300, 200)],
+            4,
+            &["big.table"],
+            budget(u64::MAX),
+            RowGatheredPolicy::BindIfFits,
+        );
+        let spans: Vec<(u64, u64)> =
+            p.segments.iter().map(|s| (s.offset, s.bytes)).collect();
+        assert_eq!(spans, vec![(0, 1450), (at, 500)]);
     }
 
     #[test]

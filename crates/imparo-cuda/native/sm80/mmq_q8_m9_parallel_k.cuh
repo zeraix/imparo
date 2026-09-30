@@ -19,8 +19,10 @@ __global__ void m9_parallel_k3_combine(const float *p,float *out,uint32_t n) {
 template<bool TileMajor=false>
 inline LaunchResult launch_m9_parallel_k3(const uint8_t *w,
         const BlockQ8_1Mmq *x,float *out,float *p,uint32_t ni,uint32_t no,
-        uint32_t nt,cudaStream_t stream) {
-    if(!w||!x||!out||!p||(nt!=9&&nt!=16)||ni==0||ni%768||!no||no%64
+        uint32_t nt,cudaStream_t stream,bool batch_invariant=false) {
+    if(!w||!x||!out||!p
+            ||((nt!=9&&nt!=16)&&!(batch_invariant&&nt>=1&&nt<=16))
+            ||ni==0||ni%768||!no||no%64
             ||uint64_t(nt)*no>UINT_MAX)return LaunchResult::NotSupported;
     int device=-1;if(cudaGetDevice(&device)!=cudaSuccess)return LaunchResult::Error;
     static int checked=-1;static bool supported=false;

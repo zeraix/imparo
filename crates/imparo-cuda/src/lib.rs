@@ -34,7 +34,7 @@ mod release_contract_tests {
         );
         assert_eq!(
             message,
-            b"imparo-cuda-backend-v1\x00windows-x86_64\x0086\x0034\x00123\x00abcd"
+            b"imparo-cuda-backend-v1\x00windows-x86_64\x0086\x0035\x00123\x00abcd"
         );
     }
 
@@ -137,6 +137,8 @@ mod dylib;
 mod ffi;
 #[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
 pub mod knobs;
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod lfm_retained;
 #[cfg(feature = "cuda-dynamic")]
 mod loader;
 #[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
@@ -154,9 +156,13 @@ pub mod owner_lab;
 pub mod dspark;
 #[cfg(feature = "cuda-speculative")]
 pub mod gemma4_mtp;
+#[cfg(feature = "cuda-speculative")]
+mod mtp_cluster_assets;
 
 #[cfg(feature = "cuda-speculative")]
 pub mod tree;
 
 #[cfg(feature = "cuda-speculative")]
 mod execution;
+#[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
+mod w4a16_module;

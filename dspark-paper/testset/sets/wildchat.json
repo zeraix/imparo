@@ -1,0 +1,260 @@
+{
+ "set": "wildchat",
+ "source_max_tokens": 1024,
+ "provenance": {
+  "source": "allenai/WildChat",
+  "config": "default",
+  "split": "train",
+  "revision": "f66566ceaaeb619dd98ffb0f3bf3ce1f86775ac4",
+  "scanned": 99,
+  "builder": "dspark-paper/testset/build.py",
+  "params": {
+   "rounds_per_kind": 2,
+   "single_kind": 8,
+   "max_chars": 4000
+  },
+  "built": "2026-09-27T16:17:47+0800"
+ },
+ "conversations": [
+  {
+   "name": "wc-1",
+   "kind": "wildchat",
+   "source": "allenai/WildChat",
+   "source_id": "b6c9e101545621fe21b57cf071ea4fbb",
+   "chars": 130,
+   "sha256": "c0655178e1ec9978",
+   "turns": [
+    {
+     "kind": "wildchat",
+     "type": "first",
+     "text": "What's the colour of grass?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Why do you spell colour without a u"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Can you use British English for me?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "So what's the colour of grass "
+    }
+   ]
+  },
+  {
+   "name": "wc-2",
+   "kind": "wildchat",
+   "source": "allenai/WildChat",
+   "source_id": "8a25422331c413d65940a906a32af6ee",
+   "chars": 1509,
+   "sha256": "030f3a5caccef997",
+   "turns": [
+    {
+     "kind": "wildchat",
+     "type": "first",
+     "text": "A survey was conducted among gynecologists-obstetricians in the Flanders region and obtained 295 responses. Of those responding, 100 indicated that they had performed at least one cesarean section on demand every year. Does this study provide sufficient evidence for us to conclude that more than 30 percent of the gynecologists-obstetricians in the Flanders region perform at least one cesarean section on demand each year? Let alpha=0.05.\n\n\nThe correct alternative hypothesis for this problem is the following:\n\nAlternative hypothesis: The proportion of OBGYNs who perform at least one c-section on demand is less than 0.30\n\n\nA survey was conducted among gynecologists-obstetricians in the Flanders region and obtained 295 responses. Of those responding, 100 indicated that they had performed at least one cesarean section on demand every year. Does this study provide sufficient evidence for us to conclude that more than 30 percent of the gynecologists-obstetricians in the Flanders region perform at least one cesarean section on demand each year? Let alpha=0.05.\n\n\nThe correct alternative hypothesis for this problem is the following:\n\nAlternative hypothesis: The proportion of OBGYNs who perform at least one c-section on demand is less than 0.30\n\n\nTrue or False?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "what is the correct formula to calculate the test statistic for the above problem?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "can you plug it in the formula for me? and solve?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Suppose our test statistic is 1.48, what is the p-value for this test? Please round to 3 decimal places.\n"
+    }
+   ]
+  },
+  {
+   "name": "wc-3",
+   "kind": "wildchat",
+   "source": "allenai/WildChat",
+   "source_id": "fb6eed391fa5f3ae74500654f02772be",
+   "chars": 1873,
+   "sha256": "d5f4f191ca2f3ecd",
+   "turns": [
+    {
+     "kind": "wildchat",
+     "type": "first",
+     "text": "Write a very long, elaborate, descriptive and detailed shooting script, including a background and dialogues, for a Modern Sitcom comic scene based on the following scenario: Two Palestinian-American women are traveling by city bus (give them names and describe them in detail). One of them has been having an urge to poop for a while until that point. She grows more and more desperate, fighting the urge persistently. Once she realizes that she won't make it in time to a restroom, she quietly informs the other woman of this. The other woman initially implores her to hold it in and the two of them get into a protracted discussion on the matter. The other woman relents relents after failing to find a solution, and tells the woman reluctantly to let nature take its course in her clothes if necessary. The woman who is desperate to poop eventually decides to relieve the pressure and voluntarily fills her pants with a full solid load to relieve the pressure in full view of the other woman while trying to remain concealed from anyone else (describe this in meticulous detail). The other woman reacts to the poop accident and the stench (describe this in meticulous detail). They attempt to remain undetected. Once they are alone, the other woman jokingly teases the woman who pooped, who takes it in stride (elaborate on this dialogue)."
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Why did Aisha have such an overwhelming urge to poop? Why didn't she mention her need immediately when the scene began? Why didn't Reem try to think of more solutions before telling Aisha to let it out? What was Aisha's posture as she was releasing? What was the consistency and size of Aisha's mess?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "How long was Aisha suppressing her urge? Tell me more about Reem covering her nostrils. Tell me more about Aisha's expression of relief."
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Why were Aisha's jeans filled to an uncomfortable level? In what way was the odor distinct?"
+    }
+   ]
+  },
+  {
+   "name": "wc-4",
+   "kind": "wildchat",
+   "source": "allenai/WildChat",
+   "source_id": "57981864902f698a05cbc0ebf368e0e8",
+   "chars": 80,
+   "sha256": "c45adcc1c90648f7",
+   "turns": [
+    {
+     "kind": "wildchat",
+     "type": "first",
+     "text": "Who is Takanashi Kiara?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Who Is IRyS?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Who is Houshou Marine?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Who is Usada Pekora?"
+    }
+   ]
+  },
+  {
+   "name": "wc-5",
+   "kind": "wildchat",
+   "source": "allenai/WildChat",
+   "source_id": "fa0d6e32991c5f125b5b2267e43414bc",
+   "chars": 749,
+   "sha256": "2fb4ff52c52b82d1",
+   "turns": [
+    {
+     "kind": "wildchat",
+     "type": "first",
+     "text": "You, ChatGPT, will be my prompt engineer. We will iterate the prompts you output in order to arrive at a prompt that gives me the desired output. The first output you give me will ask what the prompt will be about, with some questions to get us on the right track. Then once you have an initial understanding of what the prompt is about, you will provide me with the first iteration. Then you will ask more questions to make the prompt better. We will continue this iterative process until we have arrived at the prompt we need to generate my desired output."
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "(1. A general writing style that can be used in multiple stories written by chatgpt) (2. N/a) (3. A portion of a prompt)"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Don't detail what the format is yet, ask questions on it"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Ask question"
+    }
+   ]
+  },
+  {
+   "name": "wc-6",
+   "kind": "wildchat",
+   "source": "allenai/WildChat",
+   "source_id": "9c7ab3b292140809f9cb07f3ffe2a42f",
+   "chars": 276,
+   "sha256": "8845426b42fee7a8",
+   "turns": [
+    {
+     "kind": "wildchat",
+     "type": "first",
+     "text": "Write a shorty Wuxia story inspired by the work of Gu Long. The story's focal setting should be a manor and it should have an element of mystery to it."
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Tell me more about the town of Nine Lotus."
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Tell me more about the Jade Dragon Mountains."
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "Tell me more about the Known World."
+    }
+   ]
+  },
+  {
+   "name": "wc-7",
+   "kind": "wildchat",
+   "source": "allenai/WildChat",
+   "source_id": "bded6f66f8ab045628ff19a9f914b5c0",
+   "chars": 141,
+   "sha256": "4b12ef14675a60df",
+   "turns": [
+    {
+     "kind": "wildchat",
+     "type": "first",
+     "text": "download ebook stable diffusion"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "download ebook pdf stable diffusion"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "website download ebook pdf stable diffusion"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "download ebook pdf scribd.com"
+    }
+   ]
+  },
+  {
+   "name": "wc-8",
+   "kind": "wildchat",
+   "source": "allenai/WildChat",
+   "source_id": "4e9b862c216d84707f2c8d3ad372395f",
+   "chars": 387,
+   "sha256": "7408ae3dfbe7ab60",
+   "turns": [
+    {
+     "kind": "wildchat",
+     "type": "first",
+     "text": "what is the average amount and cost of ABS, or acrylonitrile butadiene styrene, polypropylene, high impact polystyrene, polycarbonate and foamed polyurethane used in manufacturing a 30L fridge"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "how much aluminium is used in manufacturing a 30L fridge?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "how much plastic material is used in manufacturing a 30 L mini fridge?"
+    },
+    {
+     "kind": "wildchat",
+     "type": "continued",
+     "text": "average plastic material used in manufacturing a 30 L mini fridge"
+    }
+   ]
+  }
+ ]
+}

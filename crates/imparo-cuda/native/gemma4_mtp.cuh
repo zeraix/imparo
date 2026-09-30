@@ -12,10 +12,21 @@
 #include "native_replay_graph.cuh"
 #include "sm86/mtp_cluster_head_lab.cuh"
 
+extern "C" uint32_t imparo_cuda_e4b_retained_decode_policy();
+extern "C" uint32_t imparo_cuda_e4b_retained_decode_domain();
+
 // Gemma4 assistant: the target owns every KV byte. Only ordinary activations,
 // captured post-output-norm target rows and assistant continuation hidden belong here.
 // All mathematical operations use the existing native backend and tuner choices.
 namespace imparo_gemma4_mtp {
+// Rust registers authenticated include_bytes slices with process-long lifetime.
+// These host addresses never become owners of an execution buffer.
+struct ClusterAssetBytes {
+    const uint8_t *centroids=nullptr;
+    const uint8_t *ordering=nullptr;
+};
+static ClusterAssetBytes embedded_cluster_assets;
+
 // Optional assistant confidence only; token selection remains the original argmax.
 // Reuse its return buffer and host synchronization. No target logits/state change.
 __global__ void first_probability(const float *logits, const uint32_t *token,
@@ -67,7 +78,7 @@ struct Session {
     std::vector<const void*> step_storage;
     Session(const Config &c,const Layer *l,uint32_t n):cfg(c),layers(l,l+n){}
     void clear_step_graphs(){step_graph.clear();step_storage.clear();}
-    bool step_graph_enabled()const{const char*v=std::getenv("IMPARO_LAB_MTP_CACHED_GRAPH");return v&&std::strcmp(v,"1")==0;}
+    bool step_graph_enabled()const{const char*v=std::getenv("IMPARO_LAB_MTP_CACHED_GRAPH");return imparo_cuda_e4b_retained_decode_policy()==1||(v&&std::strcmp(v,"1")==0);}
     std::vector<const void*> storage_signature(){
         auto&e=execution();std::vector<const void*> p;
         for(auto v:e.bufs)p.push_back(v);
@@ -226,18 +237,30 @@ struct Session {
         d->kdq.clear();d->vdq.clear();
     }
     void load_cluster_head() {
-        const char* root=std::getenv("IMPARO_LAB_MTP_CLUSTER_HEAD_DIR");
-        if(!root||!*root)return;
+        const bool retained=imparo_cuda_e4b_retained_decode_policy()==1;
+        const uint32_t domain=retained?imparo_cuda_e4b_retained_decode_domain():0;
+        if(retained&&domain==3)return;
+        const char* root=retained?nullptr:std::getenv("IMPARO_LAB_MTP_CLUSTER_HEAD_DIR");
+        if(!retained&&(!root||!*root))return;
+        req(!retained||domain==1||domain==2,"cluster head retained domain");
         req(g.sm_version==86&&cfg.hidden==256&&cfg.vocab==262144,"cluster head capability");
-        const char* minimum=std::getenv("IMPARO_LAB_MTP_MIN_PROB");
-        req(minimum&&std::strcmp(minimum,"0")==0,"cluster head requires current ungated proposal policy");
+        if(!retained) {
+            const char* minimum=std::getenv("IMPARO_LAB_MTP_MIN_PROB");
+            req(minimum&&std::strcmp(minimum,"0")==0,"cluster head requires current ungated proposal policy");
+        }
         req(!std::getenv("IMPARO_LAB_MTP_STEP_GRAPH_PROOF"),"dense logits proof incompatible with sparse head");
-        auto read=[&](const char* name,void*dst,size_t bytes){
-            std::ifstream in(std::string(root)+"/"+name,std::ios::binary|std::ios::ate);
-            req(in&&size_t(in.tellg())==bytes,"cluster sidecar file size");in.seekg(0);in.read(static_cast<char*>(dst),bytes);req(bool(in),"cluster sidecar read");
-        };
         std::vector<float> centers(2048*256);std::vector<uint32_t> order(cfg.vocab);
-        read("centroids.f32",centers.data(),centers.size()*4);read("ordering.u32",order.data(),order.size()*4);
+        if(retained) {
+            req(embedded_cluster_assets.centroids&&embedded_cluster_assets.ordering,"embedded cluster assets missing");
+            std::memcpy(centers.data(),embedded_cluster_assets.centroids,centers.size()*4);
+            std::memcpy(order.data(),embedded_cluster_assets.ordering,order.size()*4);
+        } else {
+            auto read=[&](const char* name,void*dst,size_t bytes){
+                std::ifstream in(std::string(root)+"/"+name,std::ios::binary|std::ios::ate);
+                req(in&&size_t(in.tellg())==bytes,"cluster sidecar file size");in.seekg(0);in.read(static_cast<char*>(dst),bytes);req(bool(in),"cluster sidecar read");
+            };
+            read("centroids.f32",centers.data(),centers.size()*4);read("ordering.u32",order.data(),order.size()*4);
+        }
         for(float v:centers)req(std::isfinite(v),"cluster centroid nonfinite");
         std::vector<unsigned char>seen(cfg.vocab,0);for(uint32_t id:order){req(id<cfg.vocab&&!seen[id],"cluster ordering is not permutation");seen[id]=1;}
         rc(imparo_cuda_alloc(CLUSTER_DATA,(centers.size()+order.size())*4));
@@ -401,6 +424,20 @@ template<class Fn>int invoke(Fn fn) {
     }
 }
 } // namespace imparo_gemma4_mtp
+
+extern "C" int imparo_cuda_gemma4_mtp_cluster_assets(const uint8_t*centroids,
+        uint64_t centroids_bytes,const uint8_t*ordering,uint64_t ordering_bytes) {
+    using namespace imparo_gemma4_mtp;
+    if(imparo_cuda_e4b_retained_decode_policy()!=1||attached||!execution_boundary_closed()
+        ||!centroids||!ordering||centroids_bytes!=2097152||ordering_bytes!=1048576)
+        return CUDA_RC_INVALID;
+    if(embedded_cluster_assets.centroids
+        &&(embedded_cluster_assets.centroids!=centroids||embedded_cluster_assets.ordering!=ordering))
+        return CUDA_RC_INVALID;
+    embedded_cluster_assets.centroids=centroids;
+    embedded_cluster_assets.ordering=ordering;
+    return 0;
+}
 
 extern "C" int imparo_cuda_gemma4_mtp_attach(const imparo_gemma4_mtp::Config*c,
         const imparo_gemma4_mtp::Layer*l,uint32_t nl) {

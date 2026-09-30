@@ -3,6 +3,46 @@
 use imparo_kv::{KvState, LayerStateGeom, StateKind};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+// The forward diagnostic owns this process-local, one-way reference control.
+// The first LFM device batch freezes its value; it cannot change a live owner.
+static LFM_FULL_HISTORY_CONTROL: OnceLock<bool> = OnceLock::new();
+
+fn initialize_lfm_full_history_control(
+    control: &OnceLock<bool>,
+    gate_mode: bool,
+    domain: u32,
+    finite_history_rows: Option<u32>,
+) -> Result<u32, String> {
+    if !gate_mode || !(1..=3).contains(&domain) || finite_history_rows != Some(64) {
+        return Err("full-history control requires correctness-gate mode and a prepared retained LFM finite64 owner".into());
+    }
+    control.set(true).map_err(|_| {
+        "full-history control must be initialized once before the first LFM forward"
+            .to_string()
+    })?;
+    Ok(domain)
+}
+
+/// Forward-only correctness reference. This leaves the registered finite64
+/// selection and prepared target/draft policies intact and disables only the
+/// proposed finite-history crop. The server has no caller or environment switch.
+#[doc(hidden)]
+pub fn enable_lfm_full_history_control() -> Result<u32, String> {
+    initialize_lfm_full_history_control(
+        &LFM_FULL_HISTORY_CONTROL,
+        std::env::var("IMPARO_CORRECTNESS_GATE").as_deref() == Ok("1"),
+        crate::lfm_retained_domain(),
+        crate::backend::active()
+            .and_then(imparo_backend::Backend::finite_history_prefill_tail_rows),
+    )
+}
+
+pub(crate) fn lfm_full_history_control_enabled() -> bool {
+    *LFM_FULL_HISTORY_CONTROL.get_or_init(|| false)
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Reach {
     floor: usize,
@@ -20,7 +60,8 @@ impl WindowHistory {
         Self {
             enabled: windowed
                 && cfg!(feature = "cuda-speculative")
-                && std::env::var("IMPARO_KV_HISTORY_LAB").as_deref() == Ok("1"),
+                && (crate::e4b_retained_decode_policy_enabled()
+                    || std::env::var("IMPARO_KV_HISTORY_LAB").as_deref() == Ok("1")),
             region: Cell::new(0),
             regions: RefCell::new(BTreeMap::new()),
         }
@@ -181,6 +222,46 @@ impl WindowHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_history_control_requires_gate_and_prepared_finite64_owner() {
+        for (gate, domain, rows) in [
+            (false, 1, Some(64)),
+            (true, 0, Some(64)),
+            (true, 4, Some(64)),
+            (true, 1, None),
+            (true, 1, Some(0)),
+        ] {
+            let control = OnceLock::new();
+            assert!(
+                initialize_lfm_full_history_control(&control, gate, domain, rows)
+                    .is_err()
+            );
+            assert!(control.get().is_none());
+        }
+        for domain in 1..=3 {
+            let control = OnceLock::new();
+            assert_eq!(
+                initialize_lfm_full_history_control(&control, true, domain, Some(64)),
+                Ok(domain)
+            );
+            assert_eq!(control.get(), Some(&true));
+            assert!(
+                initialize_lfm_full_history_control(&control, true, domain, Some(64))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn first_ordinary_forward_freezes_full_history_control_off() {
+        let control = OnceLock::new();
+        assert!(!*control.get_or_init(|| false));
+        assert!(
+            initialize_lfm_full_history_control(&control, true, 1, Some(64)).is_err()
+        );
+        assert_eq!(control.get(), Some(&false));
+    }
+
     fn tracked() -> WindowHistory {
         WindowHistory {
             enabled: true,

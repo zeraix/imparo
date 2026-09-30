@@ -32,7 +32,7 @@ RECOVERY_SCHEMA = 1
 DEFAULT_ALLOWLIST = "dev_harness/public-export.allowlist"
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_BYTES = 128 * 1024 * 1024
-MAX_FILES = 512
+MAX_FILES = 2048
 MAX_MARKER_BYTES = 4 * 1024 * 1024
 MAX_LOCK_BYTES = 4096
 ALLOWED_GIT_MODES = {"100644", "100755"}
@@ -55,12 +55,41 @@ FORBIDDEN_BASENAMES = {
     ".env", "credentials", "credentials.json", "id_dsa", "id_ecdsa",
     "id_ed25519", "id_rsa", "secrets.json",
 }
+# Reviewed binaries: (first bytes, last bytes, size, SHA-256). A listed path may carry a
+# suffix FORBIDDEN_SUFFIXES would refuse; the digest pins the exact reviewed bytes.
 BINARY_ALLOWLIST = {
     "assets/imparo-wordmark-black.png": (
         b"\x89PNG\r\n\x1a\n",
         b"IEND\xaeB\x60\x82",
         467655,
         "77f217e43ece7c5bed4a5e2aa2c83adf306f1406a3a3d8aec4b8756569f9f66a",
+    ),
+    # Test fixture the CPU and Metal row-kernel tests include_bytes!.
+    "crates/imparo-cpu/tests/data/quant_rows.bin": (
+        b"IQFX8\x00\x00\x00",
+        b"\x80\x93\xa0<\x80\x93\xa0<",
+        129984,
+        "3174bc6b81d02ebc23880c67657a1e2cb611f6bef91f34da7ad9e1dfef0a3420",
+    ),
+    # Gemma assistant cluster tensors (Apache-2.0; provenance in SOURCE.md beside them).
+    "crates/imparo-cuda/native/gemma4_mtp_assets/centroids.f32": (
+        b"\x00\x00\x7f=\x00\x00\x07\xbd",
+        b"\x00\x00_\xbd\x00\x00\x82=",
+        2097152,
+        "d293fc2fc2b68dea9716cc6cad81c4847084640d393962c637ef593415aa68c7",
+    ),
+    "crates/imparo-cuda/native/gemma4_mtp_assets/ordering.u32": (
+        b"\xfd<\x00\x00e\x96\x00\x00",
+        b"W\xca\x03\x00\t\xdf\x03\x00",
+        1048576,
+        "2d4a619b6fdf687972daaf298bf5ce341f4e2f1d05c20de10c77684e20481b07",
+    ),
+    # vLLM 0.28.0 Marlin SM80 image (Apache-2.0; provenance in SOURCE.md beside it).
+    "crates/imparo-cuda/native/sm86/w4a16_marlin/marlin-sm80.cubin": (
+        b"\x7fELF\x02\x01\x01A",
+        b"\x08\x00\x00\x00\x00\x00\x00\x00",
+        4348832,
+        "9521406b46b918c23450e6199ed973149c88fcb2e33e5a7d8348212f7694cf37",
     ),
 }
 SECRET_PATTERNS = (
@@ -303,7 +332,10 @@ def validate_public_path(path: str) -> None:
     if forbidden:
         raise PublicExportError("private-path", f"path contains forbidden component {forbidden[0]}", path)
     basename = parts[-1].casefold()
-    if basename in FORBIDDEN_BASENAMES or any(basename.endswith(suffix) for suffix in FORBIDDEN_SUFFIXES):
+    if basename in FORBIDDEN_BASENAMES or (
+        path not in BINARY_ALLOWLIST
+        and any(basename.endswith(suffix) for suffix in FORBIDDEN_SUFFIXES)
+    ):
         raise PublicExportError("private-path", "path has a forbidden sensitive/artifact name", path)
 
 
@@ -366,7 +398,37 @@ def _scan_text(path: str, data: bytes) -> None:
         raise PublicExportError("line-endings", "public text must use LF line endings", path)
     if any(character in text for character in BIDI_CONTROLS):
         raise PublicExportError("unicode-control", "text contains a bidirectional control", path)
+    if path.endswith(".json"):
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            decoded = None
+        if decoded is not None:
+            # JSON escapes are encoding, not content: a string holding a letter, a colon and a
+            # newline gains a backslash in the raw file and the drive-path rule reads it as a
+            # path. Secret rules run on the raw text; every rule runs on the decoded keys and
+            # strings, where an escaped Windows path decodes to a path again.
+            _scan_patterns(path, text, SECRET_PATTERNS)
+            try:
+                _scan_patterns(path, "\n".join(_json_strings(decoded)))
+            except PublicExportError as error:
+                raise PublicExportError(
+                    error.code, "blocked pattern in a JSON string", path
+                ) from None
+            return
     _scan_patterns(path, text)
+
+
+def _json_strings(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key)
+            yield from _json_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _json_strings(item)
 
 
 def _scan_blob(path: str, data: bytes) -> None:

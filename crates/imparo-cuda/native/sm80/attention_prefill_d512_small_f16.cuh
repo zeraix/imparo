@@ -12,7 +12,8 @@ namespace imparo_sm80_d512_small {
 
 constexpr uint32_t kQueryTokens = 4;
 constexpr uint32_t kGqaHeads = 4;
-// Keep the 16-column fragment/workspace ABI for both GQA2 and default GQA4.
+// Keep the 16-column fragment/workspace ABI. GQA6 is a standalone M1/F16/D256
+// candidate only; runtime admission remains unchanged and must never allow M4.
 constexpr uint32_t kColumns = kQueryTokens * kGqaHeads;
 constexpr uint32_t kKeyBatch = 32;
 constexpr uint32_t kWarps = 2;
@@ -138,7 +139,7 @@ __global__ void scores(
         uint32_t kv_width, uint32_t start_pos, float qk_scale, uint32_t window,
         uint32_t n_tok, uint32_t ring, uint32_t valid_span,
         uint32_t kv_span, uint32_t parts, const uint32_t * decode_control) {
-static_assert(GqaHeads == 2 || GqaHeads == 4, "small FA GQA factor");
+static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA factor");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (decode_control) {
         start_pos = decode_control[0];
@@ -236,7 +237,7 @@ __global__ void scores_paged(
         uint32_t n_tok, uint32_t ring, uint32_t valid_span,
         uint32_t kv_span, uint32_t parts, const uint32_t * decode_control,
         const uint32_t * page_table) {
-static_assert(GqaHeads == 2 || GqaHeads == 4, "small FA GQA factor");
+static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA factor");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (decode_control) {
         start_pos = decode_control[0];
@@ -419,18 +420,30 @@ __global__ void softmax_parts_queries(float * workspace, uint32_t kv_span,
     softmax_parts_body(workspace, kv_span, parts);
 }
 
+__device__ __forceinline__ __half2 load_probability_pair(
+        const float * workspace, uint64_t base, uint32_t span,
+        uint32_t query, uint32_t key) {
+    const float p0 = key < span ? workspace[base + uint64_t(query) * span + key] : 0.0f;
+    const float p1 = key + 1 < span ? workspace[base + uint64_t(query) * span + key + 1] : 0.0f;
+    return __floats2half2_rn(p0, p1);
+}
+
 // Compute one half-MMA numerator per stream-K partial, combine its two warp
 // partitions, then reproduce the reference uniform fixup from the last partial
 // to the first. Each thread in warp 0 owns eight (query, output-row) cells.
 template <uint32_t HeadDim, uint32_t CacheType, uint32_t OutputTiles,
-          uint32_t GqaHeads = kGqaHeads, bool QueryGrid = false, bool F32Numerator = false>
+          uint32_t GqaHeads = kGqaHeads, bool QueryGrid = false, bool F32Numerator = false,
+          bool RegisterPV = false>
 __global__ void values_combine(
         const void * vc, const float * workspace, float * out,
         uint32_t block_base, uint32_t n_heads, uint32_t n_kv,
         uint32_t kv_width, uint32_t n_tok, uint32_t ring,
         uint32_t valid_span, uint32_t kv_span, uint32_t parts,
         const uint32_t * decode_control) {
-static_assert(GqaHeads == 2 || GqaHeads == 4, "small FA GQA factor");
+static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA factor");
+static_assert(!RegisterPV || (HeadDim == 512 && CacheType == 2 && OutputTiles == 1
+    && GqaHeads == 4 && !QueryGrid && !F32Numerator),
+    "register PV is qualified only for common short Q4 D512");
 static_assert(!F32Numerator || (HeadDim == 512 && CacheType == 2 && GqaHeads == 2 && !QueryGrid),
     "FP32 PV is qualified only for the Q4 D512 assistant");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -460,8 +473,6 @@ static_assert(!F32Numerator || (HeadDim == 512 && CacheType == 2 && GqaHeads == 
     const uint32_t out0 = blockIdx.y * (16 * OutputTiles);
     const uint32_t groups = (kv_span + kKeyBatch - 1) / kKeyBatch;
     const uint64_t base = uint64_t(local_block) * block_stride(kv_span, parts);
-    __shared__ __align__(16) __half2 p_tile[kWarps][16 * 8];
-    __shared__ __align__(16) __half2 v_tile[kWarps][16 * 8];
     using PartialValue = typename std::conditional<F32Numerator, float, __half>::type;
     __shared__ __align__(16) PartialValue c_tile[kWarps][OutputTiles * 16 * 16];
     // Rescale and partial-softmax metadata are column properties, but every
@@ -531,47 +542,90 @@ static_assert(!F32Numerator || (HeadDim == 512 && CacheType == 2 && GqaHeads == 
                 }
             }
             const uint32_t key0 = group * kKeyBatch + partition * 16;
-            for (uint32_t e = lane; e < 16 * 8; e += 32) {
-                const uint32_t query = e >> 3;
-                const uint32_t pair = e & 7;
-                const uint32_t pkey = key0 + 2 * pair;
-                const float p0 = pkey < kv_span
-                    ? workspace[base + uint64_t(query) * kv_span + pkey] : 0.0f;
-                const float p1 = pkey + 1 < kv_span
-                    ? workspace[base + uint64_t(query) * kv_span + pkey + 1] : 0.0f;
-                p_tile[warp][query * 8 + pair] = __floats2half2_rn(p0, p1);
-            }
-#pragma unroll
-            for (uint32_t tile = 0; tile < OutputTiles; ++tile) {
-                for (uint32_t e = lane; e < 16 * 8; e += 32) {
-                    const uint32_t key = key0 + (e >> 3);
-                    const uint32_t out_pair = e & 7;
-                    __half2 value = __float2half2_rn(0.0f);
-                    if (key < valid_span) {
-                        const uint32_t index = kvh * HeadDim + out0
-                            + tile * 16 + 2 * out_pair;
-                        if constexpr (CacheType == 2) {
-                            value = cache_half2_q4_scaled(
-                                vc, kv_width, key, index,
-                                v_scale[warp][e >> 3]);
-                        } else {
-                            value = cache_half2<CacheType>(
-                                vc, kv_width, key, index);
-                        }
-                    }
-                    v_tile[warp][(e >> 3) * 8 + out_pair] = value;
-                }
-                __syncwarp();
+            if constexpr (RegisterPV) {
+                // Same ldmatrix.x4 row-major slots, loaded directly into registers.
+                const uint32_t row = lane >> 2;
+                const uint32_t pair_d = 2 * (lane & 3u);
                 imparo_sm80_prefill::Half16x8 probability;
-                imparo_sm80_prefill::Half16x8 value;
-                imparo_sm80_prefill::load_half16x8(
-                    probability, p_tile[warp], 8, lane);
-                imparo_sm80_prefill::load_half16x8_trans(
-                    value, v_tile[warp], 8, lane);
-                if constexpr (F32Numerator) imparo_sm80_mma::mma_qk(c[tile], probability, value);
-                else imparo_sm80_prefill::mma_pv(c[tile], probability, value);
-                if constexpr (OutputTiles > 1) {
-                    if (tile + 1 < OutputTiles) __syncwarp();
+                probability.x[0] = load_probability_pair(workspace, base, kv_span, row, key0 + pair_d);
+                probability.x[1] = load_probability_pair(workspace, base, kv_span, row + 8, key0 + pair_d);
+                probability.x[2] = load_probability_pair(workspace, base, kv_span, row, key0 + pair_d + 8);
+                probability.x[3] = load_probability_pair(workspace, base, kv_span, row + 8, key0 + pair_d + 8);
+#pragma unroll
+                for (uint32_t tile = 0; tile < OutputTiles; ++tile) {
+                    imparo_sm80_prefill::Half16x8 row_major;
+#pragma unroll
+                    for (uint32_t slot = 0; slot < 4; ++slot) {
+                        const uint32_t key_row = row + ((slot & 1u) ? 8u : 0u);
+                        const uint32_t key = key0 + key_row;
+                        const uint32_t index = kvh * HeadDim + out0 + tile * 16
+                            + pair_d + ((slot & 2u) ? 8u : 0u);
+                        __half2 value = __float2half2_rn(0.0f);
+                        if (key < valid_span) {
+                            if constexpr (CacheType == 2) {
+                                value = cache_half2_q4_scaled(
+                                    vc, kv_width, key, index, v_scale[warp][key_row]);
+                            } else {
+                                value = cache_half2<CacheType>(vc, kv_width, key, index);
+                            }
+                        }
+                        row_major.x[slot] = value;
+                    }
+                    // Preserve the original transposed ldmatrix destination swap.
+                    imparo_sm80_prefill::Half16x8 value;
+                    value.x[0] = imparo_sm80_mma::movmatrix_transpose(row_major.x[0]);
+                    value.x[1] = imparo_sm80_mma::movmatrix_transpose(row_major.x[2]);
+                    value.x[2] = imparo_sm80_mma::movmatrix_transpose(row_major.x[1]);
+                    value.x[3] = imparo_sm80_mma::movmatrix_transpose(row_major.x[3]);
+                    imparo_sm80_prefill::mma_pv(c[tile], probability, value);
+                }
+                // Shared Q4 scales must survive every lane's register loads.
+                __syncwarp();
+            } else {
+                __shared__ __align__(16) __half2 p_tile[kWarps][16 * 8];
+                __shared__ __align__(16) __half2 v_tile[kWarps][16 * 8];
+                for (uint32_t e = lane; e < 16 * 8; e += 32) {
+                    const uint32_t query = e >> 3;
+                    const uint32_t pair = e & 7;
+                    const uint32_t pkey = key0 + 2 * pair;
+                    const float p0 = pkey < kv_span
+                        ? workspace[base + uint64_t(query) * kv_span + pkey] : 0.0f;
+                    const float p1 = pkey + 1 < kv_span
+                        ? workspace[base + uint64_t(query) * kv_span + pkey + 1] : 0.0f;
+                    p_tile[warp][query * 8 + pair] = __floats2half2_rn(p0, p1);
+                }
+#pragma unroll
+                for (uint32_t tile = 0; tile < OutputTiles; ++tile) {
+                    for (uint32_t e = lane; e < 16 * 8; e += 32) {
+                        const uint32_t key = key0 + (e >> 3);
+                        const uint32_t out_pair = e & 7;
+                        __half2 value = __float2half2_rn(0.0f);
+                        if (key < valid_span) {
+                            const uint32_t index = kvh * HeadDim + out0
+                                + tile * 16 + 2 * out_pair;
+                            if constexpr (CacheType == 2) {
+                                value = cache_half2_q4_scaled(
+                                    vc, kv_width, key, index,
+                                    v_scale[warp][e >> 3]);
+                            } else {
+                                value = cache_half2<CacheType>(
+                                    vc, kv_width, key, index);
+                            }
+                        }
+                        v_tile[warp][(e >> 3) * 8 + out_pair] = value;
+                    }
+                    __syncwarp();
+                    imparo_sm80_prefill::Half16x8 probability;
+                    imparo_sm80_prefill::Half16x8 value;
+                    imparo_sm80_prefill::load_half16x8(
+                        probability, p_tile[warp], 8, lane);
+                    imparo_sm80_prefill::load_half16x8_trans(
+                        value, v_tile[warp], 8, lane);
+                    if constexpr (F32Numerator) imparo_sm80_mma::mma_qk(c[tile], probability, value);
+                    else imparo_sm80_prefill::mma_pv(c[tile], probability, value);
+                    if constexpr (OutputTiles > 1) {
+                        if (tile + 1 < OutputTiles) __syncwarp();
+                    }
                 }
             }
             if constexpr (CacheType == 2) {
@@ -702,7 +756,7 @@ __global__ void values_combine_paged(
         uint32_t kv_width, uint32_t n_tok, uint32_t ring,
         uint32_t valid_span, uint32_t kv_span, uint32_t parts,
         const uint32_t * decode_control, const uint32_t * page_table) {
-static_assert(GqaHeads == 2 || GqaHeads == 4, "small FA GQA factor");
+static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA factor");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (decode_control) {
         const uint32_t start_pos = decode_control[0];

@@ -115,6 +115,12 @@ enum PreTokenizer {
     /// `tokenizer.ggml.pre = "qwen35"`. The same splitter as Llama-3's with two
     /// alternatives written differently; see [`PieceShape`].
     Qwen35,
+    /// Qwen3 pre-tokenization plus GPT-2 byte encoding, selected by
+    /// `tokenizer.ggml.pre = "qwen2"`. THE FOURTH CORNER of the two knobs: it takes
+    /// Qwen3.5's single-digit pieces and Llama-3's treatment of combining marks as
+    /// punctuation. Reading it as either neighbour changes the token count of ordinary
+    /// text, so it is its own kind rather than an alias.
+    Qwen2,
 }
 
 /// WHERE THE TWO BYTE-BPE SPLITTERS DIFFER, and nowhere else.
@@ -175,6 +181,28 @@ const TOKENIZER_ALGORITHMS: &[TokenizerAlgorithm] = &[
         pre: Some("lfm2"),
         kind: PreTokenizer::Lfm2,
         default_add_bos: true,
+        default_add_space_prefix: false,
+    },
+    TokenizerAlgorithm {
+        // The same tokenizer as the dense LFM2.5 files, by every key the tuple reads: the
+        // vocabulary, the merges, the pre-tokenizer and the specials are identical, and
+        // only the architecture name differs. The table is keyed on the architecture, so
+        // that one row cannot serve both.
+        architecture: "lfm2moe",
+        model: "gpt2",
+        pre: Some("lfm2"),
+        kind: PreTokenizer::Lfm2,
+        default_add_bos: true,
+        default_add_space_prefix: false,
+    },
+    TokenizerAlgorithm {
+        architecture: "qwen3",
+        model: "gpt2",
+        pre: Some("qwen2"),
+        kind: PreTokenizer::Qwen2,
+        // Qwen3's file sets `tokenizer.ggml.add_bos_token = false`, and the read of that
+        // key wins over this default; it is here for a conversion that omits it.
+        default_add_bos: false,
         default_add_space_prefix: false,
     },
     TokenizerAlgorithm {
@@ -462,7 +490,7 @@ impl Tokenizer {
                 }
                 self.bpe_into(&norm, out);
             }
-            PreTokenizer::Lfm2 | PreTokenizer::Qwen35 => {
+            PreTokenizer::Lfm2 | PreTokenizer::Qwen35 | PreTokenizer::Qwen2 => {
                 for piece in byte_bpe_pieces(text, self.pre_kind.piece_shape()) {
                     let encoded = gpt2_byte_encode(piece);
                     // `ignore_merges = true`: a whole pre-tokenized word that is in the
@@ -1032,6 +1060,10 @@ impl PreTokenizer {
             Self::Qwen35 => PieceShape {
                 digit_run: 1,
                 marks_join_letters: true,
+            },
+            Self::Qwen2 => PieceShape {
+                digit_run: 1,
+                marks_join_letters: false,
             },
             Self::SentencePiece | Self::Lfm2 => PieceShape {
                 digit_run: 3,

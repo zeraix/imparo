@@ -311,8 +311,8 @@ family and no longer a knob: docs/kv-identity-grid.md.)
 
 ## Unified KV pool (2026-08-22)
 
-docs/unified-kv-pool.md is implemented on Metal end to end; the "Shipped state"
-appendix there records the design-level decisions and cuts. The verified numbers:
+docs/unified-kv-pool.md is implemented on Metal end to end; its sections state the
+design as built, and what was cut is under its "Rejected". The verified numbers:
 
 ```
 sharing      three agents, ~700-token shared preamble: reused 0/512/512, the
@@ -505,7 +505,7 @@ started; the per-run spreads do not overlap (ours 526.1-528.6, theirs
 showed did not reproduce. The fix was sharing K across query row
 groups -- the score phase's work unit was (row group, position group), so
 two simdgroups each re-loaded the same K, which is why widening the query
-tile never helped in any earlier attempt. See docs/metal_kernel.md for the
+tile never helped in any earlier attempt. See docs/metal-kernel-playbook.md for the
 configuration and why every term of it is forced. What follows is the
 analysis that located it. Fitting prefill time as base*N + attn*N^2/2
 separates it cleanly and needs no cross-harness comparison at all: our BASE is
@@ -537,7 +537,7 @@ METHOD TRAPS THAT EACH COST AN IMPLEMENTATION:
   - end-to-end decode cannot resolve a per-dispatch question (see routing).
 
 The Metal kernels themselves -- what each is for, which one the host picks, and
-the rules for changing them -- are in docs/metal_kernel.md.
+the rules for changing them -- are in docs/metal-kernel-playbook.md.
 
 ## Matmul routing
 

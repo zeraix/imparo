@@ -5,8 +5,8 @@
 
 use imparo_backend::{
     Backend, BackendKnobs, BufId, ConvForm, Gemma4MegaLayer, KnobCategory, KnobDecl,
-    Lfm2MegaLayer, Lfm2MegaMixer, NO_WEIGHT, Qwen35MegaLayer, Qwen35MegaMixer,
-    WeightKindWire,
+    Lfm2MegaLayer, Lfm2MegaMixer, NO_WEIGHT, Qwen35MegaLayer, Qwen35MegaMixer, SlotRow,
+    SlotStateRow, WeightKindWire,
 };
 
 /// The Metal backend as a trait object. Zero-sized: all state lives in the
@@ -88,8 +88,22 @@ impl Backend for MetalBackend {
             layer_work_prefill_ns: 0,
         }
     }
+    /// The seat, and with a slow tier one layer per prefill buffer. The driver reads a
+    /// buffer's dropped slow pages before that buffer starts, while the one before it runs,
+    /// so a buffer binding every slow layer waited for all of them at once: a dropped
+    /// 1977 MiB tier cost +800 ms per prompt in one buffer, +370 ms at two layers per buffer,
+    /// and a cached tier after a 3 s idle was 2% faster at one layer (docs/evidence/bracket/
+    /// 2026-09-18-slow-tier-streaming.md). Decode keeps its seat but never 0, so no buffer
+    /// binds the whole slow tier. A model larger than RAM is not verified (same document).
     fn flush_layers(&self, decode: bool) -> u32 {
-        crate::flush_layers(decode)
+        let seat = crate::flush_layers(decode);
+        if crate::slow_segments() == 0 {
+            seat
+        } else if decode {
+            seat.max(1)
+        } else {
+            1
+        }
     }
 
     fn alloc(&self, id: BufId, bytes: u64) -> Result<(), i32> {
@@ -114,6 +128,42 @@ impl Backend for MetalBackend {
     fn grow_kv(&self, bytes: &[u64]) -> Result<(), i32> {
         crate::grow_kv(bytes)
     }
+    fn supports_kv_incremental_commit(&self) -> bool {
+        true
+    }
+    fn alloc_kv_reserved(
+        &self,
+        bytes: &[u64],
+        reserve: &[u64],
+        _layouts: &[imparo_backend::KvLayout],
+    ) -> Result<(), i32> {
+        crate::alloc_kv_reserved(bytes, reserve)
+    }
+    fn kv_prefetch(&self, bytes: &[u64]) {
+        crate::kv_prefetch(bytes);
+    }
+    fn kv_adopt(&self, need: &[u64]) {
+        crate::kv_adopt(need);
+    }
+    fn kv_release(&self, bytes: &[u64]) -> Result<(), i32> {
+        crate::kv_release(bytes)
+    }
+    fn take_memory_pressure(&self) -> bool {
+        crate::take_memory_pressure()
+    }
+    fn idle_release_after(&self) -> Option<std::time::Duration> {
+        crate::idle_release_after()
+    }
+    fn kv_committed_bytes(&self) -> u64 {
+        crate::kv_committed_bytes()
+    }
+    fn kv_commits_on_demand(&self) -> bool {
+        // A no-copy view over one reservation: only the view's pages are wired.
+        true
+    }
+    fn kv_max_view_bytes(&self) -> Option<u64> {
+        Some(crate::max_buffer_bytes())
+    }
     fn write(&self, id: BufId, off: u64, src: &[f32]) {
         crate::write(b(id), off, src);
     }
@@ -125,6 +175,12 @@ impl Backend for MetalBackend {
     }
     fn set_weight_path(&self, path: &std::path::Path) {
         crate::set_weight_path(path);
+    }
+    fn set_model_bytes(&self, bytes: u64) {
+        crate::set_model_bytes(bytes);
+    }
+    fn stored_prefill_batch(&self, model_bytes: u64) -> Option<usize> {
+        crate::stored_prefill_batch(model_bytes)
     }
     fn longest_cb_gpu_seconds(&self) -> f64 {
         crate::longest_cb_gpu_seconds()
@@ -141,6 +197,41 @@ impl Backend for MetalBackend {
     fn write_kv_bytes(&self, layer: u32, is_v: bool, off: u64, src: &[u8]) {
         crate::write_kv_bytes(layer, is_v, off, src);
     }
+    fn lend_kv_ranges(
+        &self,
+        ranges: &[imparo_backend::KvRange],
+        with: &mut dyn FnMut(&mut [&mut [u8]]) -> Result<(), String>,
+    ) -> Option<Result<(), String>> {
+        let mut at: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            let p = crate::kv_host_span(r.layer, r.is_v, r.off, r.len as u64);
+            if p.is_null() {
+                return Some(Err(format!(
+                    "metal: kv layer {} {} [{}, +{}) is outside the cache's view",
+                    r.layer,
+                    if r.is_v { "V" } else { "K" },
+                    r.off,
+                    r.len
+                )));
+            }
+            at.push((p as usize, r.len));
+        }
+        // The slices are handed out together, so two ranges over the same bytes would be
+        // two live `&mut` to them.
+        let mut sorted = at.clone();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0].0 + w[0].1 > w[1].0) {
+            return Some(Err("metal: lent kv ranges overlap".into()));
+        }
+        // SAFETY: every range lies inside its layer side's current view (checked natively),
+        // no two overlap (checked above), and the device is idle for the call -- the
+        // `write_kv_bytes` contract this method shares.
+        let mut slices: Vec<&mut [u8]> = at
+            .iter()
+            .map(|&(p, n)| unsafe { std::slice::from_raw_parts_mut(p as *mut u8, n) })
+            .collect();
+        Some(with(&mut slices))
+    }
     fn kv_advise_free(&self, layer: u32, is_v: bool, off: u64, len: u64) {
         crate::kv_advise_free(layer, is_v, off, len);
     }
@@ -155,6 +246,9 @@ impl Backend for MetalBackend {
         crate::set_kv_region(layer, k_off, v_off);
     }
 
+    fn config_key(&self) -> Option<(String, u64)> {
+        crate::config_key()
+    }
     fn matmat(
         &self,
         wkind: WeightKindWire,
@@ -665,6 +759,34 @@ impl Backend for MetalBackend {
             op.snap.map_or(0, |s| s.row),
         )
     }
+    fn delta_net_slot_rows(
+        &self,
+        op: &imparo_backend::DeltaNet,
+        rows: &[imparo_backend::SlotStateRow],
+    ) -> bool {
+        let slots: Vec<u32> = rows.iter().map(|r| r.slot).collect();
+        let offs: Vec<u32> = rows.iter().map(|r| r.state_off).collect();
+        let outs: Vec<u32> = rows.iter().map(|r| r.state_out_off).collect();
+        crate::delta_net_slot_rows(
+            b(op.qkv),
+            b(op.alpha),
+            b(op.beta),
+            op.a_off,
+            op.dt_bias_off,
+            b(op.state),
+            &slots,
+            &offs,
+            &outs,
+            b(op.out),
+            op.k_heads,
+            op.v_heads,
+            op.key_dim,
+            op.value_dim,
+            op.eps,
+            op.epilogue.map_or(crate::NO_EPILOGUE, |e| e.norm_w_off),
+            op.epilogue.map_or(0, |e| b(e.gate)),
+        )
+    }
     fn supports_gated_delta(&self) -> bool {
         crate::supports_gated_delta()
     }
@@ -706,6 +828,17 @@ impl Backend for MetalBackend {
     ) {
         crate::copy_strided(b(dst), b(src), width, src_off, src_stride, n_row);
     }
+    fn scatter_strided(
+        &self,
+        dst: BufId,
+        src: BufId,
+        width: u32,
+        dst_off: u32,
+        dst_stride: u32,
+        n_row: u32,
+    ) {
+        crate::scatter_strided(b(dst), b(src), width, dst_off, dst_stride, n_row);
+    }
     /// One decode layer as one entry of the mega kernel: the architecture's variant names the
     /// operands, the entry function below turns them into the program's slots and words.
     fn mega_layer(&self, e: &imparo_backend::MegaEntry<'_>) -> bool {
@@ -713,6 +846,7 @@ impl Backend for MetalBackend {
             imparo_backend::MegaLayer::Gemma4(l) => mega_gemma4_entry(l, e.n_tok),
             imparo_backend::MegaLayer::Lfm2(l) => mega_lfm2_entry(l, e.n_tok),
             imparo_backend::MegaLayer::Qwen35(l) => mega_qwen35_entry(l, e.n_tok),
+            imparo_backend::MegaLayer::Lfm2Moe(l) => mega_lfm2moe_entry(l, e.n_tok),
         }
     }
     fn mega_qkv_wanted(&self) -> bool {
@@ -769,6 +903,502 @@ impl Backend for MetalBackend {
     fn argmax(&self, src: BufId, dst: BufId, n: u32) {
         crate::argmax(b(src), b(dst), n);
     }
+    fn supports_row_layout(&self, head_dim: u32) -> bool {
+        crate::supports_row_layout(head_dim)
+    }
+    fn attention_rows(
+        &self,
+        kv_layer: u32,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv: u32,
+        kv_width: u32,
+        start_pos: u32,
+        key_lo: u32,
+        scale: f32,
+        n_tok: u32,
+        float_q: bool,
+    ) -> bool {
+        crate::attention_rows(
+            kv_layer,
+            head_dim,
+            n_heads,
+            n_kv,
+            kv_width,
+            start_pos,
+            key_lo,
+            n_tok,
+            scale,
+            b(BufId::RowLayout),
+            float_q,
+        )
+    }
+    fn head_norm_rope_rows(
+        &self,
+        buf: BufId,
+        w_off: u64,
+        head_dim: u32,
+        eps: f32,
+        n_heads: u32,
+        n_tok: u32,
+        rope_dim: u32,
+        rope_base: f32,
+        freqs: Option<&[f32]>,
+    ) -> bool {
+        crate::head_norm_rope_rows(
+            b(buf),
+            w_off,
+            head_dim,
+            eps,
+            n_heads,
+            n_tok,
+            rope_dim,
+            rope_base,
+            freqs,
+            b(BufId::RowLayout),
+        )
+    }
+    fn causal_conv_rows(
+        &self,
+        form: ConvForm,
+        src: BufId,
+        w_off: u64,
+        state: BufId,
+        state_off: u32,
+        out: BufId,
+        width: u32,
+        kernel: u32,
+        n_tok: u32,
+    ) -> bool {
+        crate::causal_conv_rows(
+            form as u32,
+            b(src),
+            w_off,
+            b(state),
+            state_off,
+            b(out),
+            width,
+            kernel,
+            n_tok,
+            b(BufId::RowLayout),
+        )
+    }
+    fn set_slots(&self, n: u32, ring_layers: &[u32]) -> bool {
+        // The per-conversation buffers: the recurrent state and its snapshot twin, and the
+        // windowed layers' rings. The page tables are per slot on the host side of the backend
+        // already.
+        crate::set_slots(n, &[b(BufId::Recur), b(BufId::RecurSnap)], ring_layers)
+            .is_ok()
+    }
+    fn select_slot(&self, slot: u32) -> bool {
+        crate::select_slot(slot).is_ok()
+    }
+    fn release_slot(&self, slot: u32) -> bool {
+        crate::release_slot(slot)
+    }
+    fn set_decode_rows(&self, route: Option<imparo_backend::RowRoute>) -> bool {
+        crate::set_decode_rows(route);
+        true
+    }
+    fn set_verify_split(&self, on: bool) -> bool {
+        crate::set_verify_split_on(on);
+        true
+    }
+    fn decode_rows_max(&self, route: imparo_backend::RowRoute) -> usize {
+        match route {
+            // The multi-row decode GEMV's widest: past it a projection takes the GEMM.
+            imparo_backend::RowRoute::Exact => 8,
+            imparo_backend::RowRoute::Fast => usize::MAX,
+        }
+    }
+    fn kv_store_slot_rows(
+        &self,
+        src: BufId,
+        layer: u32,
+        width: u32,
+        rows: &[SlotRow],
+        is_v: bool,
+        ring: u32,
+    ) -> bool {
+        let slots: Vec<u32> = rows.iter().map(|r| r.slot).collect();
+        let pos: Vec<u32> = rows.iter().map(|r| r.pos).collect();
+        crate::kv_store_slot_rows(b(src), layer, width, &slots, &pos, is_v, ring);
+        true
+    }
+    fn attention_slot_rows(
+        &self,
+        kv_layer: u32,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv: u32,
+        kv_width: u32,
+        scale: f32,
+        window: u32,
+        rows: &[SlotRow],
+        max_scores: &[u32],
+        ring: u32,
+    ) -> bool {
+        if max_scores.len() != rows.len() {
+            return false;
+        }
+        let slots: Vec<u32> = rows.iter().map(|r| r.slot).collect();
+        let pos: Vec<u32> = rows.iter().map(|r| r.pos).collect();
+        crate::attention_slot_rows(
+            kv_layer, head_dim, n_heads, n_kv, kv_width, window, scale, &slots, &pos,
+            max_scores, ring,
+        );
+        true
+    }
+    fn causal_conv_slot_rows(
+        &self,
+        form: ConvForm,
+        src: BufId,
+        w_off: u64,
+        state: BufId,
+        rows: &[SlotStateRow],
+        out: BufId,
+        width: u32,
+        kernel: u32,
+    ) -> bool {
+        let slots: Vec<u32> = rows.iter().map(|r| r.slot).collect();
+        let offs: Vec<u32> = rows.iter().map(|r| r.state_off).collect();
+        let outs: Vec<u32> = rows.iter().map(|r| r.state_out_off).collect();
+        crate::causal_conv_slot_rows(
+            form as u32,
+            b(src),
+            w_off,
+            b(state),
+            &slots,
+            &offs,
+            &outs,
+            b(out),
+            width,
+            kernel,
+        );
+        true
+    }
+    fn head_norm_rope_at(
+        &self,
+        buf: BufId,
+        w_off: u64,
+        head_dim: u32,
+        eps: f32,
+        n_heads: u32,
+        pos: &[u32],
+        rope_dim: u32,
+        rope_base: f32,
+        freqs: Option<&[f32]>,
+    ) -> bool {
+        crate::head_norm_rope_at(
+            b(buf),
+            w_off,
+            head_dim,
+            eps,
+            n_heads,
+            pos,
+            rope_dim,
+            rope_base,
+            freqs,
+        );
+        true
+    }
+    fn causal_conv_row_inputs(
+        &self,
+        form: ConvForm,
+        src: BufId,
+        inputs: BufId,
+        inputs_off: u32,
+        row_elems: u32,
+        width: u32,
+        n_tok: u32,
+    ) -> bool {
+        crate::conv_row_inputs(
+            form as u32,
+            b(src),
+            b(inputs),
+            inputs_off,
+            row_elems,
+            width,
+            n_tok,
+        )
+    }
+    fn kv_move_rows(
+        &self,
+        layer: u32,
+        k_stride: u64,
+        v_stride: u64,
+        from: &[u32],
+        to: &[u32],
+    ) -> bool {
+        crate::kv_move_rows(layer, k_stride, v_stride, from, to)
+    }
+    fn supports_argmax_rows(&self) -> bool {
+        true
+    }
+    fn argmax_rows(&self, src: BufId, dst: BufId, width: u32, rows: u32) {
+        crate::argmax_rows(b(src), b(dst), width, rows);
+    }
+    fn supports_top_k_rows(&self, k: u32) -> bool {
+        (1..=crate::top_k_rows_max()).contains(&k)
+    }
+    fn top_k_rows_len(&self, width: u32, rows: u32, k: u32) -> u64 {
+        crate::top_k_rows_len(width, rows, k)
+    }
+    fn top_k_rows(
+        &self,
+        src: BufId,
+        dst: BufId,
+        width: u32,
+        rows: u32,
+        k: u32,
+    ) -> bool {
+        crate::top_k_rows(b(src), b(dst), width, rows, k)
+    }
+    fn supports_moe(&self) -> bool {
+        true
+    }
+    fn moe_gate(
+        &self,
+        scores: BufId,
+        probs: BufId,
+        sel: BufId,
+        bias_off: u64,
+        n_tok: u32,
+        n_expert: u32,
+        gating: imparo_backend::ExpertGating,
+    ) -> bool {
+        crate::moe_gate(
+            b(scores),
+            b(probs),
+            b(sel),
+            bias_off,
+            n_tok,
+            n_expert,
+            match gating {
+                imparo_backend::ExpertGating::Softmax => 0,
+                imparo_backend::ExpertGating::Sigmoid => 1,
+            },
+        )
+    }
+    fn moe_plan(
+        &self,
+        topk: BufId,
+        probs: BufId,
+        perm: BufId,
+        wgt: BufId,
+        seg: BufId,
+        inv: BufId,
+        n_tok: u32,
+        n_expert: u32,
+        k: u32,
+        normalise: bool,
+        scale: f32,
+    ) -> bool {
+        crate::moe_plan(
+            b(topk),
+            b(probs),
+            b(perm),
+            b(wgt),
+            b(seg),
+            b(inv),
+            n_tok,
+            n_expert,
+            k,
+            normalise,
+            scale,
+        )
+    }
+    fn moe_grouped(
+        &self,
+        wkind: u32,
+        w_off: u64,
+        expert_stride: u64,
+        src: BufId,
+        dst: BufId,
+        perm: BufId,
+        seg: BufId,
+        n_in: u32,
+        n_out: u32,
+        n_expert: u32,
+        n_tok: u32,
+        rows: u32,
+        src_work_rows: bool,
+        prefill_chunk: bool,
+    ) -> bool {
+        crate::moe_grouped(
+            wkind,
+            w_off,
+            expert_stride,
+            b(src),
+            b(dst),
+            b(perm),
+            b(seg),
+            n_in,
+            n_out,
+            n_expert,
+            n_tok,
+            rows,
+            src_work_rows,
+            prefill_chunk,
+        )
+    }
+    fn moe_route(
+        &self,
+        scores: BufId,
+        probs: BufId,
+        sel: BufId,
+        topk: BufId,
+        perm: BufId,
+        wgt: BufId,
+        seg: BufId,
+        inv: BufId,
+        bias_off: u64,
+        n_tok: u32,
+        n_expert: u32,
+        k: u32,
+        gating: imparo_backend::ExpertGating,
+        normalise: bool,
+        scale: f32,
+    ) -> bool {
+        crate::moe_route(
+            b(scores),
+            b(probs),
+            b(sel),
+            b(topk),
+            b(perm),
+            b(wgt),
+            b(seg),
+            b(inv),
+            bias_off,
+            n_tok,
+            n_expert,
+            k,
+            match gating {
+                imparo_backend::ExpertGating::Softmax => 0,
+                imparo_backend::ExpertGating::Sigmoid => 1,
+            },
+            normalise,
+            scale,
+        )
+    }
+    fn moe_grouped_pair(
+        &self,
+        wkind: u32,
+        gate_off: u64,
+        up_off: u64,
+        expert_stride: u64,
+        src: BufId,
+        dst: BufId,
+        perm: BufId,
+        seg: BufId,
+        n_in: u32,
+        n_out: u32,
+        n_expert: u32,
+        n_tok: u32,
+        rows: u32,
+        prefill_chunk: bool,
+    ) -> bool {
+        crate::moe_grouped_pair(
+            wkind,
+            gate_off,
+            up_off,
+            expert_stride,
+            b(src),
+            b(dst),
+            b(perm),
+            b(seg),
+            n_in,
+            n_out,
+            n_expert,
+            n_tok,
+            rows,
+            prefill_chunk,
+        )
+    }
+    fn moe_combine(
+        &self,
+        src: BufId,
+        wgt: BufId,
+        inv: BufId,
+        dst: BufId,
+        n_embd: u32,
+        k: u32,
+        n_tok: u32,
+    ) -> bool {
+        crate::moe_combine(b(src), b(wgt), b(inv), b(dst), n_embd, k, n_tok)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn matmat_resid(
+        &self,
+        kind: u32,
+        w_off: u64,
+        n_in: u32,
+        n_out: u32,
+        src: BufId,
+        resid: BufId,
+        n_tok: u32,
+    ) -> bool {
+        crate::matmat_resid(kind, w_off, n_in, n_out, b(src), b(resid), n_tok)
+    }
+    fn rms_norm_resid(
+        &self,
+        dst: BufId,
+        resid: BufId,
+        w_off: u64,
+        width: u32,
+        eps: f32,
+        n_row: u32,
+    ) -> bool {
+        crate::rms_norm_resid(b(dst), b(resid), w_off, width, eps, n_row)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn moe_combine_add_rms_norm(
+        &self,
+        src: BufId,
+        wgt: BufId,
+        inv: BufId,
+        k: u32,
+        dst: BufId,
+        resid: BufId,
+        w_off: u64,
+        width: u32,
+        eps: f32,
+        n_row: u32,
+    ) -> bool {
+        crate::moe_combine_add_rms_norm(
+            b(src), b(wgt), b(inv), k, b(dst), b(resid), w_off, width, eps, n_row,
+        )
+    }
+    fn supports_logistic_rows(&self) -> bool {
+        true
+    }
+    fn logistic_rows_len(&self, a_width: u32, b_width: u32, rows: u32) -> u64 {
+        crate::logistic_rows_len(a_width, b_width, rows)
+    }
+    fn logistic_rows(
+        &self,
+        a_rows: BufId,
+        a_width: u32,
+        b_rows: BufId,
+        b_width: u32,
+        w: BufId,
+        w_off: u32,
+        dst: BufId,
+        dst_off: u32,
+        rows: u32,
+    ) -> bool {
+        crate::logistic_rows(
+            b(a_rows),
+            a_width,
+            b(b_rows),
+            b_width,
+            b(w),
+            w_off,
+            b(dst),
+            dst_off,
+            rows,
+        )
+    }
     fn ple_gather_combine(
         &self,
         proj: BufId,
@@ -817,10 +1447,14 @@ impl Backend for MetalBackend {
     fn refused_dispatches(&self) -> u64 {
         crate::refused_dispatches()
     }
+    fn matmul_routes(&self) -> Vec<(&'static str, u64)> {
+        crate::matmul_routes()
+    }
     fn serves_weight_type(&self, ggml_type: u32) -> bool {
         // F32, Q4_0, Q8_0, the tile-major Q8_0 (fc 15) and the tile-major family the
-        // WFMT decode bricks read (fc 21). Q4_0_TM has a rule but no brick arm (row-major
-        // Q4_0 has kernels of its own), so it is refused BY NAME at load.
+        // WFMT decode bricks read (fc 21). Q4_0_TM (1001) is read by the brick too, and the
+        // load-time transform writes it only for an EXPERT STACK (its rule's stack readers):
+        // a 2-D Q4_0 tensor keeps the row-major layout its own kernels read.
         //
         // Row-major 3/6/7/11/12/13/14/16/19/20/23/29 are here because a ROW-GATHERED tensor
         // (token_embd) keeps the row-major layout by rule and is read by
@@ -848,6 +1482,7 @@ impl Backend for MetalBackend {
                 | 23
                 | 29
                 | 1000
+                | 1001
                 | 1003
                 | 1006
                 | 1007
@@ -929,7 +1564,7 @@ impl Backend for MetalBackend {
             cbs: p.cbs,
             dispatches: p.dispatches,
             barriers,
-            categories: crate::prof_categories(),
+            categories: crate::prof_categories_bytes(),
         }
     }
     fn prof_enable(&self, on: bool) {
@@ -1195,6 +1830,7 @@ const fn derive_flush(
 const MEGA_FAMILY_GEMMA4: u32 = 0;
 const MEGA_FAMILY_LFM2: u32 = 1;
 const MEGA_FAMILY_QWEN35: u32 = 2;
+const MEGA_FAMILY_LFM2MOE: u32 = 3;
 
 /// The pipeline family that serves `architecture`'s mega entries, or `None` when this
 /// backend has no composed kernel for it. The names are the GGUF architecture strings the
@@ -1414,6 +2050,73 @@ static METAL_KNOBS: &[KnobDecl] = &[
         },
         workload: Wl::NarrowMix(8),
     },
+    KnobDecl {
+        // Q4_0's `q8_tm_rows_mma_max`: rows past `q4_rows_gemv_max` and up to this many take
+        // the rows matmul on the fast route -- imparo_q8_tm_rows_mma reading each row's Q4_0
+        // blocks where they lie, two 8-row tiles per threadgroup where the rows divide into
+        // pairs, with the K blocks split across its simdgroups -- and the GEMM above it. 0
+        // keeps the GEMM there.
+        //
+        // Bit-affecting on purpose: the kernels sum in different orders. The compiled
+        // default is the kernel's widest, 24, as for Q8.
+        name: "q4_rows_mma_max",
+        legal: Some(|v, _m, _d| v <= 24),
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &["lanes", "nb8_max"],
+        cross_check: None,
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_q4_rows_mma_max,
+        current: crate::q4_rows_mma_max,
+        screened: false,
+        sweep: Sw::RowsCrossing {
+            ladder: &[2, 3, 4, 6, 8, 12, 16, 20, 24],
+            hi: 24,
+            lo: 0,
+        },
+        workload: Wl::DecodeMix,
+    },
+    KnobDecl {
+        // WHERE A CO-BATCHED STEP'S ROWS LEAVE THE DECODE GEMV, on the fast route
+        // (docs/continuous-batching.md, section 6). Up to this many rows every row keeps the
+        // decode-rows GEMV; above it the rows take the narrow GEMM, which reads the weights
+        // once for all of them. 8, the GEMV's widest, keeps the GEMV at every row count: the
+        // exact route's choice, and what a config without this line runs.
+        //
+        // Bit-affecting on purpose: the two kernels sum in different orders, so a row's bits
+        // depend on this value on the fast route. The exact route ignores it.
+        //
+        // E4B before the knob (imparo-forward --dbatch, ms per forward at 2 / 4 / 8 rows):
+        // GEMV 29.3-29.8 / 35.8-36.8 / 69.2, GEMM 61.4 / 61.8 / 61.1.
+        name: "q4_rows_gemv_max",
+        legal: Some(|v, _m, _d| (1..=8).contains(&v)),
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        // Above it Q4_0's rows take the rows matmul (up to `q4_rows_mma_max`), so that
+        // crossing is settled first and this one races the GEMV against it.
+        after: &["lanes", "nb8_max", "q4_rows_mma_max"],
+        cross_check: None,
+        // The decode-rows GEMV exists for Q4_0 only; the tile-major family takes the GEMM at
+        // every width.
+        applies: Some(|m| m.weight_kinds & (1 << 1) != 0),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_q4_rows_gemv_max,
+        current: crate::q4_rows_gemv_max,
+        screened: false,
+        sweep: Sw::RowsCrossing {
+            ladder: &[2, 3, 4, 5, 6, 7, 8],
+            hi: 8,
+            lo: 1,
+        },
+        workload: Wl::DecodeMix,
+    },
     // ---- THE Q8_0 WEIGHT FAMILY -----------------------------------------------------
     //
     // Ported from the LFM2.5 branch, where fourteen knobs governed these kernels and NINE
@@ -1437,7 +2140,8 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // The decode pair is a TUPLE: rows says how many outputs a threadgroup carries
         // and sgs how many simdgroups share them, and the cross-simdgroup reduction at
         // the end costs rows*sgs floats of threadgroup memory. Neither value means
-        // anything without the other.
+        // anything without the other. sgs is the most a row takes: a row whose K blocks
+        // start in fewer simdgroups takes that many (q8_one_row_sgs in imparo_metal.mm).
         tuple: Some("q8_decode"),
         category: KnobCategory::Benched,
         values: &[],
@@ -1453,7 +2157,8 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // separate from q8_decode_sgs because the two layouts measured different winners
         // (8 vs 4: the converted file's deep-leg decode read +1.8/+2.5% at 8, the
         // isolated row-major GEMV prefers 4) -- one shared value would make the tune
-        // file fight itself across layouts of the same model.
+        // file fight itself across layouts of the same model. Like q8_decode_sgs, it is
+        // the most a row takes (q8_one_row_sgs in imparo_metal.mm).
         name: "q8_tm_decode_sgs",
         legal: None,
         bit_affecting: false,
@@ -1529,45 +2234,111 @@ static METAL_KNOBS: &[KnobDecl] = &[
         workload: Wl::PrefillGemmWidths,
     },
     KnobDecl {
-        // THE SECOND TILE OF THE PREFILL PAIR. Not a threshold: the dispatch decides
-        // between the two by comparing their padded token counts (see `q8_matmat`), which
-        // is arithmetic and stores nothing. What is genuinely per-machine, and therefore
-        // here, is WHICH second tile is worth having.
+        // WHERE THE NARROW REGIME ENDS, in tokens, and the only value it needs. Which tile
+        // serves a batch under the bound is derived, not chosen: below it every candidate
+        // walks the weights once, so the answer is the narrowest tile that holds the
+        // dispatch's own rows (`q8_tile`). A separate shape knob was built first and swept
+        // INERT -- 763.2 to 766.4 us across thirteen candidates against a 764.6 control --
+        // because a shape does nothing until this bound is non-zero.
         //
-        // Its workload is PrefillGemmUbatch: the whole-ubatch width at the model's full
-        // projection. The dispatch selects this tile only where it pads no worse than the
-        // first -- whole ubatches -- so a remainder width never runs it, and ranking it on
-        // the two-width PrefillGemmWidths made half of every measurement dilution; the
-        // sliced weight tile that workload used sat inside the last-level cache besides.
-        // Measured on LFM2 (Q8): end to end by env pin 64x64 is worth +3.1% / +3.0% at
-        // 5963 / 17123 tokens and -0.1% at 455 (one chunk, padded, the rule takes the
-        // narrow tile). On PrefillGemmWidths it read -0.1% to +1.8%, inside the floor
-        // every time, and the tuner wrote 3 over a stored 7; on PrefillGemmUbatch it
-        // reads +4.0% on a 2.0% floor and the tuner picks 7 by itself.
+        // 0 is off, and off is the engine exactly as it shipped: every width takes the seat.
+        // That is also what a stored config from an earlier space carries, so an old file is
+        // not silently re-routed.
         //
-        // Equal to `st_gemm_shape` means one shape, which is the untuned path exactly. A
-        // stored config from an earlier space has no line for this key and therefore
-        // keeps that default, so an old file is not silently mis-tuned -- it is simply
-        // the single-shape engine it has always been. That is why the space version does
-        // not move for this knob: bumping it discards every OTHER knob's measured value
-        // (task #85), and on this host that regressed E4B's deep prefill 535.0 -> 530.8
-        // the last time it happened.
-        name: "st_gemm_large_shape",
-        legal: Some(|v, _m, _d| v < crate::st_gemm_shapes()),
+        // Measured end to end on LFM2 at 47, against the same binary at 0, two rounds with
+        // the arm order reversed and every trail equal: verify -20.1% at 8 rows and -12.5%
+        // at 16, plain decode and an 8444-token prefill both a tie.
+        //
+        // The bound is what keeps a verify tile out of prefill: at a 464-row chunk the narrow
+        // rule would take a 16-token tile -- 29 walks of the weights against 15 -- and
+        // prefill reads 9422.9 vs 8676.3 ms.
+        name: "st_gemm_narrow_max",
+        legal: Some(|v, _m, _d| v <= 64),
         bit_affecting: false,
         derive: None,
-        candidates: Some(|_m, _d| (0..crate::st_gemm_shapes()).collect()),
+        candidates: None,
         after: &["st_gemm_shape"],
         cross_check: None,
         applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
         tuple: None,
         category: KnobCategory::Benched,
         values: &[],
-        apply: crate::set_st_gemm_large_shape,
-        current: crate::st_gemm_large_shape,
-        screened: true,
-        sweep: Sw::Values,
-        workload: Wl::PrefillGemmChunk,
+        apply: crate::set_st_gemm_narrow_max,
+        current: crate::st_gemm_narrow_max,
+        screened: false,
+        // The batch widths a tree verify sends, and 0 so the seat can stay off. The
+        // ladder ends at 64: above that the wide tile pads no worse and walks fewer times.
+        sweep: Sw::Crossing {
+            ladder: &[4, 8, 12, 16, 24, 32, 48],
+            hi: 64,
+            lo: 0,
+        },
+        workload: Wl::NarrowMix(8),
+    },
+    KnobDecl {
+        // WHERE A CO-BATCHED STEP'S ROWS LEAVE THE ROWS MATMUL for the narrow GEMM, on the
+        // fast route, tile-major Q8_0 only: rows past `q8_rows_gemv_max` and up to this many
+        // take imparo_q8_tm_rows_mma, one 8-row unit tile per threadgroup with the K blocks
+        // split across its simdgroups -- the one-row GEMV's parallelism, where the GEMM's
+        // 64-row tiles leave a 2048-wide projection 32 threadgroups. 0 keeps the GEMM there.
+        //
+        // Bit-affecting on purpose: the two kernels sum in different orders. The compiled
+        // default is the kernel's widest, 16: on LFM2.5 it beat the tuned narrow GEMM on every
+        // tile-major projection at every row count measured, 2..6, 8, 12 and 16 (a step's
+        // matmuls at 8 rows 22.0 against 31.2 ms, one row 21.35).
+        name: "q8_tm_rows_mma_max",
+        // The kernel's widest: three 8-token columns (RM_MAX_FRAGS in imparo.metal).
+        legal: Some(|v, _m, _d| v <= 24),
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &["q8_decode_rows", "st_gemm_narrow_max"],
+        cross_check: None,
+        applies: Some(|m| m.weight_kinds & (1 << 3) != 0),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_q8_tm_rows_mma_max,
+        current: crate::q8_tm_rows_mma_max,
+        screened: false,
+        sweep: Sw::RowsCrossing {
+            ladder: &[2, 3, 4, 6, 8, 12, 16, 20, 24],
+            hi: 24,
+            lo: 0,
+        },
+        workload: Wl::DecodeMix,
+    },
+    KnobDecl {
+        // The Q8 family's `q4_rows_gemv_max`: where a co-batched step's rows leave the
+        // decode-rows GEMV, on the fast route -- for the rows matmul on tile-major weights
+        // (up to `q8_tm_rows_mma_max`), for the narrow GEMM past it and on row-major weights.
+        // Same default, same reason.
+        //
+        // LFM2.5 before the knob (imparo-forward --dbatch, ms per forward at 2 / 4 / 8 rows):
+        // GEMV 23.6-24.6 / 30.7-31.0 / 42.3-43.1, GEMM 29.8 / 30.0 / 29.6-31.9 -- the GEMV
+        // wins at two rows and costs a third more at eight.
+        name: "q8_rows_gemv_max",
+        legal: Some(|v, _m, _d| (1..=8).contains(&v)),
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        // Above it a tile-major weight's rows take the rows matmul, so that crossing is
+        // settled first and this one races the GEMV against whatever it hands the rows to.
+        after: &["q8_decode_rows", "st_gemm_narrow_max", "q8_tm_rows_mma_max"],
+        cross_check: None,
+        applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_q8_rows_gemv_max,
+        current: crate::q8_rows_gemv_max,
+        screened: false,
+        sweep: Sw::RowsCrossing {
+            ladder: &[2, 3, 4, 5, 6, 7, 8],
+            hi: 8,
+            lo: 1,
+        },
+        workload: Wl::DecodeMix,
     },
     KnobDecl {
         name: "q8_full_tiles",
@@ -1618,7 +2389,7 @@ static METAL_KNOBS: &[KnobDecl] = &[
         bit_affecting: false,
         derive: None,
         candidates: Some(|_m, _d| (0..crate::q8_designs()).collect()),
-        after: &["st_gemm_shape", "st_gemm_large_shape"],
+        after: &["st_gemm_shape"],
         cross_check: None,
         applies: Some(|m| m.weight_kinds & ((1 << 2) | (1 << 3)) != 0),
         tuple: None,
@@ -1644,14 +2415,14 @@ static METAL_KNOBS: &[KnobDecl] = &[
     //       still verifies it) for the day a decode batch dispatches it.
     //
     //   st_gemm_large_shape
-    //       The SECOND tile of the prefill pair. There is no boundary knob any more: the
-    //       dispatch picks between the two by comparing their PADDED token counts, which
-    //       is arithmetic and needs nothing stored (see `q8_matmat`, and "What math
-    //       decides" in docs/tuner-design.md). What remains genuinely tunable is WHICH
-    //       second tile is worth building, and PrefillGemm still times one token count,
-    //       so it cannot rank that yet -- the workload has to cover more than one ubatch
-    //       width first. Until it does, the engine keeps large_shape equal to
-    //       st_gemm_shape, which is the single-shape path exactly.
+    //       RETIRED 2026-09-16. It named the second tile of a prefill pair. Above the narrow
+    //       bound the tile is the SEAT now, which is what LFM2 already ran: its tuner wrote
+    //       this knob equal to `st_gemm_shape`, the single-shape engine. Deriving a wider
+    //       tile up there -- the widest that pads no worse -- was built and measured, and it
+    //       LOSES 0.5% at an 8444-token prefill (8334.4/8334.6 against 8287.4/8295.8, one
+    //       binary, arms reversed between rounds). That contradicts a +3.1% / +3.0% this
+    //       comment used to claim for a 64x64 second tile at 5963 / 17123 by env pin; that
+    //       number has no surviving log and the 0.5% does, so the rule follows the 0.5%.
     //
     //   q8_grid_token_x / q8_typed_scale / q8_dev_a
     //       All three MEASURED WORSE end to end and stay reachable as evidence, the way
@@ -1774,6 +2545,40 @@ static METAL_KNOBS: &[KnobDecl] = &[
         screened: true,
         sweep: Sw::Values,
         workload: Wl::PrefillGemm,
+    },
+    KnobDecl {
+        // WHERE THE BLOCK FORMATS' ROWS LEAVE THE MATRIX-UNIT ROWS KERNEL for the GEMM, on the
+        // fast route: rows past the format's own GEMV crossing and up to this many take
+        // imparo_blk_rows_mma
+        // (each lane decodes the eight values it holds in the 8x8 fragments; the products on the
+        // simdgroup matrix unit). 0 keeps the GEMM there.
+        //
+        // Qwen3.8-27B (M3 Pro), projections a step: 128.4 / 130.0 ms at 4 / 8 rows against the
+        // GEMM's 199.5 / 200.4, so the compiled default is the kernel's widest, 8 (one 8-token
+        // column).
+        name: "blk_rows_mma_max",
+        legal: Some(|v, _m, _d| v <= 8),
+        bit_affecting: true,
+        derive: None,
+        candidates: None,
+        after: &[],
+        cross_check: None,
+        // The kinds the block GEMV serves: the rt route's kinds without Q4_0.
+        applies: Some(|m| {
+            m.weight_kinds & (crate::rt_route_kinds() & !(1u64 << 1)) != 0
+        }),
+        tuple: None,
+        category: KnobCategory::Benched,
+        values: &[],
+        apply: crate::set_blk_rows_mma_max,
+        current: crate::blk_rows_mma_max,
+        screened: false,
+        sweep: Sw::RowsCrossing {
+            ladder: &[2, 3, 4, 5, 6, 7, 8],
+            hi: 8,
+            lo: 0,
+        },
+        workload: Wl::DecodeMix,
     },
     KnobDecl {
         name: "nr0",
@@ -2128,8 +2933,8 @@ static METAL_KNOBS: &[KnobDecl] = &[
         // bigger footprint than the hd-256 one (the head dim sizes register arrays, so each
         // dim is its own instantiation). A seat per pipeline, because admission is per
         // pipeline: one seat for both would hold the 35 windowed layers at whatever the 7
-        // hd-512 ones admit. Named like st_gemm_large_shape (the second, larger tile),
-        // never by the dim: the registry is one static list for every model. Same limit
+        // hd-512 ones admit. Named for being the larger of two seats, never by the dim:
+        // the registry is one static list for every model. Same limit
         // rule and workload as mega_tgs; ranked after the pair above has settled (the width
         // is shared). Its layers run at this seat while their span is within
         // attn_vec_max_keys; past it they take the deep-body variant at one per core, so
@@ -2513,9 +3318,75 @@ static METAL_KNOBS: &[KnobDecl] = &[
     },
 ];
 
+/// A ROUTED MODEL'S PREFILL CHUNK. A chunk of c tokens gives each expert about
+/// `c * experts_used / n_experts` work rows, and the routed GEMM walks them in whole token
+/// tiles, so the last tile of every expert is on average half empty. The chunk is the
+/// smallest power of two from the compiled width at which each expert gets at least EIGHT
+/// whole tiles -- the half-empty tile is then 1/16 of its rows -- capped at 4096.
+///
+/// Eight is MEASURED on one model, not derived: on LFM2.5-8B-A1B (32 experts, 4 used,
+/// 32-token tile) the chunks give 2, 4, 8 and 16 tiles an expert at 512, 1024, 2048 and
+/// 4096; prefill rose ~5% at depth from 512 to 2048 and tied from 2048 to 4096 (bracket,
+/// M3 Pro, 2026-09-24). A larger chunk also costs scratch memory in proportion.
+///
+/// `None` (the stored or compiled chunk stands) for a dense model, when the routed GEMM is
+/// off, and where the chunk would change the answers. A windowed attention layer's scan
+/// starts at `pos - window`, so what lands in a full tile versus the scalar tail moves with
+/// the chunk (gemma4 E4B's pins moved at 1024). Full attention and the short convolution
+/// do not: LFM2.5-8B-A1B's top-10 at every decode step are identical at 512, 1024, 2048
+/// and 4096 on Q4_K_M and Q4_0. A routed model with a chunked recurrent scan (a delta-rule
+/// layer) has NOT been checked; serving one needs that check before this covers it.
+fn derive_prefill_batch(
+    m: &imparo_backend::ModelFacts,
+    compiled: usize,
+    tile: u32,
+) -> Option<usize> {
+    const TILES_PER_EXPERT: usize = 8;
+    const MAX_CHUNK: usize = 4096;
+    if m.n_experts == 0 || m.experts_used == 0 || m.windowed_layers != 0 || tile == 0 {
+        return None;
+    }
+    let (n, k, t) = (m.n_experts as usize, m.experts_used as usize, tile as usize);
+    let mut chunk = compiled.max(1);
+    while chunk < MAX_CHUNK && chunk * k < TILES_PER_EXPERT * t * n {
+        chunk *= 2;
+    }
+    Some(chunk)
+}
+
 impl BackendKnobs for MetalBackend {
     fn knob_registry(&self) -> &'static [KnobDecl] {
         METAL_KNOBS
+    }
+    fn prefill_batch(
+        &self,
+        m: &imparo_backend::ModelFacts,
+        compiled: usize,
+    ) -> Option<usize> {
+        derive_prefill_batch(m, compiled, crate::moe_token_tile())
+    }
+    /// Times the scalar decode-rows GEMV against the matrix-unit rows kernel on each
+    /// `(kind, n_in, n_out)` and returns the winner as that tensor's crossing.
+    ///
+    /// The per-format table this replaces is right where the two kernels are far apart and
+    /// wrong where they nearly tie: on Qwen3.8-27B UD-Q4_K_S the GEMV beats the matrix unit
+    /// on six of Q4_K's seven shapes and loses on the seventh. A failure here is not fatal --
+    /// the tuner writes no seat lines and every tensor keeps its format's crossing.
+    fn measure_row_kernel_seats(
+        &self,
+        tensors: &[(u32, u64, u32, u32)],
+        rows: u32,
+    ) -> Vec<(u32, u32, u32, u32)> {
+        match crate::measure_blk_rows_kernels(tensors, rows) {
+            Ok(ms) => ms
+                .iter()
+                .map(|m| (m.wkind, m.n_in, m.n_out, m.seat(rows)))
+                .collect(),
+            Err(e) => {
+                eprintln!("[imparo-tune] per-tensor rows seats not measured: {e}");
+                Vec::new()
+            }
+        }
     }
     /// The METAL search space version -- backend-owned since #19 (history: see
     /// imparo-host's version doctrine; v10 added nb8_max/nb8_shape, v11
@@ -2541,6 +3412,32 @@ impl BackendKnobs for MetalBackend {
     /// `attn_qcomb_mask` gained the `2^slots` candidate hook its comment had always
     /// described -- without it the mask resolved to an empty ladder and was never swept.
     fn space_version(&self) -> u32 {
+        // 28: blk_rows_gemv_max LEAVES the space. The crossing is PER FORMAT -- the matrix
+        //     unit's products cost the same per weight tile whatever rows are live, so a format
+        //     short of the bandwidth wall pays them and a format at it does not -- and one
+        //     number cannot express that. A sweep would read the step total, which is 35% one
+        //     tensor group, pick the matrix unit for everything and flatten the table. The
+        //     compiled crossings are measured per format beside blk_rows_gemv_short_of_wall in
+        //     imparo_metal.mm; a v27 file's seat for this name is now ignored.
+        // 27: imparo_blk_rows_mma no longer stages a tile (each lane decodes its fragments'
+        //     values); it ties with the block formats' decode-rows GEMV at 2 rows and leads from
+        //     3, so blk_rows_gemv_max's compiled default moves from 3 to 1. A v26 file's seats
+        //     for both crossings were measured on the old kernel.
+        // 26: blk_rows_mma_max joins the space (the block formats' rows past blk_rows_gemv_max
+        //     take the matrix-unit rows kernel up to it, on the fast route). A v25 file has no
+        //     line for it and runs the compiled 8.
+        // 25: blk_rows_gemv_max joins the space (the block formats' rows take a decode-rows
+        //     GEMV up to it, on the fast route). A v24 file has no line for it and runs the
+        //     compiled default.
+        // 24: q4_rows_mma_max joins the space (Q4_0's rows past the decode-rows GEMV take the
+        //     rows matmul up to it, on the fast route). A v23 file has no line for it and runs
+        //     the compiled 24 above its q4_rows_gemv_max.
+        // 23: q8_tm_rows_mma_max joins the space (where a co-batched step's rows leave the rows
+        //     matmul for the GEMM, on the fast route, tile-major Q8_0). A v22 file has no line
+        //     for it and runs the compiled 16.
+        // 22: q8_rows_gemv_max / q4_rows_gemv_max join the space (where a co-batched step's
+        //     rows leave the decode-rows GEMV for the GEMM, on the fast route). A v21 file has
+        //     no line for them and keeps the GEMV at every row count, as the engine did.
         // 21: gemv_max_tok, q8_gemv_max_tok, q8_batch_sgs, q8_token_tile LEAVE the space --
         //     the GEMV/GEMM boundary is one row in every family by the KV identity rule,
         //     so the crossings are not knobs and the token tile is unreachable by default
@@ -2556,7 +3453,7 @@ impl BackendKnobs for MetalBackend {
         // 15: attn_qcomb_nsg joins the space. The knob set changed, so a v14 tune file
         // must not be read as if it described this space -- it has no value for the new
         // knob, and the derivation it silently fell back to is the thing being replaced.
-        21
+        28
     }
 }
 
@@ -2972,6 +3869,96 @@ fn mega_qwen35_entry(l: &Qwen35MegaLayer, n_tok: u32) -> bool {
     e.f[MEGA_F_EPS] = l.eps;
     match l.mixer {
         Qwen35MegaMixer::None => e.u[Q35_U_KIND] = 0,
+    }
+    crate::mega_layer(&e)
+}
+
+/// The routed feed-forward of one LFM2-MoE decode layer as one persistent dispatch. Decode
+/// only; every expert stack tile-major in a format the row brick reads (the load-time
+/// transform converts them); the router F32, as this file keeps it. A refusal is `false`
+/// with nothing encoded, and the layer takes the dispatch path.
+fn mega_lfm2moe_entry(l: &imparo_backend::Lfm2MoeMegaLayer, n_tok: u32) -> bool {
+    #[allow(clippy::wildcard_imports)] // the slot names are generated by build.rs
+    use crate::mega_slots::*;
+    use crate::{MEGA_SLOT_BUF_RW as RW, MEGA_SLOT_BUF_W as W};
+    use crate::{mega_slot_buf as sbuf, mega_slot_weight as sw};
+    /// The wire kind of an F32 tensor (`imparo_gguf::weights::WeightKind::F32`).
+    const WIRE_F32: u32 = 0;
+    /// What the kernel's route scratch and top-k list hold (`L2M_MAX_EXPERTS`, `MOE_MAX_K`).
+    const MAX_EXPERTS: u32 = 256;
+    const MAX_K: u32 = 8;
+    if n_tok != 1 || l.router_kind != WIRE_F32 {
+        return false;
+    }
+    // Whole tile-major units of 8 rows in every projection; the router row read as float4.
+    if l.n_embd % 32 != 0 || l.n_ff % 32 != 0 {
+        return false;
+    }
+    if l.k == 0 || l.k > MAX_K || l.n_expert < l.k || l.n_expert > MAX_EXPERTS {
+        return false;
+    }
+    let (f_gate, f_up, f_down) = (
+        crate::mega_wfmt(l.gate_kind),
+        crate::mega_wfmt(l.up_kind),
+        crate::mega_wfmt(l.down_kind),
+    );
+    if f_gate == 0 || f_up == 0 || f_down == 0 {
+        return false;
+    }
+    // The strides and the gated rows travel as 32-bit words.
+    let (Ok(sg), Ok(su), Ok(sd)) = (
+        u32::try_from(l.gate_stride),
+        u32::try_from(l.up_stride),
+        u32::try_from(l.down_stride),
+    ) else {
+        return false;
+    };
+    let Some(gated_rows) = l.k.checked_mul(l.n_ff) else {
+        return false;
+    };
+    let mut e = crate::MegaEntryFfi::new(MEGA_FAMILY_LFM2MOE);
+    e.min_level = 2;
+    e.slots[L2M_W_FN] = sw(l.ffn_norm_off, L2M_O_FN_OFF);
+    e.slots[L2M_W_ROUTER] = sw(l.router_off, L2M_O_ROUTER_OFF);
+    let has_bias = l.bias_off != imparo_backend::NO_WEIGHT;
+    e.slots[L2M_W_BIAS] = crate::MegaSlotFfi {
+        role: crate::MEGA_SLOT_WEIGHT_OPT,
+        id: L2M_O_BIAS_OFF as u32,
+        off: l.bias_off,
+    };
+    e.slots[L2M_W_GATE] = sw(l.gate_off, L2M_O_GATE_OFF);
+    e.slots[L2M_W_UP] = sw(l.up_off, L2M_O_UP_OFF);
+    e.slots[L2M_W_DOWN] = sw(l.down_off, L2M_O_DOWN_OFF);
+    e.slots[L2M_X] = sbuf(RW, b(l.x), 0);
+    e.slots[L2M_O] = sbuf(RW, b(l.add), 0);
+    e.slots[L2M_G] = sbuf(W, b(l.g), 0);
+    e.slots[L2M_SCORES] = sbuf(W, b(l.scores), 0);
+    e.u[MEGA_U_N_EMBD] = l.n_embd;
+    // The row, then the route's scratch: n_expert probabilities, k ids, k weights (the
+    // kernel indexes the ids and weights at MOE_MAX_K spacing).
+    e.u[MEGA_U_TGMEM_F] = l.n_embd + l.n_expert + 2 * MAX_K;
+    e.u[L2M_U_N_FF] = l.n_ff;
+    e.u[L2M_U_N_EXPERT] = l.n_expert;
+    e.u[L2M_U_K] = l.k;
+    e.u[L2M_U_GATING] = match l.gating {
+        imparo_backend::ExpertGating::Softmax => 0,
+        imparo_backend::ExpertGating::Sigmoid => 1,
+    };
+    e.u[L2M_U_NORMALISE] = u32::from(l.normalise);
+    e.u[L2M_U_HAS_BIAS] = u32::from(has_bias);
+    e.u[L2M_U_F_GATE] = f_gate;
+    e.u[L2M_U_F_UP] = f_up;
+    e.u[L2M_U_F_DOWN] = f_down;
+    e.u[L2M_U_STRIDE_GATE] = sg;
+    e.u[L2M_U_STRIDE_UP] = su;
+    e.u[L2M_U_STRIDE_DOWN] = sd;
+    e.u[L2M_U_GATED_ROWS] = gated_rows;
+    e.f[MEGA_F_EPS] = l.eps;
+    e.f[L2M_F_W_SCALE] = l.weights_scale;
+    if l.next_norm_off != imparo_backend::NO_WEIGHT {
+        e.slots[L2M_W_NEXT] = sw(l.next_norm_off, L2M_O_NEXT_OFF);
+        e.slots[L2M_CUR] = sbuf(W, b(l.cur), 0);
+        e.u[L2M_U_HAS_NEXT] = 1;
     }
     crate::mega_layer(&e)
 }

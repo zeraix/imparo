@@ -531,78 +531,15 @@ __global__ __launch_bounds__(kHeadDim, 1) void combine_q4_gqa4(
 __global__ __launch_bounds__(kHeadDim, 1) void combine_q4_gqa4_final(
         const float * children, float * out,
         uint32_t n_heads, uint32_t partial_count) {
-    const uint32_t head = blockIdx.x;
-    const uint32_t i = threadIdx.x;
-    if (head >= n_heads || partial_count == 0
-        || partial_count > kMaxPartials) return;
-    const float * head_base = children
-        + uint64_t(head) * kMaxPartials * kWarps * kGqaChildStride;
-    __shared__ float partial_maxima[kMaxPartials];
-    __shared__ float source_scales[kMaxPartials][kWarps];
-    __shared__ float source_denominators[kWarps];
-    __shared__ float partial_denominators[kMaxPartials];
-    __shared__ float combined_max_shared;
+#include "attention_decode_vec_d256_combine_body.inc"
+}
 
-    if (i < 32) {
-        for (uint32_t part = 0; part < partial_count; ++part) {
-            const float * base = head_base
-                + uint64_t(part) * kWarps * kGqaChildStride;
-            float combined_max = i < kWarps
-                ? base[uint64_t(i) * kGqaChildStride + kHeadDim]
-                : kNegInf * 0.5f;
-            combined_max = warp_max(combined_max);
-            if (i == 0) partial_maxima[part] = combined_max;
-            if (i < kWarps) {
-                source_scales[part][i] = expf(
-                    base[uint64_t(i) * kGqaChildStride + kHeadDim]
-                    - combined_max);
-            }
-            __syncwarp();
-#pragma unroll
-            for (uint32_t source = 0; source < kWarps; ++source) {
-                const float lane_sum =
-                    base[uint64_t(source) * kGqaChildStride
-                        + kHeadDim + 2 + i] * source_scales[part][source];
-                const float sum = warp_sum(lane_sum);
-                if (i == 0) source_denominators[source] = sum;
-            }
-            __syncwarp();
-            float denominator =
-                i < kWarps ? source_denominators[i] : 0.0f;
-            denominator = warp_sum(denominator);
-            if (i == 0) partial_denominators[part] = denominator;
-            __syncwarp();
-        }
-        float combined_max = i < partial_count
-            ? partial_maxima[i] : kNegInf * 0.5f;
-        combined_max = warp_max(combined_max);
-        if (i == 0) combined_max_shared = combined_max;
-    }
-    __syncthreads();
-
-    float numerator = 0.0f;
-    float denominator = 0.0f;
-    for (uint32_t part = 0; part < partial_count; ++part) {
-        const float * base = head_base
-            + uint64_t(part) * kWarps * kGqaChildStride;
-        float partial_numerator = __fadd_rn(
-            0.0f, __fmul_rn(source_scales[part][0], base[i]));
-#pragma unroll
-        for (uint32_t source = 1; source < kWarps; ++source) {
-            const float scaled = __fmul_rn(
-                source_scales[part][source],
-                base[uint64_t(source) * kGqaChildStride + i]);
-            partial_numerator = __fadd_rn(partial_numerator, scaled);
-        }
-        // Match combine_q4's compiler-visible multiply-add expression here:
-        // unlike the source-warp boundary, the old path has no intervening
-        // memory round before accumulating schedule partials.
-        const float scale = expf(
-            partial_maxima[part] - combined_max_shared);
-        numerator += scale * partial_numerator;
-        denominator += scale * partial_denominators[part];
-    }
-    out[uint64_t(head) * kHeadDim + i] = numerator / denominator;
+__global__ __launch_bounds__(kHeadDim, 1) void combine_q4_gqa4_final_parallel(
+        const float * children, float * out,
+        uint32_t n_heads, uint32_t partial_count) {
+#define IMPARO_D256_PARALLEL_COMBINE 1
+#include "attention_decode_vec_d256_combine_body.inc"
+#undef IMPARO_D256_PARALLEL_COMBINE
 }
 
 __global__ void combine_q4(const float * partials, float * out,

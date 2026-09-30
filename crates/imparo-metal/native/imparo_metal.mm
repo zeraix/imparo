@@ -28,13 +28,21 @@
 #include <sys/stat.h>
 #include <libproc.h>
 #include <mach/mach.h>
+#include <unordered_map>
 #include <vector>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <thread>
 #include <chrono>
 #include <algorithm>
 #include <execinfo.h>
+
+// The KV tier's own residency set (defined with the KV storage below): committed at a region
+// begin, held at a region end, released with the weights' set when idle.
+static void kvset_sync_locked(void);
+static void kvset_hold(void);
+static void kvset_release_hold(void);
 
 namespace {
 
@@ -290,6 +298,11 @@ typedef struct { uint32_t x, y; } uint2p_t;
 uint32_t g_xh_src         = 0xffffffffu;
 uint64_t g_xh_elems       = 0;
 uint32_t g_xh_buf         = B_XH;   // which scratch holds the mirror (B_XH or B_XH2)
+// Buffers whose FLOAT contents are stale, one bit per id: a GEMM epilogue in mirror mode writes
+// only the half mirror of its output (nothing after it was meant to read the floats). Set there,
+// cleared by any later write to the buffer (haz) or from the host. A reader that takes floats
+// -- the rows matmul -- reads the mirror instead while the bit is set.
+uint64_t g_float_stale    = 0;
 
 uint32_t g_skip_attn      = 0;   // diagnostic: encode no attention at all
 // Concurrent dispatch with per-site hazard tracking (haz()), DEFAULT ON: encode with
@@ -305,6 +318,15 @@ uint32_t g_skip_attn      = 0;   // diagnostic: encode no attention at all
 // measures a stage's share of the CRITICAL PATH, not its cost. Two stages that overlap will
 // not sum. Test additivity before reading any skip number as a cost.
 uint32_t g_concurrent     = 1;
+// IMPARO_HAZ_SKIP=N: drop every Nth hazard barrier (wrong answers; timing only).
+uint32_t g_haz_skip       = 0;
+// Name the conflicting buffers in the barrier instead of taking the whole buffer scope.
+// Correct either way -- the masks here are exact and the step hash is identical -- so this is
+// a SEAT, not a fix, and it is OFF until it has a measurement. IMPARO_HAZ_NAMED=1 selects it.
+// The single-run smoke test read it SLOWER (11.940 vs 11.583), which is why it does not
+// default on: a53ca476 shipped it on by accident, through a `git add -A` that swept an
+// unmeasured kernel change into a commit about something else.
+bool     g_haz_named      = false;
 uint64_t g_haz_reads      = 0;   // buffer bits read since the last barrier
 // ARENA ALIASING was task #5: place() used to wrap overlapping byte ranges of ONE
 // allocation in DISTINCT MTLBuffer objects (the ffn group's G spans the attn group's
@@ -388,6 +410,164 @@ uint32_t g_nb8_shape      = 0;   // 0: two simdgroups / 64 threads; 1: one / 32
 //
 // IMPARO_GEMV_MAX=N re-runs the A/B: every family's GEMV up to N rows. Nothing persists it.
 uint32_t g_gemv_max_tok   = 1;
+// DECODE ROWS. While set, a projection of 2..8 rows is a set of INDEPENDENT decode rows -- one
+// co-batched step over several conversations. The model sets a route around the step
+// (imparo_metal_set_decode_rows):
+//
+//   1 EXACT  every row takes the decode GEMV's arithmetic (the multi-row GEMV, function
+//            constant 28), so its bits equal what it gets decoding alone on the dispatch path.
+//            The gate that proves the per-row plumbing compares exactly that.
+//   2 FAST   the rows take the GEMV up to the family's measured row count (q8_rows_gemv_max,
+//            q4_rows_gemv_max), then on tile-major Q8 the rows matmul up to q8_tm_rows_mma_max,
+//            and the GEMM above that: at each row count the kernel the tuner timed faster.
+//
+// The one-row crossing rule above is about chunks of ONE prompt, whose K/V bytes the pool
+// shares by identity. A decode row's K/V bytes already depend on its route -- the mega route's
+// differ from the dispatch path's -- and a restored reply is held to the logit rule, not to
+// bytes, so the fast route breaks no contract a lone decode keeps. IMPARO_DECODE_ROWS=1 forces
+// the exact route for every dispatch, a measurement switch for imparo-forward --dbatch.
+uint32_t g_decode_rows    = 0;
+// Rows up to which the fast route keeps the decode GEMV, per weight family. 8, the multi-row
+// GEMV's widest, keeps it at every row count: the exact route's choice, and what a config with
+// no measured value runs.
+uint32_t g_q8_rows_gemv_max = 8;
+uint32_t g_q4_rows_gemv_max = 8;
+// The rows matmul's widest step: RM_MAX_FRAGS token columns of 8 in imparo.metal.
+constexpr uint32_t RM_MAX_FRAGS_HOST = 3;
+constexpr uint32_t RM_MAX_ROWS_HOST = 8u * RM_MAX_FRAGS_HOST;
+// Rows up to which the fast route takes the rows matmul (imparo_q8_tm_rows_mma) once the GEMV's
+// rows are passed, tile-major Q8 only; above it the GEMM. 0 keeps the GEMM there.
+uint32_t g_q8_tm_rows_mma_max = RM_MAX_ROWS_HOST;
+// The same for Q4_0, on the same kernel reading each row's blocks in place: rows past
+// q4_rows_gemv_max and up to this many take it; above it the GEMM. 0 keeps the GEMM there.
+uint32_t g_q4_rows_mma_max = RM_MAX_ROWS_HOST;
+// Rows-matmul dispatches encoded by this process: a test or harness proves the route ran with
+// this, not with the numbers the route produced.
+uint64_t g_rows_mma_dispatches = 0;
+// The block formats' decode-rows GEMV (imparo_blk_gemv_rows): rows up to which the fast route
+// takes it; above it the matrix-unit rows kernel, then the GEMM. Its forms hold up to 8 tokens.
+// The GEMV's cost grows about 23 ms with every row and the matrix unit's hardly at all, so the
+// crossing is low; it is 1 for most formats -- the matrix unit from 2 rows.
+//
+// THE CROSSING IS PER FORMAT. The matrix unit's products cost the same per 8x8 weight tile
+// whatever number of token rows is live, so whether they are free depends on how many weight
+// bytes that tile carries. A format at the bandwidth wall hides them; a format whose unpack
+// leaves it short pays them on top of an already ALU-limited kernel, and there the GEMV -- which
+// computes only the live columns -- is cheaper. Qwen3.8-27B (M3 Pro) at 2 rows, the shipping
+// kernel against itself with the products dropped, then the two kernels against each other
+// (docs/evidence/cobatch/2026-09-20-27b-rows-no-tile.md section 24, two rounds agreeing to
+// 0.04 ms):
+//
+//   format        GB/s with products -> without    GEMV against the matrix unit at 2 rows
+//   Q3_K_TM        80.9 -> 108.7  (27 short)       -0.91, -0.89   <- the GEMV wins
+//   IQ3_S_TM       81.3 -> 104.8  (31 short)       -0.98, -0.94
+//   IQ3_XXS_TM     71.8 ->  95.0  (41 short)       -0.61, -0.60
+//   IQ2_XS / IQ2_S 56-64 -> 76-91                  -0.12, -0.10
+//   Q4_K_TM       128.1 -> 136.3  (at the wall)    +0.41, +0.51   <- the matrix unit wins
+//   IQ4_XS_TM     122.0 -> 137.0  (at the wall)    +7.56, +7.76
+//   Q6_K_TM       142.6 -> 142.4  (products free)  +0.15, +0.14
+//
+// At 3 rows no format wants the GEMV (Q3_K +0.41, IQ3_S +0.70, IQ4_XS_TM +17.4), so 2 is the only
+// crossing that differs. Both layouts of a format pick the same winner (IQ4_XS / IQ4_XS_TM, Q4_K /
+// Q4_K_TM, Q5_K / Q5_K_TM, Q6_K / Q6_K_TM), so the key is the ggml source type `wfmt_for` returns.
+constexpr uint32_t BLK_ROWS_MAX_HOST = 8u;
+// The crossing for each block format, by the ggml source type `wfmt_for` returns. 2 for the
+// formats measured short of the wall -- Q3_K 11, IQ2_XS 17, IQ3_XXS 18, IQ3_S 21, IQ2_S 22 -- and
+// 1 for the rest, the matrix unit from 2 rows. Adding a format here needs the two measurements
+// above for it, not a guess from its bit width.
+//
+// THIS TABLE IS THE FALLBACK, not the answer. It is right for the formats whose two kernels are
+// far apart and wrong for the ones where they nearly tie -- see `blk_rows_gemv_max_for` below,
+// which prefers a MEASURED seat per tensor when the tune file carries one.
+//
+// `imparo_metal_set_blk_rows_gemv_max` sets EVERY format: tests/blk_decode_rows.rs uses it to put
+// every format on one kernel, and imparo-metalbench's IMPARO_BENCH_BLK_ROWS_GEMV_MAX to time the
+// two against each other.
+constexpr uint32_t BLK_WFMT_COUNT = 32u;
+static uint32_t blk_rows_gemv_max_compiled(uint32_t wf) {
+    switch (wf) {
+        case 11u: case 17u: case 18u: case 21u: case 22u: return 2u;
+        default: return 1u;
+    }
+}
+static uint32_t g_blk_rows_gemv_max_fmt[BLK_WFMT_COUNT];
+static bool g_blk_rows_gemv_max_set = false;
+static uint32_t blk_rows_gemv_max_fmt(uint32_t wf) {
+    if (!g_blk_rows_gemv_max_set) { return blk_rows_gemv_max_compiled(wf); }
+    return wf < BLK_WFMT_COUNT ? g_blk_rows_gemv_max_fmt[wf] : 1u;
+}
+
+// A SEAT PER TENSOR: (wfmt, n_in, n_out) -> the rows up to which the scalar decode-rows GEMV
+// beats the matrix unit. Absent, the format's value above answers.
+//
+// WHY PER TENSOR. On Qwen3.8-27B UD-Q4_K_S at 2 rows the GEMV beats the matrix unit on six of
+// Q4_K_TM's seven shapes (attn_qkv 5120->10240, 222.8 against 230.8 us) and loses on the seventh
+// (ffn_down 17408->5120, 458.4 against 388.8). Q4_K TILE-MAJOR wants the GEMV where Q4_K
+// ROW-MAJOR wants it not, and 17408->5120 wants the matrix unit for Q4_K and the GEMV for Q3_K.
+// Format, layout and shape interact and none of them predicts the winner alone.
+//
+// WHY THIS CAN BE A SEAT WHEN THE PER-FORMAT ONE COULD NOT. The objection to seating the crossing
+// was that a sweep reads ONE step total, and that total is 35% a single tensor group, so it picks
+// the matrix unit for everything and flattens the table. This seat is not swept: the tuner TIMES
+// BOTH KERNELS ON EACH TRIPLE (imparo-metalbench's GEMV probe already reports per tensor) and
+// records the winner, so there is no aggregate to hide in.
+//
+// The lookup runs on every block matmul dispatch -- about 60 a layer, 64 layers, so ~3800 times a
+// step. A linear scan of 67 triples there would cost more than the table saves, so the entries go
+// in an open-addressed table probed by hash.
+struct BlkRowsSeat {
+    uint32_t wf, n_in, n_out, gemv_max;
+    bool used;
+};
+constexpr uint32_t BLK_ROWS_SEAT_SLOTS = 512u;          // a power of two; load factor <= 0.5
+constexpr uint32_t BLK_ROWS_SEAT_MAX = BLK_ROWS_SEAT_SLOTS / 2u;
+static BlkRowsSeat g_blk_rows_seats[BLK_ROWS_SEAT_SLOTS];
+static uint32_t g_blk_rows_seat_count = 0u;
+
+static inline uint32_t blk_rows_seat_slot(uint32_t wf, uint32_t n_in, uint32_t n_out) {
+    uint64_t h = (uint64_t)wf * 0x9E3779B97F4A7C15ull;
+    h ^= (uint64_t)n_in * 0xC2B2AE3D27D4EB4Full;
+    h ^= (uint64_t)n_out * 0x165667B19E3779F9ull;
+    h ^= h >> 29;
+    return (uint32_t)h & (BLK_ROWS_SEAT_SLOTS - 1u);
+}
+
+static uint32_t blk_rows_gemv_max_for(uint32_t wf, uint32_t n_in, uint32_t n_out) {
+    // THE EXPLICIT OVERRIDE OUTRANKS A SEAT, and it has to. Its whole purpose is to put EVERY
+    // format on one kernel so a test or the bench can time that kernel alone; a seat that
+    // outranked it would leave some tensors on the other one and label the mixture as one. That
+    // is not hypothetical: with 37 seats loaded, IMPARO_BENCH_BLK_ROWS_GEMV_MAX=2 ran 28 tensors
+    // on the GEMV and 38 on the matrix unit while claiming to force the GEMV.
+    if (g_blk_rows_gemv_max_set) { return blk_rows_gemv_max_fmt(wf); }
+    if (g_blk_rows_seat_count != 0u) {
+        uint32_t s = blk_rows_seat_slot(wf, n_in, n_out);
+        for (uint32_t probe = 0u; probe < BLK_ROWS_SEAT_SLOTS; ++probe) {
+            const BlkRowsSeat & e = g_blk_rows_seats[s];
+            if (!e.used) { break; }                      // an empty slot ends the chain
+            if (e.wf == wf && e.n_in == n_in && e.n_out == n_out) { return e.gemv_max; }
+            s = (s + 1u) & (BLK_ROWS_SEAT_SLOTS - 1u);
+        }
+    }
+    return blk_rows_gemv_max_fmt(wf);
+}
+// Its dispatches, for the same proof.
+uint64_t g_blk_rows_dispatches = 0;
+// The block formats' rows on the simdgroup matrix unit (imparo_blk_rows_mma): rows past the
+// format's own GEMV crossing and up to this many take it -- one 8-token column, so 8 at most;
+// above it the GEMM. 0 keeps the GEMM there. Qwen3.8-27B, projections a step: 128.4 / 130.0 ms at
+// 4 / 8 rows against the GEMM's 199.5 / 200.4.
+constexpr uint32_t BLK_MMA_MAX_HOST = 8u;
+uint32_t g_blk_rows_mma_max = BLK_MMA_MAX_HOST;
+static uint32_t decode_rows_route(void) {
+    static int forced = -1;
+    if (forced < 0) { const char * e = getenv("IMPARO_DECODE_ROWS"); forced = (e != nullptr && e[0] == '1') ? 1 : 0; }
+    return forced == 1 ? 1u : g_decode_rows;
+}
+static bool decode_rows_gemv(uint32_t n_tok, uint32_t fast_max) {
+    const uint32_t route = decode_rows_route();
+    if (route == 0u || n_tok < 2u || n_tok > 8u) { return false; }
+    return route == 1u || n_tok <= fast_max;
+}
 // Force the QT 8 path, which halves threadgroup memory (12 KB against 24) and doubles the
 // KV re-reads. A diagnostic for whether occupancy or traffic binds this kernel.
 uint32_t g_attn_short     = 0;
@@ -439,6 +619,15 @@ uint32_t g_qcomb_hds[QCOMB_HD_SLOTS] = { 0u, 0u, 0u, 0u };
 // the lm head was its only dispatch; more give the kernel that many independent
 // decode-then-multiply chains and read the x values once for all of them. Measured here,
 // not assumed: IMPARO_BLK_GEMV_NR is the A/B arm.
+// THE SCALAR ROUTED KERNEL'S SKIP BITS (IMPARO_MOE_SKIP). Read in one place because TWO
+// kernels serve this path and only one of them carries the constant -- see the refusal in
+// imparo_metal_moe_grouped.
+static uint32_t moe_skip_bits() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("IMPARO_MOE_SKIP"); v = e ? atoi(e) : 0; }
+    return (uint32_t)(v > 0 ? v : 0);
+}
+
 static uint32_t blk_gemv_nr() {
     static uint32_t v = 0u;
     if (v == 0u) {
@@ -454,6 +643,10 @@ static uint32_t blk_gemv_nr() {
 }
 uint32_t g_delta_kd = 0u;   // key coordinate = Q/K head width
 uint32_t g_delta_vd = 0u;   // value coordinate = V head width
+// The depths the tree delta kernel keeps a branching row's state for: every node must be
+// shallower. Injected into the library as IMPARO_DELTA_TREE_DEPTH and read back by the Rust
+// layout check.
+static const uint32_t g_delta_tree_depth = 16u;
 // Must equal DELTA_SGS * 32 in imparo.metal: the kernel divides the state's rows among
 // its simdgroups by that count, so a smaller launch would leave rows unowned.
 // Threads per delta-rule threadgroup: DELTA_SGS simdgroups, the same macro the kernel is
@@ -713,6 +906,15 @@ uint32_t g_attn_fd        = 1u;
 // decode-step workload read 128 / 256 / 512 / 1024 at 2532 / 2366 / 2510 / 3546 us, so 256
 // is the compiled default (8 KV heads x 64 slices at 16k keys; upstream's nwg is 32).
 uint32_t g_attn_fd_chunk  = 256u;
+// A verify's row-layout attention (imparo_metal_attention_rows): threadgroups the key split aims
+// for (0 = no split) and whether the four query heads of a KV head share a threadgroup. Measured
+// on Qwen3-4B Q4_K_M, 8-row verify at 2512 keys, packed heads, verify ms by target: 32 27.6,
+// 48 27.5, 64 27.4, 96 27.9, 128 28.0, 256 28.8 (no split 35.9, neither 38.5).
+uint32_t g_verify_attn_tgs   = 64u;
+uint32_t g_verify_attn_heads = 1u;
+// Cleared by a caller that needs the causal forward's arithmetic from a row layout (the tree
+// gate's chain check); the split is the only part of the verify grid that changes it.
+uint32_t g_verify_split_on   = 1u;
 // The vector decode kernel's regime: a single query over a span of at most this many keys
 // (knob `attn_vec_max_keys`). It reads K/V once per QUERY head, so it wins while the span is
 // cache-resident and loses to the K-once-per-KV-head routes past that, which split a long
@@ -763,17 +965,17 @@ static uint32_t g_gpu_cores = 0;            // IORegistry gpu-core-count; 0 = un
 // max-threads verdict, out of the same requested seat. (The file already applies this rule
 // one level down: a deep variant below the plain verdict is switched OFF for that slot
 // rather than lowering the grid.)
-constexpr uint32_t MEGA_ARCH_GEMMA4 = 0u, MEGA_ARCH_LFM2 = 1u, MEGA_ARCH_QWEN35 = 2u;
-constexpr uint32_t MEGA_ARCH_COUNT = 3u;
-static uint32_t g_mega_threads_limit[MEGA_ARCH_COUNT] = { 0u, 0u, 0u };   // derived at init; 0 = no pipeline for this family
-static uint32_t g_mega_nsg_limit[MEGA_ARCH_COUNT] = { 0u, 0u, 0u };   // single-threadgroup pipeline limit, not the grid's
+constexpr uint32_t MEGA_ARCH_GEMMA4 = 0u, MEGA_ARCH_LFM2 = 1u, MEGA_ARCH_QWEN35 = 2u, MEGA_ARCH_LFM2MOE = 3u;
+constexpr uint32_t MEGA_ARCH_COUNT = 4u;
+static uint32_t g_mega_threads_limit[MEGA_ARCH_COUNT] = { 0u, 0u, 0u, 0u };   // derived at init; 0 = no pipeline for this family
+static uint32_t g_mega_nsg_limit[MEGA_ARCH_COUNT] = { 0u, 0u, 0u, 0u };   // single-threadgroup pipeline limit, not the grid's
 // THE GRID SEAT IS PER PIPELINE: per family AND per head-dim slot (task #203). E4B's hd-256
 // and hd-512 layers are two compiled pipelines with different footprints, and admission is a
 // pipeline's register footprint, so one seat for both would hold the 35 windowed layers at
 // whatever the 7 deep ones admit. Slot 0 is the smaller head dim (the mega_tgs knob), slot 1
 // the larger (mega_tgs_large). One per core by default; a stored tune value or IMPARO_MEGA_TGS
 // moves it.
-static uint32_t g_mega_tgs[MEGA_ARCH_COUNT][2] = { { 1u, 1u }, { 1u, 1u }, { 1u, 1u } };
+static uint32_t g_mega_tgs[MEGA_ARCH_COUNT][2] = { { 1u, 1u }, { 1u, 1u }, { 1u, 1u }, { 1u, 1u } };
 // What the admission probe found a pipeline will hold resident, as a threadgroup count,
 // PER WIDTH (task #203): indexed by family, head-dim slot and simdgroups per threadgroup,
 // because admission is a register footprint and the footprint is per thread -- a limit taken
@@ -786,7 +988,7 @@ constexpr uint32_t MEGA_NSG_MAX = 32u;
 static uint32_t g_mega_tgs_probed[MEGA_ARCH_COUNT][2][MEGA_NSG_MAX + 1u] = {};
 // The family the tuner asked about last (MEGA_ARCH_COUNT = none): what the registry reads back.
 static uint32_t g_mega_probe_family = MEGA_ARCH_COUNT;
-static uint32_t g_mega_nsg[MEGA_ARCH_COUNT] = { 16u, 16u, 16u };
+static uint32_t g_mega_nsg[MEGA_ARCH_COUNT] = { 16u, 16u, 16u, 16u };
 // The seats the tuner asks for -- the grid per slot, the width per family -- applied to every
 // family and clamped per pipeline (0 = derive).
 static uint32_t g_mega_tgs_req[2] = { 0u, 0u }, g_mega_nsg_req = 0u;
@@ -802,8 +1004,8 @@ static uint32_t mega_ceiling(uint32_t arch, uint32_t slot) {
 }
 // What the last entry of each family DERIVED, so the knob's readback reports what is running
 // rather than the compiled seat (#74's requested-vs-running rule). 0 = never derived.
-static uint32_t g_mega_derived_nsg[MEGA_ARCH_COUNT] = { 0u, 0u, 0u };
-static uint32_t g_mega_derived_tgs[MEGA_ARCH_COUNT] = { 0u, 0u, 0u };
+static uint32_t g_mega_derived_nsg[MEGA_ARCH_COUNT] = { 0u, 0u, 0u, 0u };
+static uint32_t g_mega_derived_tgs[MEGA_ARCH_COUNT] = { 0u, 0u, 0u, 0u };
 // IMPARO_MEGA_NSG_EXACT=1 turns the derivation off and runs the seat verbatim: the A/B arm
 // that prices the balance rule, and the way to reproduce a grid from an evidence table.
 static bool g_mega_nsg_exact = false;
@@ -889,9 +1091,13 @@ static const bool MEGA_PROGRAM_DEFAULT_LFM2 = true;
 // qwen35 starts on the PER-LAYER form: the per-token program is worth what its admission
 // measures (task #167), and nothing has measured it for this entry size yet.
 static const bool MEGA_PROGRAM_DEFAULT_Q35 = false;
-// By family index (MEGA_ARCH_GEMMA4, MEGA_ARCH_LFM2, MEGA_ARCH_QWEN35): the entry dispatch and
-// the tuner's applicability question (imparo_metal_mega_seat_form) read the same table.
-static const bool MEGA_PROGRAM_DEFAULTS[MEGA_ARCH_COUNT] = { MEGA_PROGRAM_DEFAULT_E4B, MEGA_PROGRAM_DEFAULT_LFM2, MEGA_PROGRAM_DEFAULT_Q35 };
+// lfm2moe's entry is the routed feed-forward alone and its mixer runs on the dispatch path
+// between two entries, so a run could never hold more than one entry: the per-layer form.
+static const bool MEGA_PROGRAM_DEFAULT_L2M = false;
+// By family index (MEGA_ARCH_GEMMA4, MEGA_ARCH_LFM2, MEGA_ARCH_QWEN35, MEGA_ARCH_LFM2MOE): the
+// entry dispatch and the tuner's applicability question (imparo_metal_mega_seat_form) read the
+// same table.
+static const bool MEGA_PROGRAM_DEFAULTS[MEGA_ARCH_COUNT] = { MEGA_PROGRAM_DEFAULT_E4B, MEGA_PROGRAM_DEFAULT_LFM2, MEGA_PROGRAM_DEFAULT_Q35, MEGA_PROGRAM_DEFAULT_L2M };
 // THE PROGRAM RING (task #153): entries recorded per layer into a device ring -- 4 region slots
 // (the debug slots' rotation, so a pipelined region's entries are not overwritten for four
 // regions) x MEGA_PROG_CAP entries, ONE ring for every architecture (task #158 gave them one
@@ -1257,7 +1463,7 @@ constexpr uint32_t RT_SHAPES[RT_CANDIDATES][4] = {
 //     nb8_shape / nb8_max         q8_token_tile / q8_batch_sgs        narrow batch
 //     rt_shape                    st_gemm_shape                       wide prefill
 //     g_gemv_max_tok, one row for both families: the route boundary (not a knob)
-constexpr uint32_t ST_GEMM_CANDIDATES = 12;
+constexpr uint32_t ST_GEMM_CANDIDATES = 13;
 constexpr uint32_t Q8_BLOCK_ELEMENTS = 32;    // Q8_0 wire-format block width
 // {ROWS, TOKENS, NSG}. MUST match the IMPARO_ST_GEMM list in imparo.metal: the host sizes
 // the grid and the threadgroup from this table, so a disagreement is a wrong-size launch,
@@ -1271,6 +1477,7 @@ constexpr uint32_t ST_GEMM_SHAPES[ST_GEMM_CANDIDATES][4] = {
     {64, 64,  8, 32}, {64, 64,  4, 32},
     {32,128,  4, 32}, {128,32,  4, 32},
     {64, 32,  4, 64}, {64, 64,  4, 64},
+    {64,  8,  4, 32},
 };
 uint32_t g_q8_decode_sgs       = 4;
 // Tile-major decode GEMV: the 256-byte unit fixes 8 rows per threadgroup, so only the
@@ -1300,7 +1507,118 @@ int32_t  g_q8_design_pin       = -1;
 // so there is no stored boundary to get wrong. Equal to the first shape means one shape,
 // which is the untuned path exactly: neither one Apple GPU nor one model's long-prompt
 // winner is a portable default.
-uint32_t g_st_gemm_large_shape   = 3;
+// THE NARROW SEAT, AND WHY IT IS A THIRD ONE AND NOT A THIRD MEMBER OF THE PAIR.
+//
+// A dispatch's cost has two terms, in `walks = ceil(n_tok / TOKENS)` and
+// `padded = walks * TOKENS`:
+//
+//   weight traffic  =  walks * (the whole projection)     set by WALKS
+//   multiply work   =  padded * (K * N per row)           set by PADDED ROWS
+//
+// Which one is scarce depends on the token count, and the two regimes want opposite
+// tiles. Measured on LFM2 (Q8, M3 Pro):
+//
+//   n_tok=8..32, ONE walk either way -- the weight read is fixed and the kernel waits on
+//     it, so what is paid for is padded rows: 28.81 / 31.27 / 44.6 ms per verify step at
+//     8 / 16 / 32 padded rows. Narrowest tile that holds the batch wins.
+//   n_tok=464, 29 walks against 15 -- weight bytes dominate and padding is at most TOKENS
+//     of 464: 9422.9 vs 8676.3 ms of prefill. Widest tile wins.
+//
+// The PAIR's rule (`q8_geometry`) compares padded counts only, which is the first regime's
+// answer. It is right for the 32/64 pair because at the widths where those two compete
+// (448..512) padding and walks move together; it is wrong for a 16- or 8-token tile, which
+// is why putting one in `g_st_gemm_shape` cost prefill 8.6%. So the narrow tile gets its
+// own seat with a token bound, and the pair keeps its measured values untouched.
+//
+// ONE KNOB, NOT TWO. Which tile the seat should use is not a free choice: below the bound
+// every candidate walks the weights once, so the answer is always the NARROWEST tile that
+// holds this dispatch's rows, and the engine derives that per dispatch. A separate shape
+// knob was built first and its sweep came back inert -- 763.2 to 766.4 us across all
+// thirteen candidates against a 764.6 control -- because the shape does nothing until the
+// bound is non-zero and the bound is swept after it. Circular, and one knob removes it.
+//
+// max = 0 is the seat OFF, which is the engine exactly as it was: a stored config from an
+// earlier space carries no line for this key and therefore keeps that.
+uint32_t g_st_gemm_narrow_max    = 0;
+
+static int32_t g_st_gemm_shape_pin = -1;   // IMPARO_ST_GEMM_SHAPE; -1 = nothing pinned
+
+// WHICH TOKEN TILE A DISPATCH TAKES. Two regimes and one bound between them, with no
+// tile index stored anywhere:
+//
+//   n <= narrow_max   the NARROWEST tile that holds n_tok in one token group
+//   n >  narrow_max   the SEAT
+//
+// The lower regime follows from the two-term cost. A dispatch of n rows through a tile of
+// width T
+//
+//   WALKS        ceil(n/T)      the whole projection re-read once per walk
+//   PADDED ROWS  ceil(n/T)*T    K x N of multiply per row, live or not
+//
+// A verify batch is ONE walk whatever the tile, so only padded rows are left and the
+// narrowest tile wins: measured on LFM2, 64x8 against the seat's 64x32 is -19.5% at 8 rows,
+// 64x16 against it -9.9% at 10 and -12.4% at 16, and 32 rows (which pad to 32 either way)
+// tie. A prefill chunk walks many times, so walks decide instead, and going narrower there
+// is what the bound prevents: at 464 rows a 16-token tile walks 29 times against 32's 15,
+// and prefill reads 9422.9 against 8676.3 ms.
+//
+// WHY THE UPPER REGIME IS THE SEAT AND NOT THE WIDEST TILE THAT PADS NO WORSE. That rule
+// was built and measured, because it would have retired the second tuned tile outright, and
+// it LOSES: one binary, four prefill samples interleaved with the arms reversed between
+// rounds, 8444 tokens at the 512 chunk --
+//
+//   derived widest-no-worse   8334.4  8334.6
+//   the seat (64x32)          8287.4  8295.8      +0.5% for the wider tile
+//
+// It contradicts a +3.1% / +3.0% that an earlier comment claimed for a 64x64 second tile at
+// 5963 / 17123 tokens by env pin; that measurement has no surviving log and this one does,
+// so the rule follows this one. A second tile above the bound is an open question with a
+// measurement against it, not a knob.
+static uint32_t q8_tile(uint32_t n_tok) {
+    // A PIN IS A PIN: with IMPARO_ST_GEMM_SHAPE set, every dispatch runs that exact tile
+    // and the bound does not move it. Deriving under a pin would answer a different shape
+    // at a different width, which is the opposite of what an A/B pin -- or the correctness
+    // bench's per-shape sweep -- is asking for.
+    if (g_st_gemm_shape_pin >= 0) { return g_st_gemm_shape; }
+    if (g_st_gemm_narrow_max == 0u || n_tok > g_st_gemm_narrow_max) {
+        return g_st_gemm_shape;
+    }
+    // THE TOKEN WIDTH IS THE ONLY AXIS THIS MOVES. Candidates match the seat in output
+    // rows, simdgroup count and K chunk depth: those three are what the tuner ranked, and a
+    // shape differing in any of them is a different kernel that nothing here measured. With
+    // them fixed the widths are distinct, so there is no tie to break -- an earlier form
+    // matched on rows alone and answered shape 6 (64x64 at EIGHT simdgroups) where the seat
+    // was 64x32 at four.
+    const uint32_t rows = ST_GEMM_SHAPES[g_st_gemm_shape][0];
+    const uint32_t nsg  = ST_GEMM_SHAPES[g_st_gemm_shape][2];
+    const uint32_t kch  = ST_GEMM_SHAPES[g_st_gemm_shape][3];
+    uint32_t best = ST_GEMM_CANDIDATES, best_toks = 0u;
+    for (uint32_t i = 0; i < ST_GEMM_CANDIDATES; ++i) {
+        const uint32_t t = ST_GEMM_SHAPES[i][1];
+        if (ST_GEMM_SHAPES[i][0] != rows || ST_GEMM_SHAPES[i][2] != nsg
+            || ST_GEMM_SHAPES[i][3] != kch || t < n_tok) { continue; }
+        if (best == ST_GEMM_CANDIDATES || t < best_toks) { best = i; best_toks = t; }
+    }
+    // A batch wider than every tile in the family has no candidate and keeps the seat.
+    return best == ST_GEMM_CANDIDATES ? g_st_gemm_shape : best;
+}
+
+// WHICH SHAPES THE RULE CAN NAME. Asked once per candidate at init, because init builds
+// only the shapes it is told to and a shape the rule names but init did not build is a
+// REFUSED projection, not a slow one: the dispatch is skipped, the previous contents of
+// the output stand, and the run continues with wrong numbers. That cost a whole A/B --
+// 100079 "nil Q8 pipeline" lines in one verify run, every FFN projection skipped. The
+// tuner never saw it because it builds every candidate (`g_q8_all`).
+//
+// Ask the rule rather than restate it. Above the bound it answers the seat, so one pass
+// over the widths under the bound is every other answer there is.
+static bool q8_tile_reaches(uint32_t shape) {
+    if (shape == g_st_gemm_shape) { return true; }
+    for (uint32_t n = 1u; n <= g_st_gemm_narrow_max; ++n) {
+        if (q8_tile(n) == shape) { return true; }
+    }
+    return false;
+}
 uint32_t g_q8_full_tiles         = 1;
 uint32_t g_q8_all              = 0;   // build every candidate, for sweeping only
 // WHICH THREADGROUP AXIS CARRIES THE TOKEN GROUPS. Threadgroups are enumerated x
@@ -1333,12 +1651,25 @@ uint32_t g_q8_typed_scale      = 0;
 // 0 off, 1 unstaged with no prefetch, 2 with depth 2, 3 with depth 5.
 uint32_t g_q8_dev_a            = 0;
 // Clamp the staging loop's edge index instead of branching on it, llama.cpp's arrangement.
-uint32_t g_q8_clamp_edge       = 0;
+// ON with the pad skip OFF (below): the two together leave the generic kernel no runtime bound
+// in its staging loops, so it compiles like the full-tile kernel, and dead rows only read
+// duplicates whose results are never stored. Either one alone left a runtime condition and
+// measured flat, which is how the clamp was first recorded as a negative. Together, at 24 / 32
+// rows of LFM2.5's co-batched step on the GEMM: 48.85 -> 44.88 / 49.85 -> 45.34 ms (the full
+// kernel reads 45.77 at 32); one-chunk prefill of 455 / 192 tokens -1.8 / -1.7%; live rows'
+// bits unchanged. IMPARO_Q8_CLAMP_EDGE=0 builds the branching form.
+uint32_t g_q8_clamp_edge       = 1;
 // Scheduling fences in the MMA loop, llama.cpp's arrangement. ON by default -- this is
 // the shader's own default too, so an unset build compiles them in. Setting it to 0
 // through IMPARO_Q8_MMA_FENCE compiles the variant WITHOUT them, which is how the +5.1%
 // short / +3.1% deep was measured and how it can be reproduced.
 uint32_t g_q8_mma_fence        = 1;
+// Skip the activation staging and the multiplies of token tiles past the last live token
+// row (shader constant 27). OFF by default, with the edge clamp ON (above): the tile rule
+// already picks the narrowest tile that holds the rows, so the skip rarely had whole dead
+// simdgroup shares to skip, and its runtime bound cost the unrolled staging loop.
+// IMPARO_Q8_PAD_SKIP=1 builds the skipping form.
+uint32_t g_q8_pad_skip         = 0;
 // The same fence question for the Q4 rt_gemm. Default OFF: that kernel already beats
 // upstream, so it does not move without a measurement. Constant 16 in the shader; set it
 // through IMPARO_RT_MMA_FENCE=1 to compile the fenced variant.
@@ -1346,6 +1677,16 @@ uint32_t g_rt_mma_fence        = 0;
 // The same for prefill attention, the deep leg's remaining growing term. Default off.
 // Phase probe for attention: 1 no score MMA, 2 no softmax, 4 no P x V.
 uint32_t g_attn_skip           = 0;
+// IMPARO_SKIP_MM_NOUT: the one decode-matmul output width to drop (0 = none). See the
+// guard beside PC_MATMAT_DECODE's.
+uint32_t g_skip_mm_nout        = 0;
+// Threads a dim in the attention combine (function constant 35); the dispatch width
+// must match what the kernel was compiled for.
+uint32_t g_attn_comb_spd       = 1;
+// IMPARO_DUP_MM_NOUT: the one decode-matmul output width to encode TWICE (0 = none).
+uint32_t g_dup_mm_nout         = 0;
+// IMPARO_DUP_ATTN_COMBINE: encode the flash-decoding combine twice (diagnostic).
+bool     g_dup_attn_combine    = false;
 // ATTRIBUTION PROBE for the prefill GEMM (function constant 10 in the shader):
 // bit 0 no multiply, bit 1 no staging, bit 2 no device weight read. Zero compiles the
 // shipping pipeline, so a measured run with this unset is byte-identical to one from a
@@ -1406,13 +1747,68 @@ enum ProfCat {
     // nothing else: the convolution is a short elementwise stencil over the projection,
     // the rule is a matrix recurrence whose serial depth is the token count. Priced
     // together they read as one 3.5% class and neither one's shape is visible.
-    PC_RECUR, PC_DELTA, PC_MEGA, PC_N
+    PC_RECUR, PC_DELTA, PC_MEGA,
+    // The drafter's candidates and its confidence head, apart from the elementwise class so a
+    // profile shows them on their own.
+    PC_TOP_K_CHUNKS, PC_TOP_K_MERGE, PC_LOGISTIC,
+    // A one-row projection out of a small rank space: at most 512 inputs and at least 64 outputs
+    // per input, the Markov head's W2 (256 to 128000 on LFM2.5's drafter). Every model's output
+    // head has more than 512 inputs and stays in matmat_decode.
+    PC_MATMAT_RANK,
+    // A ROUTED FEED-FORWARD, in two classes. The route (gating, the pick, the counting sort
+    // and the combine) is small and fixed; the expert matmuls are the work. Priced together
+    // they would read as one class and neither shape would be visible -- the same mistake
+    // splitting PC_RECUR from PC_DELTA undid.
+    // PC_MOE_ROUTE HAS NO SKIP. Every other class here can be dropped by IMPARO_SKIP_CAT
+    // so a skip-and-diff can price it, but the route produces the plan the expert matmuls
+    // index, and a skipped route leaves them reading a garbage segment table. Asking to
+    // skip it is silently a no-op, so its skip-and-diff figure is noise, not a price --
+    // read the route's cost off the profile's own timing instead.
+    PC_MOE_ROUTE, PC_MOE_EXPERT,
+    // The COMBINE apart from the route. Both run one threadgroup and both are small, which
+    // is exactly why they hid each other: priced together they read as one 6% class with no
+    // shape, and the combine's is a grid of 1 over 2048 independent outputs.
+    PC_MOE_COMBINE,
+    // THE OUTPUT HEAD ON ITS OWN. On LFM2.5-8B-A1B it is 215 MB of Q6_K read for ONE row --
+    // 45% of every dense byte a decode token moves -- so priced inside matmat_decode it
+    // hides whether the dense class is slow or merely large. 16384 outputs separates it
+    // with room to spare: the head has 128000, and the next widest decode projection is
+    // in_proj's 6144.
+    PC_MATMAT_HEAD,
+    // A NARROW PROJECTION, at most 64 outputs. On a routed model that is the router's own
+    // gate (ffn_gate_inp, 2048 -> 32): 22 of them a token, and a GEMV two rows to a
+    // simdgroup gives 32 outputs sixteen simdgroups to cover eighteen cores. Priced inside
+    // matmat_decode it is 2% of the class's bytes and invisible.
+    PC_MATMAT_NARROW,
+    // THE SAME DECODE PROJECTIONS, SPLIT BY SOURCE TYPE. The output head is the one big
+    // Q6_K tensor in this file and the only class near the device ceiling; everything else
+    // is Q4_K. Priced together the two cannot be told apart, and "is the gap the format?"
+    // is the question the rest of the class turns on.
+    PC_MATMAT_DEC_Q6,
+    // THE ROUTED GATE|UP PAIR, apart from the down projection that shares moe_expert: the
+    // two have different K and different epilogues, and one class could not say which of
+    // them a routed-GEMM change moved. IMPARO_SKIP_CAT=moe_expert still skips both.
+    PC_MOE_PAIR, PC_N
 };
 static const char * PROF_CAT_NAME[PC_N] = {
     "matmat_prefill", "matmat_decode", "row", "rms_norm", "rope",
     "kv_store", "attention", "elementwise", "mul_strided", "ple_combine",
-    "recurrent", "delta_rule", "mega_ffn"
+    "recurrent", "delta_rule", "mega_ffn", "top_k_chunks", "top_k_merge", "logistic", "matmat_rank",
+    // IN THE ENUM'S ORDER. The names are indexed by ProfCat, so a value inserted in the
+    // middle of the enum has to be inserted here too -- appending it swaps two classes'
+    // labels and the profile reads as though one kernel did the other's work.
+    "moe_route", "moe_expert", "moe_combine", "matmat_head", "matmat_narrow",
+    "matmat_dec_q6", "moe_pair"
 };
+
+// The output head's class, by the width that separates it -- see PC_MATMAT_HEAD.
+// Defined beside w_bytes, which reads the same wire table.
+static bool w_is_q6k(uint32_t wkind);
+static inline ProfCat mm_decode_cat(uint32_t n_out, uint32_t wkind = 64u) {
+    if (n_out >= 16384u) { return PC_MATMAT_HEAD; }
+    if (n_out <= 64u) { return PC_MATMAT_NARROW; }
+    return w_is_q6k(wkind) ? PC_MATMAT_DEC_Q6 : PC_MATMAT_DECODE;
+}
 constexpr uint32_t PROF_MAX_SAMPLES = 4096;     // 2048 dispatches per resolve: the device caps a sample buffer at 32768 B (8 B per sample); a decode token is ~784 dispatches, a 512-token prefill 1255
 id<MTLCounterSampleBuffer> g_prof_sbuf = nil;
 uint8_t  g_prof_cat[PROF_MAX_SAMPLES / 2];
@@ -1425,6 +1821,11 @@ uint32_t g_prof_pairs = 0;                       // pairs written this command b
 double   g_prof_cat_ticks[PC_N];                 // this region, cleared when converted
 double   g_prof_cat_s[PC_N];                     // converted, accumulated across regions
 uint64_t g_prof_cat_calls[PC_N];
+// WEIGHT BYTES per category, so a class reads as a BANDWIDTH and not only a duration. A
+// duration says a class is big; bytes over duration says whether it is slow. On this model
+// the output head and the dense per-layer projections differ by a third in GB/s while both
+// read as "matmat_decode" -- which is the whole reason for counting them.
+uint64_t g_prof_cat_bytes[PC_N];
 uint8_t  g_prof_cur = 0;
 
 
@@ -1456,6 +1857,7 @@ struct Context {
     std::vector<uint64_t> kv_reg_k, kv_reg_v;
     std::vector<id<MTLBuffer>> kv_pt;
     std::vector<uint8_t>       kv_pt_ident;  // 1 = table is the identity mapping
+    std::vector<uint32_t>      kv_pt_set;    // entries the pool set last (0 = never set)
     id<MTLCommandBuffer> cb = nil;
     id<MTLComputeCommandEncoder> enc = nil;
     // [lane-count log2 (2..5)][NR0 log2 (0..3), so NR0 in 1,2,4,8]
@@ -1468,9 +1870,25 @@ struct Context {
     // [variant][tile][wfmt + 32*rowmajor]. The variant is the rt entry point the route
     // would have taken anyway: plain, _h (half-activation mirror), _gh (gated pair); the
     // tile is a wide shape's index or one of the two narrow tiles (RT_TILE_*).
-    id<MTLComputePipelineState> p_rt_fmt[3][RT_TILES][64];
+    id<MTLComputePipelineState> p_rt_fmt[4][RT_TILES][64];
+    // The plain Q4_0 family's residual-add twins (RT_HALF_RESID), by tile; built on first use.
+    id<MTLComputePipelineState> p_rt_plain_resid[RT_TILES];
     id<MTLComputePipelineState> p_gather_fmt[32];
     id<MTLComputePipelineState> p_gemv_fmt[64];
+    // Its decode-rows form: [wfmt + 32*rowmajor][form], the forms holding 2, 4 and 8 tokens.
+    id<MTLComputePipelineState> p_blk_rows_fmt[64][3];
+    // The rows on the matrix unit (imparo_blk_rows_mma): [wfmt + 32*rowmajor].
+    // The matrix-unit rows kernel, per format x layout x units a threadgroup (1, 2, 4) x whether
+    // it reads the activations from the half mirror.
+    id<MTLComputePipelineState> p_blk_rows_mma_fmt[64][3][2];
+    // The same over two 8-row token fragments (imparo_blk_rows_mma_t2), built on first use.
+    id<MTLComputePipelineState> p_blk_rows_mma2_fmt[64][3];
+    id<MTLComputePipelineState> p_moe_grouped_mma_fmt[64][3];
+    // The gate|up pair of the same kernel: one more entry per (format, layout, tiles).
+    id<MTLComputePipelineState> p_moe_grouped_mma_pair_fmt[64][3];
+    // [wfmt + 32*rowmajor][shape], shape 0 = 32 tokens, 1 = 64 tokens
+    // [fmt+layout][moe_st_shape index][bit 0 half source, bit 1 half result]
+    id<MTLComputePipelineState> p_moe_st_gemm_fmt[64][4][4];
     id<MTLComputePipelineState> p_repack_q8_tm;
     id<MTLComputePipelineState> p_repack_tm;
     id<MTLComputePipelineState> p_attn_pre_qtile16;
@@ -1490,6 +1908,8 @@ struct Context {
     // One pipeline per legal simdgroup count (index log2 nsg): the seated one in the engine,
     // every legal one under the tuner (IMPARO_FA_ALL). nil where not built.
     id<MTLComputePipelineState> p_fa_n[4];
+    // The register-softmax form of the FA op (default; IMPARO_ATTN_FARS=0 keeps the 8-query op).
+    id<MTLComputePipelineState> p_fars;
     // K-sharing (QT-16) instantiation of the same slots.
     id<MTLComputePipelineState> p_qcomb_x[4];
     // The QT-16 K-sharing variants stay named for the dims they were tuned at: their NSG
@@ -1512,6 +1932,15 @@ struct Context {
     id<MTLComputePipelineState> p_mega_q35_deep_q[2] = { nil, nil };
     id<MTLComputePipelineState> p_mega_q35_prog[2] = { nil, nil };
     id<MTLComputePipelineState> p_mega_q35_prog_q[2] = { nil, nil };
+    // The lfm2moe routed feed-forward block per head-dim slot (formats from the entry, like
+    // qwen35's). It has no attention phase, so its deep and quantized-cache variants stay nil:
+    // the tables that index every family by its variants need the slots to exist.
+    id<MTLComputePipelineState> p_mega_l2m[2] = { nil, nil };
+    id<MTLComputePipelineState> p_mega_l2m_deep[2] = { nil, nil };
+    id<MTLComputePipelineState> p_mega_l2m_q[2] = { nil, nil };
+    id<MTLComputePipelineState> p_mega_l2m_deep_q[2] = { nil, nil };
+    id<MTLComputePipelineState> p_mega_l2m_prog[2] = { nil, nil };
+    id<MTLComputePipelineState> p_mega_l2m_prog_q[2] = { nil, nil };
     id<MTLComputePipelineState> p_mega_lfm2[2] = { nil, nil };  // the LFM2 layer block per head-dim slot (tile-major Q8, the model's activation)
     id<MTLComputePipelineState> p_mega_layer_deep[2] = { nil, nil }; // the same kernels with the deep attention body compiled in (MEGA_DEEP), one threadgroup per core
     id<MTLComputePipelineState> p_mega_lfm2_deep[2] = { nil, nil };
@@ -1551,16 +1980,36 @@ struct Context {
     // Indexed by ConvForm: 0 = gated (LFM2), 1 = plain + SiLU (Qwen3.8's delta net).
     id<MTLComputePipelineState> p_conv[2] = { nil, nil };
     id<MTLComputePipelineState> p_conv_state[2] = { nil, nil };
+    // ROW LAYOUT (a tree verify), built on first use by row_layout_ready.
+    id<MTLComputePipelineState> p_fa_rows_n[4] = { nil, nil, nil, nil };
+    // The register-softmax op over a row layout, built on first use: a verify takes the kernel
+    // prefill takes, so a chain's rows equal a causal forward's.
+    id<MTLComputePipelineState> p_fars_rows = nil;
+    // Its verify variants, indexed bit 0 = ROW_SPLIT (constant 63), bit 1 = ROW_HEADS (64); entry
+    // 0 unused (p_fars_rows). And ROW_SPLIT's merge.
+    id<MTLComputePipelineState> p_fars_rows_v[4] = { nil, nil, nil, nil };
+    id<MTLComputePipelineState> p_rows_combine = nil;
+    id<MTLComputePipelineState> p_fa_rows_fq_n[4] = { nil, nil, nil, nil };   // float Q, built on first use
+    id<MTLComputePipelineState> p_head_norm_rope_rows = nil;
+    id<MTLComputePipelineState> p_conv_rows[2] = { nil, nil };
+    id<MTLComputePipelineState> p_conv_row_inputs[2] = { nil, nil };
     id<MTLComputePipelineState> p_shortconv_step = nil;   // one token, gated: conv + state shift
     id<MTLComputePipelineState> p_shortconv_step_plain = nil;  // the same for the plain+SiLU form
+    // CO-BATCHED ROWS (function constant 32), built on a process's first co-batched step: the
+    // f16 KV store, head norm + rope, the vector decode attention per head-dim slot, the
+    // one-token convolution step per form. `tried` keeps a build that failed from being
+    // retried every step.
+    struct CobPipe { id<MTLComputePipelineState> p = nil; bool tried = false; };
+    CobPipe cob_kvstore, cob_head_norm_rope, cob_attn_vec[2], cob_conv_step[2], cob_delta_net;
     id<MTLComputePipelineState> p_delta_net = nil;        // the gated delta rule
-    id<MTLComputePipelineState> p_mul_sigmoid = nil, p_copy_strided = nil;
+    id<MTLComputePipelineState> p_delta_net_tree = nil;   // the same rule over a draft tree
+    id<MTLComputePipelineState> p_mul_sigmoid = nil, p_copy_strided = nil, p_scatter_strided = nil;
     std::vector<id<MTLCommandBuffer>> pending;   // flushed, awaiting accounting
     void * pool = nullptr;                      // autorelease pool for one forward pass
     // PIPELINED DECODE (docs/decode-turnaround.md): regions committed by `end_async` and
     // not yet waited on, oldest first. The host encodes decode step N+1 while step N
     // runs; `wait_outstanding` retires the oldest.
-    struct Region { std::vector<id<MTLCommandBuffer>> cbs; uint32_t dbg_slot = 0; };
+    struct Region { std::vector<id<MTLCommandBuffer>> cbs; uint32_t dbg_slot = 0; uint64_t seq = 0; };
     std::vector<Region> outstanding;
     id<MTLComputePipelineState> p_gemv_probe;
     id<MTLComputePipelineState> p_add4, p_copy4, p_actmul4, p_act4, p_scale4;
@@ -1587,6 +2036,20 @@ struct Context {
     // layout imparo-repack writes. Selected by the weight kind of the dispatch, never by a
     // knob, so a file's layout picks its pipeline and nothing else changes.
     id<MTLComputePipelineState> p_q8mv_tm;   // tile-major: 8 rows per threadgroup, fixed by the unit
+    // DECODE ROWS (function constant 28 = 2, 4 or 8): the one-row GEMVs over that many independent
+    // rows, built on first use (q8mv_tok_pipe). Indexed [rows log2 - 1]; row-major also by the
+    // rows per threadgroup.
+    id<MTLComputePipelineState> p_q8mv_tok_tm[3];
+    id<MTLComputePipelineState> p_q8mv_tok_rows[3][3];
+    // CO-BATCHED ROWS through the simdgroup matrix unit (imparo_q8_tm_rows_mma), tile-major only,
+    // built on first use: [token columns / 8 - 1][activations from the half mirror].
+    id<MTLComputePipelineState> p_q8_rows_mma[RM_MAX_FRAGS_HOST][2];
+    // ...and its row-major Q4_0 form (function constant 37), one or two unit tiles a
+    // threadgroup (function constant 38).
+    id<MTLComputePipelineState> p_q4_rows_mma[RM_MAX_FRAGS_HOST][2][3];
+    // The Q4_0 decode-rows twins of p_q4mm_lanes, built on first use (q4mv_tok_pipe): [lanes log2]
+    // [rows per lane log2][lane groups splitting the tokens, log2][rows log2 - 1].
+    id<MTLComputePipelineState> p_q4mv_tok[6][4][4][3];
     id<MTLComputePipelineState> p_q8mm_tile_tm[4];
     id<MTLComputePipelineState> p_stgemm_tm[ST_GEMM_CANDIDATES];
     id<MTLComputePipelineState> p_stgemm_h_tm[ST_GEMM_CANDIDATES];
@@ -1611,10 +2074,15 @@ struct Context {
     id<MTLComputePipelineState> p_q8row;
     // Batched embedding gather, one per weight kind (index = the wire value).
     id<MTLComputePipelineState> p_gather[3];
-    id<MTLComputePipelineState> p_q4mm, p_q4mm_pre, p_q4mm_pre_nomma, p_f32mm, p_q4row, p_rms, p_rope, p_head_norm_rope, p_kvstore,
+    id<MTLComputePipelineState> p_q4mm, p_q4mm_pre, p_q4mm_pre_nomma, p_f32mm, p_f32nmm, p_f32gemv, p_rms_staged, p_q4row, p_rms, p_rope, p_head_norm_rope, p_kvstore,
         p_attn_dec_direct, p_actmul, p_act, p_add, p_mul, p_scale, p_copy, p_softcap, p_argmax,
-        p_argmax_feed,
+        p_argmax_feed, p_top_k_chunks, p_top_k_merge, p_top_k8_chunks, p_top_k8_merge,
+        p_top_k8_one,
+        p_logistic_blocks, p_logistic_finish,
+        p_moe_gate, p_moe_plan, p_moe_route, p_moe_combine, p_moe_combine_norm,
         p_ple;
+    // The routed matmul, one pipeline per weight format (index = the wire value).
+    id<MTLComputePipelineState> p_moe_grouped_fmt[64];
     id<MTLComputePipelineState> p_rms_add_row = nil;   // norm + residual (+ next norm), one row per threadgroup
 };
 
@@ -1633,7 +2101,7 @@ Context g;
 // Wire layout shared with `WSegWire` in imparo-metal/src/lib.rs.
 struct WSegWire { uint64_t off; uint64_t bytes; uint32_t tier; uint32_t layer; };
 static_assert(sizeof(WSegWire) == 24, "weight segment wire drift");
-enum : uint32_t { WT_FAST = 0, WT_SLOW = 1, WT_HOST_STAGED = 2 };
+enum : uint32_t { WT_FAST = 0, WT_SLOW = 1, WT_HOST_STAGED = 2, WT_UNREAD = 3 };
 
 struct WSeg {
     uint64_t off, bytes;      // the segment in file coordinates
@@ -1651,6 +2119,9 @@ struct WStaged { uint64_t off, bytes; };
 static std::vector<WStaged> g_wstaged;
 static const uint8_t * g_map_base = nullptr;    // the weight mapping, for the host gather
 static uint64_t g_map_len = 0;
+// The model file's path: the repack reads converted weights from it
+// (imparo_metal_set_weight_path) and the slow tier's readahead advises it (wpf_post).
+static std::string g_weight_path;
 
 extern "C" void imparo_metal_set_placement(const WSegWire * segs, uint32_t n, uint64_t budget) {
     g_placement.assign(segs, segs + n);
@@ -1674,6 +2145,8 @@ static bool wsegs_build(const uint8_t * base, uint64_t len) {
             return false;
         }
         if (w.tier == WT_HOST_STAGED) { g_wstaged.push_back({w.off, w.bytes}); continue; }
+        // A block the forward never runs: no buffer, so nothing of it is ever wired.
+        if (w.tier == WT_UNREAD) { continue; }
         const uint64_t b0 = w.off & ~(page - 1);
         const uint64_t b1 = (w.off + w.bytes + page - 1) & ~(page - 1);
         id<MTLBuffer> buf = [g.device newBufferWithBytesNoCopy:(void *)(base + b0)
@@ -1688,6 +2161,13 @@ static bool wsegs_build(const uint8_t * base, uint64_t len) {
         g_wsegs.push_back({w.off, w.bytes, b0, b1 - b0, w.tier, w.layer, buf});
     }
     return true;
+}
+
+// How many weight segments are in the slow tier (0 = the whole model is wired).
+extern "C" uint32_t imparo_metal_slow_segments(void) {
+    uint32_t n = 0;
+    for (const WSeg & s : g_wsegs) { n += (s.tier == WT_SLOW) ? 1u : 0u; }
+    return n;
 }
 
 // The segment a file offset falls in. A miss is a programming error (an offset the
@@ -1713,6 +2193,144 @@ static const WSeg & wseg_at(uint64_t off) {
     backtrace_symbols_fd(frames, n, 2);
     abort();
 }
+// ---- Slow-tier readahead ----------------------------------------------------------------
+// A slow segment is the model file's own pages (the mapping is shared), wired by the driver
+// for each command buffer that binds it. Pages the system has dropped are read back by that
+// wire before the buffer can start, at about 2.4 GB/s (measured). This thread reads them
+// first, with F_RDADVISE at about 4.8 GB/s, in the order the encoder binds them:
+//
+//   encoder: binds a slow segment -> posts it, tagged with its buffer's slow ordinal
+//   thread:  resident -> skip, else F_RDADVISE; never past two slow buffers ahead of the GPU
+//   GPU:     that buffer completes -> done(ordinal)
+//
+// Two buffers ahead is double buffering: the one the GPU runs and the one the SSD fills. A
+// deeper window reads no faster than the SSD, and with a model larger than RAM it could
+// evict pages before the GPU reached them (reasoned, not measured). The model file only: a
+// paired drafter is always in the fast tier (placement). IMPARO_READAHEAD_LOG=1 prints each
+// decision. Evidence: docs/evidence/bracket/2026-09-18-slow-tier-streaming.md.
+struct WpfItem { uint64_t base, len, cb; uint32_t layer; };
+// Never destroyed. The completion handler in wpf_commit runs on Metal's own thread with no
+// order against the process's exit, and it locks `mu`; a mutex torn down by the destructors of
+// statics fails that lock with EINVAL and aborts the process after its answer (the race the
+// idle watcher's comment records). The detached thread parked on `cv` is safe for the same
+// reason.
+struct WpfState {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<WpfItem> queue;        // posted, in bind order
+    uint64_t done_cb = 0;             // highest slow buffer ordinal the GPU has completed
+    // The encoder thread's own:
+    uint64_t cb = 0;                  // ordinal of the buffer being encoded, 0 = no slow bind yet
+    uint64_t ordinals = 0;            // ordinals handed out
+    uint64_t last_base = UINT64_MAX;  // the segment this buffer posted last
+    int fd = -1;                      // the model file; -1 not opened yet, -2 unavailable
+    uint64_t file_len = 0;
+};
+static WpfState & g_wpf = *new WpfState();
+static bool wpf_log(void) {
+    static int on = -1;
+    if (on < 0) { const char * e = getenv("IMPARO_READAHEAD_LOG"); on = (e != nullptr && e[0] == '1') ? 1 : 0; }
+    return on == 1;
+}
+static void wpf_loop(void);
+// Opens the model file and starts the thread, once. False when there is no file to read.
+static bool wpf_ready(void) {
+    if (g_wpf.fd >= 0) { return true; }
+    if (g_wpf.fd == -2) { return false; }
+    const int fd = g_weight_path.empty() ? -1 : open(g_weight_path.c_str(), O_RDONLY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        NSLog(@"imparo metal: no slow-tier readahead, the model file is not readable (%s)",
+              g_weight_path.c_str());
+        if (fd >= 0) { close(fd); }
+        g_wpf.fd = -2;
+        return false;
+    }
+    g_wpf.file_len = (uint64_t)st.st_size;
+    g_wpf.fd = fd;
+    std::thread(wpf_loop).detach();
+    return true;
+}
+// The encoder binds `s`, a slow segment, into the command buffer it is encoding.
+static void wpf_post(const WSeg & s) {
+    if (g.cb == nil || !wpf_ready()) { return; }
+    if (g_wpf.cb == 0) { g_wpf.cb = ++g_wpf.ordinals; g_wpf.last_base = UINT64_MAX; }
+    if (s.base == g_wpf.last_base) { return; }
+    g_wpf.last_base = s.base;
+    { std::lock_guard<std::mutex> l(g_wpf.mu); g_wpf.queue.push_back({s.base, s.len, g_wpf.cb, s.layer}); }
+    g_wpf.cv.notify_one();
+}
+// Just before `cb` is committed: if it bound a slow segment, its completion moves the window.
+static void wpf_commit(id<MTLCommandBuffer> cb) {
+    if (g_wpf.cb == 0) { return; }
+    const uint64_t k = g_wpf.cb;
+    g_wpf.cb = 0;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+        { std::lock_guard<std::mutex> l(g_wpf.mu); if (k > g_wpf.done_cb) { g_wpf.done_cb = k; } }
+        g_wpf.cv.notify_one();
+    }];
+}
+static void wpf_loop(void) {
+    std::unique_lock<std::mutex> l(g_wpf.mu);
+    for (;;) {
+        g_wpf.cv.wait(l, [] {
+            return !g_wpf.queue.empty() && g_wpf.queue.front().cb <= g_wpf.done_cb + 2;
+        });
+        const WpfItem it = g_wpf.queue.front();
+        g_wpf.queue.pop_front();
+        const uint64_t done = g_wpf.done_cb;
+        if (it.cb <= done) {   // its buffer already ran: the driver read what it needed
+            if (wpf_log()) {
+                fprintf(stderr, "[imparo] readahead layer %u buffer %llu: already ran\n", it.layer,
+                        (unsigned long long)it.cb);
+            }
+            continue;
+        }
+        l.unlock();
+        // Resident already? A full mincore of an 84 MB segment costs ~2 ms (measured), more than
+        // a decode step's share, so three pages stand for it: a segment is wired and dropped as a
+        // unit, so its pages age together. A miss the sample does not see costs only the driver's
+        // own read, and F_RDADVISE itself skips whatever part is cached.
+        const uint64_t pg = (uint64_t)vm_page_size;
+        const uint64_t probe[3] = { it.base, it.base + (it.len / 2 / pg) * pg, it.base + it.len - pg };
+        size_t missing = 0;
+        const double tc = CACurrentMediaTime();
+        for (uint64_t at : probe) {
+            char v = 0;
+            if (mincore((const void *)(g_map_base + at), (size_t)pg, &v) != 0 || !(v & MINCORE_INCORE)) {
+                missing += 1;
+            }
+        }
+        const size_t n = 3;
+        const double check_ms = 1e3 * (CACurrentMediaTime() - tc);
+        double ms = 0.0;
+        if (missing > 0) {
+            const double t0 = CACurrentMediaTime();
+            const uint64_t end = std::min(it.base + it.len, g_wpf.file_len);
+            for (uint64_t at = it.base; at < end; ) {
+                const uint64_t take = std::min<uint64_t>(end - at, 1ull << 30);   // ra_count is an int
+                struct radvisory ra = { (off_t)at, (int)take };
+                if (fcntl(g_wpf.fd, F_RDADVISE, &ra) == -1) { break; }
+                at += take;
+            }
+            ms = 1e3 * (CACurrentMediaTime() - t0);
+        }
+        if (wpf_log()) {
+            fprintf(stderr, "[imparo] readahead layer %u buffer %llu (gpu done %llu): %zu of %zu sampled pages "
+                    "missing, check %.3f ms, advise %.1f ms\n", it.layer, (unsigned long long)it.cb,
+                    (unsigned long long)done, missing, n, check_ms, ms);
+        }
+        l.lock();
+    }
+}
+// The segment a dispatch being encoded binds: `wseg_at`, and a slow segment is posted to the
+// readahead. Every binding site goes through here; lookups that bind nothing use wseg_at.
+static const WSeg & wseg_use(uint64_t off) {
+    const WSeg & s = wseg_at(off);
+    if (s.tier == WT_SLOW) { wpf_post(s); }
+    return s;
+}
+
 // "No weight here": the sentinels the call sites already pass for an absent second tensor
 // (UINT64_MAX for an ungated matmat, 0 for a norm without a dual). Both go through
 // unchanged; 0 can never name a weight, it is the GGUF magic at the head of the file.
@@ -1740,7 +2358,7 @@ static uint64_t wbind(id<MTLComputeCommandEncoder> enc, uint64_t off, NSUInteger
         [enc setBuffer:g_wsegs.front().buf offset:0 atIndex:idx];
         return off;
     }
-    const WSeg & s = wseg_at(off);
+    const WSeg & s = wseg_use(off);
     [enc setBuffer:s.buf offset:0 atIndex:idx];
     return off - s.base;
 }
@@ -1840,6 +2458,35 @@ static void rset_stop_thread(void) {
     if (g_rset_thread.joinable()) { g_rset_thread.join(); }
 }
 
+// The system's memory pressure, reported by a dispatch source and taken by the KV tier, which
+// gives idle conversations back when there is any. Set from the source's queue, read and
+// cleared by whoever asks.
+static std::atomic<bool> g_mem_pressure{false};
+static dispatch_source_t g_mem_source = nil;
+static void mem_pressure_watch(void) {
+    if (g_mem_source != nil) { return; }
+    g_mem_source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (g_mem_source == nil) { return; }
+    dispatch_source_set_event_handler(g_mem_source, ^{
+        const unsigned long level = dispatch_source_get_data(g_mem_source);
+        if ((level & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)) != 0) {
+            g_mem_pressure.store(true);
+        }
+    });
+    dispatch_resume(g_mem_source);
+}
+extern "C" uint32_t imparo_metal_take_memory_pressure(void) {
+    return g_mem_pressure.exchange(false) ? 1u : 0u;
+}
+// Seconds the residency is held past the last region before it is released; 0 when it is held
+// for good or there is no residency set.
+extern "C" uint32_t imparo_metal_idle_release_s(void) {
+    return g_rset == nil ? 0u : (uint32_t)g_rset_idle_s;
+}
+
 static void rset_init(void) {
     if (getenv("IMPARO_METAL_NO_RESIDENCY") != NULL) { return; }
     if (const char * e = getenv("IMPARO_METAL_RESIDENCY_IDLE_S")) { g_rset_idle_s = atoi(e); }
@@ -1868,6 +2515,7 @@ static void rset_init(void) {
                 if (CACurrentMediaTime() - g_rset_last_use < (double)g_rset_idle_s) { continue; }
                 [g_rset endResidency];
                 g_rset_held = false;
+                kvset_release_hold();
             }
         });
         atexit(rset_stop_thread);
@@ -1979,6 +2627,7 @@ static void rset_begin(void) {
     std::lock_guard<std::mutex> lk(g_rset_mu);
     g_rset_in_region = true;
     rset_sync(true);
+    kvset_sync_locked();
 }
 // THE WEIGHT WINDOW: the largest piece of a fast segment that one step of the repack or of
 // the wire at load handles at once (the repack's twin, further down, is why there is a window).
@@ -2102,9 +2751,31 @@ extern "C" void imparo_metal_wire_weights(double stall_budget_s) {
         [one endResidency];
         [g.queue removeResidencySet:one];
     }
+    // LETTING GO IS NOT FREE, and load pays for it. Ending the window sets leaves the driver
+    // work it does at the next submission that carries a resource. Measured on LFM2.5 (a
+    // 2733 MiB tier in 3 windows): one blit here waited 17.2 ms before the GPU started it. With
+    // no submission here the first request paid instead -- 18-47 ms inside its first buffer
+    // release (the driver's resource finalize), or 27-53 ms inside the first KV preparation's
+    // requestResidency, which then held up the prefill beside it. Keeping the window sets
+    // alive made that release 0.0 ms, so it is their end, not the window buffers. An EMPTY
+    // command buffer does not do it (0.28 ms, and the release after it still took 47 ms).
+    double settle_ms = 0.0;
+    if (!per_seg.empty()) {
+        per_seg.clear();
+        const double s0 = CACurrentMediaTime();
+        id<MTLBuffer> scratch = [g.device newBufferWithLength:16384 options:MTLResourceStorageModePrivate];
+        id<MTLCommandBuffer> cb = [g.queue commandBuffer];
+        id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+        [be fillBuffer:scratch range:NSMakeRange(0, 16384) value:0];
+        [be endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        settle_ms = 1e3 * (CACurrentMediaTime() - s0);
+    }
     if (pieces != 0) {
-        NSLog(@"imparo metal: weights wired in %u pieces in %.1f ms (worst piece %.1f ms)",
-              pieces, 1e3 * (tw1 - tw0), 1e3 * worst);
+        NSLog(@"imparo metal: weights wired in %u pieces in %.1f ms (worst piece %.1f ms); "
+              "the driver settled their release in %.1f ms",
+              pieces, 1e3 * (tw1 - tw0), 1e3 * worst, settle_ms);
     }
     // Not in a region: the idle timer starts from here, exactly as after a real one.
     g_rset_last_use = CACurrentMediaTime();
@@ -2118,6 +2789,8 @@ static void rset_end(void) {
     // Only when it would DO something: once held and clean, this ran four clock reads and
     // three false branches at every region end, which for decode is every token.
     if (!g_rset_held || g_rset_dirty) { rset_sync(true); }
+    kvset_sync_locked();
+    kvset_hold();
     g_rset_last_use = CACurrentMediaTime();
 }
 
@@ -2326,11 +2999,12 @@ static id<MTLComputeCommandEncoder> new_encoder(void) {
                         : [g.cb computeCommandEncoder];
 }
 
-static void prof_begin(uint8_t cat) {
+static void prof_begin(uint8_t cat, uint64_t wbytes = 0) {
     // Count first: dispatch counts are exact and need no hardware support, while the
     // timestamps below need a counter-sampling capability this device does not report.
     // Counting only when sampling works would have made the counts silently unavailable.
     g_prof_cat_calls[cat] += 1;
+    g_prof_cat_bytes[cat] += wbytes;
     if (!g_prof_sbuf || g_prof_pairs * 2 + 1 >= PROF_MAX_SAMPLES) { return; }
     g_prof_cur = cat;
     if (prof_enc_mode()) { return; }   // the encoder's own start sample stands in
@@ -2420,6 +3094,35 @@ static bool g_wire_ggml_set = false;
 static uint64_t g_refused = 0;
 extern "C" uint64_t imparo_metal_refused_dispatches(void) { return g_refused; }
 
+// WHICH KERNEL EACH MATMUL RAN, counted per call by route. A harness prints the counts that grew
+// while it measured, so a number names the kernel behind it. Without them a route that could not
+// run and handed its dispatch to another reads exactly like the route itself: the GEMM without
+// room for its padded tile gave 2..4 rows to the one-row block GEMV, which re-reads every weight
+// per row, and a benchmark recorded that as the GEMM. A route named *_fallback ran because the
+// chosen kernel could not; it is also logged, once per shape.
+enum MatmatRoute : uint32_t {
+    MR_Q4_GEMV, MR_Q4_GEMV_ROWS, MR_Q4_ROWS_MMA, MR_Q4_GEMM,
+    MR_Q8_GEMV, MR_Q8_GEMV_ROWS, MR_Q8_ROWS_MMA, MR_Q8_TILE, MR_Q8_GEMM,
+    MR_BLK_GEMV, MR_BLK_GEMV_ROWS, MR_BLK_ROWS_MMA, MR_BLK_ROWS_MMA_H, MR_BLK_GEMM,
+    MR_BLK_GEMV_TOKENS_FALLBACK,
+    MR_COUNT
+};
+static const char * const MR_NAMES[MR_COUNT] = {
+    "q4.gemv", "q4.gemv_rows", "q4.rows_mma", "q4.gemm",
+    "q8.gemv", "q8.gemv_rows", "q8.rows_mma", "q8.tile", "q8.gemm",
+    "blk.gemv", "blk.gemv_rows", "blk.rows_mma", "blk.rows_mma_h", "blk.gemm",
+    "blk.gemv_tokens_fallback",
+};
+static uint64_t g_route_counts[MR_COUNT] = {};
+static inline void route_count(MatmatRoute r) { g_route_counts[r] += 1u; }
+extern "C" uint32_t imparo_metal_route_count_n(void) { return MR_COUNT; }
+extern "C" const char * imparo_metal_route_name(uint32_t i) {
+    return i < MR_COUNT ? MR_NAMES[i] : "";
+}
+extern "C" uint64_t imparo_metal_route_count(uint32_t i) {
+    return i < MR_COUNT ? g_route_counts[i] : 0u;
+}
+
 extern "C" void imparo_metal_set_weight_kind_types(const uint32_t * pairs, uint32_t n) {
     for (uint32_t i = 0; i < 64u; ++i) { g_wire_ggml[i] = 0u; }
     for (uint32_t i = 0; i < n; ++i) {
@@ -2440,6 +3143,50 @@ static bool wfmt_has_brick(uint32_t src) {
         default: return false;                       // a format with no brick arm
     }
 }
+// THE BYTES A WEIGHT OF THIS KIND OCCUPIES, from the ggml type the wire kind carries. Used
+// to report a profile category as a bandwidth; a type this table does not know returns 0,
+// which the printer shows as no bandwidth rather than as a wrong one.
+// Q6_K by the ggml type the wire kind carries; the tile-major layout moves bytes, it never
+// changes which type they came from.
+static bool w_is_q6k(uint32_t wkind) {
+    if (!g_wire_ggml_set || wkind >= 64u) { return false; }
+    const uint32_t t = g_wire_ggml[wkind];
+    return (t >= 1000u ? t - 1000u : t) == 14u;
+}
+
+static uint64_t w_bytes(uint32_t wkind, uint64_t n_in, uint64_t n_out) {
+    if (!g_wire_ggml_set || wkind >= 64u) { return 0ull; }
+    const uint32_t t = g_wire_ggml[wkind];
+    const uint32_t src = t >= 1000u ? t - 1000u : t;     // the tile-major layout moves bytes,
+    uint32_t blk = 0, bytes = 0;                         // it never adds or drops one
+    switch (src) {
+        case 0:  blk = 1;   bytes = 4;   break;          // F32
+        case 1:  blk = 1;   bytes = 2;   break;          // F16
+        case 30: blk = 1;   bytes = 2;   break;          // BF16
+        case 2:  blk = 32;  bytes = 18;  break;          // Q4_0
+        case 3:  blk = 32;  bytes = 20;  break;          // Q4_1
+        case 6:  blk = 32;  bytes = 22;  break;          // Q5_0
+        case 7:  blk = 32;  bytes = 24;  break;          // Q5_1
+        case 8:  blk = 32;  bytes = 34;  break;          // Q8_0
+        case 20: blk = 32;  bytes = 18;  break;          // IQ4_NL
+        case 10: blk = 256; bytes = 84;  break;          // Q2_K
+        case 11: blk = 256; bytes = 110; break;          // Q3_K
+        case 12: blk = 256; bytes = 144; break;          // Q4_K
+        case 13: blk = 256; bytes = 176; break;          // Q5_K
+        case 14: blk = 256; bytes = 210; break;          // Q6_K
+        case 16: blk = 256; bytes = 66;  break;          // IQ2_XXS
+        case 17: blk = 256; bytes = 74;  break;          // IQ2_XS
+        case 18: blk = 256; bytes = 98;  break;          // IQ3_XXS
+        case 19: blk = 256; bytes = 50;  break;          // IQ1_S
+        case 21: blk = 256; bytes = 110; break;          // IQ3_S
+        case 22: blk = 256; bytes = 82;  break;          // IQ2_S
+        case 23: blk = 256; bytes = 136; break;          // IQ4_XS
+        case 29: blk = 256; bytes = 56;  break;          // IQ1_M
+        default: return 0ull;
+    }
+    return n_in * n_out / (uint64_t)blk * (uint64_t)bytes;
+}
+
 static uint32_t wfmt_for(uint32_t wkind) {
     if (!g_wire_ggml_set || wkind >= 64u) { return 0u; }
     const uint32_t t = g_wire_ggml[wkind];
@@ -2452,7 +3199,24 @@ static uint32_t wfmt_for(uint32_t wkind) {
     // `serves_weight_type` refuses the row-major kind at load for the same reason.
     if (!tile_major && (src == 10u || src == 17u || src == 18u
                         || src == 21u || src == 22u)) { return 0u; }
+    // TILE-MAJOR Q4_0 is the brick's (WF_Q4_0). Only expert stacks are converted to it --
+    // a 2-D Q4_0 tensor stays row-major and keeps the Q4_0 kernels, which is why row-major
+    // Q4_0 is not a brick format here (see moe_wfmt_for for the routed kernels' row-major arm).
+    // Its id is 1001 (GGML_Q4_0_TM), NOT 1000 + 2: the first two tile-major ids, Q8_0_TM
+    // 1000 and Q4_0_TM 1001, were assigned before the "1000 + source type" numbering the
+    // rest follow, so the subtraction above reads it as type 1.
+    if (t == 1001u) { return 2u; }
     return wfmt_has_brick(src) ? src : 0u;
+}
+// THE ROUTED MATMULS' FORMAT: wfmt_for's, plus Q4_0. Q4_0 has its own dense kernels (E4B's),
+// so wfmt_for keeps it out of the block-format family -- adding it there would reroute every
+// dense Q4_0 matmul. An expert stack has no other kernel, and without this a Q4_0 MoE file
+// (LFM2.5-8B-A1B-Q4_0) was refused at its first routed layer. Row-major only: the load-time
+// transform leaves Q4_0 row-major (its tile-major rule exists; nothing reads it).
+static uint32_t moe_wfmt_for(uint32_t wkind) {
+    const uint32_t w = wfmt_for(wkind);
+    if (w != 0u || !g_wire_ggml_set || wkind >= 64u) { return w; }
+    return g_wire_ggml[wkind] == 2u ? 2u : 0u;
 }
 // WHICH WIRE KINDS THE REGISTER-TILED GEMM SERVES, one bit per kind. `matmat_impl` says
 // it in one line -- `(is_q4 && n_tok > gemv_max_tok) || wfmt != 0` -- and this answers the
@@ -2486,16 +3250,68 @@ extern "C" uint32_t imparo_metal_mega_wfmt(uint32_t wkind) {
     return wfmt_for(wkind);
 }
 
-id<MTLComputePipelineState> make(id<MTLLibrary> lib, NSString * name) {
+id<MTLComputePipelineState> make_with(id<MTLLibrary> lib, NSString * name,
+                                      MTLFunctionConstantValues * cv) {
     NSError * e = nil;
-    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
-    stamp_epi_act(cv);
     id<MTLFunction> f = [lib newFunctionWithName:name constantValues:cv error:&e];
     if (f == nil) { NSLog(@"imparo metal: function %@ not found: %@", name, e); return nil; }
     id<MTLComputePipelineState> p =
         [g.device newComputePipelineStateWithFunction:f error:&e];
     if (p == nil) { NSLog(@"imparo metal: pipeline %@ failed: %@", name, e); }
+    // IMPARO_PIPE_LOG prints what the compiler made of it, as the load-time builder does.
+    if (p != nil && getenv("IMPARO_PIPE_LOG") != NULL) {
+        NSLog(@"imparo metal pipe: %@ max_threads=%lu simd_width=%lu static_tg_bytes=%lu", name,
+              (unsigned long)[p maxTotalThreadsPerThreadgroup],
+              (unsigned long)[p threadExecutionWidth],
+              (unsigned long)[p staticThreadgroupMemoryLength]);
+    }
     return p;
+}
+
+id<MTLComputePipelineState> make(id<MTLLibrary> lib, NSString * name) {
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    stamp_epi_act(cv);
+    return make_with(lib, name, cv);
+}
+
+// THE STRADDLE VARIANT of an rt_gemm pipeline: the same function and constants plus RT_EDGE8
+// (constant 30), for an n_out that is not a multiple of 8, where the straight store's last
+// 8x8 block straddles n_out (see the shader). Built on first use; compiled into every
+// pipeline, that store cost E4B's prefill 16% without ever running there.
+struct RtSpec { NSString * name; MTLFunctionConstantValues * cv; };
+static std::unordered_map<const void *, RtSpec> g_rt_spec;   // rt pipeline -> how it was built
+static std::unordered_map<const void *, id<MTLComputePipelineState>> g_rt_edge;
+
+// Records how an rt_gemm pipeline was built, so rt_for_rows can build its variant.
+static id<MTLComputePipelineState> rt_register(id<MTLComputePipelineState> p, NSString * name,
+                                               MTLFunctionConstantValues * cv) {
+    if (p != nil) { g_rt_spec[(__bridge const void *)p] = RtSpec{name, cv}; }
+    return p;
+}
+
+// The pipeline a dispatch of n_out output rows runs: `p`, or for an rt_gemm pipeline and an
+// n_out that is not a multiple of 8, its RT_EDGE8 variant. nil when that variant cannot be
+// built, and the caller refuses the dispatch.
+static id<MTLComputePipelineState> rt_for_rows(id<MTLComputePipelineState> p, uint32_t n_out) {
+    if (p == nil || (n_out % 8u) == 0u) { return p; }
+    const void * key = (__bridge const void *)p;
+    const auto spec = g_rt_spec.find(key);
+    if (spec == g_rt_spec.end()) { return p; }
+    const auto made = g_rt_edge.find(key);
+    if (made != g_rt_edge.end()) { return made->second; }
+    MTLFunctionConstantValues * cv = [spec->second.cv copy];
+    const bool edge = true;
+    [cv setConstantValue:&edge type:MTLDataTypeBool atIndex:30];
+    id<MTLComputePipelineState> v = make_with(g.lib, spec->second.name, cv);
+    if (v == nil) {
+        NSLog(@"imparo metal: no n_out %% 8 variant of %@; its dispatch is refused",
+              spec->second.name);
+    } else {
+        NSLog(@"imparo metal: built the n_out %% 8 variant of %@ (n_out %u)",
+              spec->second.name, n_out);
+    }
+    g_rt_edge[key] = v;
+    return v;
 }
 
 // Declare one dispatch's buffer accesses. Under IMPARO_CONCURRENT, emits a barrier before
@@ -2515,10 +3331,46 @@ inline void haz(uint64_t reads, uint64_t writes) {
     // The XH conversion cache dies when anything writes its source buffer; haz() runs at
     // every encode site with exact masks, which is exactly the tracking the cache needs.
     if (g_xh_src < 62u && (writes & (1ull << g_xh_src))) { g_xh_src = 0xffffffffu; }
+    g_float_stale &= ~writes;
     if (!g_concurrent) { return; }
     if ((reads & g_haz_writes) || (writes & g_haz_writes) || (writes & g_haz_reads)) {
         if (g_prof) { g_prof_barriers += 1; }
-        [g.enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        // DIAGNOSTIC (IMPARO_HAZ_SKIP=1): do not emit the barrier this conflict needs. The
+        // dispatches still run, in the same order, with the same grids -- they just race, so
+        // the ANSWER IS WRONG and only the time may be read. This is the one instrument that
+        // separates the two readings of the decode chain's ~2.2 ms: whether it is the
+        // serialisation those barriers impose (removing them gives it back) or slack the rest
+        // of the token already absorbs (removing them gives nothing). Never set in the engine.
+        // IMPARO_HAZ_SKIP=N skips every Nth barrier (1 = all of them). A COUNT rather than a
+        // flag because the total is not the marginal: skipping all 256 a token saves 1.9 ms,
+        // but the elementwise class skip -- which drops 32 dispatches AND their barriers --
+        // saved 0.009 ms. So 1.9/256 = 7.4 us is an AVERAGE and the cost is concentrated in
+        // the barriers that follow BIG dispatches, where the drain is long.
+        static uint64_t haz_n = 0;
+        const bool drop = g_haz_skip != 0u && (++haz_n % (uint64_t)g_haz_skip) == 0u;
+        if (!drop) {
+            // NAME THE RESOURCES rather than the whole scope where we can. The masks here are
+            // already exact, and `memoryBarrierWithScope:MTLBarrierScopeBuffers` waits for
+            // EVERY outstanding buffer write; naming only the buffers this conflict is about
+            // asks the driver to wait for less. Same ordering guarantee, same bits.
+            // The KV caches live outside g.bufs (their hazard bits are 62 and 63), so a
+            // conflict touching them takes the scope form.
+            const uint64_t conflict =
+                (reads & g_haz_writes) | (writes & g_haz_writes) | (writes & g_haz_reads);
+            id<MTLResource> __unsafe_unretained rs[B_COUNT];
+            NSUInteger nr = 0;
+            const bool kv = (conflict & (HZ_KVK | HZ_KVV)) != 0ull;
+            if (!kv && g_haz_named) {
+                for (uint32_t i = 0; i < B_COUNT; ++i) {
+                    if ((conflict & (1ull << i)) && g.bufs[i] != nil) { rs[nr++] = g.bufs[i]; }
+                }
+            }
+            if (nr != 0) {
+                [g.enc memoryBarrierWithResources:rs count:nr];
+            } else {
+                [g.enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+        }
         g_haz_reads = 0; g_haz_writes = 0;
     }
     g_haz_reads |= reads; g_haz_writes |= writes;
@@ -2574,6 +3426,8 @@ extern "C" void imparo_metal_set_kv_types(uint32_t k, uint32_t v) {
 }
 
 extern "C" void imparo_metal_set_concurrent(uint32_t on) { g_concurrent = on; }
+extern "C" void imparo_metal_set_haz_skip(uint32_t n) { g_haz_skip = n; }
+extern "C" void imparo_metal_set_haz_named(uint32_t on) { g_haz_named = on != 0u; }
 
 extern "C" void imparo_metal_set_skip_attn(uint32_t on) { g_skip_attn = on; }
 
@@ -3025,6 +3879,81 @@ extern "C" void imparo_metal_set_kvq_rt(uint32_t ty, uint32_t lo, uint32_t hi) {
 }
 extern "C" void imparo_metal_set_nb8_max(uint32_t n) { g_nb8_max = n; }
 extern "C" void imparo_metal_set_gemv_max_tok(uint32_t n) { g_gemv_max_tok = n < 1u ? 1u : n; }
+extern "C" void imparo_metal_set_decode_rows(uint32_t route) { g_decode_rows = route <= 2u ? route : 0u; }
+extern "C" void imparo_metal_set_q8_rows_gemv_max(uint32_t n) { g_q8_rows_gemv_max = n; }
+extern "C" uint32_t imparo_metal_q8_rows_gemv_max(void) { return g_q8_rows_gemv_max; }
+extern "C" void imparo_metal_set_q8_tm_rows_mma_max(uint32_t n) {
+    g_q8_tm_rows_mma_max = std::min(n, RM_MAX_ROWS_HOST);
+}
+extern "C" uint32_t imparo_metal_q8_tm_rows_mma_max(void) { return g_q8_tm_rows_mma_max; }
+extern "C" void imparo_metal_set_q4_rows_mma_max(uint32_t n) {
+    g_q4_rows_mma_max = std::min(n, RM_MAX_ROWS_HOST);
+}
+extern "C" uint32_t imparo_metal_q4_rows_mma_max(void) { return g_q4_rows_mma_max; }
+extern "C" uint64_t imparo_metal_rows_mma_dispatches(void) { return g_rows_mma_dispatches; }
+// EVERY format, so a test or the bench can put them all on one kernel. 0 drops the override and
+// each format goes back to the crossing measured for it, which is what a served run uses.
+extern "C" void imparo_metal_set_blk_rows_gemv_max(uint32_t n) {
+    if (n == 0u) { g_blk_rows_gemv_max_set = false; return; }
+    const uint32_t v = std::min(n, BLK_ROWS_MAX_HOST);
+    for (uint32_t i = 0; i < BLK_WFMT_COUNT; ++i) { g_blk_rows_gemv_max_fmt[i] = v; }
+    g_blk_rows_gemv_max_set = true;
+}
+// The override, or 0 when there is none and the per-format table applies. A caller saving and
+// restoring this round-trips either state.
+extern "C" uint32_t imparo_metal_blk_rows_gemv_max(void) {
+    return g_blk_rows_gemv_max_set ? g_blk_rows_gemv_max_fmt[0] : 0u;
+}
+// The crossing one weight kind takes WITHOUT a per-tensor seat. 0 is a kind with no block rows
+// kernel. `imparo_metal_blk_rows_gemv_max_at` answers for a tensor, seat included.
+extern "C" uint32_t imparo_metal_blk_rows_gemv_max_for(uint32_t wkind) {
+    const uint32_t wf = wfmt_for(wkind);
+    return wf == 0u ? 0u : blk_rows_gemv_max_fmt(wf);
+}
+extern "C" uint32_t imparo_metal_blk_rows_gemv_max_at(uint32_t wkind, uint32_t n_in,
+                                                      uint32_t n_out) {
+    const uint32_t wf = wfmt_for(wkind);
+    return wf == 0u ? 0u : blk_rows_gemv_max_for(wf, n_in, n_out);
+}
+// ONE MEASURED TENSOR, from the tune file. `gemv_max` is the rows up to which the scalar rows
+// GEMV won when the tuner timed both kernels on this triple. Re-seating the same triple replaces
+// it, so a reload does not grow the table. Returns false when the table is full (the model has
+// more distinct (format, shape) triples than BLK_ROWS_SEAT_MAX -- 67 on the widest file seen,
+// a UD mixed quant of the 27B) or the value is out of range; the caller logs it and that tensor
+// keeps its format's crossing.
+extern "C" bool imparo_metal_set_blk_rows_seat(uint32_t wkind, uint32_t n_in, uint32_t n_out,
+                                               uint32_t gemv_max) {
+    const uint32_t wf = wfmt_for(wkind);
+    if (wf == 0u || n_in == 0u || n_out == 0u || gemv_max > BLK_ROWS_MAX_HOST) { return false; }
+    uint32_t s = blk_rows_seat_slot(wf, n_in, n_out);
+    for (uint32_t probe = 0u; probe < BLK_ROWS_SEAT_SLOTS; ++probe) {
+        BlkRowsSeat & e = g_blk_rows_seats[s];
+        if (e.used && e.wf == wf && e.n_in == n_in && e.n_out == n_out) {
+            e.gemv_max = gemv_max;                       // replace, do not add
+            return true;
+        }
+        if (!e.used) {
+            if (g_blk_rows_seat_count >= BLK_ROWS_SEAT_MAX) { return false; }
+            e = BlkRowsSeat{wf, n_in, n_out, gemv_max, true};
+            g_blk_rows_seat_count += 1u;
+            return true;
+        }
+        s = (s + 1u) & (BLK_ROWS_SEAT_SLOTS - 1u);
+    }
+    return false;
+}
+extern "C" void imparo_metal_clear_blk_rows_seats(void) {
+    for (uint32_t i = 0; i < BLK_ROWS_SEAT_SLOTS; ++i) { g_blk_rows_seats[i].used = false; }
+    g_blk_rows_seat_count = 0u;
+}
+extern "C" uint32_t imparo_metal_blk_rows_seat_count(void) { return g_blk_rows_seat_count; }
+extern "C" void imparo_metal_set_blk_rows_mma_max(uint32_t n) {
+    g_blk_rows_mma_max = std::min(n, BLK_MMA_MAX_HOST);
+}
+extern "C" uint32_t imparo_metal_blk_rows_mma_max(void) { return g_blk_rows_mma_max; }
+extern "C" uint64_t imparo_metal_blk_rows_dispatches(void) { return g_blk_rows_dispatches; }
+extern "C" void imparo_metal_set_q4_rows_gemv_max(uint32_t n) { g_q4_rows_gemv_max = n; }
+extern "C" uint32_t imparo_metal_q4_rows_gemv_max(void) { return g_q4_rows_gemv_max; }
 extern "C" uint32_t imparo_metal_gemv_max_tok_current(void) { return g_gemv_max_tok; }
 extern "C" void imparo_metal_set_nb8_shape(uint32_t v) { g_nb8_shape = v & 1u; }
 extern "C" uint32_t imparo_metal_nb8_max_current(void) { return g_nb8_max; }
@@ -3036,9 +3965,19 @@ extern "C" void imparo_metal_set_qcomb_nsg(uint32_t v) { g_qcomb_nsg = v; }
 extern "C" void imparo_metal_set_attn_fa(uint32_t v) { g_attn_fa = v; }
 extern "C" void imparo_metal_set_fa_nsg(uint32_t v) { g_fa_nsg = v; }
 extern "C" uint32_t imparo_metal_fa_nsg(void) { return fa_nsg_value(); }
-// The FA op is built for slot 0 at head dims up to 128 (its register budget; see the kernel).
+// THE REGISTER-SOFTMAX FORM SERVES the FA route wherever it is built (slot 0, head dims up
+// to 128). At 2048 queries against 16384 keys: LFM2.5 (hd 64) 62.9 -> 51.7 ms, Qwen3-8B
+// (hd 128) 241.7 -> 101.8 ms (M3 Pro, imparo-metalbench IMPARO_BENCH_ATTN, 2026-09-24).
+// IMPARO_ATTN_FARS=0 keeps the 8-query op for A/Bs.
+static bool fars_route_on(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("IMPARO_ATTN_FARS"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v != 0;
+}
+// The 8-query FA op serves slot 0 at head dims up to 128 (its register budget; see the kernel)
+// when the register-softmax form does not -- the condition attn_fa_nsg applies under.
 extern "C" uint32_t imparo_metal_fa_has_hd(uint32_t hd) {
-    return (hd != 0u && g_qcomb_hds[0] == hd && hd <= 128u) ? 1u : 0u;
+    return (hd != 0u && g_qcomb_hds[0] == hd && hd <= 128u && !fars_route_on()) ? 1u : 0u;
 }
 extern "C" uint32_t imparo_metal_max_threads_tg(void);   // defined with the device profile below
 // LEGAL simdgroup counts at this head dim, as a bit mask over 1 << i: the kernel splits the
@@ -3086,6 +4025,11 @@ extern "C" uint32_t imparo_metal_attn_blk_current(void) { return g_attn_blk; }
 extern "C" void imparo_metal_set_attn_stage(uint32_t v) { g_attn_stage = v < 1u ? 1u : (v > 7u ? 7u : v); }
 extern "C" void imparo_metal_set_attn_gqa(uint32_t on) { g_attn_gqa = on; }
 extern "C" void imparo_metal_set_attn_fd(uint32_t on) { g_attn_fd = on; }
+extern "C" void imparo_metal_set_verify_attention(uint32_t tgs, uint32_t heads) {
+    g_verify_attn_tgs = tgs;
+    g_verify_attn_heads = heads;
+}
+extern "C" void imparo_metal_set_verify_split_on(uint32_t on) { g_verify_split_on = on; }
 extern "C" void imparo_metal_set_attn_fd_chunk(uint32_t v) { g_attn_fd_chunk = v < 128u ? 128u : v; }
 extern "C" void imparo_metal_set_attn_vec_max_keys(uint32_t v) { g_attn_vec_max_keys = v; }
 extern "C" uint32_t imparo_metal_attn_vec_max_keys(void) { return g_attn_vec_max_keys; }
@@ -3151,7 +4095,6 @@ extern "C" uint32_t imparo_metal_q8_token_tile(void) {
 // -1 means nothing is pinned. A pin has to survive `apply_host_config`, which runs
 // after the environment is read and would otherwise put the tuned index straight back;
 // a lever that a later write silently undoes is the failure this file has hit before.
-static int32_t g_st_gemm_shape_pin = -1;
 extern "C" void imparo_metal_set_st_gemm_shape_pin(uint32_t shape) {
     if (shape >= ST_GEMM_CANDIDATES) {
         NSLog(@"imparo metal: IMPARO_ST_GEMM_SHAPE=%u REFUSED -- only %u shapes exist; "
@@ -3172,19 +4115,11 @@ extern "C" void imparo_metal_set_st_gemm_shape(uint32_t shape) {
         }
         return;
     }
-    if (shape < ST_GEMM_CANDIDATES) {
-        // THE FIRST TILE DEFINES THE SINGLE-SHAPE ENGINE, and the pair's second tile is
-        // set after it (its knob is declared `after: st_gemm_shape`, and the stored config
-        // lists it after), so setting the first resets the pair to one shape. That is
-        // also what makes the first tile RANKABLE: with the second tile left at some
-        // other value, `q8_geometry` selected THAT tile for every candidate the tuner
-        // tried (its rule prefers the second tile on a padding tie, and the ranking widths
-        // 256 and 224 tie for every 32-token-tile candidate), and the sweep read twelve
-        // candidates within 2.8% -- INERT -- while the second tile's own sweep, at the
-        // same widths, spread its candidates 1.9x.
-        g_st_gemm_shape = shape;
-        g_st_gemm_large_shape = shape;
-    }
+    // THE SEAT, and the only stored tile. Every other tile a dispatch can take is derived
+    // from this one by `q8_tile`, so this is rankable on its own: what a candidate changes
+    // is the row tile, the simdgroup count and the K chunk, and the token width it starts
+    // from.
+    if (shape < ST_GEMM_CANDIDATES) { g_st_gemm_shape = shape; }
 }
 extern "C" uint32_t imparo_metal_st_gemm_shape(void) { return g_st_gemm_shape; }
 // q8_design: 0 = st_gemm, k = rt_gemm<Q8> at RT_SHAPES[k - 1]. Legal when the rt shape
@@ -3206,12 +4141,8 @@ extern "C" void imparo_metal_set_q8_design(uint32_t v) {
     if (imparo_metal_q8_design_legal(v)) { g_q8_design = v; }
 }
 extern "C" uint32_t imparo_metal_q8_design(void) { return g_q8_design; }
-extern "C" void imparo_metal_set_st_gemm_large_shape(uint32_t shape) {
-    if (shape < ST_GEMM_CANDIDATES) { g_st_gemm_large_shape = shape; }
-}
-extern "C" uint32_t imparo_metal_st_gemm_large_shape(void) {
-    return g_st_gemm_large_shape;
-}
+extern "C" void imparo_metal_set_st_gemm_narrow_max(uint32_t n) { g_st_gemm_narrow_max = n; }
+extern "C" uint32_t imparo_metal_st_gemm_narrow_max(void) { return g_st_gemm_narrow_max; }
 extern "C" void imparo_metal_set_q8_full_tiles(uint32_t on) { g_q8_full_tiles = on; }
 extern "C" uint32_t imparo_metal_q8_full_tiles(void) { return g_q8_full_tiles; }
 extern "C" void imparo_metal_set_q8_all(uint32_t on) { g_q8_all = on; }
@@ -3221,8 +4152,12 @@ extern "C" void imparo_metal_set_q8_typed_scale(uint32_t on) { g_q8_typed_scale 
 extern "C" void imparo_metal_set_q8_dev_a(uint32_t on) { g_q8_dev_a = on; }
 extern "C" void imparo_metal_set_q8_clamp_edge(uint32_t on) { g_q8_clamp_edge = on; }
 extern "C" void imparo_metal_set_q8_mma_fence(uint32_t on) { g_q8_mma_fence = on; }
+extern "C" void imparo_metal_set_q8_pad_skip(uint32_t on) { g_q8_pad_skip = on; }
 extern "C" void imparo_metal_set_rt_mma_fence(uint32_t on) { g_rt_mma_fence = on; }
 extern "C" void imparo_metal_set_attn_skip(uint32_t bits) { g_attn_skip = bits; }
+extern "C" void imparo_metal_set_skip_mm_nout(uint32_t n) { g_skip_mm_nout = n; }
+extern "C" void imparo_metal_set_dup_mm_nout(uint32_t n) { g_dup_mm_nout = n; }
+extern "C" void imparo_metal_set_dup_attn_combine(uint32_t on) { g_dup_attn_combine = on != 0u; }
 extern "C" uint32_t imparo_metal_q8_grid_token_x(void) { return g_q8_grid_token_x; }
 // Must be set BEFORE init: it decides which prefill pipelines are compiled.
 extern "C" void imparo_metal_set_attention_head_dims(const uint32_t * hds, uint32_t n) {
@@ -3445,11 +4380,16 @@ extern "C" void imparo_metal_prof_enable(uint32_t on) {
 // duration of ITS OWN dispatches, so categories that ran concurrently each report their
 // full time and the column adds up to more than the wall it ran in -- that is the machine
 // reporting overlap, not an error.
-extern "C" void imparo_metal_prof_cats(double * secs, uint64_t * calls, uint32_t * n) {
+// The window's per-category seconds and calls, with the WEIGHT BYTES each one read, and the
+// counters reset on read. A category that declares no bytes reports 0, which the printer
+// shows as no bandwidth rather than as zero bandwidth.
+extern "C" void imparo_metal_prof_cats_b(double * secs, uint64_t * calls, uint64_t * bytes,
+                                         uint32_t * n) {
     *n = PC_N;
     for (uint32_t i = 0; i < PC_N; ++i) {
         secs[i] = g_prof_cat_s[i]; calls[i] = g_prof_cat_calls[i];
-        g_prof_cat_s[i] = 0.0; g_prof_cat_calls[i] = 0;
+        if (bytes != nullptr) { bytes[i] = g_prof_cat_bytes[i]; }
+        g_prof_cat_s[i] = 0.0; g_prof_cat_calls[i] = 0; g_prof_cat_bytes[i] = 0;
     }
 }
 
@@ -3608,6 +4548,8 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             [NSNumber numberWithUnsignedInt:g_delta_kd != 0u ? g_delta_kd : 32u];
         macros[@"IMPARO_DELTA_VD"] =
             [NSNumber numberWithUnsignedInt:g_delta_vd != 0u ? g_delta_vd : 32u];
+        macros[@"IMPARO_DELTA_TREE_DEPTH"] =
+            [NSNumber numberWithUnsignedInt:g_delta_tree_depth];
         // TOKENS THE DELTA RULE STAGES PER GROUP. The kernel's comment carries the
         // reason; the value is a preprocessor define consumed when the library is
         // compiled at init, so an env override is what makes re-checking it on another
@@ -3803,21 +4745,19 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                 NSLog(@"imparo metal: rt_gemm MMA scheduling fences ON");
             }
             auto make_rt = [&](NSString * nm) -> id<MTLComputePipelineState> {
-                if (g_rt_mma_fence == 0u) { return make(lib, nm); }
-                NSError * e = nil;
                 MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
                 stamp_epi_act(cv);
-                const bool rf = true;
-                [cv setConstantValue:&rf type:MTLDataTypeBool atIndex:16];
-                id<MTLFunction> f = [lib newFunctionWithName:nm constantValues:cv error:&e];
-                if (f == nil) {
-                    NSLog(@"imparo metal: function %@ not found: %@", nm, e);
-                    return nil;
+                if (g_rt_mma_fence != 0u) {
+                    const bool rf = true;
+                    [cv setConstantValue:&rf type:MTLDataTypeBool atIndex:16];
                 }
-                id<MTLComputePipelineState> p =
-                    [g.device newComputePipelineStateWithFunction:f error:&e];
-                if (p == nil) { NSLog(@"imparo metal: pipeline %@ failed: %@", nm, e); }
-                return p;
+                return rt_register(make_with(lib, nm, cv), nm, cv);
+            };
+            // rt_gemm<Q8> and the narrow tiles: the constants `make` stamps, recorded too.
+            auto make_rt_plain = [&](NSString * nm) -> id<MTLComputePipelineState> {
+                MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+                stamp_epi_act(cv);
+                return rt_register(make_with(lib, nm, cv), nm, cv);
             };
             for (uint32_t i = 0; i < RT_CANDIDATES; ++i) {
                 if (!g_rt_all && i != g_rt_shape) { continue; }
@@ -3843,16 +4783,16 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             }
             for (uint32_t i = 0; i < RT_CANDIDATES; ++i) {
                 if (!g_rt_all && !g_q8_all && i + 1u != g_q8_design) { continue; }
-                g.p_rt8[i]   = make(lib, [NSString stringWithFormat:@"imparo_rt8_%u", i]);
-                g.p_rt8_h[i] = make(lib, [NSString stringWithFormat:@"imparo_rt8_%u_h", i]);
-                g.p_rt8_gh[i] = make(lib, [NSString stringWithFormat:@"imparo_rt8_%u_gh", i]);
+                g.p_rt8[i]   = make_rt_plain([NSString stringWithFormat:@"imparo_rt8_%u", i]);
+                g.p_rt8_h[i] = make_rt_plain([NSString stringWithFormat:@"imparo_rt8_%u_h", i]);
+                g.p_rt8_gh[i] = make_rt_plain([NSString stringWithFormat:@"imparo_rt8_%u_gh", i]);
             }
-            g.p_rt_nb8    = make(lib, @"imparo_rt_nb8");
-            g.p_rt_nb8_h  = make(lib, @"imparo_rt_nb8_h");
-            g.p_rt_nb8b   = make(lib, @"imparo_rt_nb8b");
-            g.p_rt_nb8b_h = make(lib, @"imparo_rt_nb8b_h");
-            g.p_rt_nb8_gh  = make(lib, @"imparo_rt_nb8_gh");
-            g.p_rt_nb8b_gh = make(lib, @"imparo_rt_nb8b_gh");
+            g.p_rt_nb8    = make_rt_plain(@"imparo_rt_nb8");
+            g.p_rt_nb8_h  = make_rt_plain(@"imparo_rt_nb8_h");
+            g.p_rt_nb8b   = make_rt_plain(@"imparo_rt_nb8b");
+            g.p_rt_nb8b_h = make_rt_plain(@"imparo_rt_nb8b_h");
+            g.p_rt_nb8_gh  = make_rt_plain(@"imparo_rt_nb8_gh");
+            g.p_rt_nb8b_gh = make_rt_plain(@"imparo_rt_nb8b_gh");
             if (t_on) { NSLog(@"imparo metal timing: %u register-tile pipelines %.2f s",
                               built, CACurrentMediaTime() - t_rt0); }
 
@@ -3872,6 +4812,8 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             return 2;
         }
         g.p_f32mm  = make(lib, @"imparo_f32_matmat");
+        g.p_f32nmm = make(lib, @"imparo_f32_narrow_mm");
+        g.p_f32gemv = make(lib, @"imparo_f32_gemv_ksplit");
         g.p_q4row  = make(lib, @"imparo_q4_0_row");
         g.p_rms    = make(lib, @"imparo_rms_norm");
         g.p_rms_add_row = make(lib, @"imparo_rms_norm_add_row");
@@ -3942,11 +4884,9 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             // Shape 3 is also the fallback when a selected shape's K chunk does not
             // divide a projection's n_in, so it must exist whenever a deeper shape is
             // selected -- otherwise that projection would find a nil pipeline.
-            const bool q8_deep = ST_GEMM_SHAPES[g_st_gemm_shape][3] > Q8_BLOCK_ELEMENTS
-                || ST_GEMM_SHAPES[g_st_gemm_large_shape][3] > Q8_BLOCK_ELEMENTS;
+            const bool q8_deep = ST_GEMM_SHAPES[g_st_gemm_shape][3] > Q8_BLOCK_ELEMENTS;
             for (uint32_t i = 0; i < ST_GEMM_CANDIDATES; ++i) {
-                if (!g_q8_all && i != g_st_gemm_shape && i != g_st_gemm_large_shape
-                    && !(q8_deep && i == 3u)) {
+                if (!g_q8_all && !(q8_deep && i == 3u) && !q8_tile_reaches(i)) {
                     continue;
                 }
                 NSString * n  = [NSString stringWithFormat:@"imparo_st_gemm_%u", i];
@@ -3959,9 +4899,10 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                     const bool ts = true;
                     [cvg setConstantValue:&ts type:MTLDataTypeBool atIndex:9];
                 }
-                if (g_q8_clamp_edge != 0u) {
+                if (g_q8_clamp_edge == 0u) {
+                    // Only the OFF case needs a constant: the shader defaults to on.
                     if (cvg == cv_empty) { cvg = [MTLFunctionConstantValues new]; }
-                    const bool ce = true;
+                    const bool ce = false;
                     [cvg setConstantValue:&ce type:MTLDataTypeBool atIndex:13];
                 }
                 if (g_q8_mma_fence == 0u) {
@@ -3969,6 +4910,12 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                     if (cvg == cv_empty) { cvg = [MTLFunctionConstantValues new]; }
                     const bool mf = false;
                     [cvg setConstantValue:&mf type:MTLDataTypeBool atIndex:14];
+                }
+                if (g_q8_pad_skip != 0u) {
+                    // Only the ON case needs a constant: the shader defaults to off.
+                    if (cvg == cv_empty) { cvg = [MTLFunctionConstantValues new]; }
+                    const bool ps = true;
+                    [cvg setConstantValue:&ps type:MTLDataTypeBool atIndex:27];
                 }
                 if (g_q8_skip != 0u) {
                     if (cvg == cv_empty) { cvg = [MTLFunctionConstantValues new]; }
@@ -4076,9 +5023,11 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
         // is sized by them, so a zero build would be a pipeline nothing can dispatch.
         if (g_delta_kd != 0u && g_delta_vd != 0u) {
             g.p_delta_net   = make(lib, @"imparo_delta_net");
+            g.p_delta_net_tree = make(lib, @"imparo_delta_net_tree");
         }
         g.p_mul_sigmoid     = make(lib, @"imparo_mul_sigmoid");
         g.p_copy_strided    = make(lib, @"imparo_copy_strided");
+        g.p_scatter_strided = make(lib, @"imparo_scatter_strided");
         g.p_add    = make(lib, @"imparo_add");
         g.p_mul    = make(lib, @"imparo_mul");
         g.p_scale  = make(lib, @"imparo_scale");
@@ -4087,6 +5036,18 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
         g.p_softcap= make(lib, @"imparo_softcap");
         g.p_argmax = make(lib, @"imparo_argmax");
         g.p_argmax_feed = make(lib, @"imparo_argmax_feed");
+        g.p_top_k_chunks = make(lib, @"imparo_top_k_chunks");
+        g.p_top_k8_one = make(lib, @"imparo_top_k8_one");
+        g.p_top_k_merge = make(lib, @"imparo_top_k_merge");
+        g.p_top_k8_chunks = make(lib, @"imparo_top_k8_chunks");
+        g.p_top_k8_merge = make(lib, @"imparo_top_k8_merge");
+        g.p_moe_gate = make(lib, @"imparo_moe_gate");
+        g.p_moe_plan = make(lib, @"imparo_moe_plan");
+        g.p_moe_route = make(lib, @"imparo_moe_route");
+        g.p_moe_combine = make(lib, @"imparo_moe_combine");
+        g.p_moe_combine_norm = make(lib, @"imparo_moe_combine_add_rms_norm");
+        g.p_logistic_blocks = make(lib, @"imparo_logistic_blocks");
+        g.p_logistic_finish = make(lib, @"imparo_logistic_finish");
         g.p_ple    = make(lib, @"imparo_ple_combine");
         g.p_ple_gather = make(lib, @"imparo_ple_gather_combine");
         g.p_repack_q8_tm = make(lib, @"imparo_repack_q8_0_tm");
@@ -4139,6 +5100,12 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             g.p_attn_dec_stream_g256[0] = make_cv(@"imparo_attention_decode_stream_dk256_g2", cv_empty);
             g.p_attn_dec_stream_g256[1] = make_cv(@"imparo_attention_decode_stream_dk256_g3", cv_empty);
         }
+        // THE CORE COUNT IS A DEVICE FACT, read whatever the mega level. It was read only inside
+        // the block below, so IMPARO_MEGA_FFN=0 also left it 0 -- and the dispatch path reads it
+        // too (the router GEMV's K-split and the staged norm size their grids from it): the
+        // "mega off" arm silently ran the one-simdgroup-per-row router, and every A/B that took
+        // that arm as the dispatch path measured the router along with the mega entry.
+        g_gpu_cores = gpu_core_count();
         if (mega_blocks_wanted()) {
             // Same lane geometry as the decode GEMV it replaces (bit-identical rows).
             MTLFunctionConstantValues * cvm = [MTLFunctionConstantValues new];
@@ -4318,9 +5285,30 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                     }
                 }
             }
+            // The lfm2moe routed feed-forward block: the format per tensor is an entry word, the
+            // activation (fc 11) is stamped like every epilogue pipeline.
+            {
+                stamp_epi_act(cvm);
+                MTLFunctionConstantValues * cvl = [cvm copy];
+                for (uint32_t slot = 0; slot < 2u; ++slot) {
+                    const uint32_t hd = g_qcomb_hds[slot];
+                    g.p_mega_l2m[slot] = (hd != 0u && hd % 32u == 0u)
+                        ? make_cv([NSString stringWithFormat:@"imparo_mega_lfm2moe_layer_s%u", slot], cvl) : nil;
+                }
+                if (mega_program_build()) {
+                    MTLFunctionConstantValues * cvp = [cvl copy];
+                    const bool on = true;
+                    [cvp setConstantValue:&on type:MTLDataTypeBool atIndex:19];
+                    [cvp setConstantValue:&on type:MTLDataTypeBool atIndex:20];
+                    for (uint32_t slot = 0; slot < 2u; ++slot) {
+                        const uint32_t hd = g_qcomb_hds[slot];
+                        if (hd == 0u || hd % 32u != 0u) { continue; }
+                        g.p_mega_l2m_prog[slot] = make_cv([NSString stringWithFormat:@"imparo_mega_lfm2moe_layer_s%u", slot], cvp);
+                    }
+                }
+            }
             // Keep the historical grid heuristic as an outer bound for explicit experiments;
             // ordinary runs additionally use the conservative one-group-per-core ceiling.
-            g_gpu_cores = gpu_core_count();
             g_tgmem_limit = (uint32_t)[g.device maxThreadgroupMemoryLength];
             // The limit must cover EVERY pipeline the block can dispatch: both head-dim slots of
             // the layer kernel (E4B's global layers run slot 1). A slot's
@@ -4329,26 +5317,28 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             // grid policy below does not infer two-group admission from a 1024-thread value.
             // ONE VERDICT PER FAMILY, never one over all of them: see the comment at
             // g_mega_threads_limit. `tmax[arch]` is the min over that family's own pipelines.
-            uint32_t tmax[MEGA_ARCH_COUNT] = { 0u, 0u, 0u };
+            uint32_t tmax[MEGA_ARCH_COUNT] = { 0u, 0u, 0u, 0u };
             {
-                struct { uint32_t arch; id<MTLComputePipelineState> pipe; const char * name; } ps[6] = {
+                struct { uint32_t arch; id<MTLComputePipelineState> pipe; const char * name; } ps[8] = {
                     { MEGA_ARCH_GEMMA4, g.p_mega_layer[0],  "layer_s0" },
                     { MEGA_ARCH_GEMMA4, g.p_mega_layer[1],  "layer_s1" },
                     { MEGA_ARCH_LFM2,   g.p_mega_lfm2[0],   "lfm2_s0" },
                     { MEGA_ARCH_LFM2,   g.p_mega_lfm2[1],   "lfm2_s1" },
                     { MEGA_ARCH_QWEN35, g.p_mega_q35[0],    "q35_s0" },
                     { MEGA_ARCH_QWEN35, g.p_mega_q35[1],    "q35_s1" },
+                    { MEGA_ARCH_LFM2MOE, g.p_mega_l2m[0],   "l2m_s0" },
+                    { MEGA_ARCH_LFM2MOE, g.p_mega_l2m[1],   "l2m_s1" },
                 };
                 NSMutableString * rep = [NSMutableString new];
-                for (uint32_t i = 0; i < 6u; ++i) {
+                for (uint32_t i = 0; i < 8u; ++i) {
                     if (ps[i].pipe == nil) { [rep appendFormat:@" %s=nil", ps[i].name]; continue; }
                     const uint32_t t = (uint32_t)[ps[i].pipe maxTotalThreadsPerThreadgroup];
                     uint32_t & fam = tmax[ps[i].arch];
                     fam = fam ? std::min(fam, t) : t;
                     [rep appendFormat:@" %s=%u(tgmem %lu)", ps[i].name, t, (unsigned long)[ps[i].pipe staticThreadgroupMemoryLength]];
                 }
-                NSLog(@"imparo metal: mega pipelines max_threads/tg:%@ -> per-family limit gemma4=%u lfm2=%u qwen35=%u",
-                      rep, tmax[MEGA_ARCH_GEMMA4], tmax[MEGA_ARCH_LFM2], tmax[MEGA_ARCH_QWEN35]);
+                NSLog(@"imparo metal: mega pipelines max_threads/tg:%@ -> per-family limit gemma4=%u lfm2=%u qwen35=%u lfm2moe=%u",
+                      rep, tmax[MEGA_ARCH_GEMMA4], tmax[MEGA_ARCH_LFM2], tmax[MEGA_ARCH_QWEN35], tmax[MEGA_ARCH_LFM2MOE]);
             }
             // The deep variants run one threadgroup per core: each must admit the block's
             // threadgroup at all (its own max-threads verdict), else that slot's deep body is
@@ -4413,7 +5403,27 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                   g_mega_tgs[MEGA_ARCH_LFM2][0], g_mega_tgs[MEGA_ARCH_LFM2][1], g_mega_nsg[MEGA_ARCH_LFM2],
                   g_mega_tgs[MEGA_ARCH_QWEN35][0], g_mega_tgs[MEGA_ARCH_QWEN35][1], g_mega_nsg[MEGA_ARCH_QWEN35]);
         }
-        g.p_attn_dec_combine  = make(lib, @"imparo_attention_decode_combine");
+        {
+            // IMPARO_ATTN_COMB_STAGE=0 builds the combine's pre-staging form for an A/B.
+            MTLFunctionConstantValues * cv_cb = cv_empty;
+            const char * cs = getenv("IMPARO_ATTN_COMB_STAGE");
+            if (cs != nullptr) {
+                const uint32_t arm = (uint32_t)strtoul(cs, NULL, 10);
+                if (arm <= 2u) {
+                    cv_cb = [MTLFunctionConstantValues new];
+                    [cv_cb setConstantValue:&arm type:MTLDataTypeUInt atIndex:33];
+                }
+            }
+            if (const char * sp = getenv("IMPARO_ATTN_COMB_SPD")) {
+                const uint32_t spd = (uint32_t)strtoul(sp, NULL, 10);
+                if (spd == 2u || spd == 4u || spd == 8u) {
+                    if (cv_cb == cv_empty) { cv_cb = [MTLFunctionConstantValues new]; }
+                    [cv_cb setConstantValue:&spd type:MTLDataTypeUInt atIndex:35];
+                    g_attn_comb_spd = spd;
+                }
+            }
+            g.p_attn_dec_combine = make_cv(@"imparo_attention_decode_combine", cv_cb);
+        }
         // Every kernel that inlines kv_slot references KV_PAGED_FC now, so the
         // DEFAULT (paged) forms must also be created through constantValues --
         // a plain newFunctionWithName fails on functions with constant refs.
@@ -4462,6 +5472,14 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
                                 (unsigned long)g.p_fa_n[n].maxTotalThreadsPerThreadgroup);
                     }
                 }
+                MTLFunctionConstantValues * cv_fars = [MTLFunctionConstantValues new];
+                if (!g_attn_live_mask) {
+                    const bool lm_off = false;
+                    [cv_fars setConstantValue:&lm_off type:MTLDataTypeBool atIndex:10];
+                }
+                g.p_fars = g_qcomb_hds[0] <= 128u
+                    ? make_cv(@"imparo_attention_prefill_fars_s0", cv_fars) : nil;
+
             }
         }
         g.p_attn_pre_qcomb256x = make_cv(@"imparo_attention_prefill_qcomb256x", cv_pre);
@@ -4550,7 +5568,9 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             {g.p_attn_dec_combine, "attention_decode_combine"},
             {g.p_attn_pre_qtile, "attention_prefill_qtile"},
             {g.p_q4mm_pre, "matmat_prefill"}, {g.p_rt[g_rt_shape], "rt_gemm"},
-            {g.p_f32mm, "f32_matmat"}, {g.p_q4row, "q4_row"},
+            {g.p_f32mm, "f32_matmat"}, {g.p_f32gemv, "f32_gemv_ksplit"},
+            {g.p_f32nmm, "f32_narrow_mm"},
+            {g.p_q4row, "q4_row"},
             {g.p_kvstore, "kv_store"}, {g.p_actmul, "act_mul"},
             // A nil pipeline makes its op a SILENT no-op: the conv check read back an
             // output of exactly zeros and a state exactly as written, which is what
@@ -4558,6 +5578,7 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
             {g.p_conv[0], "causal_conv_gated"}, {g.p_conv_state[0], "causal_conv_state_gated"},
             {g.p_conv[1], "causal_conv_plain"}, {g.p_conv_state[1], "causal_conv_state_plain"},
             {g.p_mul_sigmoid, "mul_sigmoid"}, {g.p_copy_strided, "copy_strided"},
+            {g.p_scatter_strided, "scatter_strided"},
         };
         bool missing = false;
         for (const auto & r : required) {
@@ -4570,6 +5591,7 @@ extern "C" int imparo_metal_init(const void * base, uint64_t len) {
 
         if (!wsegs_build((const uint8_t *)base, len)) { return 4; }
         rset_init();
+        mem_pressure_watch();
         // The fast tier is wired; slow-tier segments stay pageable and take
         // per-command-buffer residency; host-staged rows have no buffer.
         uint64_t fast = 0, slow = 0, table = 0;
@@ -4646,60 +5668,444 @@ extern "C" uint64_t imparo_metal_allocated_bytes(void) {
     return (uint64_t) [g.device currentAllocatedSize];
 }
 
-// Grow a KV layer's buffers, keeping what is already in them.
+// ============================================================================================
+// KV STORAGE: one address-space reservation per layer side, and the kernels bind a no-copy
+// VIEW over its used part. Design: docs/memory-tiers-and-fit.md section 12.
 //
-// The KV cache was sized to the CONTEXT at startup, so a 440-token conversation at ctx 8192
-// held the same 148 MiB as a full one -- and on this model 128 MiB of that is four
-// full-attention layers whose head_dim is 512. The window caps the other twenty at 512 slots
-// already, which is why they are only 20 MiB.
+// A buffer the GPU can reach is committed WHOLE while it is resident (measured on macOS 15:
+// newBufferWithLength commits all of it at its first use, a no-copy mapping of anonymous memory
+// is wired whole), so the only way to hold just the blocks in use is to make the resident
+// object only as big as they are:
 //
-// Growing costs a copy of what is already stored, so it doubles rather than creeping: the
-// copies are then a constant fraction of the bytes ever written. A Metal buffer cannot be
-// resized in place, and this runs BETWEEN command buffers, never inside one.
-extern "C" int imparo_metal_grow_kv(uint32_t n_layers, const uint64_t * bytes) {
-    if (g.device == nil) { return 1; }
-    id<MTLCommandBuffer> cb = nil;
-    id<MTLBlitCommandEncoder> blit = nil;
-    // The buffers being replaced, held until the blit that READS them has completed and
-    // then discarded. Dropping the last reference is not enough in general -- the driver
-    // keeps the pages in its own cache -- which is why `imparo_metal_alloc` marks a buffer
-    // empty before releasing it; this makes the two paths agree.
+//   grow     a bigger view over the SAME memory -- every row already written stays where it
+//            is, nothing is copied, and only the new tail is wired
+//   release  a smaller view; the tail's pages go back once no view covers them
+//
+// Making a view resident costs ~20-25 ms per GiB of view, so the view the next steps will need
+// is prepared on a background thread (`imparo_metal_kv_prefetch`) and adopted between two
+// steps. Adoption never happens inside a region: every caller runs at a forward's entry.
+//
+// The views live in THEIR OWN residency set. A commit of the weights' set clears its hold and
+// the next region re-wires every weight page (4.9 s measured with one other 15 GB process
+// alive), which KV growth must never cause.
+// ============================================================================================
+static uint64_t page_round(uint64_t n);
+struct KvRes {
+    uint8_t * va = nullptr;   // anonymous mapping: a page exists once something writes it
+    uint64_t reserved = 0;    // bytes of address space
+    uint64_t committed = 0;   // bytes the current view covers
+};
+static std::vector<KvRes> g_kvres_k, g_kvres_v;
+// Bumped whenever the reservations are replaced; a preparation made for older ones is dropped.
+static uint64_t g_kv_gen = 0;
+static id<MTLResidencySet> g_kv_set = nil;
+static bool g_kv_set_dirty = false, g_kv_set_attached = false, g_kv_set_held = false;
+// Regions begun, and regions known complete. Buffers on one queue complete in commit order, so
+// region N complete means every region before it is complete too.
+static uint64_t g_region_begun = 0, g_region_done = 0;
+// Views that a command buffer committed before a swap may still address, with the staging set
+// that made their replacements resident: kept until region `after` has completed. A release's
+// tail is advised free at the same moment, when no view in use covers it.
+struct KvRetired {
+    uint64_t after = 0;
+    std::vector<id<MTLBuffer>> views;
+    id<MTLResidencySet> stage = nil;
+    std::vector<std::pair<uint8_t *, uint64_t>> tails;   // [base, base + len) to give back
+};
+static std::vector<KvRetired> g_kv_retired;
+// Views prepared off the step's path: made resident on a background thread, adopted by the
+// next forward entry that wants them.
+struct KvPrep {
+    uint64_t gen = 0;
+    std::vector<uint64_t> k, v;                 // bytes each side covers after adoption
+    std::vector<id<MTLBuffer>> kb, vb;          // nil where the side keeps its current view
+    id<MTLResidencySet> stage = nil;
+    double ms = 0.0;
+};
+static std::mutex g_kvprep_mu;
+static std::thread g_kvprep_th;
+static bool g_kvprep_busy = false;              // under g_kvprep_mu
+static bool g_kvprep_ready = false;             // under g_kvprep_mu
+static KvPrep g_kvprep;                         // under g_kvprep_mu, valid while ready
+
+static bool kv_log(void) {
+    static int on = -1;
+    if (on < 0) { const char * e = getenv("IMPARO_LOG"); on = (e != nullptr && e[0] == '1') ? 1 : 0; }
+    return on == 1;
+}
+static void kvset_add(id<MTLBuffer> b) {
+    if (g_kv_set == nil || b == nil) { return; }
+    [g_kv_set addAllocation:b];
+    g_kv_set_dirty = true;
+}
+static void kvset_remove(id<MTLBuffer> b) {
+    if (g_kv_set == nil || b == nil) { return; }
+    [g_kv_set removeAllocation:b];
+    g_kv_set_dirty = true;
+}
+// Commit membership and keep the set attached, which is what correctness needs: a set attached
+// to the queue is resident for its command buffers whether or not residency was requested.
+// Holding it is left to the region end (`kvset_hold`), off the step's path.
+// THE CALLER HOLDS g_rset_mu.
+static void kvset_sync_locked(void) {
+    if (g_kv_set == nil) { return; }
+    if (g_kv_set_dirty) {
+        [g_kv_set commit];
+        g_kv_set_dirty = false;
+        g_kv_set_held = false;
+    }
+    if (!g_kv_set_attached) {
+        [g.queue addResidencySet:g_kv_set];
+        g_kv_set_attached = true;
+    }
+}
+static void kvset_sync(void) {
+    std::lock_guard<std::mutex> lk(g_rset_mu);
+    kvset_sync_locked();
+}
+// THE CALLER HOLDS g_rset_mu. Every page in the set was touched by a region or made resident
+// by a preparation, so this only renews the hold the last commit cleared.
+static void kvset_hold(void) {
+    if (g_kv_set == nil || !g_kv_set_attached || g_kv_set_held || g_kv_set_dirty) { return; }
+    [g_kv_set requestResidency];
+    g_kv_set_held = true;
+}
+// THE CALLER HOLDS g_rset_mu. The idle release: the weights' set lets go, so does this one.
+static void kvset_release_hold(void) {
+    if (g_kv_set == nil || !g_kv_set_held) { return; }
+    [g_kv_set endResidency];
+    g_kv_set_held = false;
+}
+static void kvprep_join(void) {
+    if (g_kvprep_th.joinable()) { g_kvprep_th.join(); }
+}
+// Drop a finished preparation nobody adopted. Its staging set lets go of its views; the views
+// were never bound, so nothing else holds them.
+static void kvprep_discard(void) {
+    kvprep_join();
+    std::lock_guard<std::mutex> lk(g_kvprep_mu);
+    if (g_kvprep_ready && g_kvprep.stage != nil) { [g_kvprep.stage endResidency]; }
+    g_kvprep = KvPrep();
+    g_kvprep_ready = false;
+}
+static void kv_retire_ready(void) {
+    if (g_kv_retired.empty()) { return; }
+    std::vector<KvRetired> keep;
+    std::vector<std::pair<uint8_t *, uint64_t>> tails;
+    for (KvRetired & r : g_kv_retired) {
+        if (r.after > g_region_done) { keep.push_back(std::move(r)); continue; }
+        for (id<MTLBuffer> b : r.views) { kvset_remove(b); }
+        r.views.clear();
+        if (r.stage != nil) { [r.stage endResidency]; r.stage = nil; }
+        tails.insert(tails.end(), r.tails.begin(), r.tails.end());
+    }
+    g_kv_retired.swap(keep);
+    // The set lets go of the retired views here, and only then are their pages unwired.
+    // REUSABLE on a page that is still wired frees nothing: the advice comes after.
     //
-    // MEASURED NEUTRAL on the cold_compare long prompt (241 MiB against 239-240 without
-    // it), because that request grows the cache once and those pages were being returned
-    // anyway. Kept for the case the benchmark does not cover: at KV_BLOCK 64 a long
-    // generation grows every 64 decode tokens, and each growth retires a larger buffer.
-    std::vector<id<MTLBuffer>> retired;
-    for (uint32_t i = 0; i < n_layers && i < g.kv_k.size(); ++i) {
-        if (bytes[i] == 0) { continue; }
-        for (int kv = 0; kv < 2; ++kv) {
-            id<MTLBuffer> old = kv == 0 ? g.kv_k[i] : g.kv_v[i];
-            if (old != nil && [old length] >= bytes[i]) { continue; }
-            id<MTLBuffer> fresh = [g.device newBufferWithLength:bytes[i]
-                                                       options:MTLResourceStorageModeShared];
-            if (fresh == nil) { return 2; }
-            rset_add(fresh);
-            if (old != nil && [old length] > 0) {
-                if (cb == nil) { cb = [g.queue commandBuffer]; blit = [cb blitCommandEncoder]; }
-                [blit copyFromBuffer:old sourceOffset:0
-                            toBuffer:fresh destinationOffset:0 size:[old length]];
+    //   Wrong: advise REUSABLE -> commit the set (view leaves, pages unwired, still counted)
+    //   Right: commit the set (view leaves, pages unwired) -> advise REUSABLE -> pages go back
+    //
+    // `kv_build` says REUSE before any view covers the range again.
+    kvset_sync();
+    for (const auto & t : tails) { madvise(t.first, (size_t)t.second, MADV_FREE_REUSABLE); }
+}
+// Adopt prepared views. The old ones stay resident until every region begun so far is done.
+static void kv_adopt(KvPrep & p) {
+    KvRetired r;
+    r.after = g_region_begun;
+    r.stage = p.stage;
+    auto side = [&](std::vector<id<MTLBuffer>> & bound, std::vector<KvRes> & res,
+                    const std::vector<uint64_t> & to, std::vector<id<MTLBuffer>> & made) {
+        for (size_t i = 0; i < made.size() && i < bound.size() && i < res.size(); ++i) {
+            if (made[i] == nil) { continue; }
+            if (to[i] < res[i].committed) {
+                r.tails.push_back({res[i].va + to[i], res[i].committed - to[i]});
             }
-            if (old != nil) { retired.push_back(old); }
-            if (kv == 0) { g.kv_k[i] = fresh; } else { g.kv_v[i] = fresh; }
+            kvset_add(made[i]);
+            if (bound[i] != nil) { r.views.push_back(bound[i]); }
+            bound[i] = made[i];
+            res[i].committed = to[i];
+        }
+    };
+    side(g.kv_k, g_kvres_k, p.k, p.kb);
+    side(g.kv_v, g_kvres_v, p.v, p.vb);
+    kvset_sync();   // the new views are members before any command buffer binds them
+    g_kv_retired.push_back(std::move(r));
+}
+// Build the views a preparation names. `stage` true: in a staging set, made resident here --
+// the background thread's job. False: the first command buffer that binds them wires them.
+static void kv_build(KvPrep & p, const std::vector<uint8_t *> & vak,
+                     const std::vector<uint8_t *> & vav, const std::vector<uint64_t> & ck,
+                     const std::vector<uint64_t> & cv, bool stage) {
+    const size_t n = p.k.size();
+    p.kb.assign(n, nil);
+    p.vb.assign(n, nil);
+    const double t_set0 = CACurrentMediaTime();
+    if (stage) {
+        MTLResidencySetDescriptor * d = [[MTLResidencySetDescriptor alloc] init];
+        d.label = @"imparo kv stage";
+        d.initialCapacity = (NSUInteger)(2 * n + 1);
+        p.stage = [g.device newResidencySetWithDescriptor:d error:nil];
+    }
+    const double t_views0 = CACurrentMediaTime();
+    for (size_t i = 0; i < n; ++i) {
+        for (int s = 0; s < 2; ++s) {
+            uint8_t * va = s == 0 ? vak[i] : vav[i];
+            const uint64_t to = s == 0 ? p.k[i] : p.v[i];
+            const uint64_t now = s == 0 ? ck[i] : cv[i];
+            if (va == nullptr || to == 0 || to == now) { continue; }
+            if (to > now) { madvise(va + now, (size_t)(to - now), MADV_FREE_REUSE); }
+            id<MTLBuffer> b = [g.device newBufferWithBytesNoCopy:va length:(NSUInteger)to
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+            if (s == 0) { p.kb[i] = b; } else { p.vb[i] = b; }
+            if (p.stage != nil && b != nil) { [p.stage addAllocation:b]; }
         }
     }
-    if (cb != nil) {
-        [blit endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+    const double t_commit0 = CACurrentMediaTime();
+    if (p.stage != nil) { [p.stage commit]; }
+    const double t_wire0 = CACurrentMediaTime();
+    if (p.stage != nil) { [p.stage requestResidency]; }
+    if (kv_log()) {
+        const double t1 = CACurrentMediaTime();
+        fprintf(stderr, "[imparo] kv build%s: set %.2f ms, views %.2f ms, commit %.2f ms, wire %.2f ms\n",
+                stage ? " (prepared)" : "", 1e3 * (t_views0 - t_set0), 1e3 * (t_commit0 - t_views0),
+                1e3 * (t_wire0 - t_commit0), 1e3 * (t1 - t_wire0));
     }
-    // Only now: the blit read these, so they could not be discarded any earlier.
-    for (id<MTLBuffer> b : retired) {
-        rset_remove(b);
-        [b setPurgeableState:MTLPurgeableStateEmpty];
+}
+// What `bytes` asks each side to cover: 0 keeps the side as it is; otherwise page-rounded and
+// clamped to the reservation. `grow_only`: never below what the side covers now.
+static bool slot_ring_layer(uint32_t layer);
+static void kv_targets(uint32_t n_layers, const uint64_t * bytes, bool grow_only,
+                       std::vector<uint64_t> & tk, std::vector<uint64_t> & tv, bool & change,
+                       bool & over) {
+    const size_t n = std::min<size_t>(n_layers, g_kvres_k.size());
+    tk.assign(g_kvres_k.size(), 0);
+    tv.assign(g_kvres_v.size(), 0);
+    change = false;
+    over = false;
+    for (size_t i = 0; i < g_kvres_k.size(); ++i) {
+        tk[i] = g_kvres_k[i].committed;
+        tv[i] = g_kvres_v[i].committed;
+        if (i >= n || bytes[i] == 0 || g_kvres_k[i].va == nullptr) { continue; }
+        // A ring each slot holds its own of keeps the size it was loaded with (its bytes do not
+        // follow a position count), and g.kv_k holds the selected slot's, not this reservation's.
+        if (slot_ring_layer((uint32_t)i)) { continue; }
+        const uint64_t want = page_round(bytes[i]);
+        if (want > g_kvres_k[i].reserved) { over = true; continue; }
+        const uint64_t k = grow_only ? std::max(want, g_kvres_k[i].committed) : want;
+        const uint64_t v = grow_only ? std::max(want, g_kvres_v[i].committed) : want;
+        if (k != tk[i] || v != tv[i]) { change = true; }
+        tk[i] = k;
+        tv[i] = v;
     }
-    retired.clear();
+}
+// Adopt a finished preparation when it covers `need` (bytes per layer, 0 = no need); a stale or
+// short one is discarded. True when one was adopted.
+static bool kv_adopt_prepared(uint32_t n_layers, const uint64_t * need) {
+    {
+        std::lock_guard<std::mutex> lk(g_kvprep_mu);
+        if (g_kvprep_busy || !g_kvprep_ready) { return false; }
+    }
+    kvprep_join();
+    KvPrep p;
+    {
+        std::lock_guard<std::mutex> lk(g_kvprep_mu);
+        p = std::move(g_kvprep);
+        g_kvprep = KvPrep();
+        g_kvprep_ready = false;
+    }
+    bool ok = p.gen == g_kv_gen && p.k.size() == g_kvres_k.size();
+    for (size_t i = 0; ok && i < p.k.size() && i < n_layers; ++i) {
+        if (need != nullptr && need[i] != 0 && (page_round(need[i]) > p.k[i] || page_round(need[i]) > p.v[i])) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        if (p.stage != nil) { [p.stage endResidency]; }
+        return false;
+    }
+    kv_adopt(p);
+    if (kv_log()) {
+        uint64_t k = 0;
+        for (size_t i = 0; i < g_kvres_k.size(); ++i) { k += g_kvres_k[i].committed + g_kvres_v[i].committed; }
+        fprintf(stderr, "[imparo] kv views adopted: %.1f MiB committed, prepared in %.1f ms off the step\n",
+                (double)k / 1048576.0, p.ms);
+    }
+    return true;
+}
+
+// Grow each layer's view to cover `bytes` (0 = leave the layer alone). Never copies: the bigger
+// view maps the same memory. A preparation that covers it is adopted with no wait; otherwise the
+// views are built here and the first command buffer that binds them wires the new pages -- the
+// wait a preparation exists to hide.
+extern "C" int imparo_metal_grow_kv(uint32_t n_layers, const uint64_t * bytes) {
+    if (g.device == nil) { return 1; }
+    kv_retire_ready();
+    std::vector<uint64_t> tk, tv;
+    bool change = false, over = false;
+    kv_targets(n_layers, bytes, true, tk, tv, change, over);
+    if (over) {
+        NSLog(@"imparo metal: kv grow past the reservation refused (the fit sized it; a caller asked for more)");
+        return 5;
+    }
+    if (!change) { return 0; }
+    // Wait for a preparation in flight: it is the same work, already under way.
+    bool busy;
+    { std::lock_guard<std::mutex> lk(g_kvprep_mu); busy = g_kvprep_busy; }
+    if (busy) {
+        const double t0 = CACurrentMediaTime();
+        kvprep_join();
+        if (kv_log()) {
+            fprintf(stderr, "[imparo] kv grow waited %.1f ms for the preparation in flight\n",
+                    1e3 * (CACurrentMediaTime() - t0));
+        }
+    }
+    if (kv_adopt_prepared(n_layers, bytes)) {
+        kv_targets(n_layers, bytes, true, tk, tv, change, over);
+        if (!change) { return 0; }
+    }
+    const double t0 = CACurrentMediaTime();
+    KvPrep p;
+    p.gen = g_kv_gen;
+    p.k = tk;
+    p.v = tv;
+    std::vector<uint8_t *> vak(g_kvres_k.size()), vav(g_kvres_v.size());
+    std::vector<uint64_t> ck(g_kvres_k.size()), cv(g_kvres_v.size());
+    for (size_t i = 0; i < g_kvres_k.size(); ++i) {
+        vak[i] = g_kvres_k[i].va; ck[i] = g_kvres_k[i].committed;
+        vav[i] = g_kvres_v[i].va; cv[i] = g_kvres_v[i].committed;
+    }
+    kv_build(p, vak, vav, ck, cv, false);
+    for (size_t i = 0; i < p.kb.size(); ++i) {
+        if ((vak[i] != nullptr && tk[i] != ck[i] && p.kb[i] == nil)
+            || (vav[i] != nullptr && tv[i] != cv[i] && p.vb[i] == nil)) { return 2; }
+    }
+    kv_adopt(p);
+    if (kv_log()) {
+        uint64_t k = 0;
+        for (size_t i = 0; i < g_kvres_k.size(); ++i) { k += g_kvres_k[i].committed + g_kvres_v[i].committed; }
+        fprintf(stderr, "[imparo] kv views grown on the step: %.1f MiB committed (%.2f ms; no preparation covered it)\n",
+                (double)k / 1048576.0, 1e3 * (CACurrentMediaTime() - t0));
+    }
     return 0;
+}
+
+// Prepare views covering `bytes` on a background thread (0 = leave the layer alone), so the
+// forward that needs them adopts them with no wait. Bigger than now: the growth the next steps
+// will need. Smaller: a release, adopted when it still covers the next forward's need. One
+// preparation at a time; a finished one waits for its adoption.
+extern "C" void imparo_metal_kv_prefetch(uint32_t n_layers, const uint64_t * bytes) {
+    if (g.device == nil) { return; }
+    static int off = -1;
+    if (off < 0) { const char * e = getenv("IMPARO_KV_PREFETCH"); off = (e != nullptr && e[0] == '0') ? 1 : 0; }
+    if (off == 1) { return; }   // diagnostic: every growth builds its views on the step
+    {
+        std::lock_guard<std::mutex> lk(g_kvprep_mu);
+        if (g_kvprep_busy || g_kvprep_ready) { return; }
+    }
+    std::vector<uint64_t> tk, tv;
+    bool change = false, over = false;
+    kv_targets(n_layers, bytes, false, tk, tv, change, over);
+    if (over || !change) { return; }
+    kvprep_join();
+    std::vector<uint8_t *> vak(g_kvres_k.size()), vav(g_kvres_v.size());
+    std::vector<uint64_t> ck(g_kvres_k.size()), cv(g_kvres_v.size());
+    for (size_t i = 0; i < g_kvres_k.size(); ++i) {
+        vak[i] = g_kvres_k[i].va; ck[i] = g_kvres_k[i].committed;
+        vav[i] = g_kvres_v[i].va; cv[i] = g_kvres_v[i].committed;
+    }
+    const uint64_t gen = g_kv_gen;
+    { std::lock_guard<std::mutex> lk(g_kvprep_mu); g_kvprep_busy = true; }
+    // Joined at exit, as the idle watcher is. The last preparation's thread stays joinable
+    // until something joins it, and a joinable std::thread destroyed with the statics calls
+    // std::terminate: every process that grew its KV views aborted after its answer (rc 134).
+    // atexit runs this before the destructors of statics built earlier.
+    static const bool joined_at_exit = (atexit(kvprep_join), true);
+    (void)joined_at_exit;
+    g_kvprep_th = std::thread([gen, tk, tv, vak, vav, ck, cv]() {
+        @autoreleasepool {
+            const double t0 = CACurrentMediaTime();
+            KvPrep p;
+            p.gen = gen;
+            p.k = tk;
+            p.v = tv;
+            kv_build(p, vak, vav, ck, cv, true);
+            p.ms = 1e3 * (CACurrentMediaTime() - t0);
+            std::lock_guard<std::mutex> lk(g_kvprep_mu);
+            g_kvprep = std::move(p);
+            g_kvprep_ready = true;
+            g_kvprep_busy = false;
+        }
+    });
+}
+
+// Adopt a finished preparation if it covers `need` (0 = no need for that layer): the forward
+// entry's chance to take a prepared release, or a growth that finished early.
+extern "C" void imparo_metal_kv_adopt(uint32_t n_layers, const uint64_t * need) {
+    if (g.device == nil) { return; }
+    kv_retire_ready();
+    (void)kv_adopt_prepared(n_layers, need);
+}
+
+// Shrink each layer's view to `bytes` (0 leaves a layer alone; a target above the view leaves
+// it too): the release, once the pool holds nothing above. The smaller view maps the same
+// memory, so nothing moves. Called between requests with no command buffer in flight, so the
+// old views retire here and the pages above the new ones go back to the system at once.
+extern "C" int imparo_metal_kv_release(uint32_t n_layers, const uint64_t * bytes) {
+    if (g.device == nil) { return 1; }
+    const double t0 = CACurrentMediaTime();
+    // A preparation was built for the old size; it covers what is being given up.
+    kvprep_discard();
+    kv_retire_ready();
+    std::vector<uint64_t> tk, tv;
+    bool change = false, over = false;
+    kv_targets(n_layers, bytes, false, tk, tv, change, over);
+    if (over) { return 5; }
+    uint64_t before = 0, after = 0;
+    for (size_t i = 0; i < g_kvres_k.size(); ++i) {
+        before += g_kvres_k[i].committed + g_kvres_v[i].committed;
+        tk[i] = std::min(tk[i], g_kvres_k[i].committed);
+        tv[i] = std::min(tv[i], g_kvres_v[i].committed);
+        after += tk[i] + tv[i];
+    }
+    if (after == before) { return 0; }
+    KvPrep p;
+    p.gen = g_kv_gen;
+    p.k = tk;
+    p.v = tv;
+    std::vector<uint8_t *> vak(g_kvres_k.size()), vav(g_kvres_v.size());
+    std::vector<uint64_t> ck(g_kvres_k.size()), cv(g_kvres_v.size());
+    for (size_t i = 0; i < g_kvres_k.size(); ++i) {
+        vak[i] = g_kvres_k[i].va; ck[i] = g_kvres_k[i].committed;
+        vav[i] = g_kvres_v[i].va; cv[i] = g_kvres_v[i].committed;
+    }
+    kv_build(p, vak, vav, ck, cv, false);
+    for (size_t i = 0; i < p.kb.size(); ++i) {
+        if ((vak[i] != nullptr && tk[i] != ck[i] && p.kb[i] == nil)
+            || (vav[i] != nullptr && tv[i] != cv[i] && p.vb[i] == nil)) { return 2; }
+    }
+    kv_adopt(p);
+    kv_retire_ready();
+    if (kv_log()) {
+        fprintf(stderr, "[imparo] kv views released: %.1f -> %.1f MiB committed (%.2f ms)\n",
+                (double)before / 1048576.0, (double)after / 1048576.0,
+                1e3 * (CACurrentMediaTime() - t0));
+    }
+    return 0;
+}
+
+// The device's largest buffer: no KV view can be longer, so the fit keeps a reservation under it.
+extern "C" uint64_t imparo_metal_max_buffer_bytes(void) {
+    return g.device == nil ? 0ull : (uint64_t)[g.device maxBufferLength];
+}
+
+// Bytes the KV views cover now, K and V together: what the KV tier holds resident.
+extern "C" uint64_t imparo_metal_kv_committed_bytes(void) {
+    uint64_t b = 0;
+    for (size_t i = 0; i < g_kvres_k.size(); ++i) { b += g_kvres_k[i].committed + g_kvres_v[i].committed; }
+    return b;
 }
 
 // An arena that several activation buffers share, because their lifetimes do not overlap.
@@ -4836,7 +6242,27 @@ static void kv_pt_audit(const char * who, uint32_t layer, uint32_t needed) {
           who, layer, n, needed, n > 0 ? e[0] : 0, n > 1 ? e[1] : 0, (int)bad);
 }
 
+// IMPARO_KV_PT_LOG=1: log every page-table use past the entries the pool set for the layer.
+// Such a page maps to whatever the buffer held -- the identity value from creation, or an older
+// conversation's entry -- so the write lands on a block the pool did not assign to it.
+static void kv_pt_overrun_probe(uint32_t layer, uint32_t entries_needed) {
+    static int on = -1;
+    if (on < 0) { const char * e = getenv("IMPARO_KV_PT_LOG"); on = (e != nullptr && e[0] == '1') ? 1 : 0; }
+    if (on == 0 || layer >= g.kv_pt_set.size()) { return; }
+    const uint32_t set = g.kv_pt_set[layer];
+    if (set == 0 || entries_needed <= set || g.kv_pt[layer] == nil) { return; }
+    const uint32_t have = (uint32_t)([g.kv_pt[layer] length] / 4u);
+    const uint32_t * e = (const uint32_t *)[g.kv_pt[layer] contents];
+    for (uint32_t page = set; page < entries_needed && page < have; ++page) {
+        int32_t owner = -1;
+        for (uint32_t i = 0; i < set; ++i) { if (e[i] == e[page]) { owner = (int32_t)i; break; } }
+        fprintf(stderr, "[imparo] kv page past the pool's table: layer %u page %u (pool set %u) -> block %u%s%d\n",
+                layer, page, set, e[page], owner >= 0 ? ", the block of live page " : ", no live page", owner);
+    }
+}
+
 static void ensure_kv_pt(uint32_t layer, uint32_t entries_needed) {
+    kv_pt_overrun_probe(layer, entries_needed);
     if (layer >= g.kv_pt.size()) { g.kv_pt.resize(layer + 1, nil); }
     id<MTLBuffer> cur = g.kv_pt[layer];
     const uint32_t have = cur == nil ? 0u : (uint32_t)([cur length] / 4u);
@@ -4849,14 +6275,18 @@ static void ensure_kv_pt(uint32_t layer, uint32_t entries_needed) {
     // table set by the pool survives a mid-forward grow.
     for (uint32_t i = 0; i < have; ++i) { e[i] = ((uint32_t *)[cur contents])[i]; }
     for (uint32_t i = have; i < want; ++i) { e[i] = i; }
-    rset_remove(cur);
-    rset_add(fresh);
+    // KV-tier objects: in the KV set, so a table that grows never commits the weights' set.
+    kvset_remove(cur);
+    kvset_add(fresh);
     g.kv_pt[layer] = fresh;
 }
 
 // The pool assigns physical blocks: replace a layer's table entries wholesale.
 extern "C" void imparo_metal_set_kv_pages(uint32_t layer, const uint32_t * e, uint32_t n) {
+    if (g.kv_pt_set.size() <= layer) { g.kv_pt_set.resize(layer + 1, 0u); }
+    g.kv_pt_set[layer] = 0u;
     ensure_kv_pt(layer, n);
+    g.kv_pt_set[layer] = n;
     memcpy((uint32_t *)[g.kv_pt[layer] contents], e, (size_t)n * 4u);
     bool ident = true;
     for (uint32_t i = 0; i < n; ++i) {
@@ -4870,33 +6300,345 @@ static inline bool kv_pt_is_ident(uint32_t layer) {
     return layer >= g.kv_pt_ident.size() || g.kv_pt_ident[layer] != 0;
 }
 
+// CO-BATCHED DECODE SLOTS (docs/continuous-batching.md). A slot is one conversation's device
+// state: its page table per layer, its per-conversation buffers (the recurrent state and its
+// snapshot twin, named by the caller) and the rings of its windowed layers (named by the
+// caller too). The SELECTED slot's state lives in the fields every one-row path already reads
+// -- g.kv_pt, g.kv_pt_ident, g.kv_pt_set, the named g.bufs and the ringed layers' g.kv_k /
+// g.kv_v -- so prefill, a lone decode, capture and restore work on it unchanged; the other
+// slots' state waits here. Selecting swaps the two (std::swap, no copies). A co-batched row
+// selects its slot around its own dispatches, which bind their buffers at encode time. A slot's
+// buffers are made the first time it is selected, so a server that never runs two
+// conversations at once holds one slot's worth.
+struct SlotState {
+    std::vector<id<MTLBuffer>> kv_pt;
+    std::vector<uint8_t> kv_pt_ident;
+    std::vector<uint32_t> kv_pt_set;
+    std::vector<id<MTLBuffer>> bufs;   // one per g_slot_buf_ids entry
+    std::vector<size_t> sizes;
+    // The rings of the windowed layers, K and V, one per g_slot_ring_layers entry: made on the
+    // slot's first select and given back at its release, like `bufs`. Slot 0's are the caches
+    // the load allocated, copied out of the KV view machinery when the slots are made.
+    std::vector<id<MTLBuffer>> ring_k, ring_v;
+    std::vector<size_t> ring_bytes;
+    bool made = true;                  // false: `bufs` not made yet, `sizes` are theirs to be
+};
+static std::vector<SlotState> g_slots(1);
+static std::vector<uint32_t> g_slot_buf_ids;
+static std::vector<uint32_t> g_slot_ring_layers;
+static uint32_t g_slot_cur = 0;
+
+// Whether `layer`'s cache is a ring each slot holds its own of. The KV view machinery (grow,
+// prepare, release) never resizes such a layer: the buffer in g.kv_k / g.kv_v is whichever
+// slot's is selected, not a view over the layer's reservation.
+static bool slot_ring_layer(uint32_t layer) {
+    return std::find(g_slot_ring_layers.begin(), g_slot_ring_layers.end(), layer)
+        != g_slot_ring_layers.end();
+}
+
+static void slot_swap(uint32_t s) {
+    SlotState & st = g_slots[s];
+    std::swap(g.kv_pt, st.kv_pt);
+    std::swap(g.kv_pt_ident, st.kv_pt_ident);
+    std::swap(g.kv_pt_set, st.kv_pt_set);
+    st.bufs.resize(g_slot_buf_ids.size(), nil);
+    st.sizes.resize(g_slot_buf_ids.size(), 0);
+    for (size_t i = 0; i < g_slot_buf_ids.size(); ++i) {
+        const uint32_t bid = g_slot_buf_ids[i];
+        std::swap(g.bufs[bid], st.bufs[i]);
+        std::swap(g.sizes[bid], st.sizes[i]);
+    }
+    st.ring_k.resize(g_slot_ring_layers.size(), nil);
+    st.ring_v.resize(g_slot_ring_layers.size(), nil);
+    for (size_t i = 0; i < g_slot_ring_layers.size(); ++i) {
+        const uint32_t l = g_slot_ring_layers[i];
+        std::swap(g.kv_k[l], st.ring_k[i]);
+        std::swap(g.kv_v[l], st.ring_v[i]);
+    }
+}
+
+// Makes slot s's buffers, zeroed, at the sizes set_slots recorded for it, and its rings where it
+// has none. False: a buffer could not be made, and the slot stays unmade.
+static bool slot_make(uint32_t s) {
+    SlotState & st = g_slots[s];
+    std::vector<id<MTLBuffer>> bufs;
+    for (size_t bytes : st.sizes) {
+        id<MTLBuffer> b = nil;
+        if (bytes > 0) {
+            b = [g.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+            if (b == nil) { return false; }
+            memset([b contents], 0, bytes);
+        }
+        bufs.push_back(b);
+    }
+    // Zeroed like the rest: a prefill attention tile may read ring cells past its last key and
+    // weigh them by zero, and a zero weight times a NaN left in the cell is a NaN.
+    std::vector<id<MTLBuffer>> rk, rv;
+    const bool need_rings = !g_slot_ring_layers.empty()
+        && (st.ring_k.size() < g_slot_ring_layers.size() || st.ring_k[0] == nil);
+    if (need_rings) {
+        for (size_t bytes : st.ring_bytes) {
+            for (std::vector<id<MTLBuffer>> * side : {&rk, &rv}) {
+                id<MTLBuffer> b = [g.device newBufferWithLength:bytes
+                                                        options:MTLResourceStorageModeShared];
+                if (b == nil) { return false; }
+                memset([b contents], 0, bytes);
+                side->push_back(b);
+            }
+        }
+    }
+    for (id<MTLBuffer> b : bufs) {
+        if (b != nil) { rset_add(b); }
+    }
+    st.bufs = std::move(bufs);
+    if (need_rings) {
+        for (id<MTLBuffer> b : rk) { rset_add(b); }
+        for (id<MTLBuffer> b : rv) { rset_add(b); }
+        st.ring_k = std::move(rk);
+        st.ring_v = std::move(rv);
+    }
+    st.made = true;
+    if (kv_log()) {
+        size_t rings = 0;
+        for (size_t b : st.ring_bytes) { rings += 2 * b; }
+        fprintf(stderr, "[imparo] slot %u made: rings %s (%.1f MiB)\n", s,
+                need_rings ? "made" : "kept", (double)(need_rings ? rings : 0) / 1048576.0);
+    }
+    return true;
+}
+
+// Returns 0 with slot s selected; 1 for a slot that does not exist, 4 when its buffers could
+// not be made on this first select -- the selection is unchanged on either.
+extern "C" int imparo_metal_select_slot(uint32_t s) {
+    if (s >= g_slots.size()) { return 1; }
+    if (s == g_slot_cur) { return 0; }
+    if (!g_slots[s].made) {
+        // Its own pool, as at set_slots: a reference autoreleased on a thread that never drains
+        // would keep this slot's buffers alive past their release.
+        bool made = false;
+        @autoreleasepool { made = slot_make(s); }
+        if (!made) { return 4; }
+    }
+    slot_swap(g_slot_cur);   // the live state goes back to its slot
+    slot_swap(s);            // and the chosen slot's comes out
+    g_slot_cur = s;
+    return 0;
+}
+
+// Gives back slot s's per-conversation buffers: its next select makes them again, zeroed, at the
+// sizes they had. For a slot other than the selected one, with nothing in flight. Returns 0 when
+// buffers went back, 1 for the selected slot or one that does not exist, 2 for a slot holding
+// none (never selected, or given back already), 3 with work encoded or in flight (a region may
+// still read them, and emptying a buffer discards its contents at once).
+extern "C" int imparo_metal_release_slot(uint32_t s) {
+    if (s >= g_slots.size() || s == g_slot_cur) { return 1; }
+    SlotState & st = g_slots[s];
+    if (!st.made) { return 2; }
+    if (g.enc != nil || g.cb != nil || !g.pending.empty() || !g.outstanding.empty()) { return 3; }
+    {
+        // A removal waits for the set's commit, and the set keeps the buffer until then:
+        // commit now, or the pages stay until the next region begins.
+        std::lock_guard<std::mutex> lk(g_rset_mu);
+        for (id<MTLBuffer> b : st.bufs) {
+            if (b != nil) { rset_remove(b); }
+        }
+        for (id<MTLBuffer> b : st.ring_k) { if (b != nil) { rset_remove(b); } }
+        for (id<MTLBuffer> b : st.ring_v) { if (b != nil) { rset_remove(b); } }
+        if (g_rset != nil) {
+            [g_rset commit];
+            g_rset_dirty = false;
+        }
+    }
+    // Dropping the reference alone leaves the pages in the driver's cache.
+    for (size_t i = 0; i < st.bufs.size(); ++i) {
+        if (st.bufs[i] != nil) {
+            [st.bufs[i] setPurgeableState:MTLPurgeableStateEmpty];
+            st.bufs[i] = nil;
+        }
+    }
+    uint64_t ring_bytes = 0;
+    for (std::vector<id<MTLBuffer>> * side : {&st.ring_k, &st.ring_v}) {
+        for (size_t i = 0; i < side->size(); ++i) {
+            if ((*side)[i] != nil) {
+                ring_bytes += [(*side)[i] length];
+                [(*side)[i] setPurgeableState:MTLPurgeableStateEmpty];
+                (*side)[i] = nil;
+            }
+        }
+    }
+    if (kv_log()) {
+        fprintf(stderr, "[imparo] slot %u released: rings %.1f MiB, device now %.1f MiB\n", s,
+                (double)ring_bytes / 1048576.0,
+                (double)[g.device currentAllocatedSize] / 1048576.0);
+    }
+    st.made = false;
+    return 0;
+}
+
+// Moves the load's rings out of the KV view machinery into buffers of their own, contents
+// kept, so that slot 0's rings are made and given back like every other slot's. The views are
+// retired as a shrink retires them: they leave the set, then their pages go back.
+static bool slot_rings_detach(void) {
+    KvRetired r;
+    r.after = g_region_begun;
+    std::vector<std::pair<uint32_t, std::pair<id<MTLBuffer>, id<MTLBuffer>>>> made;
+    for (uint32_t l : g_slot_ring_layers) {
+        id<MTLBuffer> own[2] = {nil, nil};
+        for (int s = 0; s < 2; ++s) {
+            id<MTLBuffer> view = s == 0 ? g.kv_k[l] : g.kv_v[l];
+            own[s] = [g.device newBufferWithLength:[view length]
+                                           options:MTLResourceStorageModeShared];
+            if (own[s] == nil) { return false; }
+            memcpy([own[s] contents], [view contents], [view length]);
+        }
+        made.push_back({l, {own[0], own[1]}});
+    }
+    for (const auto & m : made) {
+        const uint32_t l = m.first;
+        for (int s = 0; s < 2; ++s) {
+            KvRes & res = s == 0 ? g_kvres_k[l] : g_kvres_v[l];
+            std::vector<id<MTLBuffer>> & side = s == 0 ? g.kv_k : g.kv_v;
+            r.views.push_back(side[l]);
+            if (res.va != nullptr && res.committed > 0) {
+                r.tails.push_back({res.va, res.committed});
+            }
+            res.committed = 0;
+            side[l] = s == 0 ? m.second.first : m.second.second;
+            rset_add(side[l]);
+        }
+    }
+    if (kv_log()) {
+        uint64_t bytes = 0;
+        for (const auto & t : r.tails) { bytes += t.second; }
+        fprintf(stderr, "[imparo] slot rings: %zu layers copied out of the KV views, %.1f MiB of "
+                "views retired\n", made.size(), (double)bytes / 1048576.0);
+    }
+    g_kv_retired.push_back(std::move(r));
+    return true;
+}
+
+// Slots 0..n. A new slot will own a buffer for each id the selected slot holds and a ring for
+// each windowed layer named, sized like the selected slot's are now, made on the slot's first
+// select; and no page table: its conversation sets one before use. The ids and layers are read
+// on the first call only, which needs nothing encoded or in flight (it copies the rings). Returns
+// 0, or nonzero for an id or a layer this cannot hold per slot, or work in flight.
+extern "C" int imparo_metal_set_slots(uint32_t n, const uint32_t * buf_ids, uint32_t n_ids,
+                                      const uint32_t * ring_layers, uint32_t n_rings) {
+    if (n == 0u) { return 1; }
+    if (g_slots.size() == 1u && g_slot_buf_ids.empty() && g_slot_ring_layers.empty()) {
+        for (uint32_t i = 0; i < n_ids; ++i) {
+            if (buf_ids[i] >= B_COUNT) { return 2; }
+            if (g.bufs[buf_ids[i]] != nil && g.in_arena[buf_ids[i]]) { return 3; }
+        }
+        for (uint32_t i = 0; i < n_rings; ++i) {
+            const uint32_t l = ring_layers[i];
+            if (l >= g.kv_k.size() || g.kv_k[l] == nil || g.kv_v[l] == nil) { return 4; }
+            // One size for both sides: a slot's ring is made at the K side's length.
+            if ([g.kv_k[l] length] != [g.kv_v[l] length]) { return 5; }
+        }
+        if (n_rings > 0u
+            && (g.enc != nil || g.cb != nil || !g.pending.empty() || !g.outstanding.empty())) {
+            return 6;
+        }
+        g_slot_buf_ids.assign(buf_ids, buf_ids + n_ids);
+        g_slot_ring_layers.assign(ring_layers, ring_layers + n_rings);
+        // Its own pool: the caller may be a thread with none, and an autoreleased reference
+        // left there keeps slot 0's rings alive past their release, for the process's life.
+        bool detached = false;
+        @autoreleasepool { detached = slot_rings_detach(); }
+        if (!detached) {
+            g_slot_ring_layers.clear();
+            return 7;
+        }
+    }
+    while (g_slots.size() < n) {
+        SlotState st;
+        for (uint32_t bid : g_slot_buf_ids) {
+            st.sizes.push_back(g.bufs[bid] != nil ? g.sizes[bid] : 0);
+        }
+        for (uint32_t l : g_slot_ring_layers) {
+            st.ring_bytes.push_back((size_t)[g.kv_k[l] length]);
+        }
+        st.made = false;
+        g_slots.push_back(std::move(st));
+    }
+    return 0;
+}
+
 static inline uint64_t kv_reg(uint32_t layer, bool is_v) {
     const std::vector<uint64_t> & v = is_v ? g.kv_reg_v : g.kv_reg_k;
     return layer < v.size() ? v[layer] : 0ull;
 }
 
-extern "C" int imparo_metal_alloc_kv(uint32_t n_layers, const uint64_t * bytes) {
-    // Same pairing rule as imparo_metal_grow_kv: dropping the reference does not take a
-    // buffer out of the residency set, and `g_rset_bytes` is compared against the budget --
-    // crossing it removes the set and puts the weights back on the OS's paging. Today this
-    // runs once per process, so these two loops are empty; they are here so the entry point
-    // stays safe to call twice rather than because a leak was observed.
-    for (id<MTLBuffer> b : g.kv_k) { rset_remove(b); }
-    for (id<MTLBuffer> b : g.kv_v) { rset_remove(b); }
+// Reserve each layer side's address space and commit its first view. `reserve[i]` bytes of
+// address space, `bytes[i]` of it covered now (the view), for K and V alike; a layer with both
+// zero owns no cache. Replaces whatever was there, so it runs with nothing in flight: at load,
+// and when the pool takes over the cache before its first request.
+extern "C" int imparo_metal_alloc_kv_reserved(uint32_t n_layers, const uint64_t * bytes,
+                                              const uint64_t * reserve) {
+    if (g.device == nil) { return 1; }
+    if (g.cb != nil || !g.outstanding.empty()) { return 4; }
+    // Slots hold rings sized from this allocation, and the selected slot's are in g.kv_k:
+    // replacing the cache under them would leave every slot's rings sized for the old one.
+    if (!g_slot_ring_layers.empty() && g_slots.size() > 1u) { return 6; }
+    kvprep_discard();
+    // Everything the old reservations backed goes: the views leave the set before the mappings
+    // they cover are unmapped.
+    for (id<MTLBuffer> b : g.kv_k) { kvset_remove(b); }
+    for (id<MTLBuffer> b : g.kv_v) { kvset_remove(b); }
+    for (KvRetired & r : g_kv_retired) {
+        for (id<MTLBuffer> b : r.views) { kvset_remove(b); }
+        if (r.stage != nil) { [r.stage endResidency]; }
+    }
+    g_kv_retired.clear();
     g.kv_k.assign(n_layers, nil);
     g.kv_v.assign(n_layers, nil);
+    kvset_sync();
+    for (std::vector<KvRes> * side : {&g_kvres_k, &g_kvres_v}) {
+        for (KvRes & r : *side) {
+            if (r.va != nullptr) { munmap(r.va, (size_t)r.reserved); }
+        }
+        side->assign(n_layers, KvRes());
+    }
+    g_kv_gen += 1;
+    if (g_kv_set == nil && g_rset != nil) {
+        MTLResidencySetDescriptor * d = [[MTLResidencySetDescriptor alloc] init];
+        d.label = @"imparo kv tier";
+        d.initialCapacity = (NSUInteger)(4 * n_layers + 64);
+        g_kv_set = [g.device newResidencySetWithDescriptor:d error:nil];
+    }
     g.kv_pt.assign(n_layers, nil);
     g.kv_reg_k.assign(n_layers, 0ull);
     g.kv_reg_v.assign(n_layers, 0ull);
     for (uint32_t i = 0; i < n_layers; ++i) {
-        if (bytes[i] == 0) { continue; }
-        g.kv_k[i] = [g.device newBufferWithLength:bytes[i] options:MTLResourceStorageModeShared];
-        g.kv_v[i] = [g.device newBufferWithLength:bytes[i] options:MTLResourceStorageModeShared];
-        if (g.kv_k[i] == nil || g.kv_v[i] == nil) { return 1; }
-        rset_add(g.kv_k[i]);
-        rset_add(g.kv_v[i]);
+        const uint64_t commit = page_round(bytes[i]);
+        const uint64_t res = std::max(page_round(reserve[i]), commit);
+        if (res == 0) { continue; }
+        for (int s = 0; s < 2; ++s) {
+            KvRes & r = s == 0 ? g_kvres_k[i] : g_kvres_v[i];
+            void * m = mmap(nullptr, (size_t)res, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (m == MAP_FAILED) { return 1; }
+            r.va = (uint8_t *)m;
+            r.reserved = res;
+            r.committed = commit;
+            if (commit == 0) { continue; }
+            id<MTLBuffer> b = [g.device newBufferWithBytesNoCopy:m length:(NSUInteger)commit
+                                                         options:MTLResourceStorageModeShared
+                                                     deallocator:nil];
+            if (b == nil) { return 1; }
+            if (s == 0) { g.kv_k[i] = b; } else { g.kv_v[i] = b; }
+            kvset_add(b);
+        }
     }
+    kvset_sync();
+    { std::lock_guard<std::mutex> lk(g_rset_mu); kvset_hold(); }
     return 0;
+}
+
+// The cache with no room to grow in place: reserve exactly what is committed. Kept for callers
+// that size the cache once.
+extern "C" int imparo_metal_alloc_kv(uint32_t n_layers, const uint64_t * bytes) {
+    return imparo_metal_alloc_kv_reserved(n_layers, bytes, bytes);
 }
 
 // `[queue commandBuffer]` returns an AUTORELEASED object. Splitting a decode token into
@@ -4904,8 +6646,20 @@ extern "C" int imparo_metal_alloc_kv(uint32_t n_layers, const uint64_t * bytes) 
 // which on a server thread is the whole request: 6 per token x 64 tokens sat unreleased,
 // and the footprint grew with the split (1 cb/token 214.2 MiB, 21 cb/token 220.6 MiB).
 // One pool per forward pass releases them at the end of the token instead.
+// Diagnostic (IMPARO_CB_PROBE=1): at a synchronous region end, print when each of its command
+// buffers started on the GPU relative to the region's begin, and how long each ran -- a wait
+// before the GPU starts (residency) and a slower GPU are different defects.
+static bool cb_probe(void) {
+    static int on = -1;
+    if (on < 0) { const char * e = getenv("IMPARO_CB_PROBE"); on = (e != nullptr && e[0] == '1') ? 1 : 0; }
+    return on == 1;
+}
+static double g_cb_probe_t0 = 0.0;
 extern "C" void imparo_metal_begin(void) {
     if (g.pool == nullptr) { g.pool = objc_autoreleasePoolPush(); }
+    if (cb_probe()) { g_cb_probe_t0 = CACurrentMediaTime(); }
+    kv_retire_ready();
+    g_region_begun += 1;
     g_mega_region_ordinal += 1u;
     if (!g_mega_fail_at_read) {
         g_mega_fail_at_read = true;
@@ -4973,6 +6727,7 @@ extern "C" void imparo_metal_begin(void) {
 extern "C" void imparo_metal_flush(void) {
     if (g.enc == nil) { return; }
     [g.enc endEncoding];
+    wpf_commit(g.cb);
     [g.cb commit];
     // ALWAYS retained until the region ends, not only under g_prof. `end` needs every
     // buffer of the region to report the region's GPU time, and the tuner runs with
@@ -5009,8 +6764,19 @@ extern "C" int imparo_metal_end(void) {
     mega_prog_flush(); g_prog_base = 0u;   // a pending program run ends with its region (task #153)
     [g.enc endEncoding];
     const double t0 = g_prof ? CACurrentMediaTime() : 0.0;
+    const double t_probe_commit = cb_probe() ? CACurrentMediaTime() : 0.0;
+    wpf_commit(g.cb);
     [g.cb commit];
     [g.cb waitUntilCompleted];
+    if (cb_probe()) {
+        const double b = g_cb_probe_t0, now = CACurrentMediaTime();
+        fprintf(stderr, "[imparo] cb probe: region at %.4f s, wall %.2f ms, encode-to-last-commit %.2f ms, cbs %zu:",
+                b, 1e3 * (now - b), 1e3 * (t_probe_commit - b), g.pending.size() + 1);
+        for (id<MTLCommandBuffer> pcb : g.pending) {
+            fprintf(stderr, " [start +%.2f gpu %.2f]", 1e3 * ([pcb GPUStartTime] - b), 1e3 * cb_gpu_seconds(pcb));
+        }
+        fprintf(stderr, " [start +%.2f gpu %.2f]\n", 1e3 * ([g.cb GPUStartTime] - b), 1e3 * cb_gpu_seconds(g.cb));
+    }
     // Buffers on one queue complete in commit order, so the wait above means every
     // flushed buffer of this region is done and its timestamps are valid.
     // One sum for both consumers. Buffers on a queue complete in commit order, so the
@@ -5047,6 +6813,7 @@ extern "C" int imparo_metal_end(void) {
         g_prof_cbs    += (uint64_t)g.pending.size() + 1;
     }
     g.pending.clear();
+    g_region_done = g_region_begun;
     const bool bad = ([g.cb error] != nil) || mega_check_error();
     if (!bad) { mega_good_retire(); }
     if (mega_dbg()) { mega_dbg_scan(g_mega_region_slot); }
@@ -5068,11 +6835,13 @@ extern "C" int imparo_metal_end(void) {
 extern "C" int imparo_metal_end_async(void) {
     mega_prog_flush(); g_prog_base = 0u;   // a pending program run ends with its region (task #153)
     [g.enc endEncoding];
+    wpf_commit(g.cb);
     [g.cb commit];
     Context::Region r;
     r.cbs = g.pending;
     r.cbs.push_back(g.cb);
     r.dbg_slot = g_mega_region_slot;
+    r.seq = g_region_begun;
     g_mega_region_slot = (g_mega_region_slot + 1u) % MEGA_DBG_SLOTS; g_mega_dbg_seq = 0u;
     g.pending.clear();
     g.outstanding.push_back(std::move(r));
@@ -5086,6 +6855,7 @@ extern "C" int imparo_metal_wait_outstanding(void) {
     Context::Region r = std::move(g.outstanding.front());
     g.outstanding.erase(g.outstanding.begin());
     [r.cbs.back() waitUntilCompleted];
+    if (r.seq > g_region_done) { g_region_done = r.seq; }
     double s = 0.0;
     bool bad = false;
     for (id<MTLCommandBuffer> cb : r.cbs) {
@@ -5115,6 +6885,7 @@ extern "C" uint32_t imparo_metal_stages_rows(void) { return g_wstaged.empty() ? 
 extern "C" void imparo_metal_write(uint32_t id, uint64_t off, const float * src, uint64_t n) {
     g_cvt_valid = 0;   // host wrote a buffer directly; the half copy may be stale
     if (id == g_xh_src) { g_xh_src = 0xffffffffu; }   // and so may the mirror
+    if (id < 64u) { g_float_stale &= ~(1ull << id); }
     buf_fresh_clear(id);
     std::memcpy((char *)[g.bufs[id] contents] + g.buf_off[id] + off * 4, src, n * 4);
 }
@@ -5141,37 +6912,13 @@ struct Q8Geometry {
     uint32_t toks;
     uint32_t nsg;
     uint32_t kch;
-    bool     fell_back;   // the pair's choice was illegal here and shape 3 took over
+    bool     fell_back;   // the rule's choice was illegal here and shape 3 took over
 };
 
-// The pair's choice, then legality. Both are pure functions of (n_tok, n_in) and the two
-// tuned shape indices; nothing here touches Metal.
-static Q8Geometry q8_geometry(uint32_t n_tok, uint32_t n_in, bool large_available) {
-    uint32_t shape = g_st_gemm_shape;
-    // TWO TILES, AND THE DISPATCH PICKS. The tuner names which pair is in play; which of
-    // the pair suits THIS dispatch is arithmetic, so no threshold is stored.
-    //
-    // A wider token tile walks the weight matrix half as many times and pays for it in
-    // padding, so compare the two padded token counts and take the wider tile when it
-    // pads no worse. Measured on LFM2's deep prefill at four ubatch widths, and the sign
-    // flips exactly where the arithmetic says it does:
-    //
-    //   n_tok   32-wide pads to   64-wide pads to   rule     measured
-    //     448        448               448          64-wide  819.2 vs 788.2  +3.9% wide
-    //     455        480               512          32-wide  870.5 vs 861.1  +1.1% narrow
-    //     480        480               512          32-wide  790.4 vs 785.5  +0.6% narrow
-    //     512        512               512          64-wide  827.6 vs 789.9  +4.8% wide
-    //
-    // This replaces a `n_tok >= g_st_gemm_large_min_tok` threshold, which no workload in
-    // the registry could ever have measured -- PrefillGemm times ONE token count -- and
-    // which would have got 448 wrong for any value that got 455 right.
-    if (large_available && g_st_gemm_large_shape != g_st_gemm_shape) {
-        const uint32_t tw = ST_GEMM_SHAPES[g_st_gemm_shape][1];
-        const uint32_t tl = ST_GEMM_SHAPES[g_st_gemm_large_shape][1];
-        const uint32_t pad_w = (n_tok + tw - 1u) / tw * tw;
-        const uint32_t pad_l = (n_tok + tl - 1u) / tl * tl;
-        if (pad_l <= pad_w) { shape = g_st_gemm_large_shape; }
-    }
+// The rule's choice, then legality. Both are pure functions of (n_tok, n_in) and the one
+// seated shape index; nothing here touches Metal.
+static Q8Geometry q8_geometry(uint32_t n_tok, uint32_t n_in) {
+    uint32_t shape = q8_tile(n_tok);
     // A deeper K chunk walks whole KCH steps, so a shape whose depth does not divide n_in
     // would read past the row. Fall back to the ported 32-deep shape rather than refuse:
     // the shapes differ only in staging depth, so the fallback computes the same numbers.
@@ -5184,9 +6931,9 @@ static Q8Geometry q8_geometry(uint32_t n_tok, uint32_t n_in, bool large_availabl
                       ST_GEMM_SHAPES[shape][2], ST_GEMM_SHAPES[shape][3], fell_back};
 }
 
-// Test hook: the shape this dispatch would use, with both pipelines assumed present.
+// Test hook: the shape this dispatch would use.
 extern "C" uint32_t imparo_metal_q8_pick_shape(uint32_t n_tok, uint32_t n_in) {
-    return q8_geometry(n_tok, n_in, true).shape;
+    return q8_geometry(n_tok, n_in).shape;
 }
 
 // `w_off2` of a plain projection. THE GATED PAIR passes the up tensor's offset instead,
@@ -5194,9 +6941,175 @@ extern "C" uint32_t imparo_metal_q8_pick_shape(uint32_t n_tok, uint32_t n_in) {
 // and bind the second offset at buffer 10 (imparo.metal, "THE GATED PAIR").
 constexpr uint64_t NO_PAIR = ~0ull;
 
-// Q8_0 has its own dispatch: three routes, its own grid and threadgroup sizing, and a
-// 64-bit weight offset. Returns false when nothing was encoded, so the caller logs the
-// reason once instead of faulting inside the driver on a nil pipeline.
+// THE ONE-ROW GEOMETRY of the Q8 decode GEMV. A lane's first K block is sgid * 8 + lane / 4 in the
+// row-major kernel and sgid * 2 + lane / 16 in the tile-major one, so simdgroup ceil(blocks / 8)
+// (row-major) or ceil(blocks / 2) (tile-major) and every one after it read nothing: each adds 32
+// threads, a barrier partner and a +0.0 partial. A DSpark drafter's Markov projection has 256
+// inputs, 8 K blocks: simdgroup 0 holds them all, and the row-major seat of 4 ran three idle
+// simdgroups per threadgroup, 0.78 ms per projection against 0.26 ms with one. A row takes the
+// simdgroups its blocks need, at most the tuned seat. No row's bits move: the simdgroups this
+// drops added only +0.0 to its sum (docs/evidence/dspark/2026-09-15-step4-one-row-geometry-lfm25.md).
+// IMPARO_Q8_ONE_ROW=seat is a route probe, like IMPARO_GATED_PAIR: the seat for every row.
+static uint32_t q8_one_row_sgs(bool tm, uint32_t n_in) {
+    static int seat_only = -1;
+    if (seat_only < 0) {
+        const char * e = getenv("IMPARO_Q8_ONE_ROW");
+        seat_only = (e != nullptr && strcmp(e, "seat") == 0) ? 1 : 0;
+    }
+    const uint32_t seat = tm ? g_q8_tm_decode_sgs : g_q8_decode_sgs;
+    if (seat_only == 1) { return seat; }
+    const uint32_t starts = tm ? 2u : 8u;
+    return std::min(seat, (n_in / Q8_BLOCK_ELEMENTS + starts - 1u) / starts);
+}
+
+// Simdgroups of a rows-matmul threadgroup: the tile-major GEMV's seat, and no more than the row
+// has K blocks, since each simdgroup takes one block per step.
+static uint32_t q8_rows_mma_sgs(uint32_t n_in) {
+    return std::max(1u, std::min(g_q8_tm_decode_sgs, n_in / Q8_BLOCK_ELEMENTS));
+}
+// The Q4_0 form's: IMPARO_Q4_RM_SGS (a probe, 1..32) or 8, capped the same way.
+static uint32_t q4_rows_mma_sgs(uint32_t n_in) {
+    static uint32_t seat = 0u;
+    if (seat == 0u) {
+        const char * e = getenv("IMPARO_Q4_RM_SGS");
+        const int v = e != nullptr ? atoi(e) : 0;
+        seat = (v >= 1 && v <= 32) ? (uint32_t)v : 8u;
+    }
+    return std::max(1u, std::min(seat, n_in / 32u));
+}
+// Its unit tiles per threadgroup: 2 where the rows divide into pairs of tiles, else 1.
+// IMPARO_Q4_RM_TILES (1, 2 or 4) overrides it for a measurement. Measured on E4B (M3 Pro,
+// co-batched step ms, one run each): 4 rows 30.1 at one tile, 28.0 at two, 28.6 at four; 8 rows
+// 33.0, 30.6, 31.2 (docs/evidence/cobatch/2026-09-19-q4-rows-matmul.md).
+static uint32_t q4_rows_mma_tiles(uint32_t n_out) {
+    static uint32_t want = 0u;
+    if (want == 0u) {
+        const char * e = getenv("IMPARO_Q4_RM_TILES");
+        const int v = e != nullptr ? atoi(e) : 2;
+        want = (v == 1 || v == 2 || v == 4) ? (uint32_t)v : 2u;
+    }
+    for (uint32_t t = want; t > 1u; t /= 2u) {
+        if (n_out % (t * Q8_TM_UNIT_ROWS_HOST) == 0u) { return t; }
+    }
+    return 1u;
+}
+
+// The decode-rows GEMV for 1 << tok_log2 rows (1, 2 or 3), built on first use: a process that
+// never co-batches builds none. The same constants as the one-row pipeline it widens --
+// the epilogue stamp, rows per threadgroup (1 for the tile-major unit, as at init), the layout --
+// plus the row count at index 28.
+static id<MTLComputePipelineState> q8mv_tok_pipe(bool tm, uint32_t rows_log2, uint32_t tok_log2) {
+    if (tok_log2 < 1u || tok_log2 > 3u || rows_log2 > 2u) { return nil; }
+    id<MTLComputePipelineState> have = tm ? g.p_q8mv_tok_tm[tok_log2 - 1u]
+                                          : g.p_q8mv_tok_rows[rows_log2][tok_log2 - 1u];
+    if (have != nil || g.lib == nil) { return have; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    stamp_epi_act(cv);
+    const uint32_t rows = tm ? 1u : 1u << rows_log2;
+    [cv setConstantValue:&rows type:MTLDataTypeUInt atIndex:6];
+    const uint32_t toks = 1u << tok_log2;
+    [cv setConstantValue:&toks type:MTLDataTypeUInt atIndex:28];
+    if (tm) {
+        const bool on = true;
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:15];
+    }
+    NSError * e = nil;
+    id<MTLFunction> f = [g.lib newFunctionWithName:@"imparo_q8_0_gemv" constantValues:cv error:&e];
+    if (f == nil) { NSLog(@"imparo metal: decode-rows GEMV function: %@", e); return nil; }
+    id<MTLComputePipelineState> ps = [g.device newComputePipelineStateWithFunction:f error:&e];
+    if (ps == nil) { NSLog(@"imparo metal: decode-rows GEMV pipeline: %@", e); return nil; }
+    if (getenv("IMPARO_PIPE_LOG") != NULL) {
+        NSLog(@"imparo metal pipe: imparo_q8_0_gemv tm=%d rows=%u toks=%u max_threads=%lu",
+              (int)tm, rows, toks, (unsigned long)[ps maxTotalThreadsPerThreadgroup]);
+    }
+    if (tm) { g.p_q8mv_tok_tm[tok_log2 - 1u] = ps; }
+    else    { g.p_q8mv_tok_rows[rows_log2][tok_log2 - 1u] = ps; }
+    return ps;
+}
+
+// The rows matmul for `frags` token columns of 8 (1..RM_MAX_FRAGS_HOST), reading float
+// activations or their half mirror, built on first use: a process that never co-batches builds
+// none.
+static id<MTLComputePipelineState> q8_rows_mma_pipe(uint32_t frags, bool half_x,
+                                                    bool q4 = false, uint32_t tiles = 1u) {
+    if (frags < 1u || frags > RM_MAX_FRAGS_HOST || (tiles != 1u && tiles != 2u && tiles != 4u)) {
+        return nil;
+    }
+    if (!q4 && tiles != 1u) { return nil; }
+    id<MTLComputePipelineState> __strong & slot =
+        q4 ? g.p_q4_rows_mma[frags - 1u][half_x ? 1 : 0][tiles == 4u ? 2u : tiles - 1u]
+           : g.p_q8_rows_mma[frags - 1u][half_x ? 1 : 0];
+    if (slot != nil || g.lib == nil) { return slot; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    stamp_epi_act(cv);
+    [cv setConstantValue:&frags type:MTLDataTypeUInt atIndex:31];
+    [cv setConstantValue:&half_x type:MTLDataTypeBool atIndex:36];
+    if (q4) { [cv setConstantValue:&q4 type:MTLDataTypeBool atIndex:37]; }
+    if (tiles > 1u) { [cv setConstantValue:&tiles type:MTLDataTypeUInt atIndex:38]; }
+    // Diagnostic only (the kernel's RM_SKIP): read once, so a process builds one kind.
+    static int skip = -1;
+    if (skip < 0) { const char * e = getenv("IMPARO_RM_SKIP"); skip = e != nullptr ? atoi(e) : 0; }
+    if (skip != 0) {
+        const uint32_t sk = (uint32_t)skip;
+        [cv setConstantValue:&sk type:MTLDataTypeUInt atIndex:34];
+    }
+    NSError * e = nil;
+    id<MTLFunction> f = [g.lib newFunctionWithName:@"imparo_q8_tm_rows_mma" constantValues:cv
+                                             error:&e];
+    if (f == nil) { NSLog(@"imparo metal: rows matmul function: %@", e); return nil; }
+    id<MTLComputePipelineState> ps = [g.device newComputePipelineStateWithFunction:f error:&e];
+    if (ps == nil) { NSLog(@"imparo metal: rows matmul pipeline: %@", e); return nil; }
+    if (getenv("IMPARO_PIPE_LOG") != NULL) {
+        NSLog(@"imparo metal pipe: imparo_q8_tm_rows_mma frags=%u half_x=%d q4=%d tiles=%u "
+              @"max_threads=%lu", frags, (int)half_x, (int)q4, tiles,
+              (unsigned long)[ps maxTotalThreadsPerThreadgroup]);
+    }
+    slot = ps;
+    return ps;
+}
+
+// The Q4_0 decode-rows GEMV: the one-row pipeline's constants as init builds them (lanes per row
+// at 0, rows per lane at 2), the row count at 28 and the token split at 29. Built on first use.
+static id<MTLComputePipelineState> q4mv_tok_pipe(uint32_t lanes_log2, uint32_t nr_log2,
+                                                 uint32_t split_log2, uint32_t tok_log2) {
+    if (lanes_log2 > 5u || nr_log2 > 3u || split_log2 > 3u || tok_log2 < 1u || tok_log2 > 3u) {
+        return nil;
+    }
+    id<MTLComputePipelineState> have = g.p_q4mv_tok[lanes_log2][nr_log2][split_log2][tok_log2 - 1u];
+    if (have != nil || g.lib == nil) { return have; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    const uint32_t lanes = 1u << lanes_log2, nr0 = 1u << nr_log2;
+    const uint32_t split = 1u << split_log2, toks = 1u << tok_log2;
+    [cv setConstantValue:&lanes type:MTLDataTypeUInt atIndex:0];
+    [cv setConstantValue:&nr0 type:MTLDataTypeUInt atIndex:2];
+    [cv setConstantValue:&toks type:MTLDataTypeUInt atIndex:28];
+    [cv setConstantValue:&split type:MTLDataTypeUInt atIndex:29];
+    NSError * e = nil;
+    id<MTLFunction> f = [g.lib newFunctionWithName:@"imparo_q4_0_matmat" constantValues:cv error:&e];
+    if (f == nil) { NSLog(@"imparo metal: Q4_0 decode-rows function: %@", e); return nil; }
+    id<MTLComputePipelineState> ps = [g.device newComputePipelineStateWithFunction:f error:&e];
+    if (ps == nil) { NSLog(@"imparo metal: Q4_0 decode-rows pipeline: %@", e); return nil; }
+    if (getenv("IMPARO_PIPE_LOG") != NULL) {
+        NSLog(@"imparo metal pipe: imparo_q4_0_matmat lanes=%u nr0=%u split=%u toks=%u "
+              @"max_threads=%lu", lanes, nr0, split, toks,
+              (unsigned long)[ps maxTotalThreadsPerThreadgroup]);
+    }
+    g.p_q4mv_tok[lanes_log2][nr_log2][split_log2][tok_log2 - 1u] = ps;
+    return ps;
+}
+
+// Whether the half-activation mirror holds `rows` rows of `n_in` halves. The GEMMs' half routes
+// convert (or read) whole token tiles of it, so a route that checked only that the mirror exists
+// wrote past the end of a smaller one, into whatever buffer followed it. A mirror too small for
+// the padded rows turns the half route down (tests/decode_rows.rs, check_xh_guard).
+static inline bool xh_holds(uint64_t rows, uint32_t n_in) {
+    return g.bufs[B_XH] != nil && rows * n_in * 2ull <= g.sizes[B_XH];
+}
+
+// Q8_0 has its own dispatch: its routes (the GEMM, the rows matmul, the one-row and decode-rows
+// GEMVs, the token tile), its own grid and threadgroup sizing, and a 64-bit weight offset.
+// Returns false when nothing was encoded, so the caller logs the reason once instead of
+// faulting inside the driver on a nil pipeline.
 static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, uint32_t n_out,
                       uint32_t src, uint32_t dst, uint32_t n_tok, uint32_t src_row) {
     if (n_in == 0u || n_out == 0u || n_tok == 0u) { return false; }
@@ -5209,13 +7122,33 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
         g_refused += 1;
         return false;
     }
-    const bool use_gemm = n_tok > g_gemv_max_tok;   // one row is the decode GEMV
+    // Independent decode rows on the GEMV (g_decode_rows: always on the exact route, up to the
+    // measured row count on the fast one). A gated pair falls back below to its two dispatches,
+    // as a one-row decode does.
+    const bool rows_gemv = decode_rows_gemv(n_tok, g_q8_rows_gemv_max);
+    const uint32_t tok_log2 = n_tok <= 2u ? 1u : (n_tok <= 4u ? 2u : 3u);
+    // The fast route's rows past the GEMV's, up to the rows matmul's own count (tile-major only).
+    // A gated pair is refused below on this route, so the caller issues the gate and up
+    // projections here and multiplies them: the FFN stays in float, where the pair's GEMM
+    // would hand the down projection a half mirror of G and nothing else.
+    const bool rows_mma = tm && decode_rows_route() == 2u && !rows_gemv
+                       && n_tok >= 2u && n_tok <= g_q8_tm_rows_mma_max
+                       && (n_out % Q8_TM_UNIT_ROWS_HOST) == 0u;
+    const uint32_t mma_frags = (n_tok + 7u) / 8u;
+    // Floats first; the half mirror only when a mirror-mode producer left the floats stale.
+    const bool mma_half = rows_mma && src < 64u && ((g_float_stale >> src) & 1ull) != 0ull;
+    if (mma_half && !(g_xh_src == src && g_xh_elems >= (uint64_t)n_tok * n_in)) {
+        // Stale floats and no mirror covering the rows: nothing holds the activations.
+        g_refused += 1;
+        NSLog(@"imparo metal: rows matmul source %u has stale floats and no current mirror", src);
+        return false;
+    }
+    const bool use_gemm = n_tok > g_gemv_max_tok && !rows_gemv && !rows_mma;   // one row is the decode GEMV
 
-    // One call, no decisions inline: `q8_geometry` owns the pair's choice AND the K-chunk
+    // One call, no decisions inline: `q8_geometry` owns the tile rule AND the K-chunk
     // legality fallback, and `imparo_metal_q8_pick_shape` lets a test assert the rule with
     // no GPU. Everything below only consumes the geometry.
-    const Q8Geometry geo =
-        q8_geometry(n_tok, n_in, use_gemm && g.p_stgemm[g_st_gemm_large_shape] != nil);
+    const Q8Geometry geo = q8_geometry(n_tok, n_in);
     const uint32_t shape = geo.shape;
     const uint32_t rows = geo.rows, toks = geo.toks, nsg = geo.nsg;
     if (geo.fell_back) {
@@ -5261,7 +7194,11 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
     // is encoded, so a refusal has encoded nothing and the caller's two dispatches run.
     id<MTLComputePipelineState> gated_pipe = rt_q8 ? g.p_rt8_gh[rt_i]
                                            : (tm ? g.p_stgemm_gh_tm[shape] : g.p_stgemm_gh[shape]);
-    if (gated && !(use_gemm && g_half_a && n_tok >= HALF_A_MIN && g.bufs[B_XH] != nil
+    // The mirror covers whole token tiles of WHICHEVER kernel reads it.
+    const uint32_t toks_q8 = rt_q8 ? rt_toks : ST_GEMM_SHAPES[shape][1];
+    const uint32_t padded  = (n_tok + toks_q8 - 1u) / toks_q8 * toks_q8;
+    const bool xh_fits = xh_holds(padded, n_in);
+    if (gated && !(use_gemm && g_half_a && n_tok >= HALF_A_MIN && xh_fits
                    && g_epilogue != 0u && gated_pipe != nil)) {
         return false;
     }
@@ -5269,11 +7206,7 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
         : (rt_q8 ? g.p_rt8_h[rt_i]
                  : (full ? (tm ? g.p_stgemm_full_h_tm[shape] : g.p_stgemm_full_h[shape])
                          : (tm ? g.p_stgemm_h_tm[shape] : g.p_stgemm_h[shape])));
-    if (use_gemm && g_half_a && n_tok >= HALF_A_MIN
-        && half_pipe != nil && g.bufs[B_XH] != nil) {
-        // The mirror covers whole token tiles of WHICHEVER kernel reads it.
-        const uint32_t toks_q8 = rt_q8 ? rt_toks : ST_GEMM_SHAPES[shape][1];
-        const uint32_t padded  = (n_tok + toks_q8 - 1u) / toks_q8 * toks_q8;
+    if (use_gemm && g_half_a && n_tok >= HALF_A_MIN && half_pipe != nil && xh_fits) {
         const uint64_t need    = (uint64_t)padded * n_in;
         const bool mirrored = g_xh_src == src
                            && g_xh_elems >= (uint64_t)n_tok * n_in;
@@ -5323,8 +7256,9 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
     if (rt_q8) {
         // rt_gemm<Q8>: the register-tiled dispatch, bound exactly as the Q4 rt path binds
         // it (same entry signature), on this route's operand and mirror decisions.
-        id<MTLComputePipelineState> rt_sel =
-            gated ? g.p_rt8_gh[rt_i] : (q8_half ? g.p_rt8_h[rt_i] : g.p_rt8[rt_i]);
+        id<MTLComputePipelineState> rt_sel = rt_for_rows(
+            gated ? g.p_rt8_gh[rt_i] : (q8_half ? g.p_rt8_h[rt_i] : g.p_rt8[rt_i]), n_out);
+        if (rt_sel == nil) { g_refused += 1; return false; }
         const uint32_t rt_thr = RT_SHAPES[rt_i][2] * RT_SHAPES[rt_i][3] * 32u;
         const NSUInteger rt_k = 64;   // must match the kernel
         const NSUInteger stage_f = (NSUInteger)rt_k * (rt_rows + 2u) / 2u;
@@ -5375,7 +7309,9 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
               threadsPerThreadgroup:MTLSizeMake(rt_thr, 1, 1)];
         if (g_prof) { prof_end(); }
         if (rt_epi_half != 0u) {
+            // rt_gemm's epilogue writes the mirror INSTEAD of the floats, gated or not.
             g_xh_src = dst; g_xh_elems = (uint64_t)n_tok * n_out; g_xh_buf = B_XH2;
+            g_float_stale |= hb(dst);
         }
         return true;
     }
@@ -5401,12 +7337,22 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
             sel = full ? (tm ? g.p_stgemm_full_tm[shape] : g.p_stgemm_full[shape])
                        : (tm ? g.p_stgemm_tm[shape] : g.p_stgemm[shape]);
         }
+    } else if (rows_mma) {
+        sel = q8_rows_mma_pipe(mma_frags, mma_half);
+        if (mma_half) { q8_src_bind = g_xh_buf; }
     } else if (n_tok == 1u) {
         sel = tm ? g.p_q8mv_tm : g.p_q8mv_rows[g_q8_decode_rows_log2];
+    } else if (rows_gemv) {
+        sel = q8mv_tok_pipe(tm, g_q8_decode_rows_log2, tok_log2);
     } else {
         sel = tm ? g.p_q8mm_tile_tm[g_q8_token_tile_log2] : g.p_q8mm_tile[g_q8_token_tile_log2];
     }
     if (sel == nil) {
+        // COUNTED, not only logged. A projection that never ran leaves the previous
+        // contents of its output in place: the run continues and its numbers are wrong,
+        // which is exactly how a seat naming a shape init had not built survived a whole
+        // A/B. The log line names the shape; this makes the engine's refusal count say it.
+        g_refused += 1;
         NSLog(@"imparo metal: nil Q8 pipeline (n_tok=%u gemm=%d shape=%u full=%d "
               @"rows_log2=%u tile_log2=%u)", n_tok, (int)use_gemm, shape, (int)full,
               g_q8_decode_rows_log2, g_q8_token_tile_log2);
@@ -5468,19 +7414,25 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
                           + ((sel != nil && sel == g.p_stgemm_da[shape])
                                  ? 0u : toks * ST_GEMM_SHAPES[shape][3]))
                           * sizeof(uint16_t),
-                      (NSUInteger)rows * (toks / 2u) * sizeof(float)),
+                      (NSUInteger)rows
+                          * (toks % 16u == 0u ? toks / 2u : toks) * sizeof(float)),
                   grid_tx ? (n_tok + toks - 1) / toks : (vrows + rows - 1) / rows,
                   grid_tx ? (vrows + rows - 1) / rows : (n_tok + toks - 1) / toks,
                   n_out, n_tok, (int)gated);
-        } else if (n_tok == 1u) {
-            NSLog(@"imparo metal q8: gemv rows=%u sgs=%u n_out=%u",
-                  1u << g_q8_decode_rows_log2, g_q8_decode_sgs, n_out);
+        } else if (rows_mma) {
+            NSLog(@"imparo metal q8: rows mma frags=%u half_x=%d sgs=%u n_in=%u n_out=%u n_tok=%u",
+                  mma_frags, (int)mma_half, q8_rows_mma_sgs(n_in), n_in, n_out, n_tok);
+        } else if (n_tok == 1u || rows_gemv) {
+            NSLog(@"imparo metal q8: gemv rows=%u sgs=%u n_in=%u n_out=%u n_tok=%u",
+                  tm ? 8u : 1u << g_q8_decode_rows_log2, q8_one_row_sgs(tm, n_in), n_in, n_out,
+                  n_tok);
         } else {
             NSLog(@"imparo metal q8: tile tile=%u sgs=%u n_out=%u n_tok=%u",
                   1u << g_q8_token_tile_log2, g_q8_batch_sgs, n_out, n_tok);
         }
     }
     if (use_gemm) {
+        route_count(MR_Q8_GEMM);
         // Staged operands are halves: K x ROWS weights plus TOKENS x K activations. The
         // masked write-back reuses the same block as a TOKENS x ROWS float tile, so size
         // for whichever is larger -- they overlap in time, never in use.
@@ -5497,7 +7449,8 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
         // staged operands are what sets the allocation again. Keep this in step with
         // WB_PASSES in st_gemm -- a smaller allocation than the kernel writes is
         // out-of-bounds threadgroup memory, not a slow kernel.
-        const NSUInteger out_bytes = (NSUInteger)rows * (toks / 2u) * sizeof(float);
+        const NSUInteger out_bytes =
+            (NSUInteger)rows * (toks % 16u == 0u ? toks / 2u : toks) * sizeof(float);
         [g.enc setThreadgroupMemoryLength:std::max(stage_bytes, out_bytes) atIndex:0];
         g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MATMAT_PREFILL); }
         const NSUInteger row_groups = (vrows + rows - 1) / rows;
@@ -5508,31 +7461,56 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
         if (g_prof) { prof_end(); }
         if (q8_epi_half != 0u) {
             // The output's mirror is complete, so the next GEMM off this buffer reads it
-            // instead of converting. Elems counts the FULL batch.
+            // instead of converting. Elems counts the FULL batch. The gated pair writes ONLY
+            // the mirror; the plain epilogue writes the floats as well.
             g_xh_src = dst; g_xh_elems = (uint64_t)n_tok * n_out; g_xh_buf = B_XH2;
+            if (gated) { g_float_stale |= hb(dst); }
         }
         return true;
     }
-    if (n_tok == 1u) {
+    if (rows_mma) {
+        // One threadgroup per unit tile; its simdgroups split the K blocks and add their sums in
+        // order through threadgroup memory (64 floats per 8 token columns).
+        const uint32_t sgs = q8_rows_mma_sgs(n_in);
+        [g.enc setThreadgroupMemoryLength:(NSUInteger)sgs * mma_frags * 64u * sizeof(float)
+                                  atIndex:0];
+        g_disp_seq += 1; g_rows_mma_dispatches += 1; route_count(MR_Q8_ROWS_MMA);
+        if (g_prof) { g_prof_disp += 1; prof_begin(mm_decode_cat(n_out, tm ? 3u : 2u), w_bytes(tm ? 3u : 2u, n_in, n_out)); }
+        [g.enc dispatchThreadgroups:MTLSizeMake(n_out / Q8_TM_UNIT_ROWS_HOST, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(sgs * 32u, 1, 1)];
+        if (g_prof) { prof_end(); }
+        return true;
+    }
+    if (n_tok == 1u || rows_gemv) {
         // Tile-major: the unit fixes 8 rows per threadgroup (two per lane, the row-major
         // kernel's reuse of each activation load); only the simdgroup count is a knob,
         // and it is the TM kernel's own (q8_tm_decode_sgs), not the row-major one's --
-        // the two layouts measured different winners (see the knob's comment).
+        // the two layouts measured different winners (see the knob's comment). Either
+        // count is capped by the simdgroups the row's width can use (q8_one_row_sgs).
+        // Decode rows take the SAME simdgroups: they decide a row's K split, so a different
+        // count would move its bits.
         const uint32_t rm_rows  = 1u << g_q8_decode_rows_log2;
         const uint32_t dec_rows = tm ? 8u : rm_rows;
-        const uint32_t dec_sgs  = tm ? g_q8_tm_decode_sgs : g_q8_decode_sgs;
-        // One float per (simdgroup, row) for the cross-simdgroup reduction.
-        [g.enc setThreadgroupMemoryLength:(NSUInteger)dec_rows * dec_sgs
+        const uint32_t dec_sgs  = q8_one_row_sgs(tm, n_in);
+        const uint32_t dec_toks = rows_gemv ? 1u << tok_log2 : 1u;
+        route_count(rows_gemv ? MR_Q8_GEMV_ROWS : MR_Q8_GEMV);
+        // One float per (simdgroup, row, token) for the cross-simdgroup reduction.
+        [g.enc setThreadgroupMemoryLength:(NSUInteger)dec_rows * dec_sgs * dec_toks
                                          * sizeof(float) atIndex:0];
-        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MATMAT_DECODE); }
+        g_disp_seq += 1;
+        if (g_prof) {
+            g_prof_disp += 1;
+            prof_begin(n_in <= 512u && n_out >= 64u * n_in ? PC_MATMAT_RANK : PC_MATMAT_DECODE);
+        }
         [g.enc dispatchThreadgroups:MTLSizeMake((n_out + dec_rows - 1) / dec_rows, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(dec_sgs * 32u, 1, 1)];
         if (g_prof) { prof_end(); }
         return true;
     }
     // Narrow batch: one simdgroup per output row, one threadgroup column per token tile.
+    route_count(MR_Q8_TILE);
     const uint32_t tile = 1u << g_q8_token_tile_log2;
-    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MATMAT_DECODE); }
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(mm_decode_cat(n_out, tm ? 3u : 2u), w_bytes(tm ? 3u : 2u, n_in, n_out)); }
     [g.enc dispatchThreadgroups:MTLSizeMake((n_out + g_q8_batch_sgs - 1) / g_q8_batch_sgs,
                                            (n_tok + tile - 1) / tile, 1)
           threadsPerThreadgroup:MTLSizeMake(g_q8_batch_sgs * 32u, 1, 1)];
@@ -5543,7 +7521,15 @@ static bool q8_matmat(bool tm, uint64_t w_off, uint64_t w_off2, uint32_t n_in, u
 // Defined with the weight-kind table further down (the load-time repack section); declared
 // here because matmat is their first user and C++ reads in order.
 static id<MTLComputePipelineState> gather_pipeline_for_fmt(uint32_t wfmt);
-enum { RT_PLAIN = 0, RT_HALF = 1, RT_GATED_HALF = 2 };
+enum { RT_PLAIN = 0, RT_HALF = 1, RT_GATED_HALF = 2, RT_HALF_RESID = 3 };
+// Set only inside imparo_metal_matmat_resid: the dispatch adds into dst (RT_HALF_RESID). Every
+// matmat_impl route that is not the tile-major register-tiled GEMM on the half mirror refuses
+// while it is set, so no other kernel ever sees the request.
+static bool g_mm_resid = false;
+// The plain family's half-mirror entry point for `tile` (a wide RT_SHAPES index or a narrow
+// tile) compiled with the residual-add store (constant 60) -- the constants its init build
+// stamps, plus that one. Built on first use and kept.
+static id<MTLComputePipelineState> rt_plain_resid(uint32_t tile);
 static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowmajor,
                                                        uint32_t variant, uint32_t tile);
 // The narrow tile the nb8_shape knob selects, as a pipeline-cache index.
@@ -5553,12 +7539,276 @@ static id<MTLComputePipelineState> gemv_pipeline_for_fmt(uint32_t wfmt, bool row
 // `wkind` is the weight-type -> kernel table index (0 = F32, 1 = Q4_0, 2 = Q8_0).
 // Load-time validation on the Rust side guarantees no other value arrives; the guard
 // below is defense in depth, not a path.
+// The block GEMV's SIMDGROUPS PER THREADGROUP, for the one-row kernel and its rows form. 8 was
+// inherited from imparo_q8_0_gemv's shape, and the first ranking in this kernel's own regime kept
+// it on one model's numbers. FOUR IS THE SEAT, ranked on all three, 128-160 decode steps, every
+// arm warmed, the arm order rotated each round, minimum of three rounds, ms/token:
+//
+//   LFM2.5-8B-A1B Q4_K_M   10.352 -> 10.309   -0.56%   (a second sweep: 10.333 -> 10.321)
+//   gemma-4-E4B  Q4_K_XL   23.107 -> 23.029   -0.34%
+//   Qwen3.8-27B  Q4_K_S   115.675 -> 115.613  -0.05%   (a tie, and not the loss 8 was kept for)
+//
+// The step hash is unchanged in every arm: `sgs` only repacks the same simdgroups into more
+// threadgroups, and each row's dot product stays inside one simdgroup either way.
+//
+// IT IS THE THREADGROUP COUNT, NOT THE PARALLELISM. Every arm of the ladder runs the same total
+// simdgroups, so what moves is how many threadgroups the scheduler has to spread over eighteen
+// cores: on LFM2.5 a 2048-row projection is 128 threadgroups at 8 and 256 at 4. The other axis
+// says the same thing from the other side -- blk_gemv_nr 1, which DOUBLES the simdgroups and
+// halves each one's work, loses 3.3% at both packings.
+//
+//   sgs   threadgroups (2048 rows)   LFM2.5 delta
+//    16          64                   +0.42%
+//     8         128                    0.00%   (was the seat)
+//     4         256                   -0.56%
+//     2         512                   -0.45%
+//
+// IMPARO_BLK_GEMV_SGS re-runs that A/B; a value outside the ladder falls back to the seat rather
+// than dispatching a shape nothing built.
+static uint32_t blk_gemv_sgs() {
+    static uint32_t sgs_v = 0u;
+    if (sgs_v == 0u) {
+        const char * e = getenv("IMPARO_BLK_GEMV_SGS");
+        const uint32_t w = e ? (uint32_t)atoi(e) : 4u;
+        sgs_v = (w == 2u || w == 4u || w == 8u || w == 16u || w == 32u) ? w : 4u;
+    }
+    return sgs_v;
+}
+static id<MTLComputePipelineState> blk_rows_pipeline_for_fmt(uint32_t wfmt, bool rowmajor,
+                                                             uint32_t form_log2);
+static id<MTLComputePipelineState> blk_rows_mma_pipeline_for_fmt(uint32_t wfmt, bool rowmajor,
+                                                                uint32_t tiles, bool xhalf,
+                                                                uint32_t frags = 1u);
+
+// The matrix-unit rows kernel's simdgroups (each takes every nsg-th sub-block) and 8-row units a
+// threadgroup. Measured on Qwen3.8-27B (M3 Pro, projections a step at 4 rows): 8 simdgroups 128.3
+// ms against 133.1 at 4 and 132.5 at 16; two units 143.4 against 153.8 at one and 158.1 at four
+// (both before the fetch's word loads). IMPARO_BLK_MMA_SGS (1..32) and IMPARO_BLK_MMA_TILES (1, 2
+// or 4) override them for a measurement. The simdgroups are capped by the row's sub-blocks.
+static uint32_t blk_mma_sgs(uint32_t n_in) {
+    static uint32_t seat = 0u;
+    if (seat == 0u) {
+        const char * e = getenv("IMPARO_BLK_MMA_SGS");
+        const int v = e != nullptr ? atoi(e) : 0;
+        seat = (v >= 1 && v <= 32) ? (uint32_t)v : 8u;
+    }
+    return std::max(1u, std::min(seat, n_in / 32u));
+}
+static uint32_t blk_mma_tiles() {
+    static uint32_t t = 0u;
+    if (t == 0u) {
+        const char * e = getenv("IMPARO_BLK_MMA_TILES");
+        const int v = e != nullptr ? atoi(e) : 2;
+        t = (v == 1 || v == 2 || v == 4) ? (uint32_t)v : 2u;
+    }
+    return t;
+}
+
+// The block formats' rows on the matrix unit for n_tok (2..8) rows starting at activation row
+// src_row, its outputs dst_off bytes into dst: blk_mma_tiles() 8-row units a threadgroup, their
+// simdgroups splitting the sub-blocks. False when its pipeline did not build.
+static bool blk_rows_mma_encode(uint32_t wkind, uint32_t wf, uint64_t w_off, uint32_t n_in,
+                                uint32_t n_out, uint32_t src, uint32_t dst, uint32_t n_tok,
+                                uint32_t src_row, uint64_t dst_off) {
+    const uint32_t tiles = blk_mma_tiles();
+    // 9..16 rows: two 8-row token fragments in one dispatch, each weight fragment decoded once
+    // for both (imparo_blk_rows_mma_t2), float activations.
+    const uint32_t frags = n_tok > 8u ? 2u : 1u;
+    // THE ACTIVATIONS FROM THE HALF MIRROR when a producer left one covering this step's rows:
+    // the norms dual-write it for the GEMM, and reading it here costs 1.2% less a step on the 27B
+    // (2 / 4 / 8 rows 131.7 / 140.1 / 156.6 -> 130.1 / 138.4 / 154.9 ms in the forward).
+    // OFF unless asked (IMPARO_BLK_MMA_XHALF=1): the mirror ROUNDS the activations, and these
+    // kernels hold float accuracy by the user's decision. With it on, a co-batched request's top
+    // ten logits move up to 0.66 from the same request decoded alone, against 0.01 in float (32
+    // steps, 4 rows; the top pick did not change). The exact route reads floats either way.
+    static int xh_want = -1;
+    if (xh_want < 0) { const char * xe = getenv("IMPARO_BLK_MMA_XHALF"); xh_want = (xe && xe[0] == '1') ? 1 : 0; }
+    // The rows this dispatch reads start at src_row, not at row 0 as every other mirror consumer
+    // does, so the mirror must cover src_row + n_tok rows -- not n_tok.
+    const bool xhalf = frags == 1u && xh_want == 1 && g_half_a != 0u && g_xh_buf < B_COUNT
+                    && g.bufs[g_xh_buf] != nil && g_xh_src == src
+                    && g_xh_elems >= (uint64_t)(src_row + n_tok) * n_in;
+    id<MTLComputePipelineState> ps =
+        blk_rows_mma_pipeline_for_fmt(wf, wfmt_is_rowmajor(wkind), tiles, xhalf, frags);
+    if (ps == nil) { return false; }
+    const uint32_t sgs = blk_mma_sgs(n_in);
+    haz(hb(src) | (xhalf ? hb(g_xh_buf) : 0u), hb(dst));
+    [g.enc setComputePipelineState:ps];
+    const uint64_t wl = wbind(g.enc, w_off, 0);
+    [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:1];
+    // The mirror at its own index, and only in the half kernel: the float entry point has no
+    // argument 14.
+    if (xhalf) { [g.enc setBuffer:g.bufs[g_xh_buf] offset:g.buf_off[g_xh_buf] atIndex:14]; }
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] + dst_off atIndex:2];
+    [g.enc setBytes:&wl length:8 atIndex:3];
+    [g.enc setBytes:&n_in length:4 atIndex:4];
+    [g.enc setBytes:&n_out length:4 atIndex:5];
+    [g.enc setBytes:&n_tok length:4 atIndex:6];
+    [g.enc setBytes:&src_row length:4 atIndex:7];
+    [g.enc setBytes:&g_epilogue length:4 atIndex:13];
+    // The simdgroups' sums, 64 floats a unit and token fragment, added in simdgroup order.
+    [g.enc setThreadgroupMemoryLength:(NSUInteger)sgs * tiles * frags * 64u * sizeof(float)
+                              atIndex:0];
+    // Counted apart so a run says which activations the rows took: the kernel line of the
+    // co-batch gate and the bench print it, and a route that never ran cannot be measured.
+    g_disp_seq += 1; route_count(xhalf ? MR_BLK_ROWS_MMA_H : MR_BLK_ROWS_MMA);
+    if (g_prof) { g_prof_disp += 1; prof_begin(mm_decode_cat(n_out, wkind), w_bytes(wkind, n_in, n_out)); }
+    const uint32_t rows_per_tg = 8u * tiles;
+    [g.enc dispatchThreadgroups:MTLSizeMake((n_out + rows_per_tg - 1u) / rows_per_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32u * sgs, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return true;
+}
+
+// The block formats' decode-rows GEMV for n_tok (2..8) rows starting at activation row src_row,
+// its outputs dst_off bytes into dst. False when its pipeline did not build.
+static bool blk_rows_gemv_encode(uint32_t wkind, uint32_t wf, uint64_t w_off, uint32_t n_in,
+                                 uint32_t n_out, uint32_t src, uint32_t dst, uint32_t n_tok,
+                                 uint32_t src_row, uint64_t dst_off) {
+    const uint32_t form_log2 = n_tok <= 2u ? 1u : (n_tok <= 4u ? 2u : 3u);
+    id<MTLComputePipelineState> ps = blk_rows_pipeline_for_fmt(wf, wfmt_is_rowmajor(wkind), form_log2);
+    if (ps == nil) { return false; }
+    haz(hb(src), hb(dst));
+    [g.enc setComputePipelineState:ps];
+    const uint64_t wl = wbind(g.enc, w_off, 0);
+    [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:1];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] + dst_off atIndex:2];
+    [g.enc setBytes:&wl length:8 atIndex:3];
+    [g.enc setBytes:&n_in length:4 atIndex:4];
+    [g.enc setBytes:&n_out length:4 atIndex:5];
+    [g.enc setBytes:&n_tok length:4 atIndex:6];
+    [g.enc setBytes:&src_row length:4 atIndex:7];
+    [g.enc setBytes:&g_epilogue length:4 atIndex:13];
+    // A threadgroup covers 32 weight rows, one a lane; its simdgroups each sum a slice of the
+    // row, and the slices' sums meet in threadgroup memory: one per (simdgroup, token of the
+    // form, lane).
+    const NSUInteger sgs = blk_gemv_sgs();
+    [g.enc setThreadgroupMemoryLength:sgs * ((NSUInteger)1u << form_log2) * 32u * sizeof(float)
+                              atIndex:0];
+    g_disp_seq += 1; g_blk_rows_dispatches += 1; route_count(MR_BLK_GEMV_ROWS);
+    if (g_prof) { g_prof_disp += 1; prof_begin(mm_decode_cat(n_out, wkind), w_bytes(wkind, n_in, n_out)); }
+    [g.enc dispatchThreadgroups:MTLSizeMake((n_out + 31u) / 32u, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32 * sgs, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return true;
+}
+
+// THE BLOCK FORMATS' ROWS PAST ONE RUN OF THE ROWS KERNELS: n_tok rows in the fewest runs of at
+// most BLK_ROWS_MAX_HOST rows, the runs as even as they can be (9 rows are 5 + 4, never 8 + 1), so
+// every run takes a rows kernel and the weights are read once a run. Past 8 rows the GEMM took
+// these before, and its padded tile is slow at a few rows: the 9-row DSpark drafter's layer
+// matmuls (LFM2.5-8B-A1B) took 5.75 ms a round on it and 3.37 on the runs. Each run takes the
+// decode-rows GEMV up to the format's crossing and the matrix-unit rows kernel above it. False
+// when a pipeline did not build.
+static bool blk_rows_runs_encode(uint32_t wkind, uint32_t wf, uint64_t w_off, uint32_t n_in,
+                                 uint32_t n_out, uint32_t src, uint32_t dst, uint32_t n_tok,
+                                 uint32_t src_row) {
+    // 9..16 rows whose run of 8 is the matrix unit's: ONE dispatch of two 8-row token fragments,
+    // each weight fragment decoded once for both (imparo_blk_rows_mma_t2).
+    if (n_tok > BLK_ROWS_MAX_HOST && n_tok <= 2u * BLK_ROWS_MAX_HOST
+        && BLK_ROWS_MAX_HOST > blk_rows_gemv_max_for(wf, n_in, n_out)
+        && BLK_ROWS_MAX_HOST <= g_blk_rows_mma_max) {
+        return blk_rows_mma_encode(wkind, wf, w_off, n_in, n_out, src, dst, n_tok, src_row, 0u);
+    }
+    const uint32_t runs = (n_tok + BLK_ROWS_MAX_HOST - 1u) / BLK_ROWS_MAX_HOST;
+    uint32_t c = 0u;
+    for (uint32_t r = 0u; r < runs; ++r) {
+        // The first n_tok % runs runs take one row more.
+        const uint32_t n = n_tok / runs + (r < n_tok % runs ? 1u : 0u);
+        const bool ok = n > blk_rows_gemv_max_for(wf, n_in, n_out) && n <= g_blk_rows_mma_max
+            ? blk_rows_mma_encode(wkind, wf, w_off, n_in, n_out, src, dst, n, src_row + c,
+                                  (uint64_t)c * n_out * 4u)
+            : blk_rows_gemv_encode(wkind, wf, w_off, n_in, n_out, src, dst, n, src_row + c,
+                                   (uint64_t)c * n_out * 4u);
+        if (!ok) { return false; }
+        c += n;
+    }
+    return true;
+}
+
+// Rows up to this many take blk_rows_runs_encode on the fast route where the GEMM has room;
+// above it the GEMM. Two runs: the widths measured (a DSpark drafter's 9-row block, verify trees
+// up to 16 rows); past them the GEMM's narrow tile is unmeasured against three or more runs.
+constexpr uint32_t BLK_ROWS_RUNS_MAX_HOST = 2u * BLK_ROWS_MAX_HOST;
+
 // One encode path for the plain projection and THE GATED PAIR (`w_off2 != NO_PAIR`).
 // Returns whether the request was handled -- encoded, or deliberately skipped by a
 // diagnostic -- and false when the caller must issue the two-dispatch form itself.
 static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_t n_in,
                         uint32_t n_out, uint32_t src, uint32_t dst,
                         uint32_t n_tok, uint32_t src_row) {
+    // THE BLOCK FORMATS' ROWS ON THE FAST ROUTE: up to this format's crossing the decode-rows
+    // GEMV (imparo_blk_gemv_rows), up to g_blk_rows_mma_max the matrix-unit rows kernel
+    // (imparo_blk_rows_mma), above both the GEMM; each weight sub-block decoded once for all the
+    // rows. The first crossing is per TENSOR when the tune file seats one and per format
+    // otherwise (blk_rows_gemv_max_for) -- the matrix unit's products
+    // cost the same per weight tile whatever rows are live, so a format short of the bandwidth
+    // wall pays them and a format at it does not. Not the exact route's: their rows differ from
+    // their lone decodes in the last bits, so the exact route keeps the one-row GEMV per row
+    // (below). Neither has a gated twin: a gated pair is refused, and the caller issues gate and
+    // up on it, as a one-row decode does.
+    const uint32_t wf = wfmt_for(wkind);
+    const bool blk_gemv_rows = wf != 0u && n_tok <= blk_rows_gemv_max_for(wf, n_in, n_out);
+    const bool blk_mma_rows = wf != 0u && !blk_gemv_rows && n_tok <= g_blk_rows_mma_max;
+    if (decode_rows_route() == 2u && n_tok >= 2u && (blk_gemv_rows || blk_mma_rows)
+        && src < B_COUNT && dst < B_COUNT) {
+        // Nor a residual matmul (`imparo_metal_matmat_resid`): these kernels store W . x, not
+        // resid + W . x, so taking one overwrote the residual. A co-batched step never folds
+        // the residual; a speculative round's verify (a prefill-shaped forward) does.
+        if (w_off2 != NO_PAIR || g_mm_resid) { return false; }
+        if (g_skip_cat == PC_MATMAT_DECODE) { return true; }
+        if (blk_gemv_rows
+                ? blk_rows_gemv_encode(wkind, wf, w_off, n_in, n_out, src, dst, n_tok,
+                                       src_row, 0u)
+                : blk_rows_mma_encode(wkind, wf, w_off, n_in, n_out, src, dst, n_tok,
+                                      src_row, 0u)) {
+            return true;
+        }
+        // No pipeline: the GEMM.
+    }
+    // A ONE-ROW PROJECTION WHOSE ROW IS NARROWER THAN A SIMDGROUP'S LANES: the one-row GEMV's
+    // lanes each take a 32-value sub-block of the row, so a row of fewer than 32 of them leaves
+    // lanes idle, and the decode-rows GEMV (one weight row a lane) takes it. A DSpark drafter's
+    // Markov table, 256 -> 128000 nine times a round on LFM2.5-8B-A1B: the drafter 9.9 -> 8.4 ms.
+    // Measured at that output width only; a narrow output stays on the one-row GEMV.
+    if (n_tok == 1u && wf != 0u && n_in < 32u * 32u && n_out >= 16384u
+        && w_off2 == NO_PAIR && !g_mm_resid && src < B_COUNT && dst < B_COUNT) {
+        if (blk_rows_gemv_encode(wkind, wf, w_off, n_in, n_out, src, dst, 1u, src_row, 0u)) {
+            return true;
+        }
+    }
+    // Past one run of rows, and only where a full run is the matrix unit's (its crossing at 8):
+    // a lower crossing says the GEMM beats the rows kernel above it, and a run would be worse.
+    if (decode_rows_route() == 2u && wf != 0u && n_tok > BLK_ROWS_MAX_HOST
+        && g_blk_rows_mma_max >= BLK_ROWS_MAX_HOST && n_tok <= BLK_ROWS_RUNS_MAX_HOST
+        && src < B_COUNT && dst < B_COUNT) {
+        // A gated pair is refused, as above, so the caller issues gate and up on the runs. Left
+        // to the GEMM, the pair writes only the half mirror of its output, and the down
+        // projection on the runs reads the floats, which the pair never wrote.
+        if (w_off2 != NO_PAIR || g_mm_resid) { return false; }
+        if (g_skip_cat == PC_MATMAT_DECODE) { return true; }
+        if (blk_rows_runs_encode(wkind, wf, w_off, n_in, n_out, src, dst, n_tok, src_row)) {
+            return true;
+        }
+        // No pipeline: the GEMM.
+    }
+    // THE EXACT ROUTE'S ROWS FOR A FORMAT WITHOUT A DECODE-ROWS GEMV (every block quant): the
+    // one-row decode GEMV once per row, so each row gets its lone decode's bits by
+    // construction. The exact route is the gate that proves the per-row plumbing, not a speed
+    // route (docs/continuous-batching.md, section 6); Q4_0 and Q8_0 have a decode-rows GEMV.
+    if (decode_rows_route() == 1u && n_tok >= 2u && w_off2 == NO_PAIR && src < B_COUNT
+        && dst < B_COUNT && !(wkind >= 1u && wkind <= 3u)) {
+        const uint64_t src0 = g.buf_off[src], dst0 = g.buf_off[dst];
+        bool ok = true;
+        for (uint32_t r = 0; r < n_tok && ok; ++r) {
+            g.buf_off[src] = src0 + (uint64_t)(src_row + r) * n_in * 4u;
+            g.buf_off[dst] = dst0 + (uint64_t)r * n_out * 4u;
+            ok = matmat_impl(wkind, w_off, NO_PAIR, n_in, n_out, src, dst, 1u, 0u);
+        }
+        g.buf_off[src] = src0;
+        g.buf_off[dst] = dst0;
+        return ok;
+    }
     const bool gated = w_off2 != NO_PAIR;
     const uint32_t vrows = gated ? 2u * n_out : n_out;   // rows the rt grid walks
     // one lane per token only pays off with a batch; decode keeps the split-row kernel
@@ -5591,21 +7841,71 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
         // selects the pipeline twin. They share the buffer indices and the epilogue
         // convention with Q4, nothing else: its
         // three routes have their own grid, threadgroup and boundary knobs.
+        if (g_mm_resid) { return false; }
         if (g_skip_cat == (n_tok > g_gemv_max_tok ? PC_MATMAT_PREFILL
                                                     : PC_MATMAT_DECODE)) { return true; }
         return q8_matmat(wkind == 3u, w_off, w_off2, n_in, n_out, src, dst, n_tok, src_row);
     }
     const uint32_t wfmt = wfmt_for(wkind);
     const bool is_q4 = wkind == 1u;
+    // Independent decode rows on the GEMV, as in q8_matmat. A gated pair needs the GEMM, so the
+    // check below refuses it and the caller issues the two projections a one-row decode issues.
+    const bool rows_gemv = is_q4 && decode_rows_gemv(n_tok, g_q4_rows_gemv_max);
+    // THE FAST ROUTE'S ROWS PAST THE GEMV'S, up to the rows matmul's own count: tile-major
+    // Q8's kernel (imparo_q8_tm_rows_mma) reading each row's Q4_0 blocks where they lie, each
+    // weight block read once for every row. A gated pair is refused here, as on Q8's route, so
+    // the caller issues gate and up on it and multiplies them in float.
+    if (is_q4 && decode_rows_route() == 2u && !rows_gemv && n_tok >= 2u
+        && n_tok <= g_q4_rows_mma_max && (n_out % Q8_TM_UNIT_ROWS_HOST) == 0u
+        && (n_in % 32u) == 0u) {
+        if (gated || g_mm_resid) { return false; }
+        if (g_skip_cat == PC_MATMAT_DECODE) { return true; }
+        const uint32_t frags = (n_tok + 7u) / 8u;
+        // Floats first; the half mirror only when a mirror-mode producer left them stale.
+        const bool half_x = src < 64u && ((g_float_stale >> src) & 1ull) != 0ull;
+        if (half_x && !(g_xh_src == src && g_xh_elems >= (uint64_t)n_tok * n_in)) {
+            g_refused += 1;
+            NSLog(@"imparo metal: rows matmul source %u has stale floats and no current mirror",
+                  src);
+            return false;
+        }
+        const uint32_t src_bind = half_x ? g_xh_buf : src;
+        const uint32_t tiles = q4_rows_mma_tiles(n_out);
+        id<MTLComputePipelineState> ps = q8_rows_mma_pipe(frags, half_x, true, tiles);
+        if (ps == nil) { g_refused += 1; return false; }
+        haz(hb(src_bind), hb(dst));
+        [g.enc setComputePipelineState:ps];
+        const uint64_t wl = wbind(g.enc, w_off, 0);
+        [g.enc setBuffer:g.bufs[src_bind] offset:g.buf_off[src_bind] atIndex:1];
+        [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:2];
+        [g.enc setBytes:&wl length:8 atIndex:3];
+        [g.enc setBytes:&n_in length:4 atIndex:4];
+        [g.enc setBytes:&n_out length:4 atIndex:5];
+        [g.enc setBytes:&n_tok length:4 atIndex:6];
+        [g.enc setBytes:&src_row length:4 atIndex:7];
+        [g.enc setBytes:&g_epilogue length:4 atIndex:13];
+        const uint32_t sgs = q4_rows_mma_sgs(n_in);
+        [g.enc setThreadgroupMemoryLength:(NSUInteger)sgs * tiles * frags * 64u * sizeof(float)
+                                  atIndex:0];
+        g_disp_seq += 1; g_rows_mma_dispatches += 1; route_count(MR_Q4_ROWS_MMA);
+        if (g_prof) { g_prof_disp += 1; prof_begin(mm_decode_cat(n_out, wkind), w_bytes(wkind, n_in, n_out)); }
+        [g.enc dispatchThreadgroups:MTLSizeMake(n_out / (Q8_TM_UNIT_ROWS_HOST * tiles), 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(sgs * 32u, 1, 1)];
+        if (g_prof) { prof_end(); }
+        return true;
+    }
     // THE TILE-MAJOR FAMILY takes the register-tiled GEMM at EVERY batch width, decode
     // included: its stage arm lives there and nowhere else yet. Correct first; whether a
     // decode GEMV is worth its own arm is a measurement, the same order Q8_0_TM followed.
-    bool use_prefill = (is_q4 && n_tok > g_gemv_max_tok) || wfmt != 0u;
+    bool use_prefill = (is_q4 && n_tok > g_gemv_max_tok && !rows_gemv) || wfmt != 0u;
+    if (g_mm_resid && (!use_prefill || gated || !g_rt)) { return false; }
     if (gated) {
         // The pair rides the register-tiled half-activation route only; its pipelines are
         // that route's _gh twins. Decided before anything is encoded.
+        const uint32_t wide = RT_SHAPES[g_rt_shape][0] * 8u * RT_SHAPES[g_rt_shape][3];
         const bool rt_half = use_prefill && g_rt && g.p_rt[g_rt_shape] != nil
-                          && g_half_a && n_tok >= HALF_A_MIN && g.bufs[B_XH] != nil
+                          && g_half_a && n_tok >= HALF_A_MIN
+                          && xh_holds((n_tok + wide - 1u) / wide * wide, n_in)
                           && g.p_rt_h[g_rt_shape] != nil && g.p_rt_gh[g_rt_shape] != nil
                           && g.p_rt_nb8_gh != nil && g.p_rt_nb8b_gh != nil
                           && g_epilogue != 0u;
@@ -5622,6 +7922,11 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
     const bool decode_class = wfmt != 0u ? n_tok <= g_gemv_max_tok : !use_prefill;
     if (!decode_class && g_skip_cat == PC_MATMAT_PREFILL) { return true; }
     if (decode_class  && g_skip_cat == PC_MATMAT_DECODE)  { return true; }
+    // DIAGNOSTIC: skip only the decode matmuls of ONE output width, so the class can be
+    // decomposed by shape in the stream rather than by an encoder-per-dispatch profile
+    // (which gives a tiny dispatch its own encoder and reads it far above its real cost).
+    // Wrong answers; only the difference in time is read.
+    if (decode_class && g_skip_mm_nout != 0u && n_out == g_skip_mm_nout) { return true; }
     // Hazards are declared ONCE, at each dispatch, with the operand that dispatch actually
     // reads (the float source or its half mirror). A route-wide haz(src, dst) used to sit
     // here as well, so the mirror route's own declaration always found `dst` in the window
@@ -5640,6 +7945,28 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
     const uint32_t nr0     = 1u << nr_log2;
     id<MTLComputePipelineState> chosen = g.p_q4mm_lanes[g_lanes_log2][nr_log2];
     if (chosen == nil) { chosen = g.p_q4mm; }
+    // DECODE ROWS: how a lane's work is shaped (the bits do not depend on it; tests/decode_rows.rs
+    // runs every shape). Per block a lane loads a scale and four payload words for each of its
+    // rows and eight activation float4s for each of its tokens, so its weight loads are shared by
+    // its tokens and its activation loads by its rows; it holds rows x tokens accumulators twice
+    // over (acc and part). Measured on E4B (16 lanes per row), ms per forward: 2 rows 29.4 at
+    // 2 rows x 2 tokens per lane against 34.0 at 2 x 1; 4 rows 35.8 at 2 x 2, 37.5 at 4 x 2, 37.8
+    // at 4 x 4; 8 rows 70.1 at 4 x 4, 74.4 at 2 x 4, 84.3 at 8 x 4, 89.5 at 4 x 8. So a lane takes
+    // two tokens and four accumulators up to 4 rows, four tokens and sixteen at 8; the lane groups
+    // of a simdgroup split the tokens to get there.
+    uint32_t mv_rows_per_sg = 0;   // rows one simdgroup covers on the decode-rows route
+    if (rows_gemv) {
+        const uint32_t tok_log2 = n_tok <= 2u ? 1u : (n_tok <= 4u ? 2u : 3u);
+        const uint32_t groups_log2 = 5u - g_lanes_log2;      // lane groups per simdgroup
+        const uint32_t lane_tok_log2 = tok_log2 <= 2u ? 1u : 2u;
+        const uint32_t split_log2 = std::min(groups_log2, tok_log2 - std::min(tok_log2, lane_tok_log2));
+        const uint32_t acc_log2 = tok_log2 <= 2u ? 2u : 4u;
+        const uint32_t tpl_log2 = tok_log2 - split_log2;
+        const uint32_t rows_log2 = std::min(3u, acc_log2 - std::min(acc_log2, tpl_log2));
+        chosen = q4mv_tok_pipe(g_lanes_log2, rows_log2, split_log2, tok_log2);
+        if (chosen == nil) { return false; }
+        mv_rows_per_sg = ((32u / g_lanes) >> split_log2) << rows_log2;
+    }
     id<MTLComputePipelineState> pre = g.p_q4mm_pre;
     // The register-tiled kernel takes precedence and implements `skip` ITSELF via its
     // uniform. Selecting p_q4mm_pre_nomma on any nonzero skip meant every skip measurement
@@ -5697,9 +8024,39 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
                         && (uint64_t)g.sizes[src] >= need_src;
     const bool rowmajor = wfmt_is_rowmajor(wkind);
     if (wfmt != 0u && (n_tok <= g_gemv_max_tok || !tile_fits || gemv_always)) {
+        if (g_mm_resid) { return false; }
         id<MTLComputePipelineState> gv = gemv_pipeline_for_fmt(wfmt, rowmajor);
         if (gv == nil) { return false; }
         if (gated) { return false; }   // the pair has no GEMV twin; two dispatches instead
+        // A CO-BATCHED STEP'S ROWS WHERE THE GEMM HAS NO ROOM (the lm head: its logits hold the
+        // step's rows, not a padded tile). The decode-rows GEMV or the matrix-unit rows kernel
+        // reads the weights once for up to 8 rows, by the same crossings as above; the one-row
+        // kernel below would read them once per row -- on Qwen3.8-27B the 1 GB lm head four times
+        // a 4-row step.
+        if (n_tok > 1u && decode_rows_route() == 2u && !gemv_always) {
+            const bool ok = blk_rows_runs_encode(wkind, wfmt, w_off, n_in, n_out, src, dst,
+                                                 n_tok, src_row);
+            // A pipeline that did not build: the token loop below redoes every row.
+            if (ok) { return true; }
+        }
+        if (n_tok > 1u) {
+            // The one-row kernel loops the tokens outermost: every weight is read again per
+            // token. It runs here only because the GEMM cannot (no room for its padded tile, or
+            // IMPARO_BLK_GEMV_ALWAYS), so it is counted as a fallback and said once per shape.
+            route_count(MR_BLK_GEMV_TOKENS_FALLBACK);
+            static uint64_t said[256]; static uint32_t n_said = 0u;
+            const uint64_t key = ((uint64_t)wkind << 48) | ((uint64_t)n_out << 24) | n_in;
+            bool fresh = true;
+            for (uint32_t i = 0; i < n_said; ++i) { if (said[i] == key) { fresh = false; break; } }
+            if (fresh && n_said < 256u) {
+                said[n_said++] = key;
+                NSLog(@"imparo metal: FALLBACK kind=%u %u->%u n_tok=%u: the one-row block GEMV "
+                      @"loops the tokens (%s)", wkind, n_in, n_out, n_tok,
+                      gemv_always ? "IMPARO_BLK_GEMV_ALWAYS" : "no room for the GEMM's padded tile");
+            }
+        } else {
+            route_count(MR_BLK_GEMV);
+        }
         haz(hb(src), hb(dst));
         [g.enc setComputePipelineState:gv];
         const uint64_t wl = wbind(g.enc, w_off, 0);
@@ -5711,18 +8068,7 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
         [g.enc setBytes:&n_tok length:4 atIndex:6];
         [g.enc setBytes:&src_row length:4 atIndex:7];
         [g.enc setBytes:&g_epilogue length:4 atIndex:13];
-        // SIMDGROUPS PER THREADGROUP. 8 was inherited from imparo_q8_0_gemv's shape; it
-        // is now RANKED in this kernel's own regime and 8 is the seat. Qwen3.8-27B
-        // UD-Q4_K_M, 512-token prompt, warm decode, ms/token: 133.7 at 4, 133.1 at 8,
-        // 134.5 at 16, 139.9 at 32. IMPARO_BLK_GEMV_SGS re-runs that A/B; a value outside
-        // the ladder falls back to the seat rather than dispatching a shape nothing built.
-        static uint32_t sgs_v = 0u;
-        if (sgs_v == 0u) {
-            const char * e = getenv("IMPARO_BLK_GEMV_SGS");
-            const uint32_t w = e ? (uint32_t)atoi(e) : 8u;
-            sgs_v = (w == 2u || w == 4u || w == 8u || w == 16u || w == 32u) ? w : 8u;
-        }
-        const NSUInteger sgs = sgs_v;                  // simdgroups per threadgroup
+        const NSUInteger sgs = blk_gemv_sgs();         // simdgroups per threadgroup
         const NSUInteger rows = sgs * blk_gemv_nr();   // rows one threadgroup covers
         NSUInteger tgs = (n_out + rows - 1) / rows;
         // PROBE: force the threadgroup count, which only covers n_out when the kernel was
@@ -5739,10 +8085,21 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
             }
         }
         if (forced != (NSUInteger)-1 && forced_ok && forced < tgs) { tgs = forced; }
-        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MATMAT_DECODE); }
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(mm_decode_cat(n_out, wkind), w_bytes(wkind, n_in, n_out)); }
         [g.enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * sgs, 1, 1)];
         if (g_prof) { prof_end(); }
+        // DIAGNOSTIC: encode the SAME dispatch a second time. The matmul's epilogue is an
+        // activation, not an accumulate, so a second copy writes the same values and the
+        // answer is unchanged -- the step hash is the check. This prices one output width
+        // ADDITIVELY, which IMPARO_SKIP_MM_NOUT does not: skipping four widths there summed
+        // to 2.33 ms against the class's own 4.23, so each skip is a lower bound. A
+        // duplicate adds exactly its own cost and nothing else.
+        if (g_dup_mm_nout != 0u && n_out == g_dup_mm_nout) {
+            haz(hb(src), hb(dst));
+            [g.enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32 * sgs, 1, 1)];
+        }
         return true;
     }
     if (wfmt != 0u) {
@@ -5766,7 +8123,8 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
     }
     else if (g_rt && g.p_rt[g_rt_shape] != nil)            { pre = g.p_rt[g_rt_shape]; }
     else if (g_skip_mma && g.p_q4mm_pre_nomma != nil)      { pre = g.p_q4mm_pre_nomma; }
-    id<MTLComputePipelineState> sel = use_prefill ? pre : (is_q4 ? chosen : g.p_f32mm);
+    id<MTLComputePipelineState> sel =
+        use_prefill ? rt_for_rows(pre, n_out) : (is_q4 ? chosen : g.p_f32mm);
     if (sel == nil) {
         // setComputePipelineState: with nil faults inside the driver, and the backtrace
         // names neither the kernel nor the reason. Say which selection was empty.
@@ -5793,6 +8151,8 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
     [g.enc setBytes:&rows length:4 atIndex:8];
     [g.enc setBytes:&g_epilogue length:4 atIndex:13];
     const NSUInteger sgs = g_sgs;                    // simdgroups per threadgroup
+    route_count(use_prefill ? (wfmt != 0u ? MR_BLK_GEMM : MR_Q4_GEMM)
+                            : (rows_gemv ? MR_Q4_GEMV_ROWS : MR_Q4_GEMV));
     if (use_prefill) {
         // Only the weight tile is staged; activations are read from device memory and
         // the write-back reuses the same block. Keep this well under 32 KB or occupancy
@@ -5817,6 +8177,7 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
             if (wfmt != 0u) { return rt_pipeline_for_fmt(wfmt, rowmajor, variant, rt_narrow_tile()); }
             switch (variant) {
                 case RT_HALF:       return g_nb8_shape ? g.p_rt_nb8b_h  : g.p_rt_nb8_h;
+                case RT_HALF_RESID: return rt_plain_resid(rt_narrow_tile());
                 case RT_GATED_HALF: return g_nb8_shape ? g.p_rt_nb8b_gh : g.p_rt_nb8_gh;
                 default:            return g_nb8_shape ? g.p_rt_nb8b    : g.p_rt_nb8;
             }
@@ -5912,8 +8273,12 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
             // Every prefill width takes this path (HALF_A_MIN, declared above with the
             // measurement): the batch's width must not choose the precision, or a
             // resumed pass stops reproducing the cold one.
-            if (g_half_a && n_tok >= HALF_A_MIN
-                && g.p_rt_h[g_rt_shape] != nil && g.bufs[B_XH] != nil) {
+            // The widest tile's padding, as the gated pair's precondition checks it: the two
+            // must agree, or a pair admitted there would run here without its half operand.
+            bool half_route = false;
+            if (g_half_a && n_tok >= HALF_A_MIN && g.p_rt_h[g_rt_shape] != nil
+                && xh_holds((n_tok + wide_toks - 1u) / wide_toks * wide_toks, n_in)) {
+                half_route = true;
                 // Convert the activation slice to half once per (buffer, content): the
                 // cache lives until haz() sees a write to the source or the cb turns
                 // over. Padded to whole token tiles because the GEMM reads whole tiles.
@@ -5950,18 +8315,26 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
                     if (g_prof) { prof_end(); }
                     g_xh_src = src; g_xh_elems = need; g_xh_buf = B_XH;
                 }
-                const uint32_t hv = gated ? RT_GATED_HALF : RT_HALF;
+                const uint32_t hv = gated ? RT_GATED_HALF : (g_mm_resid ? RT_HALF_RESID : RT_HALF);
                 if (wfmt != 0u) {
                     rt_sel = nb8 ? rt_narrow(hv)
                                  : rt_pipeline_for_fmt(wfmt, rowmajor, hv, g_rt_shape);
                     if (rt_sel == nil) { return false; }   // refuse; never the wrong kernel
                 } else {
                     rt_sel = nb8 ? rt_narrow(hv)
-                                 : (gated ? g.p_rt_gh[g_rt_shape] : g.p_rt_h[g_rt_shape]);
+                                 : (gated ? g.p_rt_gh[g_rt_shape]
+                                          : (g_mm_resid ? rt_plain_resid(g_rt_shape)
+                                                        : g.p_rt_h[g_rt_shape]));
+                    if (rt_sel == nil) { return false; }   // refuse; never the wrong kernel
                 }
                 src_bind = g_xh_buf;
             }
-            haz(hb(src_bind), hb(dst));   // behind the mirror's writer, or the float producer
+            // The residual add has only the half-mirror twin; the float route refuses it.
+            if (g_mm_resid && !half_route) { return false; }
+            rt_sel = rt_for_rows(rt_sel, n_out);
+            if (rt_sel == nil) { g_refused += 1; return false; }
+            // RT_HALF_RESID reads dst as well as writing it.
+            haz(hb(src_bind) | (g_mm_resid ? hb(dst) : 0u), hb(dst));   // behind the mirror's writer, or the float producer
             [g.enc setComputePipelineState:rt_sel];
             const uint64_t w_off2_l = wlocal(w_off2, w_off);   // gate and up: one layer, one segment
             const uint64_t w_off_l = wbind(g.enc, w_off, 0);
@@ -6016,8 +8389,11 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
                 // kernel adds src_row); WRITES are dispatch-relative, so the output and
                 // the epilogue mirror bind with a row offset instead.
                 const bool half_sel = (src_bind == g_xh_buf) && g_half_a;
-                id<MTLComputePipelineState> tp =
-                    rt_narrow(gated ? RT_GATED_HALF : (half_sel ? RT_HALF : RT_PLAIN));
+                id<MTLComputePipelineState> tp = rt_for_rows(
+                    rt_narrow(gated ? RT_GATED_HALF
+                                    : (half_sel ? (g_mm_resid ? RT_HALF_RESID : RT_HALF) : RT_PLAIN)),
+                    n_out);
+                if (tp == nil) { g_refused += 1; return false; }
                 const uint32_t t_thr  = g_nb8_shape ? 32u : 64u;
                 const uint32_t t_src_row = src_row + main_tok;
                 [g.enc setComputePipelineState:tp];
@@ -6051,8 +8427,10 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
             }
             if (epi_half != 0u) {
                 // G's mirror is complete in B_XH2 (both parts): the down projection can
-                // read it. Elems counts the FULL batch, not the last dispatch's part.
+                // read it. Elems counts the FULL batch, not the last dispatch's part. The
+                // floats were not written (rt_gemm's epilogue writes the mirror instead).
                 g_xh_src = dst; g_xh_elems = (uint64_t)n_tok * n_out; g_xh_buf = B_XH2;
+                g_float_stale |= hb(dst);
             }
         } else {
             haz(hb(src), hb(dst));
@@ -6064,14 +8442,122 @@ static bool matmat_impl(uint32_t wkind, uint64_t w_off, uint64_t w_off2, uint32_
             if (g_prof) { prof_end(); }
         }
     } else {
-        const NSUInteger rows_per_tg = sgs * (is_q4 ? (32 / g_lanes) * nr0 : 1);
+        // A NARROW PROJECTION LEAVES MOST OF THE DEVICE EMPTY. `sgs` output rows share a
+        // threadgroup, so the router's own gate -- 2048 -> 32, once a routed layer -- is
+        // FOUR threadgroups on an eighteen-core GPU, and reads 13.1 GB/s against the
+        // output head's 132. Shrinking the group puts the SAME rows on more cores:
+        // imparo_f32_matmat gives each output row one simdgroup and takes its row from
+        // `tgid.x * nsg + sgid`, so the row's lane partition and its simd_sum are
+        // untouched and NO BIT MOVES -- only which threadgroup hosts the row changes.
+        //
+        // The F32 GEMV only. The Q4 decode kernels tie threadgroup memory and their row
+        // tiles to sgs, so the same reshape there is a different change with its own A/B.
+        // IMPARO_NARROW_SPREAD=0 keeps the old grid so the two can be timed in one binary.
+        // THE K-SPLIT GEMV when the rows alone cannot fill the device. One threadgroup an
+        // output row, its simdgroups splitting the dot product -- see
+        // imparo_f32_gemv_ksplit. Bit-affecting, so it is a route with an A/B:
+        // IMPARO_NARROW_SPREAD=0 keeps the one-simdgroup-per-row kernel.
+        static int spread = -1;
+        if (spread < 0) {
+            const char * e = getenv("IMPARO_NARROW_SPREAD");
+            spread = !(e != nullptr && e[0] == '0');
+        }
+        const NSUInteger cores = g_gpu_cores > 0u ? g_gpu_cores : 1u;
+        // ONE ROW ONLY (decode). The split IS the row's arithmetic (its K partition and the
+        // order its partials add), and its count followed the batch: a router row got different
+        // bits at 1, 2, 3-4 and 5+ rows, so a 3-token prefill tail disagreed with the same
+        // tokens inside a 512-token chunk, and a 4-row verify with an 8-row one, where a near
+        // tie picks another expert. Every count from 2 now takes the one-simdgroup-per-row
+        // kernel prefill takes (and its many-token twin, bit-identical to it). Deriving the
+        // split from the output rows alone for every count instead cost an 8444-token
+        // LFM2.5-8B-A1B prefill 5.6% (5347 -> 5645 ms).
+        if (spread && !is_q4 && !rows_gemv && g.p_f32gemv != nil && n_out > 0u && n_tok == 1u
+            && (NSUInteger)n_out < cores * 8u && n_in >= 256u) {
+            // Enough simdgroups to give every core a few, bounded by the K it has to
+            // split and by the threadgroup width the device allows.
+            // HOW MANY SIMDGROUPS A CORE WANTS, measured on LFM2.5-8B-A1B's router gate
+            // (2048 -> 32, M3 Pro, 18 cores), reading the matmat_narrow class alone:
+            //
+            //     per core     2       8      32     128
+            //     GB/s      21.8    34.0    47.0    40.9
+            //
+            // It climbs while the extra simdgroups hide load latency and turns over when
+            // the threadgroup outgrows 512 threads: 128 asks for 64 simdgroups, the
+            // device clamps to 32, and one core's registers are split too many ways. This
+            // is a measured seat, not a derived one -- it belongs in the tuner, and until
+            // it is there IMPARO_NARROW_SG_PER_CORE moves it.
+            static int sg_per_core = -1;
+            if (sg_per_core < 0) {
+                const char * e = getenv("IMPARO_NARROW_SG_PER_CORE");
+                sg_per_core = e != nullptr ? atoi(e) : 32;
+                if (sg_per_core < 1) { sg_per_core = 1; }
+            }
+            NSUInteger want = (cores * (NSUInteger)sg_per_core + (NSUInteger)n_out - 1)
+                            / (NSUInteger)n_out;
+            NSUInteger nsg = 1;
+            while (nsg * 2u <= want && nsg * 2u * 32u <= (NSUInteger)n_in
+                   && nsg * 2u * 32u <= g.p_f32gemv.maxTotalThreadsPerThreadgroup) {
+                nsg *= 2u;
+            }
+            [g.enc setComputePipelineState:g.p_f32gemv];
+            const uint64_t kw = wbind(g.enc, w_off, 0);
+            [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:1];
+            [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:2];
+            [g.enc setBytes:&kw length:8 atIndex:3];
+            [g.enc setBytes:&n_in length:4 atIndex:4];
+            [g.enc setBytes:&n_out length:4 atIndex:5];
+            [g.enc setBytes:&n_tok length:4 atIndex:6];
+            [g.enc setBytes:&src_row length:4 atIndex:7];
+            [g.enc setThreadgroupMemoryLength:nsg * sizeof(float) atIndex:0];
+            haz(hb(src), hb(dst));
+            g_disp_seq += 1;
+            if (g_prof) {
+                g_prof_disp += 1;
+                prof_begin(mm_decode_cat(n_out, wkind), w_bytes(wkind, n_in, n_out));
+            }
+            [g.enc dispatchThreadgroups:MTLSizeMake(n_out, n_tok, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+            if (g_prof) { prof_end(); }
+            return true;
+        }
+        // MANY TOKENS INTO AT MOST 32 OUTPUTS: one simdgroup holds every output of its
+        // tokens and the threadgroup stages the weight once for all of them -- see
+        // imparo_f32_narrow_mm. BIT-IDENTICAL to imparo_f32_matmat, so the boundary only
+        // decides speed: it needs a threadgroup for every core, or the old grid, which
+        // spreads the same work over n_out times as many simdgroups, wins.
+        // Eight simdgroups of two tokens each (imparo_f32_narrow_mm).
+        const NSUInteger f32n_sgs = 8u;
+        const NSUInteger f32n_tg_tok = f32n_sgs * 2u;
+        id<MTLComputePipelineState> f32n_ps = g.p_f32nmm;
+        if (!is_q4 && !rows_gemv && sel == g.p_f32mm && f32n_ps != nil
+            && n_out <= 32u && (n_in % 128u) == 0u && (w_off_l % 16u) == 0u
+            && (n_tok + f32n_tg_tok - 1u) / f32n_tg_tok >= cores) {
+            [g.enc setComputePipelineState:f32n_ps];
+            haz(hb(src), hb(dst));
+            g_disp_seq += 1;
+            if (g_prof) {
+                g_prof_disp += 1;
+                prof_begin(mm_decode_cat(n_out, wkind), w_bytes(wkind, n_in, n_out));
+            }
+            [g.enc dispatchThreadgroups:MTLSizeMake((n_tok + f32n_tg_tok - 1u) / f32n_tg_tok, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32u * f32n_sgs, 1, 1)];
+            if (g_prof) { prof_end(); }
+            return true;
+        }
+        const NSUInteger dsgs = sgs;
+        NSUInteger rows_per_tg = dsgs * (is_q4 ? (32 / g_lanes) * nr0 : 1);
         // The kernel's TOKEN_TILE, from the same constant the shader is compiled with.
-        const NSUInteger tile = is_q4 ? Q4_TOKEN_TILE : 1;
+        NSUInteger tile = is_q4 ? Q4_TOKEN_TILE : 1;
+        if (rows_gemv) {
+            // One threadgroup covers its rows for every token.
+            rows_per_tg = dsgs * mv_rows_per_sg;
+            tile = n_tok;
+        }
     haz(hb(src), hb(dst));
-    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MATMAT_DECODE); }
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(mm_decode_cat(n_out, wkind), w_bytes(wkind, n_in, n_out)); }
     [g.enc dispatchThreadgroups:MTLSizeMake((n_out + rows_per_tg - 1) / rows_per_tg,
                                                 (n_tok + tile - 1) / tile, 1)
-              threadsPerThreadgroup:MTLSizeMake(32 * sgs, 1, 1)];
+              threadsPerThreadgroup:MTLSizeMake(32 * dsgs, 1, 1)];
     if (g_prof) { prof_end(); }
     }
     return true;
@@ -6099,6 +8585,8 @@ extern "C" uint32_t imparo_metal_matmat_gated(uint32_t gate_kind, uint64_t gate_
     // up with the activation epilogue reading G back, then down -- three passes over the
     // activations where the pair makes one (docs/evidence/bracket/2026-09-11-27b-gated-pair.md).
     if (gate_kind != up_kind) { return 0u; }
+    // A one-row decode never runs the pair, so the exact route's rows do not either.
+    if (decode_rows_route() == 1u) { return 0u; }
     const bool plain = gate_kind == 1u || gate_kind == 2u || gate_kind == 3u;
     if (!plain && wfmt_for(gate_kind) == 0u) { return 0u; }
     if (n_tok < 2u || g_epi_act == 0u) { return 0u; }
@@ -6270,6 +8758,43 @@ extern "C" bool imparo_metal_rms_norm_add_row(uint32_t dst, uint32_t src, uint32
     if (g_prof) { prof_end(); }
     return true;
 }
+// THE NORM'S STAGED TWIN. Same kernel, compiled with the threadgroup stage on: the
+// pre-add order reads the residual and the source twice each, and staging their sum makes
+// it once. Built on first use, because it is a second pipeline of a kernel that already
+// exists and most models never take this path.
+//
+// STAGE_OFF is 32 floats -- the most reduction partials any threadgroup width here can
+// need (1024 threads is 32 simdgroups) -- so the offset is a compile-time constant and the
+// stage always starts in the same place.
+static const uint32_t RMS_STAGE_OFF = 32u;
+static id<MTLComputePipelineState> rms_staged_pipeline() {
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        if (g.lib != nil) {
+            MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+            const bool on = true;
+            [cv setConstantValue:&on type:MTLDataTypeBool atIndex:56];
+            [cv setConstantValue:&RMS_STAGE_OFF type:MTLDataTypeUInt atIndex:57];
+            g.p_rms_staged = make_with(g.lib, @"imparo_rms_norm", cv);
+        }
+    }
+    return g.p_rms_staged;
+}
+
+// Whether this norm should take it: the pre-add order (the only one that reads two rows
+// twice), a width the stage fits under the 32 KB threadgroup limit, and few enough rows
+// that a core hosts ONE threadgroup -- the occupancy the stage costs is occupancy nothing
+// else was going to use. IMPARO_RMS_STAGE=0 keeps the unstaged kernel for the A/B.
+static bool rms_stage_on(uint32_t width, uint32_t n_row) {
+    static int on = -1;
+    if (on < 0) { const char * e = getenv("IMPARO_RMS_STAGE"); on = !(e != nullptr && e[0] == '0'); }
+    if (!on || (width % 4u) != 0u) { return false; }
+    if ((uint64_t)(RMS_STAGE_OFF + width) * sizeof(float) > 32768ull) { return false; }
+    const uint32_t cores = g_gpu_cores > 0u ? g_gpu_cores : 1u;
+    return (uint64_t)n_row <= cores;
+}
+
 extern "C" void imparo_metal_add_rms_norm(uint32_t dst, uint32_t resid, uint32_t other,
                                           uint64_t w_off, uint32_t width, float eps,
                                           uint32_t n_row, uint32_t row_stride,
@@ -6281,7 +8806,8 @@ extern "C" void imparo_metal_add_rms_norm(uint32_t dst, uint32_t resid, uint32_t
                     && (uint64_t)n_row * width * 2ull <= g.sizes[B_XH]
                     && half_consumers_exist();
     haz(hb(resid) | hb(other), hb(resid) | hb(dst) | (xh_on ? hb(B_XH) : 0u));
-    [g.enc setComputePipelineState:g.p_rms];
+    const bool staged = rms_stage_on(width, n_row) && rms_staged_pipeline() != nil;
+    [g.enc setComputePipelineState:staged ? g.p_rms_staged : g.p_rms];
     const uint64_t w_off_l = wbind(g.enc, w_off, 0);
     [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:1];
     [g.enc setBytes:&w_off_l length:8 atIndex:2];
@@ -6305,7 +8831,10 @@ extern "C" void imparo_metal_add_rms_norm(uint32_t dst, uint32_t resid, uint32_t
     while (threads < vec_units && threads < 1024) { threads *= 2; }
     threads = std::min(threads, (vec_units + 31) / 32 * 32);
     threads = std::max<NSUInteger>(threads, 32);
-    [g.enc setThreadgroupMemoryLength:tg_bytes16((threads / 32) * sizeof(float)) atIndex:0];
+    // The reduction partials, plus the staged row when the staged twin is bound.
+    [g.enc setThreadgroupMemoryLength:
+        tg_bytes16((staged ? (RMS_STAGE_OFF + width) : (threads / 32)) * sizeof(float))
+                              atIndex:0];
     g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_RMSNORM); }
     [g.enc dispatchThreadgroups:MTLSizeMake(n_row, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
@@ -6722,14 +9251,40 @@ extern "C" uint32_t imparo_metal_qcomb_has_hd(uint32_t hd) {
 
 extern "C" void imparo_metal_scale(uint32_t a, float k, uint32_t n);
 
+// The qcomb head-dim slot of `head_dim`: its index in g_qcomb_hds, QCOMB_HD_SLOTS when no slot
+// holds it. The decode kernels are built per slot too.
+static uint32_t attn_hd_slot(uint32_t head_dim) {
+    for (uint32_t i = 0; i < QCOMB_HD_SLOTS; ++i) {
+        if (g_qcomb_hds[i] == head_dim) { return i; }
+    }
+    return QCOMB_HD_SLOTS;
+}
+// The positions one decode query at `start_pos` attends to.
+static inline uint32_t attn_decode_span(uint32_t start_pos, uint32_t window) {
+    return (window > 0 && start_pos + 1 > window) ? window : start_pos + 1;
+}
+// Diagnostic (imparo_metal_set_skip_attn): whether attention at `head_dim` is left out.
+static inline bool attn_skipped(uint32_t head_dim) {
+    return g_skip_attn == 1u || (g_skip_attn == 2u && head_dim == 512u)
+        || (g_skip_attn == 3u && head_dim == 256u);
+}
+// THE VECTOR DECODE ROUTE'S TERMS: one query over an f16 cache, a span within the kernel's
+// regime. imparo_metal_attention takes the route on exactly these terms; a co-batched step
+// reads them to know each row's attention is one dispatch with no scratch.
+static bool attn_vec_serves(uint32_t head_dim, uint32_t n_heads, uint32_t n_kv, uint32_t n_pos,
+                            bool kv_quant) {
+    const uint32_t slot = attn_hd_slot(head_dim);
+    return !kv_quant && slot < 2u && g.p_attn_dec_vec[slot] != nil && n_kv > 0u
+        && n_heads % n_kv == 0u && n_pos <= g_attn_vec_max_keys && attn_vec_enabled();
+}
+
 extern "C" void imparo_metal_attention(uint32_t kv_layer, uint32_t head_dim, uint32_t n_heads,
                                        uint32_t n_kv, uint32_t kv_width, uint32_t start_pos,
                                        uint32_t window, uint32_t n_tok, uint32_t max_scores,
                                        uint32_t ring, float scale) {
     // Diagnostic only; output is wrong on purpose. 1 = skip all attention,
     // 2 = skip only the hd-512 (full-attention) layers, 3 = skip only hd-256.
-    if (g_skip_attn == 1u || (g_skip_attn == 2u && head_dim == 512u)
-                          || (g_skip_attn == 3u && head_dim == 256u)) { return; }
+    if (attn_skipped(head_dim)) { return; }
 
     // Prefill, combined rewrite (IMPARO_QCOMB=1): staged float Q, register accumulator.
     // Scope for bisection: 1 = all layers, 2 = full-attention only, 3 = windowed only.
@@ -6752,10 +9307,7 @@ extern "C" void imparo_metal_attention(uint32_t kv_layer, uint32_t head_dim, uin
     // floor. `qcomb_for` is the one place that maps a dim to its instantiation, so adding
     // a dim is adding a kernel, not editing a condition here.
     // Its slot index, not its size: dims below the floor fall through to qtile.
-    uint32_t slot_of = QCOMB_HD_SLOTS;
-    for (uint32_t i = 0; i < QCOMB_HD_SLOTS; ++i) {
-        if (g_qcomb_hds[i] == head_dim) { slot_of = i; break; }
-    }
+    const uint32_t slot_of = attn_hd_slot(head_dim);
     const bool qcomb_hd = slot_of < QCOMB_HD_SLOTS
                        && (g_qcomb_mask & (1u << slot_of)) != 0u
                        && qcomb_for(head_dim, g_qcomb_blk, false).pipe != nil;
@@ -6774,11 +9326,17 @@ extern "C" void imparo_metal_attention(uint32_t kv_layer, uint32_t head_dim, uin
         static bool said = false;
         if (!said) { said = true; fprintf(stderr, "imparo metal: attn_fa_nsg=%u has no built pipeline (seated %u; IMPARO_FA_ALL=1 builds every legal one) -- qcomb serves this layer\n", fa_nsg_live, g_fa_nsg_built); }
     }
-    if (g_attn_fa && slot_of == 0u && p_fa != nil && ring == 0u && n_tok > 1u) {
-        const uint32_t QB = FA_QB, NSG_FA = fa_nsg_live, THREADS = NSG_FA * 32u;
-        // sq (QB x hd half) + ss (QB x CB float) + so (QB x hd float).
+    // The register-softmax form where it is built (see fars_route_on).
+    const bool fars = fars_route_on() && g.p_fars != nil;
+    if (g_attn_fa && slot_of == 0u && (p_fa != nil || fars) && ring == 0u && n_tok > 1u) {
+        const uint32_t QB = fars ? 32u : FA_QB;
+        const uint32_t NSG_FA = fars ? 4u : fa_nsg_live, THREADS = NSG_FA * 32u;
         const uint32_t CB_FA = FA_CB;
-        const uint32_t sfloats = (QB * head_dim) / 2u + QB * CB_FA + QB * head_dim;
+        // 8-query op: sq (QB x hd half) + ss (QB x CB float) + so (QB x hd float).
+        // Register-softmax op: two 32-key blocks of (hd + 8)-half rows, in floats.
+        const uint32_t sfloats = fars ? (2u * 32u * (head_dim + 8u)) / 2u
+                                      : (QB * head_dim) / 2u + QB * CB_FA + QB * head_dim;
+        if (fars) { p_fa = g.p_fars; }
         if (getenv("IMPARO_ATTN_WHICH")) {
             fprintf(stderr, "attn branch FA layer=%u n_tok=%u hd=%u qb=%u cb=64 threads=%u "
                             "tg_bytes=%lu\n",
@@ -7068,7 +9626,7 @@ extern "C" void imparo_metal_attention(uint32_t kv_layer, uint32_t head_dim, uin
     // One threadgroup per (head, token) is plenty during prefill, where n_tok is large,
     // and far too few at decode, where it is 1. The split path costs an extra combine
     // dispatch, so it is used only when the direct grid would leave cores idle.
-    const uint32_t n_pos = (window > 0 && start_pos + 1 > window) ? window : start_pos + 1;
+    const uint32_t n_pos = attn_decode_span(start_pos, window);
     // THE DEPTH BOUNDARY IS DECIDED FIRST, and grouping yields to it. It used to be the
     // other way round by accident: want_stream carried a `!gqa` term with no stated
     // reason, written when grouping was off by default so it never mattered. Grouping now
@@ -7246,9 +9804,7 @@ extern "C" void imparo_metal_attention(uint32_t kv_layer, uint32_t head_dim, uin
     // THE VECTOR DECODE KERNEL: one query, f16 cache, a span within its regime (at most
     // attn_vec_max_keys keys, cache-resident). One query head per threadgroup, a simdgroup
     // per position, the output written directly -- no partials, no combine.
-    if (n_tok == 1 && !kv_quant && slot_of < 2u && g.p_attn_dec_vec[slot_of] != nil
-        && n_kv > 0u && n_heads % n_kv == 0u && n_pos <= g_attn_vec_max_keys
-        && attn_vec_enabled()) {
+    if (n_tok == 1 && attn_vec_serves(head_dim, n_heads, n_kv, n_pos, kv_quant)) {
         if (getenv("IMPARO_ATTN_WHICH")) {
             fprintf(stderr, "attn branch vec layer=%u hd=%u slot=%u nsg=%u n_pos=%u window=%u\n",
                     kv_layer, head_dim, slot_of, ATTN_VEC_NSG, n_pos, window);
@@ -7467,10 +10023,26 @@ extern "C" void imparo_metal_attention(uint32_t kv_layer, uint32_t head_dim, uin
         [g.enc setBytes:&head_dim length:4 atIndex:2];
         [g.enc setBytes:&n_heads length:4 atIndex:3];
         [g.enc setBytes:&slices length:4 atIndex:4];
+        // The staged per-slice headers: `slices` x (weight, sum) floats. ATTN_MAX_SLICES
+        // bounds it at 2 KiB, well inside the 32 KiB threadgroup budget, so this costs no
+        // occupancy at the 64-thread shape the combine runs.
+        [g.enc setThreadgroupMemoryLength:slices * 2u * sizeof(float) atIndex:0];
+        const NSUInteger comb_thr = 64u * g_attn_comb_spd;
         g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_ATTENTION); }
         [g.enc dispatchThreadgroups:MTLSizeMake(n_heads, n_tok, 1)
-              threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+              threadsPerThreadgroup:MTLSizeMake(comb_thr, 1, 1)];
         if (g_prof) { prof_end(); }
+        // DIAGNOSTIC (IMPARO_DUP_ATTN_COMBINE=1): encode the flash-decoding combine a SECOND
+        // time. It reads the slice partials and writes B_ATTN, so a second copy writes the
+        // same values -- the step hash is the check. Additive by construction, which a skip
+        // of one class inside a chain is not. The combine's own work grows with `slices`
+        // (24 at 5962 keys, 67 at 17122) while its grid stays n_heads x n_tok = 32
+        // threadgroups, so this is how to tell whether that shape costs anything.
+        if (g_dup_attn_combine) {
+            haz(hb(B_ATTN_PART), hb(B_ATTN));
+            [g.enc dispatchThreadgroups:MTLSizeMake(n_heads, n_tok, 1)
+                  threadsPerThreadgroup:MTLSizeMake(comb_thr, 1, 1)];
+        }
         return;
     }
 
@@ -7505,6 +10077,17 @@ extern "C" void imparo_metal_attention(uint32_t kv_layer, uint32_t head_dim, uin
     if (g_prof) { prof_end(); }
 }
 
+// The one-token convolution step's pipeline for `form` (the output and the state shift in one
+// dispatch), nil when the step route is off (IMPARO_SHORTCONV_STEP=0, the A/B arm) or not
+// built. imparo_metal_causal_conv takes the route on exactly this; a co-batched step reads it
+// to know each row's convolution is one dispatch.
+static id<MTLComputePipelineState> conv_step_pipe(uint32_t form) {
+    static int step_on = -1;
+    if (step_on < 0) { const char * e = getenv("IMPARO_SHORTCONV_STEP"); step_on = !(e && e[0] == '0'); }
+    if (!step_on || form > 1u) { return nil; }
+    return form == 0u ? g.p_shortconv_step : g.p_shortconv_step_plain;
+}
+
 // A CAUSAL DEPTHWISE CONVOLUTION over per-conversation history: outputs, then the state
 // advance. Two dispatches with the encoder's hazard barrier between them -- see the
 // kernel note for why one will not do. `form` selects the pipeline (0 gated, 1 plain +
@@ -7525,14 +10108,11 @@ extern "C" void imparo_metal_causal_conv(uint32_t form, uint32_t src, uint64_t w
     // It was the gated form's only, so qwen35's plain+SiLU conv ran the output and the shift
     // as two dependent dispatches -- 48 boundaries a token that LFM2's identical pair has
     // not paid since task #117.
-    static int step_on = -1;
-    if (step_on < 0) { const char * e = getenv("IMPARO_SHORTCONV_STEP"); step_on = !(e && e[0] == '0'); }
-    id<MTLComputePipelineState> step_p =
-        form == 0u ? g.p_shortconv_step : g.p_shortconv_step_plain;
-    if (n_tok == 1u && step_on && step_p != nil) {
+    id<MTLComputePipelineState> step_p = conv_step_pipe(form);
+    if (n_tok == 1u && step_p != nil) {
         haz(hb(src) | hb(state), hb(out) | hb(state));
         [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:0];
-        { const WSeg & ws = wseg_at(w_off);
+        { const WSeg & ws = wseg_use(w_off);
           [g.enc setBuffer:ws.buf offset:(NSUInteger)(w_off - ws.base) atIndex:1]; }
         [g.enc setBuffer:g.bufs[state] offset:g.buf_off[state] + (NSUInteger)state_off * 4
                  atIndex:2];
@@ -7552,7 +10132,7 @@ extern "C" void imparo_metal_causal_conv(uint32_t form, uint32_t src, uint64_t w
     haz(hb(src) | hb(state), hb(out) | (xh_on ? hb(B_XH) : 0u));
     [g.enc setComputePipelineState:g.p_conv[form]];
     [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:0];
-    { const WSeg & ws = wseg_at(w_off);
+    { const WSeg & ws = wseg_use(w_off);
       [g.enc setBuffer:ws.buf offset:(NSUInteger)(w_off - ws.base) atIndex:1]; }
     [g.enc setBuffer:g.bufs[state] offset:g.buf_off[state] + (NSUInteger)state_off * 4
              atIndex:2];
@@ -7608,6 +10188,792 @@ extern "C" void imparo_metal_causal_conv_snapshot(uint32_t form, uint32_t src, u
     dispatch1(g.p_conv_state[form], width, PC_RECUR);
 }
 
+// ---- ROW LAYOUT: a batch whose rows are not one causal chain (a tree verify) -------------------
+// The FA prefill kernel and head norm + rope compiled with ROW_LAYOUT (function constant 25) read
+// each row's visibility and position from the layout buffer; the convolution has its own
+// kernels. Built when a model first asks, so a process that never verifies a tree builds none.
+static id<MTLComputePipelineState> row_layout_pipeline(NSString * name, bool row_layout,
+                                                       bool float_q = false,
+                                                       uint32_t verify_variant = 0u) {
+    if (g.lib == nil) { return nil; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    stamp_epi_act(cv);
+    if (!g_attn_live_mask) {
+        const bool lm_off = false;
+        [cv setConstantValue:&lm_off type:MTLDataTypeBool atIndex:10];
+    }
+    if (row_layout) {
+        const bool on = true;
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:25];
+    }
+    if (float_q) {
+        const bool on = true;
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:26];
+    }
+    if ((verify_variant & 1u) != 0u) {
+        const bool on = true;
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:63];
+    }
+    if ((verify_variant & 2u) != 0u) {
+        const bool on = true;
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:64];
+    }
+    NSError * e = nil;
+    id<MTLFunction> f = [g.lib newFunctionWithName:name constantValues:cv error:&e];
+    if (f == nil) { NSLog(@"imparo metal: row-layout function %@: %@", name, e); return nil; }
+    id<MTLComputePipelineState> ps = [g.device newComputePipelineStateWithFunction:f error:&e];
+    if (ps == nil) { NSLog(@"imparo metal: row-layout pipeline %@: %@", name, e); }
+    // IMPARO_PIPE_LOG prints what the compiler made of it, as the load-time builder does.
+    if (ps != nil && getenv("IMPARO_PIPE_LOG") != NULL) {
+        NSLog(@"imparo metal pipe: %@ row_layout=%d float_q=%d max_threads=%lu simd_width=%lu "
+              @"static_tg_bytes=%lu", name, row_layout ? 1 : 0, float_q ? 1 : 0,
+              (unsigned long)[ps maxTotalThreadsPerThreadgroup],
+              (unsigned long)[ps threadExecutionWidth],
+              (unsigned long)[ps staticThreadgroupMemoryLength]);
+    }
+    return ps;
+}
+
+static uint32_t fa_nsg_index(uint32_t nsg) {
+    return nsg == 1u ? 0u : nsg == 2u ? 1u : nsg == 4u ? 2u : nsg == 8u ? 3u : 4u;
+}
+
+// What the FA route serves (slot 0's head dim, at most 128) is what a row layout serves.
+static bool row_layout_ready(uint32_t head_dim) {
+    if (g.lib == nil || !g_attn_fa || head_dim == 0u || head_dim != g_qcomb_hds[0]
+        || head_dim > 128u) { return false; }
+    const uint32_t nsg = fa_nsg_value();
+    const uint32_t idx = fa_nsg_index(nsg);
+    if (idx >= 4u) { return false; }
+    static bool tried[4] = { false, false, false, false };
+    if (!tried[idx]) {
+        tried[idx] = true;
+        g.p_fa_rows_n[idx] = row_layout_pipeline(
+            [NSString stringWithFormat:@"imparo_attention_prefill_fa_s0_n%u", nsg], true);
+        if (g.p_head_norm_rope_rows == nil) {
+            g.p_head_norm_rope_rows = row_layout_pipeline(@"imparo_head_norm_rope", true);
+        }
+        for (uint32_t form = 0; form < 2u; ++form) {
+            if (g.p_conv_rows[form] == nil) {
+                g.p_conv_rows[form] = row_layout_pipeline(
+                    form == 0u ? @"imparo_causal_conv_rows_gated" : @"imparo_causal_conv_rows_plain", false);
+            }
+            if (g.p_conv_row_inputs[form] == nil) {
+                g.p_conv_row_inputs[form] = row_layout_pipeline(
+                    form == 0u ? @"imparo_conv_row_inputs_gated"
+                               : @"imparo_conv_row_inputs_plain", false);
+            }
+        }
+        NSLog(@"imparo metal: row-layout pipelines for head dim %u nsg %u: fa=%d head_norm_rope=%d "
+              @"conv=%d/%d inputs=%d/%d", head_dim, nsg, g.p_fa_rows_n[idx] != nil,
+              g.p_head_norm_rope_rows != nil, g.p_conv_rows[0] != nil, g.p_conv_rows[1] != nil,
+              g.p_conv_row_inputs[0] != nil, g.p_conv_row_inputs[1] != nil);
+    }
+    return g.p_fa_rows_n[idx] != nil && g.p_head_norm_rope_rows != nil
+        && g.p_conv_rows[0] != nil && g.p_conv_row_inputs[0] != nil;
+}
+
+extern "C" uint32_t imparo_metal_supports_row_layout(uint32_t head_dim) {
+    return row_layout_ready(head_dim) ? 1u : 0u;
+}
+
+// Words per row of a row layout: imparo_backend::ROW_LAYOUT_WORDS (imparo.metal holds it too).
+static constexpr uint32_t ROW_LAYOUT_WORDS = 12u;
+
+// The FA dispatch of imparo_metal_attention with the row-layout pipeline, the layout bound at
+// 15, the furthest any row sees past itself at 16 and the key floor at 17 (no row sees a key
+// below it; 0 for every caller but a drafter rebuilt from a restore point). No window and no
+// ring: the batch's rows sit in consecutive cache slots. float_q: the pipeline that keeps Q in
+// float (function constant 26), built on its first use.
+extern "C" uint32_t imparo_metal_attention_rows(uint32_t kv_layer, uint32_t head_dim,
+                                                uint32_t n_heads, uint32_t n_kv, uint32_t kv_width,
+                                                uint32_t start_pos, uint32_t key_lo, uint32_t n_tok,
+                                                float scale, uint32_t layout, uint32_t float_q) {
+    if (n_tok < 2u || n_tok > 64u || layout >= B_COUNT || g.bufs[layout] == nil
+        || key_lo > start_pos || !row_layout_ready(head_dim)) { return 0u; }
+    const uint32_t nsg = fa_nsg_value();
+    const bool fq = float_q != 0u;
+    if (fq && g.p_fa_rows_fq_n[fa_nsg_index(nsg)] == nil) {
+        g.p_fa_rows_fq_n[fa_nsg_index(nsg)] = row_layout_pipeline(
+            [NSString stringWithFormat:@"imparo_attention_prefill_fa_s0_n%u", nsg], true, true);
+    }
+    id<MTLComputePipelineState> p = fq ? g.p_fa_rows_fq_n[fa_nsg_index(nsg)]
+                                       : g.p_fa_rows_n[fa_nsg_index(nsg)];
+    // WHERE PREFILL TAKES THE REGISTER-SOFTMAX OP, SO DOES A ROW LAYOUT: with the key split
+    // off, a chain's rows are prefill's rows bit for bit. Q in float (a drafter's option) has no
+    // such twin, and keeps the 8-query op.
+    // The kernel is compiled for slot 0's head dim (g.p_fars is built only at <= 128).
+    const bool fars = !fq && fars_route_on() && g.p_fars != nil && head_dim == g_qcomb_hds[0];
+    if (fars && g.p_fars_rows == nil) {
+        g.p_fars_rows = row_layout_pipeline(@"imparo_attention_prefill_fars_s0", true, false);
+    }
+    // The verify's grid. One query tile a head is n_heads threadgroups each walking every key:
+    // ROW_HEADS makes it n_kv threadgroups doing four heads' useful rows each, ROW_SPLIT cuts the
+    // keys into `slices` threadgroups each (partials, then a merge). Both change the arithmetic
+    // against the causal forward (the split reassociates the softmax), so a verify row is held to
+    // the causal row by tolerance, not bits, where either is on.
+    const uint32_t grp = n_kv > 0u && n_heads % n_kv == 0u ? n_heads / n_kv : 0u;
+    const bool vheads = fars && g_verify_attn_heads != 0u && grp == 4u;
+    const uint32_t QT = vheads ? 8u : 32u;
+    const uint32_t gx = vheads ? n_kv : n_heads, gy = (n_tok + QT - 1u) / QT;
+    // THE SLICES FOLLOW THE CACHE BELOW THE BATCH, NOT THE BATCH: the chunk is sized from the
+    // keys under start_pos and the query tile count is left out, so a tree's row and the same
+    // row of a chain cut the keys at the same places -- the two stay bit-identical. A slice is
+    // at least two 32-key blocks. Only past the partials buffer (rows x slices beyond what it
+    // holds) does the chunk grow with the rows.
+    const uint32_t scan_lo = key_lo & ~31u;
+    const uint32_t span = start_pos + n_tok - scan_lo;
+    uint32_t slices = 1u, chunk = 0u;
+    if (fars && g_verify_split_on != 0u && g_verify_attn_tgs > gx && g.bufs[B_ATTN_PART] != nil) {
+        const uint32_t want = (g_verify_attn_tgs + gx - 1u) / gx;
+        const uint32_t cache_blk = (start_pos - scan_lo + 31u) / 32u;
+        chunk = std::max(2u, (cache_blk + want - 1u) / want) * 32u;
+        const uint64_t per_slice = (uint64_t)n_tok * n_heads * (head_dim + 2u) * 4u;
+        const uint64_t fit = g.sizes[B_ATTN_PART] / per_slice;
+        if (fit >= 2u && (span + chunk - 1u) / chunk > fit) {
+            chunk = ((span + (uint32_t)fit * 32u - 1u) / ((uint32_t)fit * 32u)) * 32u;
+        }
+        slices = fit >= 2u ? (span + chunk - 1u) / chunk : 1u;
+    }
+    const bool vsplit = slices >= 2u;
+    if (!vsplit) { chunk = 0u; }
+    const uint32_t variant = (vsplit ? 1u : 0u) | (vheads ? 2u : 0u);
+    if (variant != 0u && g.p_fars_rows_v[variant] == nil) {
+        g.p_fars_rows_v[variant] = row_layout_pipeline(@"imparo_attention_prefill_fars_s0", true,
+                                                       false, variant);
+    }
+    if (vsplit && g.p_rows_combine == nil) {
+        g.p_rows_combine = row_layout_pipeline(@"imparo_attention_rows_combine", false);
+    }
+    if (variant != 0u && (g.p_fars_rows_v[variant] == nil
+                          || (vsplit && g.p_rows_combine == nil))) { return 0u; }
+    if (fars) { p = variant != 0u ? g.p_fars_rows_v[variant] : g.p_fars_rows; }
+    if (p == nil) { return 0u; }
+    if (getenv("IMPARO_ATTN_WHICH")) {
+        fprintf(stderr, "attn rows layer=%u n_tok=%u start=%u key_lo=%u fars=%u heads=%u slices=%u "
+                        "chunk=%u grid=%ux%ux%u\n", kv_layer, n_tok, start_pos, key_lo, fars ? 1u : 0u,
+                vheads ? 1u : 0u, slices, chunk, gx, gy, slices);
+    }
+    // How many rows past its own the furthest-seeing row attends to: 0 for a chain or a tree
+    // (a row sees only earlier rows), the rest of the block for a drafted block. The kernel
+    // ends each query tile's key scan that far past the tile's last row. A layout naming a
+    // row outside the batch is refused: those keys are not the batch's.
+    if ((uint64_t)n_tok * ROW_LAYOUT_WORDS * 4u > g.sizes[layout]) { return 0u; }
+    const uint32_t * words = (const uint32_t *)((char *)[g.bufs[layout] contents] + g.buf_off[layout]);
+    uint32_t reach = 0u;
+    for (uint32_t t = 0; t < n_tok; ++t) {
+        const uint64_t seen = (uint64_t)words[t * ROW_LAYOUT_WORDS + 2u]
+                            | ((uint64_t)words[t * ROW_LAYOUT_WORDS + 3u] << 32);
+        if (seen == 0u) { continue; }
+        const uint32_t last = 63u - (uint32_t)__builtin_clzll(seen);
+        if (last >= n_tok) { return 0u; }
+        if (last > t && last - t > reach) { reach = last - t; }
+    }
+    const bool kq = kv_eff_type(kv_layer, 0) != 1u;
+    const bool vq = kv_eff_type(kv_layer, 1) != 1u;
+    if (kq) { kv_dequant_now(kv_layer, kv_width, start_pos + n_tok, 0u, 0u); }
+    if (vq) { kv_dequant_now(kv_layer, kv_width, start_pos + n_tok, 1u, 0u); }
+    // The register-softmax op: 32 queries and four simdgroups a threadgroup, two 32-key blocks
+    // of (hd + 8)-half rows staged (the prefill dispatch's sizes).
+    const uint32_t QB = fars ? 32u : FA_QB;
+    const uint32_t THREADS = fars ? 128u : nsg * 32u;
+    // Staged Q is QB x hd halves, or QB x hd floats with Q kept in float.
+    const uint32_t q_floats = fq ? FA_QB * head_dim : (FA_QB * head_dim) / 2u;
+    const uint32_t sfloats = fars ? (2u * 32u * (head_dim + 8u)) / 2u
+                                  : q_floats + FA_QB * FA_CB + FA_QB * head_dim;
+    const bool axh = g_half_a && n_tok >= HALF_A_MIN && g.bufs[B_XH] != nil
+                  && half_consumers_exist()
+                  && (uint64_t)n_tok * n_heads * head_dim * 2ull <= g.sizes[B_XH];
+    ensure_kv_pt(kv_layer, (start_pos + n_tok + KV_PAGE_CELLS - 1u) / KV_PAGE_CELLS);
+    haz(hb(B_Q) | hb(layout) | (kq ? hb(B_KDQ) : HZ_KVK) | (vq ? hb(B_VDQ) : HZ_KVV),
+        vsplit ? hb(B_ATTN_PART) : (hb(B_ATTN) | (axh ? hb(B_XH) : 0u)));
+    const uint32_t window = 0u, ring = 0u;
+    [g.enc setComputePipelineState:p];
+    [g.enc setBuffer:g.bufs[B_Q]    offset:g.buf_off[B_Q]    atIndex:0];
+    if (kq) { [g.enc setBuffer:g.bufs[B_KDQ] offset:g.buf_off[B_KDQ] atIndex:1]; }
+    else    { [g.enc setBuffer:g.kv_k[kv_layer] offset:kv_reg(kv_layer, false) atIndex:1]; }
+    if (vq) { [g.enc setBuffer:g.bufs[B_VDQ] offset:g.buf_off[B_VDQ] atIndex:2]; }
+    else    { [g.enc setBuffer:g.kv_v[kv_layer] offset:kv_reg(kv_layer, true) atIndex:2]; }
+    [g.enc setBuffer:g.bufs[B_ATTN] offset:g.buf_off[B_ATTN] atIndex:3];
+    [g.enc setBytes:&n_heads   length:4 atIndex:4];
+    [g.enc setBytes:&n_kv      length:4 atIndex:5];
+    [g.enc setBytes:&kv_width  length:4 atIndex:6];
+    [g.enc setBytes:&start_pos length:4 atIndex:7];
+    [g.enc setBytes:&window    length:4 atIndex:8];
+    [g.enc setBytes:&ring      length:4 atIndex:9];
+    [g.enc setBytes:&n_tok     length:4 atIndex:10];
+    if (axh) { [g.enc setBuffer:g.bufs[B_XH] offset:g.buf_off[B_XH] atIndex:11]; }
+    else     { [g.enc setBuffer:g.bufs[B_ATTN] offset:g.buf_off[B_ATTN] atIndex:11]; }
+    const uint32_t axh_flag = axh ? 1u : 0u;
+    [g.enc setBytes:&axh_flag length:4 atIndex:12];
+    [g.enc setBuffer:g.kv_pt[kv_layer] offset:0 atIndex:13];
+    [g.enc setBytes:&scale length:sizeof(scale) atIndex:14];
+    [g.enc setBuffer:g.bufs[layout] offset:g.buf_off[layout] atIndex:15];
+    [g.enc setBytes:&reach length:4 atIndex:16];
+    [g.enc setBytes:&key_lo length:4 atIndex:17];
+    if (vsplit) {
+        [g.enc setBuffer:g.bufs[B_ATTN_PART] offset:g.buf_off[B_ATTN_PART] atIndex:18];
+        [g.enc setBytes:&chunk length:4 atIndex:19];
+    }
+    [g.enc setThreadgroupMemoryLength:sfloats * sizeof(float) atIndex:0];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_ATTENTION); }
+    if (fars) {
+        [g.enc dispatchThreadgroups:MTLSizeMake(gx, gy, slices)
+              threadsPerThreadgroup:MTLSizeMake(THREADS, 1, 1)];
+    } else {
+        [g.enc dispatchThreadgroups:MTLSizeMake(n_heads, (n_tok + QB - 1u) / QB, 1)
+              threadsPerThreadgroup:MTLSizeMake(THREADS, 1, 1)];
+    }
+    if (g_prof) { prof_end(); }
+    if (vsplit) {
+        haz(hb(B_ATTN_PART), hb(B_ATTN) | (axh ? hb(B_XH) : 0u));
+        [g.enc setComputePipelineState:g.p_rows_combine];
+        [g.enc setBuffer:g.bufs[B_ATTN_PART] offset:g.buf_off[B_ATTN_PART] atIndex:0];
+        [g.enc setBuffer:g.bufs[B_ATTN] offset:g.buf_off[B_ATTN] atIndex:1];
+        [g.enc setBytes:&head_dim length:4 atIndex:2];
+        [g.enc setBytes:&n_heads length:4 atIndex:3];
+        [g.enc setBytes:&slices length:4 atIndex:4];
+        if (axh) { [g.enc setBuffer:g.bufs[B_XH] offset:g.buf_off[B_XH] atIndex:5]; }
+        else     { [g.enc setBuffer:g.bufs[B_ATTN] offset:g.buf_off[B_ATTN] atIndex:5]; }
+        const uint32_t axh_c = axh ? 1u : 0u;
+        [g.enc setBytes:&axh_c length:4 atIndex:6];
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_ATTENTION); }
+        [g.enc dispatchThreadgroups:MTLSizeMake(n_heads, n_tok, 1)
+              threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
+        if (g_prof) { prof_end(); }
+    }
+    if (axh) {
+        g_xh_src = B_ATTN;
+        g_xh_elems = (uint64_t)n_tok * n_heads * head_dim;
+        g_xh_buf = B_XH;
+    }
+    return 1u;
+}
+
+// imparo_metal_head_norm_rope with each row roped at its layout position (bound at 12).
+extern "C" uint32_t imparo_metal_head_norm_rope_rows(uint32_t buf, uint64_t w_off,
+                                                     uint32_t head_dim, float eps, uint32_t n_heads,
+                                                     uint32_t n_tok, uint32_t n_rot, float base,
+                                                     const float * freqs, uint32_t n_freqs,
+                                                     uint32_t layout) {
+    if (layout >= B_COUNT || g.bufs[layout] == nil || g.p_head_norm_rope_rows == nil) {
+        return 0u;
+    }
+    haz(hb(buf) | hb(layout), hb(buf));
+    const uint32_t n_row = n_tok * n_heads;
+    const uint32_t start_pos = 0u;   // unread under ROW_LAYOUT: positions come from the layout
+    [g.enc setComputePipelineState:g.p_head_norm_rope_rows];
+    const uint64_t w_off_l = wbind(g.enc, w_off, 0);
+    [g.enc setBuffer:g.bufs[buf] offset:g.buf_off[buf] atIndex:1];
+    [g.enc setBytes:&w_off_l length:8 atIndex:2];
+    [g.enc setBytes:&head_dim length:4 atIndex:3];
+    [g.enc setBytes:&eps length:4 atIndex:4];
+    [g.enc setBytes:&n_row length:4 atIndex:5];
+    [g.enc setBytes:&n_rot length:4 atIndex:6];
+    [g.enc setBytes:&base length:4 atIndex:7];
+    [g.enc setBytes:&n_heads length:4 atIndex:8];
+    [g.enc setBytes:&start_pos length:4 atIndex:9];
+    static const float kNoFreqs[1] = {1.0f};
+    [g.enc setBytes:(n_freqs > 0 ? freqs : kNoFreqs)
+             length:(n_freqs > 0 ? n_freqs * 4 : 4) atIndex:10];
+    [g.enc setBytes:&n_freqs length:4 atIndex:11];
+    [g.enc setBuffer:g.bufs[layout] offset:g.buf_off[layout] atIndex:12];
+    // Thread count exactly as imparo_metal_head_norm_rope derives it: the bits depend on it.
+    const NSUInteger vec_units = (head_dim + 3) / 4;
+    NSUInteger threads = 32;
+    while (threads < vec_units && threads < 1024) { threads *= 2; }
+    threads = std::min(threads, (vec_units + 31) / 32 * 32);
+    threads = std::max<NSUInteger>(threads, 32);
+    [g.enc setThreadgroupMemoryLength:tg_bytes16((threads / 32) * sizeof(float)) atIndex:0];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_RMSNORM); }
+    [g.enc dispatchThreadgroups:MTLSizeMake(n_row, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return 1u;
+}
+
+// CO-BATCHED ROWS: row r of a step runs the one-row kernel with its slot selected and its
+// operands moved to row r. The one-row paths read row 0 of each operand and bind a buffer's
+// offset when the dispatch is encoded, so moving it for one call moves nothing else -- and a
+// row's arithmetic is the one-row decode's by construction.
+struct RowRebase {
+    uint32_t id;
+    uint64_t saved;
+    RowRebase(uint32_t id_, uint64_t bytes) : id(id_), saved(g.buf_off[id_]) { g.buf_off[id_] += bytes; }
+    ~RowRebase() { g.buf_off[id] = saved; }
+    RowRebase(const RowRebase &) = delete;
+    RowRebase & operator=(const RowRebase &) = delete;
+};
+
+// Whether no slot appears twice among the rows.
+static bool slots_distinct(const uint32_t * slots, uint32_t n_rows) {
+    for (uint32_t a = 0; a < n_rows; ++a) {
+        for (uint32_t b = a + 1u; b < n_rows; ++b) {
+            if (slots[a] == slots[b]) { return false; }
+        }
+    }
+    return true;
+}
+
+// ---- CO-BATCHED ROWS AS ONE DISPATCH -----------------------------------------------------------
+// A per-row operation of a co-batched step runs its one-row kernel's code once over all the rows
+// (function constant 32): grid row t is row t of the activations, and row t's conversation -- its
+// position, its page table for the layer, its recurrent state -- is entry t of a CobRow table in
+// constant memory. A row's arithmetic is its one-row dispatch's; only where it finds its
+// conversation changes. The table holds addresses, so every buffer it names is declared to the
+// encoder, as the mega route's operands are.
+//
+// Run as the one-row kernel per row with the row's slot selected, an operation cost B dispatches,
+// and a barrier between each two: rows of different slots touch different buffers under one
+// buffer id, and the hazard tracker keys on ids. That loop stays for what the rows kernels do not
+// serve (a ring, the store's roundtrip diagnostic, attention off the vector route, two rows of one
+// conversation).
+struct CobRowHost { uint64_t pt, state, state_out; uint32_t pos, pad; };   // imparo.metal CobRow
+static_assert(sizeof(CobRowHost) == 32u, "CobRow drift");
+// Rows one table carries: setBytes takes at most 4 KB, so a wider step is several dispatches.
+static constexpr uint32_t COB_TABLE_ROWS = 4096u / (uint32_t)sizeof(CobRowHost);
+
+// The rows variant of a one-row pipeline: the one-row pipeline's constants (`live_mask`: the
+// live-mask setting the decode attention kernels are built with) plus constant 32. Built on first
+// use, so a process that never co-batches builds none.
+static id<MTLComputePipelineState> cob_pipeline(Context::CobPipe & cp, NSString * name,
+                                                bool live_mask) {
+    if (cp.p != nil || cp.tried || g.lib == nil) { return cp.p; }
+    cp.tried = true;
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    if (live_mask && !g_attn_live_mask) {
+        const bool lm_off = false;
+        [cv setConstantValue:&lm_off type:MTLDataTypeBool atIndex:10];
+    }
+    const bool on = true;
+    [cv setConstantValue:&on type:MTLDataTypeBool atIndex:32];
+    stamp_epi_act(cv);
+    const double t0 = CACurrentMediaTime();
+    cp.p = make_with(g.lib, name, cv);
+    NSLog(@"imparo metal: co-batch rows pipeline %@ %s in %.1f ms", name,
+          cp.p != nil ? "built" : "FAILED", (CACurrentMediaTime() - t0) * 1e3);
+    return cp.p;
+}
+
+// Each row's conversation, for a rows kernel's table: the rows' slots are selected in turn, `fill`
+// writes row r's entry from the selected slot's state, and the selection is restored. Every
+// buffer `fill` names in `used` is declared to the encoder once. False, with nothing encoded, when
+// a slot cannot be selected or `fill` refuses a row.
+template <typename F>
+static bool cob_gather(const uint32_t * slots, uint32_t n_rows, std::vector<CobRowHost> & tab,
+                       MTLResourceUsage usage, F && fill) {
+    static std::vector<id<MTLResource>> used;
+    tab.assign(n_rows, CobRowHost{});
+    used.clear();
+    const uint32_t cur = g_slot_cur;
+    bool ok = true;
+    for (uint32_t r = 0; r < n_rows && ok; ++r) {
+        ok = imparo_metal_select_slot(slots[r]) == 0 && fill(r, tab[r], used);
+    }
+    imparo_metal_select_slot(cur);
+    if (ok && !used.empty()) {
+        [g.enc useResources:used.data() count:used.size() usage:usage];
+    }
+    used.clear();
+    return ok;
+}
+
+// imparo_metal_kv_store for co-batched rows: row t of `src` stored at pos[t] through its slot's
+// page table, the one-row f16 store's kernel. False, with nothing encoded, for a quantized cache
+// (co-batched decode reads f16 only: Workflow::set_slots refuses the others), a ring, the
+// roundtrip diagnostic, or two rows of one slot.
+static bool cob_kv_store(uint32_t src, uint32_t layer, uint32_t width, const uint32_t * slots,
+                         const uint32_t * pos, uint32_t n_rows, uint32_t is_v, uint32_t ring) {
+    if (g.enc == nil || n_rows == 0u || ring != 0u || kv_eff_type(layer, is_v) != 1u
+        || !slots_distinct(slots, n_rows)) {
+        return false;
+    }
+    const uint32_t rt_msk = is_v ? g_kvq_mask_v : g_kvq_mask_k;
+    if (g_kvq_rt != 0u && (is_v ? g_kv_type_v : g_kv_type_k) == 1u && layer < 32u
+        && ((rt_msk >> layer) & 1u) && g.p_kvstore_rt != nil) { return false; }
+    id<MTLComputePipelineState> p = cob_pipeline(g.cob_kvstore, @"imparo_kv_store", false);
+    if (p == nil) { return false; }
+    static std::vector<CobRowHost> tab;
+    id<MTLBuffer> any_pt = nil;
+    const bool ok = cob_gather(slots, n_rows, tab, MTLResourceUsageRead,
+        [&](uint32_t r, CobRowHost & e, std::vector<id<MTLResource>> & used) {
+            // The page table sized as the row's one-row store sizes it.
+            const uint32_t need = (pos[r] + 1u + KV_PAGE_CELLS - 1u) / KV_PAGE_CELLS;
+            ensure_kv_pt(layer, need);
+            kv_pt_audit("store-f16", layer, need);
+            id<MTLBuffer> pt = g.kv_pt[layer];
+            used.push_back(pt);
+            e.pt = (uint64_t)[pt gpuAddress];
+            e.pos = pos[r];
+            if (any_pt == nil) { any_pt = pt; }
+            return true;
+        });
+    if (!ok) { return false; }
+    haz(hb(src), is_v ? HZ_KVV : HZ_KVK);
+    const uint32_t start_pos = 0u;   // unread under the constant: positions come from the table
+    // One thread per four values, plus up to four for a tail (the one-row store's grid).
+    const NSUInteger gx = width / 4u + ((width % 4u) ? 4u : 0u);
+    for (uint32_t r0 = 0; r0 < n_rows; r0 += COB_TABLE_ROWS) {
+        const uint32_t n = std::min(COB_TABLE_ROWS, n_rows - r0);
+        [g.enc setComputePipelineState:p];
+        [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] + (NSUInteger)r0 * width * 4u atIndex:0];
+        [g.enc setBuffer:(is_v ? g.kv_v[layer] : g.kv_k[layer]) offset:kv_reg(layer, is_v)
+                 atIndex:1];
+        [g.enc setBytes:&width length:4 atIndex:2];
+        [g.enc setBytes:&start_pos length:4 atIndex:3];
+        [g.enc setBytes:&n length:4 atIndex:4];
+        [g.enc setBytes:&ring length:4 atIndex:5];
+        [g.enc setBuffer:any_pt offset:0 atIndex:6];   // unread under the constant
+        [g.enc setBytes:tab.data() + r0 length:n * sizeof(CobRowHost) atIndex:7];
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_KV_STORE); }
+        [g.enc dispatchThreads:MTLSizeMake(gx, n, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        if (g_prof) { prof_end(); }
+    }
+    return true;
+}
+
+// The vector decode route of imparo_metal_attention for co-batched rows: row t of B_Q (already
+// scaled) attends over its slot's cache through pos[t] into row t of B_ATTN. False, with nothing
+// encoded, unless every row takes that route (one query, an f16 cache, a span within
+// attn_vec_max_keys) with no ring and no two rows of one slot.
+static bool cob_attention(uint32_t kv_layer, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv,
+                          uint32_t kv_width, uint32_t window, const uint32_t * slots,
+                          const uint32_t * pos, uint32_t n_rows, uint32_t ring) {
+    if (g.enc == nil || n_rows == 0u || ring != 0u || !slots_distinct(slots, n_rows)) {
+        return false;
+    }
+    const bool kv_quant = kv_eff_type(kv_layer, 0) != 1u || kv_eff_type(kv_layer, 1) != 1u;
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        if (!attn_vec_serves(head_dim, n_heads, n_kv, attn_decode_span(pos[r], window),
+                             kv_quant)) { return false; }
+    }
+    const uint32_t slot_of = attn_hd_slot(head_dim);   // < 2: attn_vec_serves held
+    static NSString * const names[2] = {
+        @"imparo_attention_decode_vec_s0", @"imparo_attention_decode_vec_s1" };
+    id<MTLComputePipelineState> p = cob_pipeline(g.cob_attn_vec[slot_of], names[slot_of], true);
+    if (p == nil) { return false; }
+    static std::vector<CobRowHost> tab;
+    id<MTLBuffer> any_pt = nil;
+    const bool ok = cob_gather(slots, n_rows, tab, MTLResourceUsageRead,
+        [&](uint32_t r, CobRowHost & e, std::vector<id<MTLResource>> & used) {
+            // The table as the step's store left it, which is what the one-row route binds.
+            if (kv_layer >= g.kv_pt.size() || g.kv_pt[kv_layer] == nil) { return false; }
+            id<MTLBuffer> pt = g.kv_pt[kv_layer];
+            used.push_back(pt);
+            e.pt = (uint64_t)[pt gpuAddress];
+            e.pos = pos[r];
+            if (any_pt == nil) { any_pt = pt; }
+            return true;
+        });
+    if (!ok) { return false; }
+    if (getenv("IMPARO_ATTN_WHICH")) {
+        fprintf(stderr, "attn branch vec rows=%u layer=%u hd=%u slot=%u nsg=%u window=%u\n",
+                n_rows, kv_layer, head_dim, slot_of, ATTN_VEC_NSG, window);
+    }
+    haz(hb(B_Q) | HZ_KVK | HZ_KVV, hb(B_ATTN));
+    const uint64_t row_bytes = (uint64_t)n_heads * head_dim * 4u;
+    const uint32_t start_pos = 0u;   // unread under the constant
+    for (uint32_t r0 = 0; r0 < n_rows; r0 += COB_TABLE_ROWS) {
+        const uint32_t n = std::min(COB_TABLE_ROWS, n_rows - r0);
+        [g.enc setComputePipelineState:p];
+        [g.enc setBuffer:g.bufs[B_Q] offset:g.buf_off[B_Q] + r0 * row_bytes atIndex:0];
+        [g.enc setBuffer:g.kv_k[kv_layer] offset:kv_reg(kv_layer, false) atIndex:1];
+        [g.enc setBuffer:g.kv_v[kv_layer] offset:kv_reg(kv_layer, true) atIndex:2];
+        [g.enc setBuffer:g.bufs[B_ATTN] offset:g.buf_off[B_ATTN] + r0 * row_bytes atIndex:3];
+        [g.enc setBytes:&head_dim length:4 atIndex:4];
+        [g.enc setBytes:&n_heads length:4 atIndex:5];
+        [g.enc setBytes:&n_kv length:4 atIndex:6];
+        [g.enc setBytes:&kv_width length:4 atIndex:7];
+        [g.enc setBytes:&start_pos length:4 atIndex:8];
+        [g.enc setBytes:&window length:4 atIndex:9];
+        [g.enc setBytes:&ring length:4 atIndex:10];
+        [g.enc setBuffer:any_pt offset:0 atIndex:18];   // unread under the constant
+        [g.enc setBytes:tab.data() + r0 length:n * sizeof(CobRowHost) atIndex:19];
+        [g.enc setThreadgroupMemoryLength:(NSUInteger)(ATTN_VEC_NSG / 2u) * (head_dim + 2u) * sizeof(float) atIndex:0];
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_ATTENTION); }
+        [g.enc dispatchThreadgroups:MTLSizeMake(n_heads, n, 1)
+              threadsPerThreadgroup:MTLSizeMake(ATTN_VEC_NSG * 32u, 1, 1)];
+        if (g_prof) { prof_end(); }
+    }
+    return true;
+}
+
+// The one-token step of imparo_metal_causal_conv for co-batched rows: row t reads row t of `src`
+// and its slot's history, writes row t of `out` and its advanced history. False, with nothing
+// encoded, when the step route is off or two rows share a slot.
+static bool cob_causal_conv(uint32_t form, uint32_t src, uint64_t w_off, uint32_t state,
+                            const uint32_t * slots, const uint32_t * state_off,
+                            const uint32_t * state_out_off, uint32_t n_rows, uint32_t out,
+                            uint32_t width, uint32_t kern) {
+    if (g.enc == nil || n_rows == 0u || form > 1u || conv_step_pipe(form) == nil
+        || !slots_distinct(slots, n_rows)) { return false; }
+    id<MTLComputePipelineState> p = cob_pipeline(
+        g.cob_conv_step[form], form == 0u ? @"imparo_shortconv_step" : @"imparo_shortconv_step_plain",
+        false);
+    if (p == nil) { return false; }
+    static std::vector<CobRowHost> tab;
+    id<MTLBuffer> any_state = nil;
+    const bool ok = cob_gather(slots, n_rows, tab, MTLResourceUsageRead | MTLResourceUsageWrite,
+        [&](uint32_t r, CobRowHost & e, std::vector<id<MTLResource>> & used) {
+            id<MTLBuffer> b = g.bufs[state];   // the selected slot's
+            if (b == nil) { return false; }
+            used.push_back(b);
+            const uint64_t base = (uint64_t)[b gpuAddress] + g.buf_off[state];
+            e.state = base + (uint64_t)state_off[r] * 4u;
+            e.state_out = base + (uint64_t)state_out_off[r] * 4u;
+            if (any_state == nil) { any_state = b; }
+            return true;
+        });
+    if (!ok) { return false; }
+    haz(hb(src) | hb(state), hb(out) | hb(state));
+    // The gated form's source row is [b | c | x], three widths; the plain form's is one.
+    const uint64_t src_row = (form == 0u ? 3ull : 1ull) * width * 4u;
+    NSUInteger tw = p.maxTotalThreadsPerThreadgroup;
+    if (tw > 256) { tw = 256; }
+    for (uint32_t r0 = 0; r0 < n_rows; r0 += COB_TABLE_ROWS) {
+        const uint32_t n = std::min(COB_TABLE_ROWS, n_rows - r0);
+        [g.enc setComputePipelineState:p];
+        [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] + r0 * src_row atIndex:0];
+        { const WSeg & ws = wseg_use(w_off);
+          [g.enc setBuffer:ws.buf offset:(NSUInteger)(w_off - ws.base) atIndex:1]; }
+        [g.enc setBuffer:any_state offset:0 atIndex:2];   // unread under the constant
+        [g.enc setBuffer:g.bufs[out] offset:g.buf_off[out] + (NSUInteger)r0 * width * 4u atIndex:3];
+        [g.enc setBytes:&width length:4 atIndex:4];
+        [g.enc setBytes:&kern length:4 atIndex:5];
+        [g.enc setBuffer:any_state offset:0 atIndex:6];   // unread under the constant
+        [g.enc setBytes:tab.data() + r0 length:n * sizeof(CobRowHost) atIndex:7];
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_RECUR); }
+        [g.enc dispatchThreads:MTLSizeMake(width, n, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        if (g_prof) { prof_end(); }
+    }
+    return true;
+}
+
+// imparo_metal_head_norm_rope for co-batched rows: row t's heads normed and roped at pos[t].
+// False, with nothing encoded, when the rows pipeline could not be built.
+static bool cob_head_norm_rope(uint32_t buf, uint64_t w_off, uint32_t head_dim, float eps,
+                               uint32_t n_heads, const uint32_t * pos, uint32_t n_rows,
+                               uint32_t n_rot, float base, const float * freqs,
+                               uint32_t n_freqs) {
+    if (g.enc == nil || n_rows == 0u) { return false; }
+    id<MTLComputePipelineState> p =
+        cob_pipeline(g.cob_head_norm_rope, @"imparo_head_norm_rope", false);
+    if (p == nil) { return false; }
+    static std::vector<CobRowHost> tab;
+    tab.assign(n_rows, CobRowHost{});
+    for (uint32_t r = 0; r < n_rows; ++r) { tab[r].pos = pos[r]; }
+    haz(hb(buf), hb(buf));
+    const uint64_t row = (uint64_t)n_heads * head_dim * 4u;
+    const uint32_t start_pos = 0u;   // unread under the constant
+    static const float kNoFreqs[1] = {1.0f};
+    // Thread count exactly as imparo_metal_head_norm_rope derives it: the bits depend on it.
+    const NSUInteger vec_units = (head_dim + 3) / 4;
+    NSUInteger threads = 32;
+    while (threads < vec_units && threads < 1024) { threads *= 2; }
+    threads = std::min(threads, (vec_units + 31) / 32 * 32);
+    threads = std::max<NSUInteger>(threads, 32);
+    for (uint32_t r0 = 0; r0 < n_rows; r0 += COB_TABLE_ROWS) {
+        const uint32_t n = std::min(COB_TABLE_ROWS, n_rows - r0);
+        const uint32_t n_row = n * n_heads;
+        [g.enc setComputePipelineState:p];
+        const uint64_t w_off_l = wbind(g.enc, w_off, 0);
+        [g.enc setBuffer:g.bufs[buf] offset:g.buf_off[buf] + r0 * row atIndex:1];
+        [g.enc setBytes:&w_off_l length:8 atIndex:2];
+        [g.enc setBytes:&head_dim length:4 atIndex:3];
+        [g.enc setBytes:&eps length:4 atIndex:4];
+        [g.enc setBytes:&n_row length:4 atIndex:5];
+        [g.enc setBytes:&n_rot length:4 atIndex:6];
+        [g.enc setBytes:&base length:4 atIndex:7];
+        [g.enc setBytes:&n_heads length:4 atIndex:8];
+        [g.enc setBytes:&start_pos length:4 atIndex:9];
+        [g.enc setBytes:(n_freqs > 0 ? freqs : kNoFreqs)
+                 length:(n_freqs > 0 ? n_freqs * 4 : 4) atIndex:10];
+        [g.enc setBytes:&n_freqs length:4 atIndex:11];
+        [g.enc setBytes:tab.data() + r0 length:n * sizeof(CobRowHost) atIndex:13];
+        [g.enc setThreadgroupMemoryLength:tg_bytes16((threads / 32) * sizeof(float)) atIndex:0];
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_RMSNORM); }
+        [g.enc dispatchThreadgroups:MTLSizeMake(n_row, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        if (g_prof) { prof_end(); }
+    }
+    return true;
+}
+
+extern "C" void imparo_metal_kv_store_slot_rows(uint32_t src, uint32_t layer, uint32_t width,
+                                                const uint32_t * slots, const uint32_t * pos,
+                                                uint32_t n_rows, uint32_t is_v, uint32_t ring) {
+    if (g_skip_cat == PC_KV_STORE) { return; }
+    if (cob_kv_store(src, layer, width, slots, pos, n_rows, is_v, ring)) { return; }
+    const uint32_t cur = g_slot_cur;
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        imparo_metal_select_slot(slots[r]);
+        RowRebase row(src, (uint64_t)r * width * 4u);
+        imparo_metal_kv_store(src, layer, width, pos[r], 1u, is_v, ring);
+    }
+    imparo_metal_select_slot(cur);
+}
+
+extern "C" void imparo_metal_attention_slot_rows(uint32_t kv_layer, uint32_t head_dim,
+                                                 uint32_t n_heads, uint32_t n_kv,
+                                                 uint32_t kv_width, uint32_t window, float scale,
+                                                 const uint32_t * slots, const uint32_t * pos,
+                                                 const uint32_t * max_scores, uint32_t n_rows,
+                                                 uint32_t ring) {
+    if (attn_skipped(head_dim)) { return; }
+    // Every decode route scales Q in place before it attends (see imparo_metal_attention): one
+    // elementwise dispatch over all the rows gives each row the bits its own would, and the
+    // rows then attend unscaled.
+    if (scale != 1.0f) { imparo_metal_scale(B_Q, scale, n_rows * n_heads * head_dim); }
+    if (cob_attention(kv_layer, head_dim, n_heads, n_kv, kv_width, window, slots, pos, n_rows,
+                      ring)) { return; }
+    const uint64_t row_bytes = (uint64_t)n_heads * head_dim * 4u;
+    const uint32_t cur = g_slot_cur;
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        imparo_metal_select_slot(slots[r]);
+        RowRebase q(B_Q, (uint64_t)r * row_bytes);
+        RowRebase o(B_ATTN, (uint64_t)r * row_bytes);
+        imparo_metal_attention(kv_layer, head_dim, n_heads, n_kv, kv_width, pos[r], window, 1u,
+                               max_scores[r], ring, 1.0f);
+    }
+    imparo_metal_select_slot(cur);
+}
+
+extern "C" void imparo_metal_causal_conv_slot_rows(uint32_t form, uint32_t src, uint64_t w_off,
+                                                   uint32_t state, const uint32_t * slots,
+                                                   const uint32_t * state_off,
+                                                   const uint32_t * state_out_off,
+                                                   uint32_t n_rows, uint32_t out, uint32_t width,
+                                                   uint32_t kern) {
+    if (g_skip_cat == PC_RECUR) { return; }
+    if (cob_causal_conv(form, src, w_off, state, slots, state_off, state_out_off, n_rows, out,
+                        width, kern)) { return; }
+    // The gated form's source row is [b | c | x], three widths; the plain form's is one.
+    const uint64_t src_row = (form == 0u ? 3ull : 1ull) * width * 4u;
+    const uint32_t cur = g_slot_cur;
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        imparo_metal_select_slot(slots[r]);
+        RowRebase in(src, (uint64_t)r * src_row);
+        RowRebase o(out, (uint64_t)r * width * 4u);
+        imparo_metal_causal_conv(form, src, w_off, state, state_off[r], state_out_off[r], out,
+                                 width, kern, 1u);
+    }
+    imparo_metal_select_slot(cur);
+}
+
+// Per-head norm and rope of rows that sit at unrelated positions: row r at pos[r], each with
+// the one-row kernel's arithmetic, so a row's bits are its lone decode's.
+extern "C" void imparo_metal_head_norm_rope_at(uint32_t buf, uint64_t w_off, uint32_t head_dim,
+                                               float eps, uint32_t n_heads, const uint32_t * pos,
+                                               uint32_t n_rows, uint32_t n_rot, float base,
+                                               const float * freqs, uint32_t n_freqs) {
+    if (g_skip_cat == PC_RMSNORM) { return; }
+    if (cob_head_norm_rope(buf, w_off, head_dim, eps, n_heads, pos, n_rows, n_rot, base, freqs,
+                           n_freqs)) { return; }
+    const uint64_t row = (uint64_t)n_heads * head_dim * 4u;
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        RowRebase at(buf, (uint64_t)r * row);
+        imparo_metal_head_norm_rope(buf, w_off, head_dim, eps, n_heads, pos[r], 1u, n_rot, base,
+                                    freqs, n_freqs);
+    }
+}
+
+// The output pass of imparo_metal_causal_conv for a layout batch; the state is not advanced.
+extern "C" uint32_t imparo_metal_causal_conv_rows(uint32_t form, uint32_t src, uint64_t w_off,
+                                                  uint32_t state, uint32_t state_off, uint32_t out,
+                                                  uint32_t width, uint32_t kern, uint32_t n_tok,
+                                                  uint32_t layout) {
+    if (form > 1u || n_tok == 0u || layout >= B_COUNT || g.bufs[layout] == nil
+        || g.p_conv_rows[form] == nil) { return 0u; }
+    const bool xh_on = g_half_a != 0u && n_tok >= HALF_A_MIN && g.bufs[B_XH] != nil
+                    && (uint64_t)n_tok * width * 2ull <= g.sizes[B_XH]
+                    && half_consumers_exist();
+    haz(hb(src) | hb(state) | hb(layout), hb(out) | (xh_on ? hb(B_XH) : 0u));
+    [g.enc setComputePipelineState:g.p_conv_rows[form]];
+    [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:0];
+    { const WSeg & ws = wseg_use(w_off);
+      [g.enc setBuffer:ws.buf offset:(NSUInteger)(w_off - ws.base) atIndex:1]; }
+    [g.enc setBuffer:g.bufs[state] offset:g.buf_off[state] + (NSUInteger)state_off * 4
+             atIndex:2];
+    [g.enc setBuffer:g.bufs[out] offset:g.buf_off[out] atIndex:3];
+    [g.enc setBytes:&width length:4 atIndex:4];
+    [g.enc setBytes:&kern length:4 atIndex:5];
+    [g.enc setBytes:&n_tok length:4 atIndex:6];
+    [g.enc setBuffer:xh_on ? g.bufs[B_XH] : g.bufs[out]
+             offset:xh_on ? g.buf_off[B_XH] : g.buf_off[out] atIndex:7];
+    const uint32_t xh_flag = xh_on ? 1u : 0u;
+    [g.enc setBytes:&xh_flag length:4 atIndex:8];
+    [g.enc setBuffer:g.bufs[layout] offset:g.buf_off[layout] atIndex:9];
+    dispatch1(g.p_conv_rows[form], n_tok * width, PC_RECUR);
+    if (xh_on) { g_xh_src = out; g_xh_elems = (uint64_t)n_tok * width; g_xh_buf = B_XH; }
+    return 1u;
+}
+
+// Each batch row's input to a convolution window: `width` values at inputs_off + row * row_elems.
+extern "C" uint32_t imparo_metal_conv_row_inputs(uint32_t form, uint32_t src, uint32_t inputs,
+                                                 uint32_t inputs_off, uint32_t row_elems,
+                                                 uint32_t width, uint32_t n_tok) {
+    if (form > 1u || n_tok == 0u || width == 0u || width > row_elems || src >= B_COUNT
+        || inputs >= B_COUNT || g.bufs[src] == nil || g.bufs[inputs] == nil
+        || g.p_conv_row_inputs[form] == nil) {
+        return 0u;
+    }
+    const uint64_t end = (uint64_t)inputs_off + (uint64_t)(n_tok - 1u) * row_elems + width;
+    if (end * 4ull > g.sizes[inputs]) { return 0u; }
+    haz(hb(src), hb(inputs));
+    [g.enc setComputePipelineState:g.p_conv_row_inputs[form]];
+    [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:0];
+    [g.enc setBuffer:g.bufs[inputs] offset:g.buf_off[inputs] + (NSUInteger)inputs_off * 4
+             atIndex:1];
+    [g.enc setBytes:&width length:4 atIndex:2];
+    [g.enc setBytes:&row_elems length:4 atIndex:3];
+    [g.enc setBytes:&n_tok length:4 atIndex:4];
+    dispatch1(g.p_conv_row_inputs[form], n_tok * width, PC_RECUR);
+    return 1u;
+}
+
+// A tree commit's row move: cache rows of one full-attention layer copied between logical
+// positions, row from[i] -> row to[i] in order, K then V, through the layer's block table (the
+// page rule kv_slot applies for the store and the attention). The cache is shared storage, so a
+// host copy is the whole transfer; call with the device idle. Every row is checked against both
+// buffers before any byte moves, so a refusal leaves the cache as it was.
+static inline uint64_t kv_host_slot(uint32_t layer, uint32_t pos) {
+    id<MTLBuffer> pt = layer < g.kv_pt.size() ? g.kv_pt[layer] : nil;
+    const uint32_t page = pos / KV_PAGE_CELLS;
+    // A table that does not reach this page is the identity there: ensure_kv_pt extends a table
+    // with identity entries before any kernel reads it.
+    if (pt == nil || page >= (uint32_t)([pt length] / 4u)) { return pos; }
+    const uint32_t * e = (const uint32_t *)[pt contents];
+    return (uint64_t)e[page] * KV_PAGE_CELLS + pos % KV_PAGE_CELLS;
+}
+extern "C" uint32_t imparo_metal_kv_move_rows(uint32_t layer, uint64_t k_stride,
+                                              uint64_t v_stride, const uint32_t * from,
+                                              const uint32_t * to, uint32_t n) {
+    if (layer >= g.kv_k.size() || layer >= g.kv_v.size() || k_stride == 0 || v_stride == 0) {
+        return 0u;
+    }
+    id<MTLBuffer> kb = g.kv_k[layer];
+    id<MTLBuffer> vb = g.kv_v[layer];
+    if (kb == nil || vb == nil) { return 0u; }
+    const uint64_t k_reg = kv_reg(layer, false);
+    const uint64_t v_reg = kv_reg(layer, true);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint64_t top = std::max(kv_host_slot(layer, from[i]), kv_host_slot(layer, to[i])) + 1;
+        if (k_reg + top * k_stride > [kb length] || v_reg + top * v_stride > [vb length]) {
+            return 0u;
+        }
+    }
+    uint8_t * k = (uint8_t *)[kb contents] + k_reg;
+    uint8_t * v = (uint8_t *)[vb contents] + v_reg;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint64_t src = kv_host_slot(layer, from[i]);
+        const uint64_t dst = kv_host_slot(layer, to[i]);
+        if (src == dst) { continue; }
+        memcpy(k + dst * k_stride, k + src * k_stride, (size_t)k_stride);
+        memcpy(v + dst * v_stride, v + src * v_stride, (size_t)v_stride);
+    }
+    return 1u;
+}
+
 // THE GATED DELTA RULE, one threadgroup per value head, the batch's tokens looped inside
 // the kernel so the head's state matrix is loaded once and stored once. Returns false
 // when the pipeline does not exist -- the model then refuses, because a no-op here leaves
@@ -7647,9 +11013,9 @@ extern "C" bool imparo_metal_delta_net(uint32_t qkv, uint32_t alpha, uint32_t be
     [g.enc setBuffer:g.bufs[qkv] offset:g.buf_off[qkv] atIndex:0];
     [g.enc setBuffer:g.bufs[alpha] offset:g.buf_off[alpha] atIndex:1];
     [g.enc setBuffer:g.bufs[beta] offset:g.buf_off[beta] atIndex:2];
-    { const WSeg & ws = wseg_at(a_off);
+    { const WSeg & ws = wseg_use(a_off);
       [g.enc setBuffer:ws.buf offset:(NSUInteger)(a_off - ws.base) atIndex:3]; }
-    { const WSeg & ws = wseg_at(dt_off);
+    { const WSeg & ws = wseg_use(dt_off);
       [g.enc setBuffer:ws.buf offset:(NSUInteger)(dt_off - ws.base) atIndex:4]; }
     [g.enc setBuffer:g.bufs[state] offset:g.buf_off[state] + (NSUInteger)state_off * 4
              atIndex:5];
@@ -7669,7 +11035,7 @@ extern "C" bool imparo_metal_delta_net(uint32_t qkv, uint32_t alpha, uint32_t be
     // has to be an offset that actually resolves -- any real one will do, because
     // fuse_epi == 0 means the kernel never reads it.
     { const uint64_t w = fuse ? norm_w_off : a_off;
-      const WSeg & ws = wseg_at(w);
+      const WSeg & ws = wseg_use(w);
       [g.enc setBuffer:ws.buf offset:(NSUInteger)(w - ws.base) atIndex:12]; }
     { const uint32_t gb = fuse ? gate : out;
       [g.enc setBuffer:g.bufs[gb] offset:g.buf_off[gb] atIndex:13]; }
@@ -7686,6 +11052,182 @@ extern "C" bool imparo_metal_delta_net(uint32_t qkv, uint32_t alpha, uint32_t be
     if (g_prof) { prof_end(); }
     return true;
 }
+
+// THE ROWS FORM OF THE DELTA RULE, one dispatch for every row. Each row's matrix lives in its own
+// slot -- a different Metal buffer, which a single binding cannot reach -- so the addresses go in
+// the row table and the buffers are declared with `useResources`, the shape plan step 7b gave the
+// other per-row ops. The rule's own cost barely changes with the row count (38.5 us a call at one
+// row, 44.7 at two, measured per encoder), so what this removes is the second dispatch, not work.
+// False, with nothing encoded, when the pipeline cannot be built or two rows share a slot; the
+// caller then runs the per-row loop.
+// A/B: IMPARO_DELTA_ROWS=0 keeps the per-row loop, so one binary times both arms.
+static bool delta_rows_on() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("IMPARO_DELTA_ROWS"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v == 1;
+}
+static bool cob_delta_net(uint32_t qkv, uint32_t alpha, uint32_t beta, uint64_t a_off,
+                          uint64_t dt_off, uint32_t state, const uint32_t * slots,
+                          const uint32_t * state_off, const uint32_t * state_out_off,
+                          uint32_t n_rows, uint32_t out, uint32_t k_heads, uint32_t v_heads,
+                          uint32_t key_dim, uint32_t value_dim, float eps, uint64_t norm_w_off,
+                          uint32_t gate) {
+    if (!delta_rows_on() || g.enc == nil || n_rows == 0u || g.p_delta_net == nil
+        || key_dim != g_delta_kd || value_dim != g_delta_vd
+        || !slots_distinct(slots, n_rows)) { return false; }
+    const bool fuse = norm_w_off != UINT64_MAX;
+    if (fuse && imparo_metal_delta_net_fuses_epilogue() == 0u) { return false; }
+    id<MTLComputePipelineState> p = cob_pipeline(g.cob_delta_net, @"imparo_delta_net", false);
+    if (p == nil) { return false; }
+    static std::vector<CobRowHost> tab;
+    id<MTLBuffer> any_state = nil;
+    const bool ok = cob_gather(slots, n_rows, tab, MTLResourceUsageRead | MTLResourceUsageWrite,
+        [&](uint32_t r, CobRowHost & e, std::vector<id<MTLResource>> & used) {
+            id<MTLBuffer> b = g.bufs[state];   // the selected slot's
+            if (b == nil) { return false; }
+            used.push_back(b);
+            const uint64_t base = (uint64_t)[b gpuAddress] + g.buf_off[state];
+            e.state = base + (uint64_t)state_off[r] * 4u;
+            e.state_out = base + (uint64_t)state_out_off[r] * 4u;
+            if (any_state == nil) { any_state = b; }
+            return true;
+        });
+    if (!ok || any_state == nil) { return false; }
+    if (g_skip_cat == PC_DELTA) { return true; }
+    haz(hb(qkv) | hb(alpha) | hb(beta) | hb(state) | (fuse ? hb(gate) : 0u),
+        (fuse ? hb(gate) : hb(out)) | hb(state));
+    const uint32_t one = 1u, fuse_flag = fuse ? 1u : 0u, snap_row_v = 0u;
+    for (uint32_t r0 = 0; r0 < n_rows; r0 += COB_TABLE_ROWS) {
+        const uint32_t n = std::min(COB_TABLE_ROWS, n_rows - r0);
+        const uint64_t qkv_row = ((uint64_t)2 * k_heads * key_dim + (uint64_t)v_heads * value_dim) * 4u;
+        const uint64_t head_row = (uint64_t)v_heads * 4u;
+        const uint64_t out_row = (uint64_t)v_heads * value_dim * 4u;
+        [g.enc setComputePipelineState:p];
+        [g.enc setBuffer:g.bufs[qkv]   offset:g.buf_off[qkv]   + (NSUInteger)(r0 * qkv_row)  atIndex:0];
+        [g.enc setBuffer:g.bufs[alpha] offset:g.buf_off[alpha] + (NSUInteger)(r0 * head_row) atIndex:1];
+        [g.enc setBuffer:g.bufs[beta]  offset:g.buf_off[beta]  + (NSUInteger)(r0 * head_row) atIndex:2];
+        { const WSeg & ws = wseg_use(a_off);
+          [g.enc setBuffer:ws.buf offset:(NSUInteger)(a_off - ws.base) atIndex:3]; }
+        { const WSeg & ws = wseg_use(dt_off);
+          [g.enc setBuffer:ws.buf offset:(NSUInteger)(dt_off - ws.base) atIndex:4]; }
+        // Slots 5, 11 and 15 stand in: under COB_ROWS the matrix comes from the table and the
+        // snapshot is not taken, but a flag-guarded binding is bound on every call (#152).
+        [g.enc setBuffer:any_state offset:0 atIndex:5];
+        [g.enc setBuffer:g.bufs[out] offset:g.buf_off[out] + (NSUInteger)(r0 * out_row) atIndex:6];
+        [g.enc setBytes:&k_heads length:4 atIndex:7];
+        [g.enc setBytes:&v_heads length:4 atIndex:8];
+        [g.enc setBytes:&one     length:4 atIndex:9];
+        [g.enc setBytes:&eps     length:4 atIndex:10];
+        [g.enc setBuffer:any_state offset:0 atIndex:11];
+        { const uint64_t w = fuse ? norm_w_off : a_off;
+          const WSeg & ws = wseg_use(w);
+          [g.enc setBuffer:ws.buf offset:(NSUInteger)(w - ws.base) atIndex:12]; }
+        { const uint32_t gb = fuse ? gate : out;
+          [g.enc setBuffer:g.bufs[gb] offset:g.buf_off[gb] + (NSUInteger)(r0 * out_row) atIndex:13]; }
+        [g.enc setBytes:&fuse_flag length:4 atIndex:14];
+        [g.enc setBuffer:any_state offset:0 atIndex:15];
+        [g.enc setBytes:&snap_row_v length:4 atIndex:16];
+        [g.enc setBytes:tab.data() + r0 length:n * sizeof(CobRowHost) atIndex:17];
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_DELTA); }
+        [g.enc dispatchThreadgroups:MTLSizeMake(v_heads, n, 1)
+              threadsPerThreadgroup:MTLSizeMake(g_delta_sgs * 32u, 1, 1)];
+        if (g_prof) { prof_end(); }
+    }
+    return true;
+}
+
+// The one-token delta rule for co-batched rows: row t reads row t of `qkv`, `alpha` and `beta`, its
+// matrix at state_off[t] in its slot's `state`, writes the advanced matrix at state_out_off[t]
+// there and row t of `out` (of `gate` with the fused epilogue), by the one-token step's kernel:
+// the rows select their slots in turn. False when a slot cannot be selected or the rule refuses
+// a row; rows before it were encoded, so the caller fails the step.
+extern "C" bool imparo_metal_delta_net_slot_rows(uint32_t qkv, uint32_t alpha, uint32_t beta,
+                                                 uint64_t a_off, uint64_t dt_off, uint32_t state,
+                                                 const uint32_t * slots,
+                                                 const uint32_t * state_off,
+                                                 const uint32_t * state_out_off, uint32_t n_rows,
+                                                 uint32_t out, uint32_t k_heads,
+                                                 uint32_t v_heads, uint32_t key_dim,
+                                                 uint32_t value_dim, float eps,
+                                                 uint64_t norm_w_off, uint32_t gate) {
+    const bool fuse = norm_w_off != UINT64_MAX;
+    const uint64_t qkv_row = ((uint64_t)2 * k_heads * key_dim + (uint64_t)v_heads * value_dim) * 4u;
+    const uint64_t head_row = (uint64_t)v_heads * 4u;
+    const uint64_t out_row = (uint64_t)v_heads * value_dim * 4u;
+    if (cob_delta_net(qkv, alpha, beta, a_off, dt_off, state, slots, state_off, state_out_off,
+                      n_rows, out, k_heads, v_heads, key_dim, value_dim, eps, norm_w_off, gate)) {
+        return true;
+    }
+    const uint32_t cur = g_slot_cur;
+    bool ok = true;
+    for (uint32_t r = 0; r < n_rows && ok; ++r) {
+        if (imparo_metal_select_slot(slots[r]) != 0) { ok = false; break; }
+        RowRebase q(qkv, r * qkv_row);
+        RowRebase a(alpha, r * head_row);
+        RowRebase bt(beta, r * head_row);
+        RowRebase o(out, r * out_row);
+        // The gate is only rebased when it is its own buffer; unfused it stands in as `out`.
+        const bool gate_row = fuse && gate != out && gate < B_COUNT;
+        const uint64_t gate0 = gate_row ? g.buf_off[gate] : 0ull;
+        if (gate_row) { g.buf_off[gate] += r * out_row; }
+        ok = imparo_metal_delta_net(qkv, alpha, beta, a_off, dt_off, state, state_off[r],
+                                    state_out_off[r], out, k_heads, v_heads, key_dim, value_dim,
+                                    1u, eps, norm_w_off, gate, UINT32_MAX, 0u, 0u);
+        if (gate_row) { g.buf_off[gate] = gate0; }
+    }
+    imparo_metal_select_slot(cur);
+    return ok;
+}
+
+// THE GATED DELTA RULE OVER A DRAFT TREE (imparo_delta_net_tree): every node's output from the
+// state and its own ancestors, the state only read; the inputs are the serial rule's, plus the
+// row layout and the rows with more than one child as a mask (`keep_lo` rows 0..31, `keep_hi`
+// 32..63). The rows must be depth-first and shallower than imparo_metal_delta_tree_depth(): the
+// Rust entry checks the words it was handed and derives the mask from them, and the kernel
+// clamps a depth to its slots, so a layout that slipped past gives wrong numbers but never
+// reaches outside them. `layout_words` is the row width of the caller's words, checked here
+// against the layout buffer's size.
+extern "C" bool imparo_metal_delta_net_tree(uint32_t qkv, uint32_t alpha, uint32_t beta,
+                                            uint64_t a_off, uint64_t dt_off,
+                                            uint32_t state, uint32_t state_off, uint32_t out,
+                                            uint32_t layout, uint32_t layout_words,
+                                            uint32_t keep_lo, uint32_t keep_hi,
+                                            uint32_t k_heads, uint32_t v_heads,
+                                            uint32_t key_dim, uint32_t value_dim,
+                                            uint32_t n_tok, float eps) {
+    if (g.p_delta_net_tree == nil) { return false; }
+    if (key_dim != g_delta_kd || value_dim != g_delta_vd) { return false; }
+    if (n_tok == 0u || n_tok > 64u || layout >= B_COUNT || g.bufs[layout] == nil
+        || (uint64_t)n_tok * layout_words * 4u > g.sizes[layout]) { return false; }
+    if (g_skip_cat == PC_DELTA) { return true; }
+    haz(hb(qkv) | hb(alpha) | hb(beta) | hb(state) | hb(layout), hb(out));
+    [g.enc setComputePipelineState:g.p_delta_net_tree];
+    [g.enc setBuffer:g.bufs[qkv] offset:g.buf_off[qkv] atIndex:0];
+    [g.enc setBuffer:g.bufs[alpha] offset:g.buf_off[alpha] atIndex:1];
+    [g.enc setBuffer:g.bufs[beta] offset:g.buf_off[beta] atIndex:2];
+    { const WSeg & ws = wseg_use(a_off);
+      [g.enc setBuffer:ws.buf offset:(NSUInteger)(a_off - ws.base) atIndex:3]; }
+    { const WSeg & ws = wseg_use(dt_off);
+      [g.enc setBuffer:ws.buf offset:(NSUInteger)(dt_off - ws.base) atIndex:4]; }
+    [g.enc setBuffer:g.bufs[state] offset:g.buf_off[state] + (NSUInteger)state_off * 4
+             atIndex:5];
+    [g.enc setBuffer:g.bufs[out] offset:g.buf_off[out] atIndex:6];
+    [g.enc setBytes:&k_heads length:4 atIndex:7];
+    [g.enc setBytes:&v_heads length:4 atIndex:8];
+    [g.enc setBytes:&n_tok length:4 atIndex:9];
+    [g.enc setBytes:&eps length:4 atIndex:10];
+    [g.enc setBuffer:g.bufs[layout] offset:g.buf_off[layout] atIndex:11];
+    [g.enc setBytes:&keep_lo length:4 atIndex:12];
+    [g.enc setBytes:&keep_hi length:4 atIndex:13];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_DELTA); }
+    [g.enc dispatchThreadgroups:MTLSizeMake(v_heads, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(g_delta_sgs * 32u, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return true;
+}
+
+// The tree delta kernel's depth limit; every node must be shallower.
+extern "C" uint32_t imparo_metal_delta_tree_depth(void) { return g_delta_tree_depth; }
 
 extern "C" void imparo_metal_mul_sigmoid(uint32_t a, uint32_t b, uint32_t n,
                                          uint32_t b_off, uint32_t b_stride,
@@ -7718,6 +11260,24 @@ extern "C" void imparo_metal_copy_strided(uint32_t dst, uint32_t src, uint32_t w
     [g.enc setBytes:&width length:4 atIndex:2];
     [g.enc setBytes:&src_off length:4 atIndex:3];
     [g.enc setBytes:&src_stride length:4 atIndex:4];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_ELEMENTWISE); }
+    [g.enc dispatchThreads:MTLSizeMake(width, n_row, 1)
+      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    if (g_prof) { prof_end(); }
+}
+
+extern "C" void imparo_metal_scatter_strided(uint32_t dst, uint32_t src, uint32_t width,
+                                             uint32_t dst_off, uint32_t dst_stride,
+                                             uint32_t n_row) {
+    if (g_skip_cat == PC_ELEMENTWISE) { return; }
+    if (g.p_scatter_strided == nil || width == 0u || n_row == 0u) { return; }
+    haz(hb(src), hb(dst));
+    [g.enc setComputePipelineState:g.p_scatter_strided];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:0];
+    [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:1];
+    [g.enc setBytes:&width length:4 atIndex:2];
+    [g.enc setBytes:&dst_off length:4 atIndex:3];
+    [g.enc setBytes:&dst_stride length:4 atIndex:4];
     g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_ELEMENTWISE); }
     [g.enc dispatchThreads:MTLSizeMake(width, n_row, 1)
       threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -7769,7 +11329,7 @@ struct MegaTokenHost { uint32_t start_pos, dbg_slot, n_tg, entry_bytes, dbg_seq,
 // Every referenced buffer is declared to the encoder: it is reached by address, not binding.
 static uint64_t mega_waddr(uint64_t off, uint64_t & local) {
     if (w_absent(off)) { local = off; return (uint64_t)[g_wsegs.front().buf gpuAddress]; }
-    const WSeg & sg = wseg_at(off);
+    const WSeg & sg = wseg_use(off);
     local = off - sg.base;
     [g.enc useResource:sg.buf usage:MTLResourceUsageRead];
     return (uint64_t)[sg.buf gpuAddress];
@@ -7939,8 +11499,8 @@ static uint32_t mega_probe_seat(id<MTLComputePipelineState> pipe, uint32_t cores
 // head-dim slot). The seat is per pipeline (see g_mega_tgs), so the limit is too.
 static void mega_measure_ceiling(uint32_t family, uint32_t slot, uint32_t cores) {
     __strong id<MTLComputePipelineState> * const plain[MEGA_ARCH_COUNT] =
-        { g.p_mega_layer, g.p_mega_lfm2, g.p_mega_q35 };
-    static const char * const nm[MEGA_ARCH_COUNT] = { "gemma4", "LFM2", "qwen35" };
+        { g.p_mega_layer, g.p_mega_lfm2, g.p_mega_q35, g.p_mega_l2m };
+    static const char * const nm[MEGA_ARCH_COUNT] = { "gemma4", "LFM2", "qwen35", "lfm2moe" };
     if (family >= MEGA_ARCH_COUNT || slot >= 2u || g_mega_threads_limit[family] == 0u) { return; }
     id<MTLComputePipelineState> pipe = plain[family][slot];
     if (pipe == nil) { return; }   // no pipeline compiled for this slot (one attention geometry)
@@ -7974,7 +11534,8 @@ extern "C" uint32_t imparo_metal_mega_admission_current(uint32_t slot) {
 // second grid knob.
 extern "C" uint32_t imparo_metal_mega_slot_present(uint32_t slot) {
     if (slot >= 2u) { return 0u; }
-    return (g.p_mega_layer[slot] != nil || g.p_mega_lfm2[slot] != nil || g.p_mega_q35[slot] != nil) ? 1u : 0u;
+    return (g.p_mega_layer[slot] != nil || g.p_mega_lfm2[slot] != nil || g.p_mega_q35[slot] != nil
+            || g.p_mega_l2m[slot] != nil) ? 1u : 0u;
 }
 // Backend::mega_seat_form: 0 = no pipeline family, 1 = per-layer dispatches at the grid seat,
 // 2 = the per-token program at one threadgroup per core (task #153's default for the family,
@@ -8140,12 +11701,12 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
     // architecture adds a row rather than another ternary.
     const bool * const prog_default = MEGA_PROGRAM_DEFAULTS;
     const bool prog = mega_program_for(prog_default[e->arch]);
-    __strong id<MTLComputePipelineState> * const plain_of[MEGA_ARCH_COUNT] = { g.p_mega_layer, g.p_mega_lfm2, g.p_mega_q35 };
-    __strong id<MTLComputePipelineState> * const qp_of[MEGA_ARCH_COUNT]    = { g.p_mega_layer_q, g.p_mega_lfm2_q, g.p_mega_q35_q };
-    __strong id<MTLComputePipelineState> * const deepp_of[MEGA_ARCH_COUNT] = { g.p_mega_layer_deep, g.p_mega_lfm2_deep, g.p_mega_q35_deep };
-    __strong id<MTLComputePipelineState> * const deepq_of[MEGA_ARCH_COUNT] = { g.p_mega_layer_deep_q, g.p_mega_lfm2_deep_q, g.p_mega_q35_deep_q };
-    __strong id<MTLComputePipelineState> * const progp_of[MEGA_ARCH_COUNT] = { g.p_mega_layer_prog, g.p_mega_lfm2_prog, g.p_mega_q35_prog };
-    __strong id<MTLComputePipelineState> * const progq_of[MEGA_ARCH_COUNT] = { g.p_mega_layer_prog_q, g.p_mega_lfm2_prog_q, g.p_mega_q35_prog_q };
+    __strong id<MTLComputePipelineState> * const plain_of[MEGA_ARCH_COUNT] = { g.p_mega_layer, g.p_mega_lfm2, g.p_mega_q35, g.p_mega_l2m };
+    __strong id<MTLComputePipelineState> * const qp_of[MEGA_ARCH_COUNT]    = { g.p_mega_layer_q, g.p_mega_lfm2_q, g.p_mega_q35_q, g.p_mega_l2m_q };
+    __strong id<MTLComputePipelineState> * const deepp_of[MEGA_ARCH_COUNT] = { g.p_mega_layer_deep, g.p_mega_lfm2_deep, g.p_mega_q35_deep, g.p_mega_l2m_deep };
+    __strong id<MTLComputePipelineState> * const deepq_of[MEGA_ARCH_COUNT] = { g.p_mega_layer_deep_q, g.p_mega_lfm2_deep_q, g.p_mega_q35_deep_q, g.p_mega_l2m_deep_q };
+    __strong id<MTLComputePipelineState> * const progp_of[MEGA_ARCH_COUNT] = { g.p_mega_layer_prog, g.p_mega_lfm2_prog, g.p_mega_q35_prog, g.p_mega_l2m_prog };
+    __strong id<MTLComputePipelineState> * const progq_of[MEGA_ARCH_COUNT] = { g.p_mega_layer_prog_q, g.p_mega_lfm2_prog_q, g.p_mega_q35_prog_q, g.p_mega_l2m_prog_q };
     __strong id<MTLComputePipelineState> * plain = plain_of[e->arch];
     __strong id<MTLComputePipelineState> * qp    = qp_of[e->arch];
     __strong id<MTLComputePipelineState> * deepp = deepp_of[e->arch];
@@ -8266,6 +11827,18 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
         default: MEGA_REFUSE();
         }
     }
+    // EVERY EXPERT THROUGH ONE BASE: the lfm2moe phases address expert e at e * stride past the
+    // stack's segment base, so the whole stack must lie in that segment -- the dispatch path's
+    // moe_grouped rule. The slot pass above checked only where each stack starts.
+    if (e->arch == MEGA_ARCH_LFM2MOE) {
+        const uint64_t ne = e->u[L2M_U_N_EXPERT];
+        const uint32_t stacks[3][2] = { { L2M_W_GATE, L2M_U_STRIDE_GATE }, { L2M_W_UP, L2M_U_STRIDE_UP },
+                                        { L2M_W_DOWN, L2M_U_STRIDE_DOWN } };
+        for (uint32_t i = 0; i < 3u; ++i) {
+            const uint64_t off = e->slots[stacks[i][0]].off, span = ne * (uint64_t)e->u[stacks[i][1]];
+            if (span == 0ull || !w_pair_in_one_segment(off, off + span - 1ull)) { MEGA_REFUSE(); }
+        }
+    }
     if (!mega_scratch_ensure(e->scratch_rows)) { MEGA_REFUSE(); }
     if (attn_on) { ensure_kv_pt(e->kv_layer, (e->start_pos + 1u + KV_PAGE_CELLS - 1u) / KV_PAGE_CELLS); }
     if (attn_on && getenv("IMPARO_ATTN_WHICH")) {
@@ -8335,8 +11908,8 @@ extern "C" bool imparo_metal_mega_layer(const MegaEntryFfi * e) {
     // What this entry's phases need in threadgroup memory: the row when a phase reuses it
     // across its simdgroups, a few bytes when every phase works on device memory (task #175).
     [g.enc setThreadgroupMemoryLength:(NSUInteger)tgmem_b atIndex:0];
-    static const char * const arch_name[MEGA_ARCH_COUNT] = { "gemma4", "LFM2", "qwen35" };
-    static bool said[MEGA_ARCH_COUNT] = { false, false, false };
+    static const char * const arch_name[MEGA_ARCH_COUNT] = { "gemma4", "LFM2", "qwen35", "lfm2moe" };
+    static bool said[MEGA_ARCH_COUNT] = { false, false, false, false };
     if (!said[e->arch]) {
         said[e->arch] = true;
         NSLog(@"imparo metal: mega %s layer block engaged (level=%d attn=%u kv_write=%u n_embd=%u scratch_rows=%u tgs=%u threads=%u)",
@@ -8577,33 +12150,31 @@ extern "C" void imparo_metal_read_kv(uint32_t layer, uint32_t is_v, uint64_t off
     memcpy(dst, (const uint8_t *)[b contents] + kv_reg(layer, is_v) + off, n);
 }
 
-// The Darwin reclaim protocol for freed KV block ranges (the pair Apple's own
-// malloc uses): REUSABLE on release -- the pages leave phys_footprint at once
-// and their content is forfeit -- and REUSE when the block is allocated again,
-// BEFORE any GPU kernel writes it, so the GPU only ever touches committed
-// pages. Content correctness is structural: a freed block leaves the pool
-// index, and a re-allocated block's rows are written before `filled` lets any
-// attention read them. Rounded INWARD to page boundaries; a sub-page remainder
-// just stays resident. Call with the GPU idle.
-static void kv_advise(uint32_t layer, uint32_t is_v, uint64_t off, uint64_t len,
-                      int advice) {
-    id<MTLBuffer> b = is_v ? g.kv_v[layer] : g.kv_k[layer];
-    if (b == nil || len == 0) { return; }
-    const uint64_t page = (uint64_t)getpagesize();
-    uint8_t * base = (uint8_t *)[b contents];
-    const uint64_t reg = kv_reg(layer, is_v != 0u);
-    uint64_t lo = (reg + off + page - 1) & ~(page - 1);
-    uint64_t hi = (reg + off + len) & ~(page - 1);
-    if (hi <= lo || hi > (uint64_t)[b length]) { return; }
-    madvise(base + lo, (size_t)(hi - lo), advice);
-}
+// The pool's per-block advice. Nothing to do on this backend: a block lives in a resident view,
+// and the pages of a resident buffer are wired, so MADV_FREE_REUSABLE on them frees nothing
+// (measured: footprint unchanged). Pages go back when a smaller view replaces the one covering
+// them (`imparo_metal_kv_prefetch` with a smaller size, then the retirement).
 extern "C" void imparo_metal_kv_advise_free(uint32_t layer, uint32_t is_v,
                                             uint64_t off, uint64_t len) {
-    kv_advise(layer, is_v, off, len, MADV_FREE_REUSABLE);
+    (void)layer; (void)is_v; (void)off; (void)len;
 }
 extern "C" void imparo_metal_kv_advise_reuse(uint32_t layer, uint32_t is_v,
                                              uint64_t off, uint64_t len) {
-    kv_advise(layer, is_v, off, len, MADV_FREE_REUSE);
+    (void)layer; (void)is_v; (void)off; (void)len;
+}
+
+// The host address of `n` bytes of a layer's KV cache at `off` (the coordinates
+// imparo_metal_write_kv takes), or NULL when the range is not inside the side's current
+// view. The KV pool's restore reads a file straight into it; the storage is shared with
+// the GPU, so that read is the whole transfer. Use it with the GPU idle, as the write.
+extern "C" uint8_t * imparo_metal_kv_host_span(uint32_t layer, uint32_t is_v, uint64_t off,
+                                               uint64_t n) {
+    const std::vector<id<MTLBuffer>> & side = is_v ? g.kv_v : g.kv_k;
+    if (layer >= side.size() || side[layer] == nil) { return nullptr; }
+    id<MTLBuffer> b = side[layer];
+    const uint64_t at = kv_reg(layer, is_v) + off;
+    if (at < off || at + n < at || at + n > [b length]) { return nullptr; }
+    return (uint8_t *)[b contents] + at;
 }
 
 // Restore raw bytes into a KV cache buffer (call after the GPU is idle): the KV
@@ -8652,6 +12223,1140 @@ extern "C" void imparo_metal_argmax(uint32_t src, uint32_t dst, uint32_t n) {
     [g.enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
     if (g_prof) { prof_end(); }
+}
+// One greedy pick per row: the single-row kernel dispatched once per row at that row's
+// offsets, so row r's index is exactly imparo_metal_argmax over row r. Each row declares its
+// own hazard, so the rows run one after another, as that many single-row calls would.
+extern "C" void imparo_metal_argmax_rows(uint32_t src, uint32_t dst, uint32_t width,
+                                         uint32_t rows) {
+    NSUInteger tw = std::min<NSUInteger>(1024, g.p_argmax.maxTotalThreadsPerThreadgroup);
+    while (tw & (tw - 1)) { tw &= tw - 1; }   // the tree reduce needs a power of two
+    for (uint32_t r = 0; r < rows; r++) {
+        haz(hb(src), hb(dst));
+        [g.enc setComputePipelineState:g.p_argmax];
+        [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] + (NSUInteger)r * width * 4
+                 atIndex:0];
+        [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] + (NSUInteger)r * 4 atIndex:1];
+        [g.enc setBytes:&width length:4 atIndex:2];
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_ELEMENTWISE); }
+        [g.enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        if (g_prof) { prof_end(); }
+    }
+}
+// THE K LARGEST ENTRIES OF EACH ROW: see imparo_top_k_chunks. A chunk thread scans `chunk`
+// floats and a row's merge visits `chunks * k` list slots; chunks near sqrt(width / k) keeps
+// the two about equal.
+// The list capacity: imparo.metal holds it too, as the size of its lists.
+static constexpr uint32_t TOP_K_ROWS_MAX = 64u;
+// The slots of imparo_top_k8_chunks and imparo_top_k8_merge.
+static constexpr uint32_t TOP_K_NARROW = 8u;
+// The widest row the one-pass kernel takes. A thread scans the whole row, so this trades a
+// longer scan against a dispatch and a barrier; 64 covers every router this engine serves
+// (LFM2.5-8B-A1B has 32 experts) and leaves a wide vocabulary argmax on the two-pass form.
+static constexpr uint32_t TOP_K_ONE_MAX = 64u;
+// IMPARO_TOPK_ONE=0 is the A/B arm: the two-pass form on the same binary.
+static bool top_k_one_on() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("IMPARO_TOPK_ONE"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v != 0;
+}
+struct TopKArgs { uint32_t width, rows, k, chunk, chunks; };
+static TopKArgs top_k_args(uint32_t width, uint32_t rows, uint32_t k) {
+    const uint64_t kk = std::max(k, 1u);
+    uint32_t chunks = 1u;
+    while ((uint64_t)chunks * chunks * kk < width) { chunks += 1u; }
+    const uint32_t chunk = std::max(1u, (width + chunks - 1u) / chunks);
+    chunks = std::max(1u, (width + chunk - 1u) / chunk);   // no empty chunk
+    return TopKArgs{width, rows, k, chunk, chunks};
+}
+extern "C" uint32_t imparo_metal_top_k_rows_max(void) { return TOP_K_ROWS_MAX; }
+extern "C" uint64_t imparo_metal_top_k_rows_len(uint32_t width, uint32_t rows, uint32_t k) {
+    const TopKArgs a = top_k_args(width, rows, k);
+    return 2ull * (uint64_t)rows * k * (1ull + a.chunks);
+}
+extern "C" int imparo_metal_top_k_rows(uint32_t src, uint32_t dst, uint32_t width,
+                                       uint32_t rows, uint32_t k) {
+    if (k == 0u || k > TOP_K_ROWS_MAX || k > width || rows == 0u || src == dst
+        || src >= B_COUNT || dst >= B_COUNT || g.bufs[src] == nil || g.bufs[dst] == nil
+        || (uint64_t)rows * width * 4ull > g.sizes[src]
+        || imparo_metal_top_k_rows_len(width, rows, k) * 4ull > g.sizes[dst]) {
+        NSLog(@"imparo metal: top_k_rows refused (src=%u dst=%u width=%u rows=%u k=%u)", src,
+              dst, width, rows, k);
+        return 1;
+    }
+    const TopKArgs a = top_k_args(width, rows, k);
+    // Eight entries or fewer: the scalar-list kernels.
+    const bool narrow = k <= TOP_K_NARROW;
+    // ONE PASS when the row is narrow. The split into chunk lists plus a merge pays for
+    // itself only when a row is wide enough that one thread scanning it is the bottleneck.
+    // A 32-expert router picking 4 gives chunks=3: a three-thread dispatch and a one-thread
+    // dispatch, both of them launch and nothing else, once per routed layer per token.
+    if (narrow && width <= TOP_K_ONE_MAX && g.p_top_k8_one != nil && top_k_one_on()) {
+        haz(hb(src), hb(dst));
+        [g.enc setComputePipelineState:g.p_top_k8_one];
+        [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:0];
+        [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:1];
+        [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:2];
+        [g.enc setBytes:&a length:sizeof(a) atIndex:3];
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_TOP_K_MERGE); }
+        [g.enc dispatchThreads:MTLSizeMake(rows, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(
+              std::min<NSUInteger>(rows, g.p_top_k8_one.maxTotalThreadsPerThreadgroup), 1, 1)];
+        if (g_prof) { prof_end(); }
+        return 0;
+    }
+    id<MTLComputePipelineState> chunks_ps = narrow ? g.p_top_k8_chunks : g.p_top_k_chunks;
+    id<MTLComputePipelineState> merge_ps = narrow ? g.p_top_k8_merge : g.p_top_k_merge;
+    haz(hb(src), hb(dst));
+    [g.enc setComputePipelineState:chunks_ps];
+    [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:0];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:1];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:2];
+    [g.enc setBytes:&a length:sizeof(a) atIndex:3];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_TOP_K_CHUNKS); }
+    [g.enc dispatchThreads:MTLSizeMake(a.chunks, rows, 1)
+      threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(64, chunks_ps.maxTotalThreadsPerThreadgroup), 1, 1)];
+    if (g_prof) { prof_end(); }
+    // The merge reads the lists pass one wrote.
+    haz(hb(dst), hb(dst));
+    [g.enc setComputePipelineState:merge_ps];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:0];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:1];
+    [g.enc setBytes:&a length:sizeof(a) atIndex:2];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_TOP_K_MERGE); }
+    [g.enc dispatchThreads:MTLSizeMake(rows, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(rows, merge_ps.maxTotalThreadsPerThreadgroup), 1, 1)];
+    if (g_prof) { prof_end(); }
+    return 0;
+}
+// ============================================================================================
+// A ROUTED FEED-FORWARD (imparo.metal, "MIXTURE OF EXPERTS"). Four entries, in the order a
+// layer calls them: gate, plan, grouped (three times -- gate, up, down), combine.
+//
+// The model owns the buffers and the order; this file owns only the dispatches. Every entry
+// checks its ranges and returns non-zero rather than writing outside them, because a routed
+// layer's indices come from a kernel rather than from the host and a wrong one would read a
+// neighbouring expert's weights and still produce plausible text.
+static constexpr uint32_t MOE_MAX_EXPERTS = 256u;   // the shader's threadgroup arrays
+static constexpr uint32_t MOE_MAX_K = 8u;
+static constexpr uint32_t MOE_GROUPED_SGS = 8u;     // simdgroups a threadgroup, one row each
+// The work rows the grouped matmul stages at once, and the bytes that costs. Must match
+// MOE_STAGE_ROWS in the kernel: the kernel indexes `xstage + i * 1024` and the host is
+// what says how much of it exists.
+static constexpr uint32_t MOE_STAGE_ROWS = 4u;
+static constexpr NSUInteger MOE_STAGE_BYTES = MOE_STAGE_ROWS * 1024u * sizeof(float);
+
+// The activation staging: OFF unless IMPARO_MOE_STAGE=1. A measured negative -- the kernel
+// comment says why, and the short version is that the cost is load COUNT, which staging
+// does not change. Kept as an arm so the next attempt starts from a measurement.
+static uint32_t moe_stage() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("IMPARO_MOE_STAGE"); v = e ? atoi(e) : 0; }
+    return (uint32_t)(v != 0);
+}
+
+extern "C" int imparo_metal_moe_gate(uint32_t scores, uint32_t probs, uint32_t sel,
+                                     uint64_t bias_off, uint32_t n_tok, uint32_t n_expert,
+                                     uint32_t gating) {
+    const uint64_t words = (uint64_t)n_tok * n_expert;
+    if (n_tok == 0u || n_expert == 0u || n_expert > MOE_MAX_EXPERTS || gating > 1u
+        || scores >= B_COUNT || probs >= B_COUNT || sel >= B_COUNT
+        || g.bufs[scores] == nil || g.bufs[probs] == nil || g.bufs[sel] == nil
+        || probs == sel
+        || words * 4ull > g.sizes[scores] || words * 4ull > g.sizes[probs]
+        || words * 4ull > g.sizes[sel]) {
+        NSLog(@"imparo metal: moe_gate refused (n_tok=%u n_expert=%u gating=%u)", n_tok,
+              n_expert, gating);
+        return 1;
+    }
+    haz(hb(scores), hb(probs) | hb(sel));
+    [g.enc setComputePipelineState:g.p_moe_gate];
+    const uint64_t bias_l = (bias_off == W_NONE) ? W_NONE : wbind(g.enc, bias_off, 0);
+    if (bias_off == W_NONE) { [g.enc setBuffer:g_wsegs.front().buf offset:0 atIndex:0]; }
+    [g.enc setBuffer:g.bufs[scores] offset:g.buf_off[scores] atIndex:1];
+    [g.enc setBuffer:g.bufs[probs] offset:g.buf_off[probs] atIndex:2];
+    [g.enc setBuffer:g.bufs[sel] offset:g.buf_off[sel] atIndex:3];
+    [g.enc setBytes:&n_expert length:4 atIndex:4];
+    [g.enc setBytes:&gating length:4 atIndex:5];
+    [g.enc setBytes:&bias_l length:8 atIndex:6];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MOE_ROUTE); }
+    [g.enc dispatchThreadgroups:MTLSizeMake(n_tok, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return 0;
+}
+
+extern "C" int imparo_metal_moe_plan(uint32_t topk, uint32_t probs, uint32_t perm,
+                                     uint32_t wgt, uint32_t seg, uint32_t inv, uint32_t n_tok,
+                                     uint32_t n_expert, uint32_t k, uint32_t normalise,
+                                     float scale) {
+    const uint64_t rows = (uint64_t)n_tok * k;
+    if (n_tok == 0u || k == 0u || k > MOE_MAX_K || k > n_expert || n_expert > MOE_MAX_EXPERTS
+        || topk >= B_COUNT || probs >= B_COUNT || perm >= B_COUNT || wgt >= B_COUNT
+        || seg >= B_COUNT || inv >= B_COUNT || g.bufs[topk] == nil || g.bufs[probs] == nil
+        || g.bufs[perm] == nil || g.bufs[wgt] == nil || g.bufs[seg] == nil
+        || g.bufs[inv] == nil
+        || rows * 4ull > g.sizes[topk] || (uint64_t)n_tok * n_expert * 4ull > g.sizes[probs]
+        || rows * 4ull > g.sizes[perm] || rows * 4ull > g.sizes[wgt]
+        || rows * 4ull > g.sizes[inv]
+        // seg holds n_expert+1 offsets, then the active count, then up to n_expert ids.
+        || (2ull * (uint64_t)n_expert + 2ull) * 4ull > g.sizes[seg]) {
+        NSLog(@"imparo metal: moe_plan refused (n_tok=%u n_expert=%u k=%u)", n_tok, n_expert, k);
+        return 1;
+    }
+    haz(hb(topk) | hb(probs), hb(perm) | hb(wgt) | hb(seg) | hb(inv));
+    [g.enc setComputePipelineState:g.p_moe_plan];
+    [g.enc setBuffer:g.bufs[topk] offset:g.buf_off[topk] atIndex:0];
+    [g.enc setBuffer:g.bufs[probs] offset:g.buf_off[probs] atIndex:1];
+    [g.enc setBuffer:g.bufs[perm] offset:g.buf_off[perm] atIndex:2];
+    [g.enc setBuffer:g.bufs[wgt] offset:g.buf_off[wgt] atIndex:3];
+    [g.enc setBuffer:g.bufs[seg] offset:g.buf_off[seg] atIndex:4];
+    [g.enc setBuffer:g.bufs[inv] offset:g.buf_off[inv] atIndex:5];
+    [g.enc setBytes:&n_tok length:4 atIndex:6];
+    [g.enc setBytes:&n_expert length:4 atIndex:7];
+    [g.enc setBytes:&k length:4 atIndex:8];
+    [g.enc setBytes:&normalise length:4 atIndex:9];
+    [g.enc setBytes:&scale length:4 atIndex:10];
+    // ONE THREADGROUP. The counting sort's positions come from threadgroup atomics and its
+    // bases from one prefix sum over them, so a second threadgroup would need a device-wide
+    // barrier this encoder does not have -- and the sort is tens of microseconds of work.
+    const NSUInteger tw = std::min<NSUInteger>(256, g.p_moe_plan.maxTotalThreadsPerThreadgroup);
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MOE_ROUTE); }
+    [g.enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return 0;
+}
+
+// THE GATE, THE PICK AND THE PLAN AS ONE DISPATCH. Refused -- with nothing encoded, so the
+// caller runs the three -- whenever a precondition does not hold; the three compute the same
+// thing, which is why every refusal here is silent.
+//
+// The threshold is in TOKENS and it is what keeps this honest: the plan is one threadgroup
+// at every width, but the gate is n_tok threadgroups, and folding it in puts 512 softmaxes
+// on one core at a full prefill chunk. Below the threshold the whole route is a few hundred
+// operations and the two saved dispatches are the entire cost of it.
+static uint32_t moe_route_fuse_max() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("IMPARO_MOE_ROUTE_FUSE_MAX"); v = e ? atoi(e) : 32; }
+    return (uint32_t)(v < 0 ? 0 : v);
+}
+
+extern "C" int imparo_metal_moe_route(uint32_t scores, uint32_t probs, uint32_t sel,
+                                      uint32_t topk, uint32_t perm, uint32_t wgt,
+                                      uint32_t seg, uint32_t inv, uint64_t bias_off,
+                                      uint32_t n_tok, uint32_t n_expert, uint32_t k,
+                                      uint32_t gating, uint32_t normalise, float scale) {
+    const uint64_t rows = (uint64_t)n_tok * k;
+    const uint64_t words = (uint64_t)n_tok * n_expert;
+    // THE PICK IS THE ONE-PASS TOP-8 LIST, so this serves only what that serves: eight
+    // entries or fewer over a row narrow enough for one thread to scan. Wider rows keep the
+    // chunked top-k, which is two dispatches of its own and not foldable into one group.
+    if (g.p_moe_route == nil || n_tok == 0u || n_tok > moe_route_fuse_max()
+        || k == 0u || k > TOP_K_NARROW || k > MOE_MAX_K || k > n_expert
+        || n_expert == 0u || n_expert > MOE_MAX_EXPERTS || n_expert > TOP_K_ONE_MAX
+        || !top_k_one_on() || gating > 1u
+        || scores >= B_COUNT || probs >= B_COUNT || sel >= B_COUNT || topk >= B_COUNT
+        || perm >= B_COUNT || wgt >= B_COUNT || seg >= B_COUNT || inv >= B_COUNT
+        || g.bufs[scores] == nil || g.bufs[probs] == nil || g.bufs[sel] == nil
+        || g.bufs[topk] == nil || g.bufs[perm] == nil || g.bufs[wgt] == nil
+        || g.bufs[seg] == nil || g.bufs[inv] == nil || probs == sel
+        || words * 4ull > g.sizes[scores] || words * 4ull > g.sizes[probs]
+        || words * 4ull > g.sizes[sel]
+        || imparo_metal_top_k_rows_len(n_expert, n_tok, k) * 4ull > g.sizes[topk]
+        || rows * 4ull > g.sizes[perm] || rows * 4ull > g.sizes[wgt]
+        || rows * 4ull > g.sizes[inv]
+        || (2ull * (uint64_t)n_expert + 2ull) * 4ull > g.sizes[seg]) {
+        return 1;
+    }
+    haz(hb(scores), hb(probs) | hb(sel) | hb(topk) | hb(perm) | hb(wgt) | hb(seg) | hb(inv));
+    [g.enc setComputePipelineState:g.p_moe_route];
+    const uint64_t bias_l = (bias_off == W_NONE) ? W_NONE : wbind(g.enc, bias_off, 0);
+    if (bias_off == W_NONE) { [g.enc setBuffer:g_wsegs.front().buf offset:0 atIndex:0]; }
+    [g.enc setBuffer:g.bufs[scores] offset:g.buf_off[scores] atIndex:1];
+    [g.enc setBuffer:g.bufs[probs] offset:g.buf_off[probs] atIndex:2];
+    [g.enc setBuffer:g.bufs[sel] offset:g.buf_off[sel] atIndex:3];
+    // The top-k destination carries ids then values in ONE buffer, bound twice, exactly as
+    // imparo_metal_top_k_rows binds it.
+    [g.enc setBuffer:g.bufs[topk] offset:g.buf_off[topk] atIndex:4];
+    [g.enc setBuffer:g.bufs[topk] offset:g.buf_off[topk] atIndex:5];
+    [g.enc setBuffer:g.bufs[perm] offset:g.buf_off[perm] atIndex:6];
+    [g.enc setBuffer:g.bufs[wgt] offset:g.buf_off[wgt] atIndex:7];
+    [g.enc setBuffer:g.bufs[seg] offset:g.buf_off[seg] atIndex:8];
+    [g.enc setBuffer:g.bufs[inv] offset:g.buf_off[inv] atIndex:9];
+    [g.enc setBytes:&n_tok length:4 atIndex:10];
+    [g.enc setBytes:&n_expert length:4 atIndex:11];
+    [g.enc setBytes:&k length:4 atIndex:12];
+    [g.enc setBytes:&gating length:4 atIndex:13];
+    [g.enc setBytes:&bias_l length:8 atIndex:14];
+    [g.enc setBytes:&normalise length:4 atIndex:15];
+    [g.enc setBytes:&scale length:4 atIndex:16];
+    const NSUInteger tw = std::min<NSUInteger>(256, g.p_moe_route.maxTotalThreadsPerThreadgroup);
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MOE_ROUTE); }
+    [g.enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return 0;
+}
+
+// The routed matmul's pipeline, built on first use: the weight format alone, since it always
+// addresses row-major blocks.
+static id<MTLComputePipelineState> moe_grouped_pipeline_for_fmt(uint32_t wfmt,
+                                                                bool rowmajor) {
+    if (wfmt == 0u || wfmt >= 32u || g.lib == nil) { return nil; }
+    // One slot per (format, layout): the kernel now addresses both, so a stack that was
+    // repacked must not be served by a pipeline compiled for the row-major addresses.
+    id<MTLComputePipelineState> __strong & have =
+        g.p_moe_grouped_fmt[wfmt + (rowmajor ? 0u : 32u)];
+    if (have != nil) { return have; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    [cv setConstantValue:&wfmt type:MTLDataTypeUInt atIndex:21];
+    [cv setConstantValue:&rowmajor type:MTLDataTypeBool atIndex:22];
+    // DIAGNOSTIC (IMPARO_MOE_SKIP, the kernel's skip bits); unset in every served run.
+    if (moe_skip_bits() > 0) {
+        const uint32_t sk = moe_skip_bits();
+        [cv setConstantValue:&sk type:MTLDataTypeUInt atIndex:45];
+    }
+    const uint32_t stage = moe_stage();
+    [cv setConstantValue:&stage type:MTLDataTypeUInt atIndex:46];
+    NSError * e = nil;
+    id<MTLFunction> f = [g.lib newFunctionWithName:@"imparo_moe_grouped" constantValues:cv
+                                             error:&e];
+    have = f ? [g.device newComputePipelineStateWithFunction:f error:&e] : nil;
+    if (have == nil) {
+        NSLog(@"imparo metal: routed matmul for weight format %u (%s): %@", wfmt,
+              rowmajor ? "row-major" : "tile-major", e);
+    } else if (getenv("IMPARO_WFMT_LOG")) {
+        NSLog(@"imparo metal: built the routed matmul for weight format %u", wfmt);
+    }
+    return have;
+}
+
+// The routed matmul on the matrix unit. Same constants as the rows matmul it shares a body
+// with; no half arm, because the routed path holds float activations like every other
+// non-fast route.
+static id<MTLComputePipelineState> moe_grouped_mma_pipeline_for_fmt(uint32_t wfmt,
+                                                                   uint32_t tiles,
+                                                                   bool rowmajor,
+                                                                   bool pair = false) {
+    if (wfmt == 0u || wfmt >= 32u || g.lib == nil) { return nil; }
+    if (tiles != 1u && tiles != 2u && tiles != 4u) { return nil; }
+    id<MTLComputePipelineState> __strong & have =
+        pair ? g.p_moe_grouped_mma_pair_fmt[wfmt + (rowmajor ? 0u : 32u)]
+                                           [tiles == 4u ? 2u : tiles - 1u]
+             : g.p_moe_grouped_mma_fmt[wfmt + (rowmajor ? 0u : 32u)]
+                                      [tiles == 4u ? 2u : tiles - 1u];
+    if (have != nil) { return have; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    [cv setConstantValue:&wfmt type:MTLDataTypeUInt atIndex:21];
+    [cv setConstantValue:&rowmajor type:MTLDataTypeBool atIndex:22];
+    stamp_epi_act(cv);
+    [cv setConstantValue:&tiles type:MTLDataTypeUInt atIndex:43];
+    // The shared body's skip bits reach the routed kernel too (IMPARO_BLK_MMA_SKIP): the
+    // routed matmul is priced by the same three differences as the rows matmul it is.
+    static int mskip = -1;
+    if (mskip < 0) { const char * se = getenv("IMPARO_BLK_MMA_SKIP"); mskip = se ? atoi(se) : 0; }
+    if (mskip > 0) {
+        const uint32_t sk = (uint32_t)mskip;
+        [cv setConstantValue:&sk type:MTLDataTypeUInt atIndex:44];
+    }
+    NSError * e = nil;
+    id<MTLFunction> f = [g.lib newFunctionWithName:pair ? @"imparo_moe_grouped_mma_pair"
+                                                        : @"imparo_moe_grouped_mma"
+                                    constantValues:cv error:&e];
+    have = f ? [g.device newComputePipelineStateWithFunction:f error:&e] : nil;
+    if (have == nil) {
+        NSLog(@"imparo metal: routed matrix-unit matmul%s for weight format %u: %@",
+              pair ? " (pair)" : "", wfmt, e);
+    } else if (getenv("IMPARO_WFMT_LOG")) {
+        NSLog(@"imparo metal: built the routed matrix-unit matmul%s for weight format %u "
+              @"(tiles=%u, max_threads=%lu)", pair ? " (pair)" : "", wfmt, tiles,
+              (unsigned long)[have maxTotalThreadsPerThreadgroup]);
+    }
+    return have;
+}
+
+// THE STAGED ROUTED GEMM (IMPARO_MOE_ST=1). Both operands staged as half in threadgroup
+// memory and multiplied on the matrix unit -- the design st_gemm uses for Q8_0, which a
+// k-quant has never had. Measured on Q8_0, where IMPARO_Q8_DESIGN switches the two designs
+// on one shape: staged beats register-tiled 1.63x at 64 rows, 1.25x at 128, 1.12x at 512.
+// A routed layer is nothing but thin shapes, so this is where that 1.63x lives.
+static constexpr uint32_t MOE_ST_ROWS = 64u, MOE_ST_TOKENS = 32u, MOE_ST_K = 64u;
+// ONE buffer the kernel partitions (imparo.metal, moe_st_gemm_body), so no binding is trusted
+// to be distinct from another: the weight tile (K / 8 * ROWS / 8 tiles of 64 halves), the
+// activation tile (K / 8 * TOKENS / 8 of them), then the resolved row bases. The paired and
+// two-block shapes restage one weight tile, so they need no more than the single shape.
+static constexpr NSUInteger moe_st_tg_bytes(uint32_t rows, uint32_t tokens, uint32_t k) {
+    const NSUInteger stage =
+        (NSUInteger)(k / 8u) * ((rows / 8u) + (tokens / 8u)) * 64u * sizeof(uint16_t);
+    return stage + (NSUInteger)tokens * sizeof(uint64_t);
+}
+
+// A WORK-ROW GROUP THAT COVERS A WHOLE EXPERT stages the weight tile ONCE. The grid is
+// (row groups, token groups, experts) and every token group of an expert stages the SAME
+// weight tile, so at a 512-token chunk -- 2048 work rows over 32 experts, 64 each -- a
+// 32-token group dequantises every weight twice. 64 covers the segment in one.
+// THE ROUTED GEMM'S SHAPES: one kernel each (imparo.metal, IMPARO_MOE_ST_KERNEL). `tokens` is
+// the token tile (the grid's token axis and the n_tok floor), `nsg` the simdgroups a
+// threadgroup, `paired` whether it is the gate|up form.
+// `rblk` row blocks of `rows` a threadgroup (imparo.metal, ROW2): the grid's row axis covers
+// rows * rblk, the threadgroup buffer holds one block.
+struct MoeStShape { NSString * fn; uint32_t rows, tokens, k, nsg; bool paired; uint32_t rblk = 1u; };
+static MoeStShape moe_st_shape(uint32_t i) {
+    switch (i) {
+    case 0: return {@"imparo_moe_st_gemm_pair",    64u, 32u, 64u, 4u, true};
+    case 1: return {@"imparo_moe_st_gemm_n8",      64u, 8u, 64u, 2u, false};
+    case 2: return {@"imparo_moe_st_gemm_pair_n8", 64u, 8u, 64u, 2u, true};
+    case 3: return {@"imparo_moe_st_gemm_r2",      64u, 32u, 64u, 4u, false, 2u};
+    default: return {nil, 0u, 0u, 0u, 0u, false};
+    }
+}
+// The single-projection shape (the down projection): two 64-row blocks a threadgroup (3), which
+// stages each activation tile once for 128 rows as the pair does for gate and up -- 868 -> 839
+// ms of down projection at a 5955-token prefill against one 64-row block, bit-identical; a
+// 64-token tile read 937. The 8-token shape serves a chunk under 32 tokens (16 tokens: 42.9 ms
+// a forward against 72.3 on the 32-token shape; the rows kernel's 34.7 is not the same
+// arithmetic).
+static uint32_t moe_st_single_shape(uint32_t n_tok = 0xffffffffu) { return n_tok < 32u ? 1u : 3u; }
+// The gate|up shape: the paired kernel, its 8-token form under 32 tokens.
+static uint32_t moe_st_pair_shape(uint32_t n_tok = 0xffffffffu) { return n_tok < 32u ? 2u : 0u; }
+// THE HALF HANDOFF (imparo.metal, MOE_ST_SRC_HALF / MOE_ST_DST_HALF): the staged GEMM reads a
+// current half mirror of its source instead of the floats, and the gate|up pair writes its
+// result as half when the down projection will stage it. Bit-identical: both round to half at
+// the same point the tile staging did.
+// Where a routed matmul's activation rows live. A current half mirror of `src` covering
+// `elems` is read in place of the floats (`*half` true, the mirror's buffer returned); floats
+// a mirror-mode producer left stale with no such mirror mean nothing holds the activations,
+// and the caller refuses (returns B_COUNT).
+static uint32_t moe_st_source(uint32_t src, uint64_t elems, bool * half) {
+    const bool stale = src < 64u && ((g_float_stale >> src) & 1ull) != 0ull;
+    const bool mirrored = g_xh_src == src && g_xh_elems >= elems
+                       && g_xh_buf < B_COUNT && g.bufs[g_xh_buf] != nil;
+    *half = mirrored;
+    if (mirrored) { return g_xh_buf; }
+    return stale ? (uint32_t)B_COUNT : src;
+}
+static uint32_t moe_st_tokens() {
+    const uint32_t a = moe_st_shape(moe_st_single_shape()).tokens;
+    const uint32_t b = moe_st_shape(moe_st_pair_shape()).tokens;
+    return a > b ? a : b;
+}
+
+// ON. Prefill 926.6 -> 1348.4 tok/s against llama's 1374.3 on the long leg and 1279.8
+// against 1247.8 on the short one (bracket, LFM2.5-8B-A1B Q4_K_M, M3 Pro, 2026-09-21).
+// IMPARO_MOE_ST=0 is the off arm.
+//
+// DECODE IS UNTOUCHED: a decode step (1 row) and co-batched decode rows keep the rows kernel
+// (moe_st_wanted). Every multi-token chunk of one sequence -- a prefill chunk or a speculative
+// verify batch -- stages both operands as half, as the dense GEMMs do from two tokens; on this
+// model that lands CLOSER to llama than the rows kernel does (max |delta-to-top1| 0.698 vs
+// 0.793).
+static uint32_t moe_st_on() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("IMPARO_MOE_ST"); v = (e && e[0] == '0') ? 0 : 1; }
+    return (uint32_t)v;
+}
+// WHICH FORWARDS TAKE THE STAGED GEMM.
+//
+//   a prompt chunk of one sequence, 2+ tokens   always (narrow shape under 32 tokens)
+//   a verify batch, 32+ tokens                  yes
+//   a verify batch under 32, a decode step,
+//   co-batched decode rows                      no: the rows kernel, in float
+//
+// A PROMPT CHUNK'S POSITIONS MUST COMPUTE THE SAME AT EVERY WIDTH: a resumed prompt is chunked
+// differently from a cold one and the KV pool reuses one for the other byte for byte. With the
+// floor at the tile (32) a 9-token resumed tail ran the rows kernel where the cold prefill had
+// staged half, and kv_gates' split and grid phases stopped being byte-equal. The narrow shape
+// gives the same per-element arithmetic, so the width no longer matters.
+//
+// A VERIFY BATCH KEEPS THE ROWS KERNEL under 32: speculation on LFM2.5-8B-A1B (agentic --tiny,
+// second turn, 2026-09-24) ran 75.7 / 76.0 tok/s that way and 47.5 / 47.4 with the staged GEMM
+// (the rows kernel streams a few rows an expert far better). Verify positions are decode-time
+// work, like a decode step, which is float everywhere.
+static bool moe_st_wanted(uint32_t n_tok, bool prefill_chunk) {
+    if (!moe_st_on() || decode_rows_route() != 0u) { return false; }
+    return n_tok >= 32u || (prefill_chunk && n_tok >= HALF_A_MIN);
+}
+// The routed GEMM's token tile, or 0 when the staged GEMM is off: the prefill chunk knob
+// derives from how many whole tiles a chunk gives each expert.
+extern "C" uint32_t imparo_metal_moe_token_tile(void) { return moe_st_on() ? moe_st_tokens() : 0u; }
+
+static id<MTLComputePipelineState> moe_st_pipeline_for_fmt(uint32_t wfmt, bool rowmajor,
+                                                           uint32_t shape,
+                                                           bool src_half = false,
+                                                           bool dst_half = false) {
+    if (wfmt == 0u || wfmt >= 32u || g.lib == nil || moe_st_shape(shape).fn == nil) { return nil; }
+    const uint32_t io = (src_half ? 1u : 0u) | (dst_half ? 2u : 0u);
+    id<MTLComputePipelineState> __strong & have =
+        g.p_moe_st_gemm_fmt[wfmt + (rowmajor ? 0u : 32u)][shape][io];
+    if (have != nil) { return have; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    [cv setConstantValue:&wfmt type:MTLDataTypeUInt atIndex:21];
+    [cv setConstantValue:&rowmajor type:MTLDataTypeBool atIndex:22];
+    // THE MODEL'S ACTIVATION. imparo_act_f reads function constant 11 and DEFAULTS TO GELU
+    // when it is not set, so a paired pipeline built without it silently computes gelu
+    // where the model wants silu -- a ~1% difference in the SwiGLU, which is what this
+    // kernel's first build produced. The single-projection shapes never noticed because
+    // they do not call imparo_act_f at all.
+    [cv setConstantValue:&g_epi_act type:MTLDataTypeUInt atIndex:11];
+    [cv setConstantValue:&src_half type:MTLDataTypeBool atIndex:61];
+    [cv setConstantValue:&dst_half type:MTLDataTypeBool atIndex:62];
+    NSError * e = nil;
+    id<MTLFunction> f =
+        [g.lib newFunctionWithName:moe_st_shape(shape).fn constantValues:cv error:&e];
+    have = f ? [g.device newComputePipelineStateWithFunction:f error:&e] : nil;
+    if (have == nil) {
+        NSLog(@"imparo metal: staged routed GEMM for weight format %u: %@", wfmt, e);
+    } else if (getenv("IMPARO_WFMT_LOG")) {
+        NSLog(@"imparo metal: built the staged routed GEMM for weight format %u (%s, shape %u, "
+              @"%s source, %s result, max_threads=%lu)", wfmt,
+              rowmajor ? "row-major" : "tile-major", shape, src_half ? "half" : "float",
+              dst_half ? "half" : "float", (unsigned long)[have maxTotalThreadsPerThreadgroup]);
+    }
+    return have;
+}
+
+// THERE IS NO CROSSING: the matrix-unit routed matmul wins at every width, so it runs at
+// every width. Measured on LFM2.5-8B-A1B (M3 Pro, 2026-09-21) by setting the prefill chunk
+// to the width with IMPARO_BATCH and taking the median chunk of 512/width, first dropped:
+//
+//     width      1      2      4      8     16     32     64
+//     scalar  10.1   17.6   28.4   52.9  110.8  241.4  514.5  ms
+//     mma     10.0   15.6   18.5   21.8   31.1   46.8   73.1
+//     ratio  0.990  0.886  0.651  0.412  0.281  0.194  0.142
+//
+// The scalar kernel is linear in width, the matrix unit sub-linear -- 29x against 4.7x over
+// the same 32x in rows. Width 1 is a tie, and the decode step agrees (12.678 vs 12.486 ms,
+// inside this harness's noise), so nothing is given up at the bottom.
+//
+// I seated this at 16 first, by analogy with llama.cpp crossing its own two routed kernels
+// at 32 tokens (ggml-metal-common.cpp:19, `ne21 >= 32`). That was wrong in the direction
+// that mattered most: a speculative verify batch is about nine rows, so every verify was
+// taking the kernel that loses 2.4x at that width.
+//
+// IMPARO_MOE_MMA_MIN is kept as the A/B arm -- a large value forces the scalar kernel back.
+// THE ROUTED MATMUL'S OWN SHAPE, separate from blk_rows_mma's.
+//
+// The two kernels share a body and nothing else about their shape. blk_rows_mma runs N rows
+// of ONE tensor; the routed matmul at decode runs ONE work row in each of k experts, so its
+// grid is k times shorter and its threadgroups want to be smaller and more numerous. Sharing
+// blk_mma_tiles/blk_mma_sgs made the routed path inherit a seat chosen for the other shape,
+// and nobody had searched this one -- neither knob is declared to the tuner.
+//
+// Searched on LFM2.5-8B-A1B at decode, every arm warmed, 128 steps a point:
+//
+//             sgs=1     sgs=2     sgs=4     sgs=8
+//   tiles=1  11.190    10.999    11.165    11.385
+//   tiles=2  11.460    11.218    11.123    11.246   <- what it inherited
+//   tiles=4     --     13.199    13.018    13.443
+//
+// ABAB: inherited 11.283 / 11.231 against (1,2)'s 10.985 / 10.979 -- -2.44%. (1,2) is a real
+// optimum and not the end of a trend: sgs=1 is worse than sgs=2.
+//
+// SEPARATE SEATS ARE THE POINT. Moving the shared ones would move E4B, LFM2 and the 27B
+// co-batch, whose bits and gates have nothing to do with this shape. These move only the
+// routed matmul, so only a routed model's gate is at stake.
+static uint32_t moe_mma_tiles() {
+    static uint32_t t = 0u;
+    if (t == 0u) {
+        const char * e = getenv("IMPARO_MOE_MMA_TILES");
+        const int v = e != nullptr ? atoi(e) : 1;
+        t = (v == 1 || v == 2 || v == 4) ? (uint32_t)v : 1u;
+    }
+    return t;
+}
+static uint32_t moe_mma_sgs(uint32_t n_in) {
+    static uint32_t seat = 0u;
+    if (seat == 0u) {
+        const char * e = getenv("IMPARO_MOE_MMA_SGS");
+        const int v = e != nullptr ? atoi(e) : 0;
+        seat = (v >= 1 && v <= 32) ? (uint32_t)v : 2u;
+    }
+    return std::max(1u, std::min(seat, n_in / 32u));
+}
+
+// THE PAIR'S K-SPLIT, WHICH FOLLOWS THE SINGLE PROJECTION'S BY DEFAULT. Matching it is what
+// makes the pair BIT-IDENTICAL to the three dispatches it replaces: the split decides the
+// order the partial sums are added, so a pair on a different split computes the same
+// arithmetic in a different order and every logit moves. Measured both ways -- matched, a
+// 16-token chunk agrees to the last bit; at 4 against the single's 2 it does not.
+//
+// The override exists because the pair carries two weight stacks in one threadgroup and may
+// well want its own shape. It is a SEPARATE seat so that searching it cannot move the down
+// projection too (that confounded the first routed search), and it is BIT-AFFECTING, so
+// seating it away from the single's needs the logit gate first.
+static uint32_t moe_pair_sgs(uint32_t n_in) {
+    static int seat = -1;
+    if (seat < 0) {
+        const char * e = getenv("IMPARO_MOE_PAIR_SGS");
+        const int v = e != nullptr ? atoi(e) : 0;
+        seat = (v >= 1 && v <= 32) ? v : 0;
+    }
+    if (seat == 0) { return moe_mma_sgs(n_in); }
+    return std::max(1u, std::min((uint32_t)seat, n_in / 32u));
+}
+
+// THE PAIR'S ADMISSION, in tokens. Below it the pair's halved grid costs more than its
+// saved dispatch and activation loads; above it the win grows to -9.6% by 24 tokens. The
+// measurement is in imparo_metal_moe_grouped_pair, where the route is chosen.
+static uint32_t moe_pair_min_tok() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("IMPARO_MOE_PAIR_MIN"); v = e ? atoi(e) : 8; }
+    return (uint32_t)(v < 1 ? 1 : v);
+}
+
+static uint32_t moe_mma_min_tok() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("IMPARO_MOE_MMA_MIN"); v = e ? atoi(e) : 1; }
+    return (uint32_t)(v < 1 ? 1 : v);
+}
+
+extern "C" int imparo_metal_moe_grouped(uint32_t wkind, uint64_t w_off, uint64_t expert_stride,
+                                        uint32_t src, uint32_t dst, uint32_t perm, uint32_t seg,
+                                        uint32_t n_in, uint32_t n_out, uint32_t n_expert,
+                                        uint32_t n_tok, uint32_t rows,
+                                        uint32_t src_work_rows, uint32_t prefill_chunk) {
+    // ROW-MAJOR ONLY, and said here rather than assumed: `wfmt_for` maps a tile-major kind
+    // to its SOURCE format, so a tile-major stack would build a pipeline that reads the
+    // right format at the wrong addresses. No stack can be tile-major today -- the
+    // transform refuses a 3-D tensor by name (`tm_applies`, "not 2-D") -- and this is what
+    // makes that a checked fact rather than a remembered one.
+    // A STACK MAY NOW BE TILE-MAJOR. tm_applies used to refuse a 3-D tensor, so 91% of an
+    // MoE file's bytes stayed row-major and the matrix unit read eight streams a unit
+    // instead of one. It converts slice by slice, which for a stack whose slice rows divide
+    // the unit is the same as converting it whole. `wfmt_for` maps the tile-major kind back
+    // to its SOURCE format -- the decode is the same, only the addresses differ -- and the
+    // layout rides on constant 22.
+    const bool tile_major =
+        g_wire_ggml_set && wkind < 64u && g_wire_ggml[wkind] >= 1000u;
+    const uint32_t wfmt = moe_wfmt_for(wkind);
+    id<MTLComputePipelineState> ps = moe_grouped_pipeline_for_fmt(wfmt, !tile_major);
+    const uint64_t span = (uint64_t)n_expert * expert_stride;
+    if (ps == nil || rows == 0u || n_expert == 0u || n_expert > MOE_MAX_EXPERTS || n_in == 0u
+        || n_out == 0u || (n_in % 32u) != 0u
+        || src >= B_COUNT || dst >= B_COUNT || perm >= B_COUNT || seg >= B_COUNT
+        || g.bufs[src] == nil || g.bufs[dst] == nil || g.bufs[perm] == nil
+        || g.bufs[seg] == nil || src == dst
+        // THE SOURCE HOLDS ONE ROW PER TOKEN unless it is the down projection's input,
+        // which the gate and up projections wrote one row per WORK ROW. Checking a
+        // token-indexed source against the work rows refused every routed layer of a real
+        // model, where there are k times as many.
+        || (uint64_t)(src_work_rows ? rows : n_tok) * n_in * 4ull > g.sizes[src]
+        || (uint64_t)rows * n_out * 4ull > g.sizes[dst]
+        || (uint64_t)rows * 4ull > g.sizes[perm]
+        // seg holds n_expert+1 offsets, then the active count, then up to n_expert ids.
+        || (2ull * (uint64_t)n_expert + 2ull) * 4ull > g.sizes[seg]
+        // EVERY EXPERT THROUGH ONE BOUND BUFFER: the kernel offsets from the stack's base,
+        // so the whole stack has to be in the segment that base falls in.
+        || !w_pair_in_one_segment(w_off, w_off + span - 1ull)) {
+        NSLog(@"imparo metal: moe_grouped refused (kind=%u %u->%u experts=%u tokens=%u "
+              @"rows=%u%s)", wkind, n_in, n_out, n_expert, n_tok, rows,
+              ps == nil ? ", no pipeline" : "");
+        return 1;
+    }
+    // DIAGNOSTIC: IMPARO_SKIP_CAT=moe_expert drops the routed matmuls so a skip-and-diff
+    // can price them in situ, the way matmat_decode is priced. The category existed in the
+    // profiler's table with no dispatch honouring it, which is the failure the skip-cat
+    // parser warns about for "attention": asking to skip it silently skipped nothing and
+    // would have priced the routed matmul at ZERO.
+    if (g_skip_cat == PC_MOE_EXPERT) { return 0; }
+    // THE STAGED GEMM when it is on and the batch is worth a 64x32 tile. At one token the
+    // tile is 1/32 live, so decode keeps the rows kernel.
+    // HOW MANY EXPERT GROUPS TO LAUNCH. A token picks k DISTINCT experts, so the work
+    // rows can reach at most `rows` experts, and never more than n_expert. The kernel
+    // maps group -> the g-th ACTIVE expert through moe_plan's compacted tail, so this
+    // bound needs no read-back. Decode: 4 work rows over 32 experts, 4 groups not 32.
+    const NSUInteger zg = (NSUInteger)((rows < n_expert) ? rows : n_expert);
+    const MoeStShape st_sh = moe_st_shape(moe_st_single_shape(n_tok));
+    const uint32_t st_tok = st_sh.tokens;
+    // The activations: a current half mirror when one exists (the pair's half result), the
+    // floats otherwise. Only the staged GEMM reads a mirror, so floats left stale by a
+    // mirror-mode producer are refused on every other route -- nothing else holds them.
+    bool st_src_half = false;
+    const uint32_t st_src =
+        moe_st_source(src, (uint64_t)(src_work_rows ? rows : n_tok) * n_in, &st_src_half);
+    id<MTLComputePipelineState> st = (moe_st_wanted(n_tok, prefill_chunk != 0u) && st_src < B_COUNT)
+        ? moe_st_pipeline_for_fmt(wfmt, !tile_major, moe_st_single_shape(n_tok), st_src_half)
+        : nil;
+    const bool src_stale = src < 64u && ((g_float_stale >> src) & 1ull) != 0ull;
+    if (st == nil && src_stale) {
+        NSLog(@"imparo metal: moe_grouped source %u holds a half result only this route's "
+              @"staged GEMM reads, and it cannot run (tokens=%u)", src, n_tok);
+        return 1;
+    }
+    haz(hb(st != nil ? st_src : src) | hb(perm) | hb(seg), hb(dst));
+    if (st != nil) {
+        {
+            [g.enc setComputePipelineState:st];
+            const uint64_t wls = wbind(g.enc, w_off, 0);
+            [g.enc setBuffer:g.bufs[st_src] offset:g.buf_off[st_src] atIndex:1];
+            [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:2];
+            [g.enc setBuffer:g.bufs[perm] offset:g.buf_off[perm] atIndex:3];
+            [g.enc setBuffer:g.bufs[seg] offset:g.buf_off[seg] atIndex:4];
+            [g.enc setBytes:&wls length:8 atIndex:5];
+            [g.enc setBytes:&expert_stride length:8 atIndex:6];
+            [g.enc setBytes:&n_in length:4 atIndex:7];
+            [g.enc setBytes:&n_out length:4 atIndex:8];
+            [g.enc setBytes:&src_work_rows length:4 atIndex:9];
+            [g.enc setBytes:&n_expert length:4 atIndex:14];
+            const uint64_t no_pair_off = 0ull;      // unused by the single-projection form
+            [g.enc setBytes:&no_pair_off length:8 atIndex:15];
+            (void)wbind(g.enc, w_off, 16);           // likewise; bound so no argument dangles
+            // The staged tiles and the resolved row bases (moe_st_tg_bytes); the result
+            // leaves from the fragments, so there is no spill to size.
+            [g.enc setThreadgroupMemoryLength:moe_st_tg_bytes(st_sh.rows, st_tok, st_sh.k)
+                                      atIndex:0];
+            // A token never picks one expert twice, so an expert holds at most n_tok work
+            // rows: this covers ANY routing without reading one, and a group past its
+            // expert's segment returns on seg.
+            const NSUInteger rg = (n_out + st_sh.rows * st_sh.rblk - 1u) / (st_sh.rows * st_sh.rblk);
+            const NSUInteger tg = (n_tok + st_tok - 1u) / st_tok;
+            g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MOE_EXPERT, (uint64_t)zg * expert_stride); }
+            // The shape's own simdgroup count: NSG * RT_SG * TT_SG covers its output tile.
+            [g.enc dispatchThreadgroups:MTLSizeMake(rg, tg, zg)
+                  threadsPerThreadgroup:MTLSizeMake(32u * st_sh.nsg, 1, 1)];
+            if (g_prof) { prof_end(); }
+            return 0;
+        }
+    }
+    // THE MATRIX UNIT above the crossing. Same buffers in the same slots -- the routed mma
+    // kernel takes the scalar one's arguments plus an epilogue it is always handed 0 for,
+    // because a routed layer's activation runs as its own dispatch (act_mul) between the up
+    // projection and the down one.
+    if (n_tok >= moe_mma_min_tok()) {
+        // THE PROBE DOES NOT REACH THIS KERNEL, and saying so is the whole point. The skip
+        // bits are a function constant on imparo_moe_grouped, the SCALAR kernel; the matrix
+        // unit serves every width from moe_mma_min_tok() up, which defaults to 1 -- so at
+        // DECODE the scalar kernel does not run and IMPARO_MOE_SKIP changed nothing while
+        // reporting a clean measurement. It cost this chapter two built-and-measured "ties"
+        // that were edits to a kernel the decode step never dispatches. A probe that is
+        // silently a no-op is worse than no probe: it answers.
+        static bool warned = false;
+        if (moe_skip_bits() != 0u && !warned) {
+            warned = true;
+            NSLog(@"imparo metal: IMPARO_MOE_SKIP=%u IGNORED -- the matrix-unit routed kernel "
+                  @"serves n_tok >= %u and carries no skip bits. Set IMPARO_MOE_MMA_MIN above "
+                  @"n_tok to reach the scalar kernel the bits belong to.",
+                  moe_skip_bits(), moe_mma_min_tok());
+        }
+        const uint32_t tiles = moe_mma_tiles();
+        id<MTLComputePipelineState> mm =
+            moe_grouped_mma_pipeline_for_fmt(wfmt, tiles, !tile_major);
+        if (mm != nil) {
+            const uint32_t sgs = moe_mma_sgs(n_in);
+            [g.enc setComputePipelineState:mm];
+            const uint64_t wlm = wbind(g.enc, w_off, 0);
+            [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:1];
+            [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:2];
+            [g.enc setBuffer:g.bufs[perm] offset:g.buf_off[perm] atIndex:3];
+            [g.enc setBuffer:g.bufs[seg] offset:g.buf_off[seg] atIndex:4];
+            [g.enc setBytes:&wlm length:8 atIndex:5];
+            [g.enc setBytes:&expert_stride length:8 atIndex:6];
+            [g.enc setBytes:&n_in length:4 atIndex:7];
+            [g.enc setBytes:&n_out length:4 atIndex:8];
+            [g.enc setBytes:&src_work_rows length:4 atIndex:9];
+            const uint32_t no_epi = 0u;
+            [g.enc setBytes:&no_epi length:4 atIndex:13];
+            [g.enc setBytes:&n_expert length:4 atIndex:14];
+            [g.enc setThreadgroupMemoryLength:(NSUInteger)sgs * tiles * 64u * sizeof(float)
+                                      atIndex:0];
+            const uint32_t rows_per_tg = 8u * tiles;
+            g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MOE_EXPERT, (uint64_t)zg * expert_stride); }
+            [g.enc dispatchThreadgroups:MTLSizeMake((n_out + rows_per_tg - 1u) / rows_per_tg,
+                                                    zg, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32u * sgs, 1, 1)];
+            if (g_prof) { prof_end(); }
+            return 0;
+        }
+    }
+    // THE SCALAR KERNEL NOW READS EITHER LAYOUT. It used to refuse a tile-major stack --
+    // which, since the load-time repack converts 91% of an MoE file, meant it could not be
+    // reached at all on a served model, and forcing it produced a run with the routed
+    // matmuls silently MISSING rather than a slow one.
+    [g.enc setComputePipelineState:ps];
+    const uint64_t wl = wbind(g.enc, w_off, 0);
+    [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:1];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:2];
+    [g.enc setBuffer:g.bufs[perm] offset:g.buf_off[perm] atIndex:3];
+    [g.enc setBuffer:g.bufs[seg] offset:g.buf_off[seg] atIndex:4];
+    [g.enc setBytes:&wl length:8 atIndex:5];
+    [g.enc setBytes:&expert_stride length:8 atIndex:6];
+    [g.enc setBytes:&n_in length:4 atIndex:7];
+    [g.enc setBytes:&n_out length:4 atIndex:8];
+    [g.enc setBytes:&src_work_rows length:4 atIndex:9];
+    [g.enc setBytes:&n_expert length:4 atIndex:14];
+    // The staged activation slice. 16 bytes when the staging is off: the argument is
+    // declared either way, and a length the kernel never reads must not cost occupancy.
+    [g.enc setThreadgroupMemoryLength:moe_stage() ? MOE_STAGE_BYTES : 16u atIndex:0];
+    // The grid covers every (output row, ACTIVE expert) pair -- see the bound above.
+    const NSUInteger tgx = (n_out + MOE_GROUPED_SGS - 1u) / MOE_GROUPED_SGS;
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MOE_EXPERT, (uint64_t)zg * expert_stride); }
+    [g.enc dispatchThreadgroups:MTLSizeMake(tgx, zg, 1)
+          threadsPerThreadgroup:MTLSizeMake(32 * MOE_GROUPED_SGS, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return 0;
+}
+
+// GATE, UP AND THE ACTIVATION IN ONE ROUTED DISPATCH. Refused -- with nothing encoded, so
+// the caller runs the three -- whenever the pair's preconditions do not hold; the three
+// compute the same thing, which is why every refusal here is silent.
+//
+// ONE BOUND BUFFER FOR BOTH WEIGHTS, so the two stacks have to live in one segment. A tiered
+// placement can split a layer, and then they do not.
+extern "C" int imparo_metal_moe_grouped_pair(uint32_t wkind, uint64_t gate_off, uint64_t up_off,
+                                             uint64_t expert_stride, uint32_t src, uint32_t dst,
+                                             uint32_t perm, uint32_t seg, uint32_t n_in,
+                                             uint32_t n_out, uint32_t n_expert, uint32_t n_tok,
+                                             uint32_t rows, uint32_t prefill_chunk) {
+    // ABOVE A TOKEN THRESHOLD, AND THE THRESHOLD IS THE WHOLE FINDING. Measured on
+    // LFM2.5-8B-A1B (M3 Pro, gpu_per_cb over one prefill chunk, both arms warmed), with the
+    // weight layout UNCHANGED across the sweep:
+    //
+    //     n_tok        2        4        8       16       24
+    //     delta    +1.01%   -0.04%   -2.10%   -8.25%   -9.63%
+    //
+    // So the 63.3 MiB between `ffn_gate_exps` and `ffn_up_exps` is NOT what decides it --
+    // that gap is the same at every column. THE GRID SIZE IS. The pair halves the
+    // threadgroup count, and at one token only `rows` experts are active (4 of 32), so the
+    // grid is already the smallest it ever gets: 224 x 4 groups against two dispatches'
+    // 224 x 4 twice. By 8 tokens every expert holds a work row, both grids are far past
+    // saturation, and the pair keeps its halved activation loads and its saved dispatch.
+    //
+    // This is the same rule the DENSE pair reached first: imparo_metal_matmat_gated is
+    // "prefill only -- at one token the split GEMV path is the measured better form".
+    //
+    // The threshold is 8, not 4: 4 is the measured tie and 8 is the first clear win.
+    // IMPARO_MOE_PAIR=0 refuses the pair outright, so the two forms can be timed in one
+    // binary. A config, not a knob: it selects a route.
+    static int pair_on = -1;
+    if (pair_on < 0) { const char * e = getenv("IMPARO_MOE_PAIR"); pair_on = !(e && e[0] == '0'); }
+    if (!pair_on || n_tok < moe_pair_min_tok()) { return 1; }
+    const bool tile_major =
+        g_wire_ggml_set && wkind < 64u && g_wire_ggml[wkind] >= 1000u;
+    const uint32_t wfmt = moe_wfmt_for(wkind);
+    // THE STAGED GEMM OWNS THE BATCHED SHAPE, AND NOW HAS A PAIRED FORM. It used to have
+    // none, so this returned and the caller ran gate, up and act_mul as three dispatches --
+    // which writes gate (14.7 MB a routed layer-chunk on LFM2.5-8B-A1B), writes up, then
+    // reads both back and writes the hidden. 11.63 GB over a 5962-token prefill at
+    // 138 GB/s, the device ceiling: not slow, just work that need not happen.
+    // IMPARO_MOE_ST_PAIR=0 restores the three dispatches for the A/B.
+    const MoeStShape sp_sh = moe_st_shape(moe_st_pair_shape(n_tok));
+    if (moe_st_wanted(n_tok, prefill_chunk != 0u)) {
+        static int st_pair = -1;
+        if (st_pair < 0) {
+            const char * e = getenv("IMPARO_MOE_ST_PAIR");
+            st_pair = !(e != nullptr && e[0] == '0');
+        }
+        const uint32_t st_tok = sp_sh.tokens;
+        // The FFN input's half mirror when the norm left one; its result as half when the
+        // down projection will stage it (the same token floor), published below as G's mirror.
+        bool sp_src_half = false;
+        const uint32_t sp_src = moe_st_source(src, (uint64_t)n_tok * n_in, &sp_src_half);
+        const bool sp_dst_half = moe_st_wanted(n_tok, prefill_chunk != 0u);
+        id<MTLComputePipelineState> sp = (st_pair && sp_src < B_COUNT)
+            ? moe_st_pipeline_for_fmt(wfmt, !tile_major, moe_st_pair_shape(n_tok), sp_src_half,
+                                      sp_dst_half)
+            : nil;
+        const uint64_t span2 = (uint64_t)n_expert * expert_stride;
+        if (sp == nil || rows == 0u || n_expert == 0u || n_expert > MOE_MAX_EXPERTS
+            || n_in == 0u || n_out == 0u || (n_in % 32u) != 0u
+            || src >= B_COUNT || dst >= B_COUNT || perm >= B_COUNT || seg >= B_COUNT
+            || g.bufs[src] == nil || g.bufs[dst] == nil || g.bufs[perm] == nil
+            || g.bufs[seg] == nil || src == dst
+            || (uint64_t)n_tok * n_in * 4ull > g.sizes[src]
+            || (uint64_t)rows * n_out * 4ull > g.sizes[dst]
+            || (uint64_t)rows * 4ull > g.sizes[perm]
+            || (2ull * (uint64_t)n_expert + 2ull) * 4ull > g.sizes[seg]
+            // EACH STACK IN ONE SEGMENT; the two stacks may sit in different ones. Gate is
+            // bound at 0 and up at 16, so a file whose repack windows split a layer's gate
+            // and up stacks (Q4_0: 4 of LFM2.5-8B-A1B's 22 layers) still takes the pair.
+            // It used to require both in one bound buffer and fell back to three
+            // dispatches and an act_mul for those layers.
+            || !w_pair_in_one_segment(gate_off, gate_off + span2 - 1ull)
+            || !w_pair_in_one_segment(up_off, up_off + span2 - 1ull)) {
+            return 1;
+        }
+        if (g_skip_cat == PC_MOE_EXPERT) { return 0; }
+        haz(hb(sp_src) | hb(perm) | hb(seg), hb(dst));
+        const NSUInteger zg2 = (NSUInteger)((rows < n_expert) ? rows : n_expert);
+        [g.enc setComputePipelineState:sp];
+        const uint64_t wls = wbind(g.enc, gate_off, 0);
+        const uint64_t wls2 = wbind(g.enc, up_off, 16);
+        [g.enc setBuffer:g.bufs[sp_src] offset:g.buf_off[sp_src] atIndex:1];
+        [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:2];
+        [g.enc setBuffer:g.bufs[perm] offset:g.buf_off[perm] atIndex:3];
+        [g.enc setBuffer:g.bufs[seg] offset:g.buf_off[seg] atIndex:4];
+        [g.enc setBytes:&wls length:8 atIndex:5];
+        [g.enc setBytes:&expert_stride length:8 atIndex:6];
+        [g.enc setBytes:&n_in length:4 atIndex:7];
+        [g.enc setBytes:&n_out length:4 atIndex:8];
+        const uint32_t swr = 0u;
+        [g.enc setBytes:&swr length:4 atIndex:9];
+        [g.enc setBytes:&n_expert length:4 atIndex:14];
+        [g.enc setBytes:&wls2 length:8 atIndex:15];
+        [g.enc setThreadgroupMemoryLength:
+            moe_st_tg_bytes(sp_sh.rows, st_tok, sp_sh.k) atIndex:0];
+        const NSUInteger rg2 = (n_out + sp_sh.rows * sp_sh.rblk - 1u) / (sp_sh.rows * sp_sh.rblk);
+        const NSUInteger tg2 = (n_tok + st_tok - 1u) / st_tok;
+        g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MOE_PAIR); }
+        [g.enc dispatchThreadgroups:MTLSizeMake(rg2, tg2, zg2)
+              threadsPerThreadgroup:MTLSizeMake(32u * sp_sh.nsg, 1, 1)];
+        if (g_prof) { prof_end(); }
+        if (sp_dst_half) {
+            // G holds its rows as HALF, in its own first half: the down projection's staged
+            // GEMM reads them as its mirror, and every float reader refuses G until it is
+            // written again. Not B_XH2: that aliases U, which the down projection writes whole.
+            g_xh_src = dst; g_xh_elems = (uint64_t)rows * n_out; g_xh_buf = dst;
+            g_float_stale |= hb(dst);
+        }
+        return 0;
+    }
+    if (n_tok < moe_mma_min_tok()) { return 1; }
+    if (src < 64u && ((g_float_stale >> src) & 1ull) != 0ull) { return 1; }
+    const uint32_t tiles = moe_mma_tiles();
+    id<MTLComputePipelineState> mm =
+        moe_grouped_mma_pipeline_for_fmt(wfmt, tiles, !tile_major, true);
+    const uint64_t span = (uint64_t)n_expert * expert_stride;
+    if (mm == nil || rows == 0u || n_expert == 0u || n_expert > MOE_MAX_EXPERTS || n_in == 0u
+        || n_out == 0u || (n_in % 32u) != 0u
+        || src >= B_COUNT || dst >= B_COUNT || perm >= B_COUNT || seg >= B_COUNT
+        || g.bufs[src] == nil || g.bufs[dst] == nil || g.bufs[perm] == nil
+        || g.bufs[seg] == nil || src == dst
+        // The pair is the gate and up projections, whose source holds one row per TOKEN.
+        || (uint64_t)n_tok * n_in * 4ull > g.sizes[src]
+        || (uint64_t)rows * n_out * 4ull > g.sizes[dst]
+        || (uint64_t)rows * 4ull > g.sizes[perm]
+        || (2ull * (uint64_t)n_expert + 2ull) * 4ull > g.sizes[seg]
+        || !w_pair_in_one_segment(gate_off, gate_off + span - 1ull)
+        || !w_pair_in_one_segment(up_off, up_off + span - 1ull)
+        || !w_pair_in_one_segment(gate_off, up_off)) {
+        return 1;
+    }
+    if (g_skip_cat == PC_MOE_EXPERT) { return 0; }
+    haz(hb(src) | hb(perm) | hb(seg), hb(dst));
+    const uint32_t sgs = moe_pair_sgs(n_in);
+    [g.enc setComputePipelineState:mm];
+    const uint64_t wlg = wbind(g.enc, gate_off, 0);
+    const uint64_t wlu = wlocal(up_off, gate_off);
+    [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:1];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:2];
+    [g.enc setBuffer:g.bufs[perm] offset:g.buf_off[perm] atIndex:3];
+    [g.enc setBuffer:g.bufs[seg] offset:g.buf_off[seg] atIndex:4];
+    [g.enc setBytes:&wlg length:8 atIndex:5];
+    [g.enc setBytes:&expert_stride length:8 atIndex:6];
+    [g.enc setBytes:&n_in length:4 atIndex:7];
+    [g.enc setBytes:&n_out length:4 atIndex:8];
+    // The gate and up projections read the TOKEN's activations, always.
+    const uint32_t src_work_rows = 0u;
+    [g.enc setBytes:&src_work_rows length:4 atIndex:9];
+    const uint32_t epi = 1u;
+    [g.enc setBytes:&epi length:4 atIndex:13];
+    [g.enc setBytes:&n_expert length:4 atIndex:14];
+    [g.enc setBytes:&wlu length:8 atIndex:15];
+    // TWICE the single projection's: each simdgroup reduces two stacks, the second stack's
+    // sums laid after every simdgroup's first.
+    [g.enc setThreadgroupMemoryLength:(NSUInteger)2u * sgs * tiles * 64u * sizeof(float)
+                              atIndex:0];
+    const uint32_t rows_per_tg = 8u * tiles;
+    const NSUInteger zg = (NSUInteger)((rows < n_expert) ? rows : n_expert);
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MOE_EXPERT, (uint64_t)zg * expert_stride); }
+    [g.enc dispatchThreadgroups:MTLSizeMake((n_out + rows_per_tg - 1u) / rows_per_tg, zg, 1)
+          threadsPerThreadgroup:MTLSizeMake(32u * sgs, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return 0;
+}
+
+// THE COMBINE FOLDED INTO THE NEXT NORM (imparo.metal, imparo_moe_combine_add_rms_norm):
+// resid += sum over the k slots of wgt * ydown, then dst = rms_norm(resid) * w, with the half
+// mirror under the same rule as imparo_metal_add_rms_norm -- whose thread count this copies,
+// because the reduction's partition is part of the bits. Returns 0 having encoded it, nonzero
+// having encoded nothing (the caller then runs moe_combine and add_rms_norm).
+// k == 0: THE RESIDUAL ALONE (imparo_metal_rms_norm_resid) -- resid already holds resid + O;
+// ydown / wgt / inv are then stand-ins the kernel never reads.
+static int combine_norm_impl(uint32_t ydown, uint32_t wgt, uint32_t inv, uint32_t k,
+                             uint32_t dst, uint32_t resid, uint64_t w_off, uint32_t width,
+                             float eps, uint32_t n_row) {
+    const uint64_t rows = (uint64_t)n_row * k;
+    if (g.p_moe_combine_norm == nil || n_row == 0u || k > MOE_MAX_K
+        || width == 0u || (width % 4u) != 0u || w_off == ~0ull
+        || ydown >= B_COUNT || wgt >= B_COUNT || inv >= B_COUNT || dst >= B_COUNT
+        || resid >= B_COUNT || g.bufs[ydown] == nil || g.bufs[wgt] == nil
+        || g.bufs[inv] == nil || g.bufs[dst] == nil || g.bufs[resid] == nil
+        || dst == resid || (k != 0u && (ydown == dst || ydown == resid))
+        || rows * width * 4ull > g.sizes[ydown] || rows * 4ull > g.sizes[wgt]
+        || rows * 4ull > g.sizes[inv] || (uint64_t)n_row * width * 4ull > g.sizes[dst]
+        || (uint64_t)n_row * width * 4ull > g.sizes[resid]
+        || (g.buf_off[resid] % 16u) != 0u || (g.buf_off[dst] % 16u) != 0u
+        || (g.buf_off[ydown] % 16u) != 0u) {
+        return 1;
+    }
+    if (g_skip_cat == (k != 0u ? PC_MOE_COMBINE : PC_RMSNORM)) { return 0; }
+    const bool xh_on = g_half_a != 0u && dst == B_CUR && n_row >= HALF_A_MIN
+                    && g.bufs[B_XH] != nil
+                    && (uint64_t)n_row * width * 2ull <= g.sizes[B_XH]
+                    && half_consumers_exist();
+    // The kernel reads the norm weight as float4: a misaligned tensor is refused before
+    // haz() records anything (binding a buffer writes no memory).
+    const uint64_t w_off_l = wbind(g.enc, w_off, 0);
+    if ((w_off_l % 16u) != 0u) { return 1; }
+    haz((k != 0u ? hb(ydown) | hb(wgt) | hb(inv) : 0u) | hb(resid),
+        (k != 0u ? hb(resid) : 0u) | hb(dst) | (xh_on ? hb(B_XH) : 0u));
+    [g.enc setComputePipelineState:g.p_moe_combine_norm];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:1];
+    [g.enc setBytes:&w_off_l length:8 atIndex:2];
+    [g.enc setBytes:&width length:4 atIndex:3];
+    [g.enc setBytes:&eps length:4 atIndex:4];
+    [g.enc setBytes:&n_row length:4 atIndex:5];
+    [g.enc setBuffer:g.bufs[resid] offset:g.buf_off[resid] atIndex:8];
+    [g.enc setBuffer:g.bufs[ydown] offset:g.buf_off[ydown] atIndex:10];
+    if (g.bufs[B_XH] != nil) { [g.enc setBuffer:g.bufs[B_XH] offset:g.buf_off[B_XH] atIndex:11]; }
+    else { [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:11]; }
+    const uint32_t xh_flag = xh_on ? 1u : 0u;
+    [g.enc setBytes:&xh_flag length:4 atIndex:12];
+    [g.enc setBuffer:g.bufs[wgt] offset:g.buf_off[wgt] atIndex:13];
+    [g.enc setBuffer:g.bufs[inv] offset:g.buf_off[inv] atIndex:14];
+    [g.enc setBytes:&k length:4 atIndex:15];
+    // imparo_metal_add_rms_norm's thread count, line for line.
+    const NSUInteger vec_units = (width + 3) / 4;
+    NSUInteger threads = 32;
+    while (threads < vec_units && threads < 1024) { threads *= 2; }
+    threads = std::min(threads, (vec_units + 31) / 32 * 32);
+    threads = std::max<NSUInteger>(threads, 32);
+    [g.enc setThreadgroupMemoryLength:tg_bytes16((threads / 32) * sizeof(float)) atIndex:0];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(k != 0u ? PC_MOE_COMBINE : PC_RMSNORM); }
+    [g.enc dispatchThreadgroups:MTLSizeMake(n_row, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    if (g_prof) { prof_end(); }
+    if (xh_on) { g_xh_src = dst; g_xh_elems = (uint64_t)n_row * width; g_xh_buf = B_XH; }
+    return 0;
+}
+extern "C" int imparo_metal_moe_combine_add_rms_norm(uint32_t ydown, uint32_t wgt, uint32_t inv,
+                                                     uint32_t k, uint32_t dst, uint32_t resid,
+                                                     uint64_t w_off, uint32_t width, float eps,
+                                                     uint32_t n_row) {
+    if (k == 0u) { return 1; }
+    return combine_norm_impl(ydown, wgt, inv, k, dst, resid, w_off, width, eps, n_row);
+}
+
+// THE MIXER'S OUTPUT PROJECTION ADDED INTO THE RESIDUAL (RT_RESID): resid += W . src, on the
+// tile-major register-tiled GEMM over the half mirror only (g_mm_resid makes every other route
+// refuse). Then imparo_metal_rms_norm_resid normalises resid with the pre-add norm's floats.
+// Returns 0 having encoded it, nonzero having encoded nothing that changes a result.
+extern "C" int imparo_metal_matmat_resid(uint32_t wkind, uint64_t w_off, uint32_t n_in,
+                                         uint32_t n_out, uint32_t src, uint32_t resid,
+                                         uint32_t n_tok) {
+    if (g_epilogue != 0u || resid == src) { return 1; }
+    g_mm_resid = true;
+    const bool ok = matmat_impl(wkind, w_off, NO_PAIR, n_in, n_out, src, resid, n_tok, 0u);
+    g_mm_resid = false;
+    return ok ? 0 : 1;
+}
+extern "C" int imparo_metal_rms_norm_resid(uint32_t dst, uint32_t resid, uint64_t w_off,
+                                           uint32_t width, float eps, uint32_t n_row) {
+    return combine_norm_impl(resid, resid, resid, 0u, dst, resid, w_off, width, eps, n_row);
+}
+
+extern "C" int imparo_metal_moe_combine(uint32_t src, uint32_t wgt, uint32_t inv, uint32_t dst,
+                                        uint32_t n_embd, uint32_t k, uint32_t n_tok) {
+    const uint64_t rows = (uint64_t)n_tok * k;
+    if (n_tok == 0u || k == 0u || k > MOE_MAX_K || n_embd == 0u
+        || src >= B_COUNT || wgt >= B_COUNT || inv >= B_COUNT || dst >= B_COUNT
+        || g.bufs[src] == nil || g.bufs[wgt] == nil || g.bufs[inv] == nil
+        || g.bufs[dst] == nil || dst == src
+        || rows * n_embd * 4ull > g.sizes[src] || rows * 4ull > g.sizes[wgt]
+        || rows * 4ull > g.sizes[inv] || (uint64_t)n_tok * n_embd * 4ull > g.sizes[dst]) {
+        NSLog(@"imparo metal: moe_combine refused (n_tok=%u k=%u n_embd=%u)", n_tok, k, n_embd);
+        return 1;
+    }
+    haz(hb(src) | hb(wgt) | hb(inv), hb(dst));
+    [g.enc setComputePipelineState:g.p_moe_combine];
+    [g.enc setBuffer:g.bufs[src] offset:g.buf_off[src] atIndex:0];
+    [g.enc setBuffer:g.bufs[wgt] offset:g.buf_off[wgt] atIndex:1];
+    [g.enc setBuffer:g.bufs[inv] offset:g.buf_off[inv] atIndex:2];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:3];
+    [g.enc setBytes:&n_embd length:4 atIndex:4];
+    [g.enc setBytes:&k length:4 atIndex:5];
+    const NSUInteger tw =
+        std::min<NSUInteger>(256, g.p_moe_combine.maxTotalThreadsPerThreadgroup);
+    // ONE THREADGROUP PER (TOKEN, EMBEDDING CHUNK). A token's n_embd outputs are
+    // independent sums, so a grid of n_tok alone put all of them on one core -- 1x1x1 at
+    // decode, 12.5 us to move 40 KB. The kernel strides by tcount * grid.y, so any chunk
+    // count is correct and this one gives each threadgroup a single pass.
+    // IMPARO_MOE_COMBINE_CHUNKS=1 puts the whole embedding back on one threadgroup, so the
+    // split can be timed against what it replaced in ONE binary. A config, not a knob: any
+    // value is correct, because the kernel strides by tcount * chunks.
+    static int chunk_cap = -1;
+    if (chunk_cap < 0) {
+        const char * e = getenv("IMPARO_MOE_COMBINE_CHUNKS");
+        chunk_cap = e != nullptr ? atoi(e) : 0;
+    }
+    uint32_t chunks = (uint32_t)std::max<NSUInteger>(1, ((NSUInteger)n_embd + tw - 1) / tw);
+    if (chunk_cap > 0 && (uint32_t)chunk_cap < chunks) { chunks = (uint32_t)chunk_cap; }
+    [g.enc setBytes:&chunks length:4 atIndex:6];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_MOE_COMBINE); }
+    [g.enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tok * chunks, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    if (g_prof) { prof_end(); }
+    return 0;
+}
+
+// ONE LOGISTIC OUTPUT PER ROW: see imparo_logistic_blocks. dst holds the outputs, then one partial
+// sum per row and block; LOGISTIC_BLOCK matches the shader's.
+static constexpr uint32_t LOGISTIC_BLOCK = 64u;
+struct LogisticArgs { uint32_t a_width, b_width, w_off, dst_off, rows, a_blocks, blocks; };
+static LogisticArgs logistic_args(uint32_t a_width, uint32_t b_width, uint32_t w_off,
+                                  uint32_t dst_off, uint32_t rows) {
+    const uint32_t a_blocks = (uint32_t)(((uint64_t)a_width + LOGISTIC_BLOCK - 1u) / LOGISTIC_BLOCK);
+    const uint32_t b_blocks = (uint32_t)(((uint64_t)b_width + LOGISTIC_BLOCK - 1u) / LOGISTIC_BLOCK);
+    return LogisticArgs{a_width, b_width, w_off, dst_off, rows, a_blocks, a_blocks + b_blocks};
+}
+extern "C" uint64_t imparo_metal_logistic_rows_len(uint32_t a_width, uint32_t b_width,
+                                                   uint32_t rows) {
+    return (uint64_t)rows * (1ull + logistic_args(a_width, b_width, 0u, 0u, rows).blocks);
+}
+extern "C" int imparo_metal_logistic_rows(uint32_t a, uint32_t a_width, uint32_t b,
+                                          uint32_t b_width, uint32_t w, uint32_t w_off,
+                                          uint32_t dst, uint32_t dst_off, uint32_t rows) {
+    const LogisticArgs p = logistic_args(a_width, b_width, w_off, dst_off, rows);
+    const uint64_t w_end = (uint64_t)w_off + a_width + b_width + 1ull;
+    const uint64_t dst_end =
+        (uint64_t)dst_off + imparo_metal_logistic_rows_len(a_width, b_width, rows);
+    if (rows == 0u || p.blocks == 0u || a >= B_COUNT || b >= B_COUNT || w >= B_COUNT
+        || dst >= B_COUNT || g.bufs[a] == nil || g.bufs[b] == nil || g.bufs[w] == nil
+        || g.bufs[dst] == nil || dst == a || dst == b
+        || (uint64_t)rows * a_width * 4ull > g.sizes[a]
+        || (uint64_t)rows * b_width * 4ull > g.sizes[b]
+        || w_end * 4ull > g.sizes[w] || dst_end * 4ull > g.sizes[dst]
+        || (w == dst && w_off < dst_end && dst_off < w_end)) {
+        NSLog(@"imparo metal: logistic_rows refused (a=%u b=%u w=%u dst=%u rows=%u)", a, b, w,
+              dst, rows);
+        return 1;
+    }
+    haz(hb(a) | hb(b) | hb(w), hb(dst));
+    [g.enc setComputePipelineState:g.p_logistic_blocks];
+    [g.enc setBuffer:g.bufs[a] offset:g.buf_off[a] atIndex:0];
+    [g.enc setBuffer:g.bufs[b] offset:g.buf_off[b] atIndex:1];
+    [g.enc setBuffer:g.bufs[w] offset:g.buf_off[w] atIndex:2];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:3];
+    [g.enc setBytes:&p length:sizeof(p) atIndex:4];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_LOGISTIC); }
+    // One SIMD group per threadgroup.
+    const NSUInteger tw = std::max<NSUInteger>(1, std::min<NSUInteger>(
+        g.p_logistic_blocks.threadExecutionWidth, p.blocks));
+    [g.enc dispatchThreads:MTLSizeMake(p.blocks, rows, 1)
+      threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    if (g_prof) { prof_end(); }
+    // The finish reads the block sums the blocks pass wrote.
+    haz(hb(dst) | hb(w), hb(dst));
+    [g.enc setComputePipelineState:g.p_logistic_finish];
+    [g.enc setBuffer:g.bufs[w] offset:g.buf_off[w] atIndex:0];
+    [g.enc setBuffer:g.bufs[dst] offset:g.buf_off[dst] atIndex:1];
+    [g.enc setBytes:&p length:sizeof(p) atIndex:2];
+    g_disp_seq += 1; if (g_prof) { g_prof_disp += 1; prof_begin(PC_LOGISTIC); }
+    [g.enc dispatchThreads:MTLSizeMake(rows, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(rows, g.p_logistic_finish.maxTotalThreadsPerThreadgroup), 1, 1)];
+    if (g_prof) { prof_end(); }
+    return 0;
 }
 extern "C" void imparo_metal_ple_gather_combine(uint32_t proj, uint32_t tokens_buf,
                                                 uint64_t w_offset, uint32_t width,
@@ -8717,7 +13422,6 @@ extern "C" int32_t imparo_metal_stage_rows(uint64_t off, uint32_t row_bytes,
 //
 // Weights used DIRECTLY keep the mapping: there the mapping IS the resident copy, one copy,
 // and pread would only trade clean file pages for anonymous ones.
-static std::string g_weight_path;
 extern "C" void imparo_metal_set_weight_path(const char * path) {
     g_weight_path = (path != nullptr) ? path : "";
 }
@@ -8749,7 +13453,7 @@ static_assert(sizeof(WXformWire) == 96, "transform wire drift");
 // handful of formats.
 static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowmajor,
                                                        uint32_t variant, uint32_t tile) {
-    if (wfmt == 0u || wfmt >= 32u || variant > RT_GATED_HALF || tile >= RT_TILES
+    if (wfmt == 0u || wfmt >= 32u || variant > RT_HALF_RESID || tile >= RT_TILES
         || g.lib == nil) { return nil; }
     const uint32_t slot = wfmt + (rowmajor ? 32u : 0u);
     if (g.p_rt_fmt[variant][tile][slot] != nil) { return g.p_rt_fmt[variant][tile][slot]; }
@@ -8766,6 +13470,11 @@ static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowma
         const bool rf = true;
         [cv setConstantValue:&rf type:MTLDataTypeBool atIndex:16];
     }
+    // RT_HALF_RESID: the half-mirror entry point with the residual-add store (constant 60).
+    if (variant == RT_HALF_RESID) {
+        const bool ra = true;
+        [cv setConstantValue:&ra type:MTLDataTypeBool atIndex:60];
+    }
     NSError * e = nil;
     // THE VARIANT IS PART OF THE PIPELINE, NOT A LATER SUBSTITUTION. The route picks an
     // rt entry point from (half-activation mirror, gated pair) before it dispatches; the
@@ -8776,7 +13485,7 @@ static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowma
     // with the "built the register-tiled GEMM for weight format 12" line in the log.
     // The same entry points the plain family dispatches, compiled for this format: a
     // wide shape by its index, or the narrow tile the route takes for 2..nb8_max rows.
-    static const char * const SUF[3] = { "", "_h", "_gh" };
+    static const char * const SUF[4] = { "", "_h", "_gh", "_h" };
     NSString * nm = tile < RT_CANDIDATES
         ? [NSString stringWithFormat:@"imparo_rt_%u%s", tile, SUF[variant]]
         : [NSString stringWithFormat:@"imparo_rt_nb8%s%s", tile == RT_TILE_NB8B ? "b" : "",
@@ -8786,7 +13495,8 @@ static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowma
         NSLog(@"imparo metal: no rt function %@ for WFMT %u: %@", nm, wfmt, e);
         return nil;
     }
-    g.p_rt_fmt[variant][tile][slot] = [g.device newComputePipelineStateWithFunction:f error:&e];
+    g.p_rt_fmt[variant][tile][slot] =
+        rt_register([g.device newComputePipelineStateWithFunction:f error:&e], nm, cv);
     if (g.p_rt_fmt[variant][tile][slot] == nil) {
         NSLog(@"imparo metal: rt pipeline %@ for WFMT %u: %@", nm, wfmt, e);
     } else {
@@ -8799,6 +13509,33 @@ static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowma
     return g.p_rt_fmt[variant][tile][slot];
 }
 
+static id<MTLComputePipelineState> rt_plain_resid(uint32_t tile) {
+    if (tile >= RT_TILES || g.lib == nil) { return nil; }
+    if (g.p_rt_plain_resid[tile] != nil) { return g.p_rt_plain_resid[tile]; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    stamp_epi_act(cv);
+    // The wide tiles are built by make_rt, which stamps the fence when it is on; the narrow
+    // tiles by make_rt_plain, which does not.
+    if (tile < RT_CANDIDATES && g_rt_mma_fence != 0u) {
+        const bool rf = true;
+        [cv setConstantValue:&rf type:MTLDataTypeBool atIndex:16];
+    }
+    const bool ra = true;
+    [cv setConstantValue:&ra type:MTLDataTypeBool atIndex:60];
+    NSString * nm = tile < RT_CANDIDATES
+        ? [NSString stringWithFormat:@"imparo_rt_%u_h", tile]
+        : (tile == RT_TILE_NB8B ? @"imparo_rt_nb8b_h" : @"imparo_rt_nb8_h");
+    NSError * e = nil;
+    id<MTLFunction> f = [g.lib newFunctionWithName:nm constantValues:cv error:&e];
+    if (f == nil) { NSLog(@"imparo metal: no rt function %@ (residual add): %@", nm, e); return nil; }
+    g.p_rt_plain_resid[tile] =
+        rt_register([g.device newComputePipelineStateWithFunction:f error:&e], nm, cv);
+    if (g.p_rt_plain_resid[tile] == nil) {
+        NSLog(@"imparo metal: rt pipeline %@ (residual add): %@", nm, e);
+    }
+    return g.p_rt_plain_resid[tile];
+}
+
 // THE BRICK'S GATE (test-only entry). Decodes `n_bytes` of ROW-MAJOR blocks of format
 // `wfmt` through `tm_sub32` and returns `n_elems` floats, so a Rust test can diff the MSL
 // transcription against the CPU row codec -- which is itself pinned bit-exact against
@@ -8806,15 +13543,26 @@ static id<MTLComputePipelineState> rt_pipeline_for_fmt(uint32_t wfmt, bool rowma
 extern "C" int imparo_metal_decode_probe(uint32_t wfmt,
                                          const void * scales, uint64_t n_scale_bytes,
                                          const void * payload, uint64_t n_pay_bytes,
-                                         uint32_t n_elems, uint32_t as_half, float * out) {
+                                         uint32_t n_elems, uint32_t mode, float * out) {
     if (g.device == nil || g.lib == nil) { return 1; }
     if (wfmt == 0u || wfmt >= 32u || scales == nullptr || payload == nullptr
         || out == nullptr) { return 2; }
     if (n_elems == 0u || (n_elems % 32u) != 0u) { return 3; }
     MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
     [cv setConstantValue:&wfmt type:MTLDataTypeUInt atIndex:21];
-    const bool probe_half = as_half != 0u;
+    // mode bit 0: the half output; bit 1: the run fetch (tm_run8); bit 2: the aligned flag;
+    // bit 3: with bit 1, the pair fetch (tm_run8_pair) where the format has one; bit 4: with bit
+    // 1, the half-block fetch (tm_quad_scales) where the format has one.
+    const bool probe_half = (mode & 1u) != 0u;
+    const bool probe_run = (mode & 2u) != 0u;
+    const bool probe_a16 = (mode & 4u) != 0u;
+    const bool probe_pair = (mode & 8u) != 0u;
+    const bool probe_quad = (mode & 16u) != 0u;
     [cv setConstantValue:&probe_half type:MTLDataTypeBool atIndex:24];
+    [cv setConstantValue:&probe_run type:MTLDataTypeBool atIndex:41];
+    [cv setConstantValue:&probe_a16 type:MTLDataTypeBool atIndex:42];
+    [cv setConstantValue:&probe_pair type:MTLDataTypeBool atIndex:48];
+    [cv setConstantValue:&probe_quad type:MTLDataTypeBool atIndex:52];
     stamp_epi_act(cv);
     NSError * e = nil;
     id<MTLFunction> f = [g.lib newFunctionWithName:@"imparo_blk_decode_probe"
@@ -8892,6 +13640,95 @@ static id<MTLComputePipelineState> gemv_pipeline_for_fmt(uint32_t wfmt, bool row
     return g.p_gemv_fmt[slot];
 }
 
+// Its decode-rows form for 1 << form_log2 tokens (2, 4 or 8), built on first use: a process
+// that never co-batches builds none. The one-row pipeline's constants plus the token count at 39.
+static id<MTLComputePipelineState> blk_rows_pipeline_for_fmt(uint32_t wfmt, bool rowmajor,
+                                                             uint32_t form_log2) {
+    if (wfmt == 0u || wfmt >= 32u || form_log2 < 1u || form_log2 > 3u || g.lib == nil) {
+        return nil;
+    }
+    const uint32_t slot = wfmt + (rowmajor ? 32u : 0u);
+    id<MTLComputePipelineState> __strong & have = g.p_blk_rows_fmt[slot][form_log2 - 1u];
+    if (have != nil) { return have; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    [cv setConstantValue:&wfmt type:MTLDataTypeUInt atIndex:21];
+    [cv setConstantValue:&rowmajor type:MTLDataTypeBool atIndex:22];
+    stamp_epi_act(cv);   // constant 11: SiLU vs GELU, see the builder
+    const bool pb = getenv("IMPARO_WFMT_PROBE") != nullptr;
+    [cv setConstantValue:&pb type:MTLDataTypeBool atIndex:23];
+    const uint32_t tok = 1u << form_log2;
+    [cv setConstantValue:&tok type:MTLDataTypeUInt atIndex:39];
+    // DIAGNOSTIC (IMPARO_BLK_ROWS_SKIP, the kernel's skip bits); unset in every served run.
+    static int skip = -1;
+    if (skip < 0) { const char * e = getenv("IMPARO_BLK_ROWS_SKIP"); skip = e ? atoi(e) : 0; }
+    if (skip > 0) {
+        const uint32_t sk = (uint32_t)skip;
+        [cv setConstantValue:&sk type:MTLDataTypeUInt atIndex:40];
+    }
+    NSError * e = nil;
+    id<MTLFunction> f = [g.lib newFunctionWithName:@"imparo_blk_gemv_rows" constantValues:cv
+                                             error:&e];
+    have = f ? [g.device newComputePipelineStateWithFunction:f error:&e] : nil;
+    if (have == nil) {
+        NSLog(@"imparo metal: decode-rows GEMV for weight format %u, %u tokens: %@", wfmt, tok, e);
+    } else if (getenv("IMPARO_WFMT_LOG")) {
+        NSLog(@"imparo metal: built the decode-rows GEMV for weight format %u (%s, %u tokens, "
+              @"max_threads=%lu)", wfmt, rowmajor ? "row-major" : "tile-major", tok,
+              (unsigned long)[have maxTotalThreadsPerThreadgroup]);
+    }
+    return have;
+}
+
+// Its matrix-unit form (imparo_blk_rows_mma), built on first use: the one-row pipeline's
+// constants; one 8-token column serves every row count it takes.
+static id<MTLComputePipelineState> blk_rows_mma_pipeline_for_fmt(uint32_t wfmt, bool rowmajor,
+                                                                uint32_t tiles, bool xhalf,
+                                                                uint32_t frags) {
+    if (wfmt == 0u || wfmt >= 32u || g.lib == nil) { return nil; }
+    if (tiles != 1u && tiles != 2u && tiles != 4u) { return nil; }
+    if (frags != 1u && (frags != 2u || xhalf)) { return nil; }
+    const uint32_t slot = wfmt + (rowmajor ? 32u : 0u);
+    id<MTLComputePipelineState> __strong & have = frags == 2u
+        ? g.p_blk_rows_mma2_fmt[slot][tiles == 4u ? 2u : tiles - 1u]
+        : g.p_blk_rows_mma_fmt[slot][tiles == 4u ? 2u : tiles - 1u][xhalf ? 1u : 0u];
+    if (have != nil) { return have; }
+    MTLFunctionConstantValues * cv = [MTLFunctionConstantValues new];
+    [cv setConstantValue:&wfmt type:MTLDataTypeUInt atIndex:21];
+    [cv setConstantValue:&rowmajor type:MTLDataTypeBool atIndex:22];
+    stamp_epi_act(cv);   // constant 11: SiLU vs GELU, see the builder
+    [cv setConstantValue:&tiles type:MTLDataTypeUInt atIndex:43];
+    // DIAGNOSTIC (IMPARO_BLK_MMA_SKIP, the kernel's skip bits); unset in every served run.
+    static int skip = -1;
+    if (skip < 0) { const char * se = getenv("IMPARO_BLK_MMA_SKIP"); skip = se ? atoi(se) : 0; }
+    if (skip > 0) {
+        const uint32_t sk = (uint32_t)skip;
+        [cv setConstantValue:&sk type:MTLDataTypeUInt atIndex:44];
+    }
+    // DIAGNOSTIC (IMPARO_BLK_RUN_PROBE, the run fetch's probe bits); unset in every served run.
+    static int runp = -1;
+    if (runp < 0) { const char * re = getenv("IMPARO_BLK_RUN_PROBE"); runp = re ? atoi(re) : 0; }
+    if (runp > 0) {
+        const uint32_t rp = (uint32_t)runp;
+        [cv setConstantValue:&rp type:MTLDataTypeUInt atIndex:50];
+    }
+    NSError * e = nil;
+    // A SEPARATE ENTRY POINT for the half mirror: the two kernels share one templated body in the
+    // .metal, and the float one carries no half code and no extra buffer argument.
+    id<MTLFunction> f = [g.lib newFunctionWithName:(frags == 2u ? @"imparo_blk_rows_mma_t2"
+                                                    : xhalf ? @"imparo_blk_rows_mma_xh"
+                                                            : @"imparo_blk_rows_mma")
+                                    constantValues:cv error:&e];
+    have = f ? [g.device newComputePipelineStateWithFunction:f error:&e] : nil;
+    if (have == nil) {
+        NSLog(@"imparo metal: matrix-unit rows for weight format %u: %@", wfmt, e);
+    } else if (getenv("IMPARO_WFMT_LOG")) {
+        NSLog(@"imparo metal: built the matrix-unit rows for weight format %u (%s, tiles=%u, "
+              @"activations %s, max_threads=%lu)", wfmt, rowmajor ? "row-major" : "tile-major",
+              tiles, xhalf ? "half" : "float", (unsigned long)[have maxTotalThreadsPerThreadgroup]);
+    }
+    return have;
+}
+
 static WSeg * wseg_mut_at(uint64_t off) {
     size_t lo = 0, hi = g_wsegs.size();
     while (lo < hi) {
@@ -8954,8 +13791,9 @@ extern "C" int32_t imparo_metal_transform_weights(const WXformWire * jobs, uint3
               [&](uint32_t x, uint32_t y) { return jobs[x].off < jobs[y].off; });
 
     const uint64_t page = 16384, cap = weight_window_cap();
-    // The mapping is whole-file at offset 0 (imparo-gguf `Weights::open_with`), so a segment
-    // offset IS a file offset and no translation is needed.
+    // The mapping starts with the model's file at offset 0 (imparo-gguf `Weights`), so a segment
+    // offset below the file's end IS a file offset and no translation is needed. A paired
+    // drafter's file follows past that end; it is never read from this file (`in_file`).
     int src_fd = -1;
     uint64_t src_len = 0;
     id<MTLBuffer> staging = nil;
@@ -9066,7 +13904,10 @@ extern "C" int32_t imparo_metal_transform_weights(const WXformWire * jobs, uint3
             };
             id<MTLBuffer> src = nil;
             uint64_t src_org = base;
-            if (src_fd >= 0 && (job_top - base) <= (uint64_t)[staging length]) {
+            // Past the file's last page the mapping holds another file (a paired drafter): a
+            // window reaching there takes the mapping route.
+            const bool in_file = top <= ((src_len + page - 1) & ~(page - 1));
+            if (src_fd >= 0 && in_file && (job_top - base) <= (uint64_t)[staging length]) {
                 if (read_into((uint8_t *)[staging contents], base, job_top - base)
                     && read_into((uint8_t *)[twin contents] + (job_top - base), job_top,
                                  top - job_top)) {

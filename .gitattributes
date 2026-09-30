@@ -11,3 +11,6 @@
 *.png binary
 *.safetensors binary
 *.so binary
+
+# Preserve raw evidence bytes and their recorded source hashes.
+/evidence/** -text

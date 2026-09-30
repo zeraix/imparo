@@ -62,11 +62,11 @@ Proposal frontier_generate(){
 
 }
 
-Proposal generate(){const char* tree_flag=std::getenv("IMPARO_LAB_DSPARK_TREE16");const bool tree=tree_flag&&std::strcmp(tree_flag,"1")==0;tree_secondary.clear();tree_frontier.clear();imparo_cuda_begin();rc(imparo_cuda_set_batch_geometry(S,M,0,S,M));std::vector<uint32_t> ids(M,cfg.mask_token);ids[0]=current_anchor;imparo_cuda_write_u32(TOK,0,ids.data(),M);imparo_cuda_rows(2,cfg.embedding,H,VOC,TOK,1.0f,X,M);
+Proposal generate(){const char* tree_flag=std::getenv("IMPARO_LAB_DSPARK_TREE16");const bool tree=imparo_lfm_retained::common(tree_flag&&std::strcmp(tree_flag,"1")==0);tree_secondary.clear();tree_frontier.clear();imparo_cuda_begin();rc(imparo_cuda_set_batch_geometry(S,M,0,S,M));std::vector<uint32_t> ids(M,cfg.mask_token);ids[0]=current_anchor;imparo_cuda_write_u32(TOK,0,ids.data(),M);imparo_cuda_rows(2,cfg.embedding,H,VOC,TOK,1.0f,X,M);
 for(unsigned l=0;l<dw.size();++l){norm(CUR,X,dw[l].attn_norm,M);mm(dw[l].q,H,H,CUR,Q,M);mm(dw[l].k,H,KW,CUR,K,M);mm(dw[l].v,H,KW,CUR,V,M);head(Q,dw[l].qn,cfg.heads,S,M);head(K,dw[l].kn,cfg.kv_heads,S,M);store(l,S,M);imparo_cuda_scale(Q,0.125f,M*H);auto plan=imparo_sm80_d64_mma_plan::make(M,cfg.kv_heads,S+M);if(!launch_attention_d64_ordered_qk((const float*)execution().bufs[Q],(const __half*)execution().kv_k[l],(const __half*)execution().kv_v[l],(float*)execution().bufs[ATTN],cfg.heads,cfg.kv_heads,KW,S,0,M,0,0.125f,S+M,plan.key_updates,nullptr,false,S+M))imparo_sm80_d64_mma_noncausal::whole_k_tile<false><<<plan.blocks,128,0,g.stream>>>((const float*)execution().bufs[Q],(const __half*)execution().kv_k[l],(const __half*)execution().kv_v[l],(float*)execution().bufs[ATTN],cfg.heads,cfg.kv_heads,KW,S,0,M,0,0.125f,S+M,plan.key_updates,nullptr,false,S+M);mark_buf_written(ATTN);mm(dw[l].o,H,H,ATTN,O,M);imparo_cuda_add(X,O,M*H);norm(CUR,X,dw[l].ffn_norm,M);imparo_cuda_matmat_gated(2,dw[l].gate,2,dw[l].up,H,F,CUR,GATE,UP,M,2);mm(dw[l].down,F,H,GATE,O,M);imparo_cuda_add(X,O,M*H);}
 dense_norm(CUR,X,cfg.out_norm,M);mm(cfg.embedding,H,VOC,CUR,LOGITS,M);
 const char*frontier_flag=std::getenv("IMPARO_LAB_DSPARK_FRONTIER16");
-if(tree&&frontier_flag&&std::strcmp(frontier_flag,"1")==0&&16<=cfg.batch_capacity-S%cfg.batch_capacity&&uint64_t(S)+16<=cfg.kv_capacity)return frontier_generate();
+if(tree&&imparo_lfm_retained::common(frontier_flag&&std::strcmp(frontier_flag,"1")==0)&&16<=cfg.batch_capacity-S%cfg.batch_capacity&&uint64_t(S)+16<=cfg.kv_capacity)return frontier_generate();
 // GPU Markov chain: each argmax becomes the next position's table row index.
 // Token shadow is irrelevant to the resident-weight device row kernel.
 uint32_t anchor=current_anchor;imparo_cuda_write_u32(TOK,0,&anchor,1);

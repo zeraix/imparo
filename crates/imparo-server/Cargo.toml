@@ -6,8 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+# See imparo-model: speculation ships on. `--no-default-features` builds the server without it.
+default = ["speculative"]
 cuda = ["imparo-model/cuda"]
-cuda-speculative = ["imparo-model/cuda-speculative"]
+speculative = ["imparo-model/speculative"]
+cuda-speculative = ["speculative", "imparo-model/cuda-speculative"]
 cuda-owner-lab = ["cuda-speculative", "imparo-model/cuda-owner-lab"]
 cuda-dynamic = ["imparo-model/cuda-dynamic"]
 

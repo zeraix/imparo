@@ -351,4 +351,396 @@ mod tests {
             "False"
         );
     }
+
+    /// LFM2.5-2.6B's `tokenizer.chat_template`, byte for byte from the served GGUF.
+    const LFM25: &str = include_str!("../testdata/lfm25_chat_template.jinja");
+
+    fn lfm25() -> Template {
+        Template::compile(LFM25).expect("the LFM2.5 template compiles")
+    }
+
+    fn preserve(on: bool) -> serde_json::Map<String, serde_json::Value> {
+        let mut kw = serde_json::Map::new();
+        if on {
+            kw.insert("preserve_thinking".into(), serde_json::Value::Bool(true));
+        }
+        kw
+    }
+
+    fn weather_tool() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({"type": "function", "function": {
+            "name": "get_weather", "description": "Current weather for a city.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                           "required": ["city"]}}})]
+    }
+
+    const SYSTEM: &str = "You are a finance analyst.";
+
+    /// What two conversations with the same system prompt and tools, and different first user
+    /// messages, render alike: the preamble another conversation can share. It must end
+    /// exactly where the user turn opens -- the system prompt's end.
+    fn shared_preamble(
+        t: &Template,
+        kw: &serde_json::Map<String, serde_json::Value>,
+    ) -> String {
+        let sys = serde_json::json!({"role": "system", "content": SYSTEM});
+        let render = |user: &str| {
+            let msgs = [
+                sys.clone(),
+                serde_json::json!({"role": "user", "content": user}),
+            ];
+            t.render(&msgs, &weather_tool(), true, "", kw).unwrap()
+        };
+        let (a, b) = (
+            render("Alpha: summarise Q3."),
+            render("Beta: list the risks."),
+        );
+        let n = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+        a[..n].to_string()
+    }
+
+    /// A later turn of the same conversation: an answer, a tool round trip, a new question.
+    fn later_turn(
+        t: &Template,
+        kw: &serde_json::Map<String, serde_json::Value>,
+    ) -> String {
+        let msgs = [
+            serde_json::json!({"role": "system", "content": SYSTEM}),
+            serde_json::json!({"role": "user", "content": "Alpha: summarise Q3."}),
+            serde_json::json!({"role": "assistant", "content": "Revenue rose 4%."}),
+            serde_json::json!({"role": "user", "content": "Weather in Oslo?"}),
+            serde_json::json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_0", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\": \"Oslo\"}"}}]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "3 C"}),
+            serde_json::json!({"role": "assistant", "content": "It is 3 C."}),
+            serde_json::json!({"role": "user", "content": "Thanks."}),
+        ];
+        t.render(&msgs, &weather_tool(), true, "", kw).unwrap()
+    }
+
+    #[test]
+    fn lfm25_system_prompt_and_tools_render_one_preamble_on_every_turn() {
+        let t = lfm25();
+        let preamble = shared_preamble(&t, &preserve(false));
+        assert_eq!(
+            preamble,
+            "<|im_start|>system\nYou are a finance analyst.\nList of tools: [{\"type\": \
+             \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \
+             \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \
+             \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}]\
+             <|im_end|>\n<|im_start|>user\n"
+        );
+        assert!(later_turn(&t, &preserve(false)).starts_with(&preamble));
+    }
+
+    #[test]
+    fn lfm25_raises_on_string_arguments_so_they_are_parsed_first() {
+        assert!(lfm25().requires_object_arguments());
+    }
+
+    /// THE PROPERTY A REPLY-END CHECKPOINT NEEDS: with `preserve_thinking` the next prompt
+    /// is this prompt, then the reply exactly as the model generated it after the
+    /// generation prompt's `<think>`, then the next turn.
+    #[test]
+    fn lfm25_preserve_thinking_rerenders_the_reply_as_generated() {
+        let t = lfm25();
+        let user = serde_json::json!({"role": "user", "content": "Write a haiku."});
+        let first = t
+            .render(std::slice::from_ref(&user), &[], true, "", &preserve(true))
+            .unwrap();
+        assert!(
+            first.ends_with("<|im_start|>assistant\n<think>"),
+            "{first:?}"
+        );
+        let reply = serde_json::json!({"role": "assistant",
+            "reasoning_content": "Five, seven, five.", "content": "Autumn moon rises"});
+        let next = serde_json::json!({"role": "user", "content": "Another."});
+        let second = t
+            .render(&[user, reply, next], &[], true, "", &preserve(true))
+            .unwrap();
+        let generated = "Five, seven, five.</think>Autumn moon rises<|im_end|>";
+        assert!(
+            second.starts_with(&format!("{first}{generated}")),
+            "{second:?}"
+        );
+    }
+
+    /// Without the flag the template drops a past reply's thinking at the next user turn,
+    /// so the next prompt parts from the generated stream at the reply's first token.
+    #[test]
+    fn lfm25_drops_past_thinking_without_the_flag() {
+        let t = lfm25();
+        let msgs = [
+            serde_json::json!({"role": "user", "content": "Write a haiku."}),
+            serde_json::json!({"role": "assistant",
+                "reasoning_content": "Five, seven, five.", "content": "Autumn moon rises"}),
+            serde_json::json!({"role": "user", "content": "Another."}),
+        ];
+        let second = t.render(&msgs, &[], true, "", &preserve(false)).unwrap();
+        assert!(
+            second.contains("<|im_start|>assistant\nAutumn moon rises<|im_end|>\n")
+        );
+        assert!(!second.contains("Five, seven, five."));
+    }
+
+    /// A tool round trip as an OpenAI client sends it back: arguments are JSON TEXT, a
+    /// call-only turn has `content: null`, two calls ride one turn. The template raises on
+    /// string arguments, so they must be parsed first; otherwise the request fell back to
+    /// the built-in renderer, which spelled the tool list differently and the next prompt
+    /// shared nothing with this one past `List of tools: [{"type":`.
+    #[test]
+    fn lfm25_tool_round_trip_rerenders_the_calls_as_generated() {
+        let t = lfm25();
+        let tools = weather_tool();
+        let user = serde_json::json!({"role": "user", "content": "Weather in Oslo and Bergen?"});
+        let first = t
+            .render(
+                std::slice::from_ref(&user),
+                &tools,
+                true,
+                "",
+                &preserve(false),
+            )
+            .unwrap();
+        assert!(
+            first.starts_with(
+                "<|im_start|>system\nList of tools: [{\"type\": \"function\", \
+                 \"function\": {\"name\": \"get_weather\""
+            ),
+            "{first:?}"
+        );
+        let calls = serde_json::json!({"role": "assistant", "content": null,
+            "reasoning_content": "Two cities.",
+            "tool_calls": [
+                {"id": "call_0", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\": \"Oslo\"}"}},
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\": \"Bergen\"}"}}]});
+        let msgs = [
+            user,
+            calls,
+            serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "3 C"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "5 C"}),
+        ];
+        // The template keeps a tool loop's thinking (it follows the last user message)
+        // whether or not the flag is set.
+        let second = t.render(&msgs, &tools, true, "", &preserve(false)).unwrap();
+        let generated = "Two cities.</think><|tool_call_start|>[get_weather(city='Oslo'), \
+                         get_weather(city='Bergen')]<|tool_call_end|><|im_end|>";
+        assert!(
+            second.starts_with(&format!("{first}{generated}")),
+            "{second:?}"
+        );
+        assert!(!second.contains("null"), "{second:?}");
+    }
+
+    /// gemma-4-E4B-it's `tokenizer.chat_template`, byte for byte from the served GGUF.
+    const GEMMA4_E4B: &str = include_str!("../testdata/gemma4_e4b_chat_template.jinja");
+
+    fn gemma4() -> Template {
+        Template::compile(GEMMA4_E4B).expect("the gemma4 E4B template compiles")
+    }
+
+    #[test]
+    fn gemma4_spells_object_arguments_in_its_own_syntax() {
+        assert!(gemma4().requires_object_arguments());
+    }
+
+    #[test]
+    fn gemma4_system_prompt_and_tools_render_one_preamble_on_every_turn() {
+        let t = gemma4();
+        let preamble = shared_preamble(&t, &preserve(false));
+        assert!(
+            preamble.starts_with(
+                "<|turn>system\nYou are a finance analyst.<|tool>declaration:get_weather{"
+            ),
+            "{preamble:?}"
+        );
+        assert!(
+            preamble.ends_with("<tool|><turn|>\n<|turn>user\n"),
+            "{preamble:?}"
+        );
+        assert!(later_turn(&t, &preserve(false)).starts_with(&preamble));
+    }
+
+    /// The model hands a tool call over by writing `<|tool_response>` (the server stops
+    /// there); the next prompt must continue the SAME model turn with that call as written.
+    #[test]
+    fn gemma4_tool_round_trip_rerenders_the_call_as_generated() {
+        let t = gemma4();
+        let tools = weather_tool();
+        let user = serde_json::json!({"role": "user", "content": "Weather in Oslo?"});
+        let first = t
+            .render(
+                std::slice::from_ref(&user),
+                &tools,
+                true,
+                "",
+                &preserve(false),
+            )
+            .unwrap();
+        assert!(first.ends_with("<|turn>model\n"), "{first:?}");
+        let msgs = [
+            user,
+            serde_json::json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_0", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\": \"Oslo\"}"}}]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "3 C"}),
+        ];
+        let second = t.render(&msgs, &tools, true, "", &preserve(false)).unwrap();
+        let generated = "<|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>}<tool_call|>\
+                         <|tool_response>";
+        assert!(
+            second.starts_with(&format!("{first}{generated}")),
+            "{second:?}"
+        );
+        assert!(
+            second.ends_with(
+                "<|tool_response>response:get_weather{value:<|\"|>3 C<|\"|>}<tool_response|>"
+            ),
+            "{second:?}"
+        );
+    }
+
+    /// gemma4 keeps a past thought channel only on a tool-call turn with `preserve_thinking`
+    /// (or after the last user message); a plain past reply loses it either way.
+    #[test]
+    fn gemma4_keeps_past_thinking_only_on_tool_call_turns() {
+        let t = gemma4();
+        let mut kw = preserve(true);
+        kw.insert("enable_thinking".into(), serde_json::Value::Bool(true));
+        let tools = weather_tool();
+        let msgs = [
+            serde_json::json!({"role": "user", "content": "Weather in Oslo?"}),
+            serde_json::json!({"role": "assistant", "content": null,
+                "reasoning_content": "One city.", "tool_calls": [
+                {"id": "call_0", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\": \"Oslo\"}"}}]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "3 C"}),
+            serde_json::json!({"role": "assistant", "content": "It is 3 C.",
+                "reasoning_content": "Report it."}),
+            serde_json::json!({"role": "user", "content": "Thanks."}),
+        ];
+        let out = t.render(&msgs, &tools, true, "", &kw).unwrap();
+        assert!(out.starts_with("<|turn>system\n<|think|>\n"), "{out:?}");
+        assert!(
+            out.contains(
+                "<|channel>thought\nOne city.\n<channel|><|tool_call>call:get_weather"
+            ),
+            "{out:?}"
+        );
+        assert!(!out.contains("Report it."), "{out:?}");
+        assert!(out.ends_with("<|turn>model\n"), "{out:?}");
+    }
+
+    /// Qwen3.8-27B's `tokenizer.chat_template`, byte for byte from the served GGUF.
+    const QWEN38_27B: &str = include_str!("../testdata/qwen38_27b_chat_template.jinja");
+
+    fn qwen38() -> Template {
+        Template::compile(QWEN38_27B).expect("the Qwen3.8-27B template compiles")
+    }
+
+    #[test]
+    fn qwen38_raises_on_string_arguments_so_they_are_parsed_first() {
+        assert!(qwen38().requires_object_arguments());
+    }
+
+    #[test]
+    fn qwen38_system_prompt_and_tools_render_one_preamble_on_every_turn() {
+        let t = qwen38();
+        let preamble = shared_preamble(&t, &preserve(false));
+        assert!(preamble.starts_with("<|im_start|>system\n"), "{preamble:?}");
+        assert!(
+            preamble.contains(
+                "<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""
+            ),
+            "{preamble:?}"
+        );
+        assert!(
+            preamble
+                .ends_with("You are a finance analyst.<|im_end|>\n<|im_start|>user\n"),
+            "{preamble:?}"
+        );
+        assert!(later_turn(&t, &preserve(false)).starts_with(&preamble));
+    }
+
+    /// Qwen3.8 keeps a past reply's thinking unless the client sets `preserve_thinking` to
+    /// false, so by default the next prompt carries the reply as the model generated it.
+    #[test]
+    fn qwen38_keeps_past_thinking_by_default_and_rerenders_the_reply() {
+        let t = qwen38();
+        let user = serde_json::json!({"role": "user", "content": "Write a haiku."});
+        let first = t
+            .render(std::slice::from_ref(&user), &[], true, "", &preserve(false))
+            .unwrap();
+        assert!(
+            first.ends_with("<|im_start|>assistant\n<think>\n"),
+            "{first:?}"
+        );
+        let reply = serde_json::json!({"role": "assistant",
+            "reasoning_content": "Five, seven, five.", "content": "Autumn moon rises"});
+        let next = serde_json::json!({"role": "user", "content": "Another."});
+        let msgs = [user, reply, next];
+        let second = t.render(&msgs, &[], true, "", &preserve(false)).unwrap();
+        let generated = "Five, seven, five.\n</think>\n\nAutumn moon rises<|im_end|>";
+        assert!(
+            second.starts_with(&format!("{first}{generated}")),
+            "{second:?}"
+        );
+        let mut off = serde_json::Map::new();
+        off.insert("preserve_thinking".into(), serde_json::Value::Bool(false));
+        let dropped = t.render(&msgs, &[], true, "", &off).unwrap();
+        assert!(dropped.contains("<|im_start|>assistant\nAutumn moon rises<|im_end|>"));
+        assert!(!dropped.contains("Five, seven, five."));
+    }
+
+    /// Two calls in one turn, sent back in the OpenAI wire form (JSON-text arguments,
+    /// `content: null`): the template raises on string arguments, and renders the parsed
+    /// ones in its XML form exactly as the model writes them.
+    #[test]
+    fn qwen38_tool_round_trip_rerenders_the_calls_as_generated() {
+        let t = qwen38();
+        let tools = weather_tool();
+        let user = serde_json::json!({"role": "user", "content": "Weather in Oslo and Bergen?"});
+        let first = t
+            .render(
+                std::slice::from_ref(&user),
+                &tools,
+                true,
+                "",
+                &preserve(false),
+            )
+            .unwrap();
+        let msgs = [
+            user,
+            serde_json::json!({"role": "assistant", "content": null,
+                "reasoning_content": "Two cities.",
+                "tool_calls": [
+                    {"id": "call_0", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Oslo\"}"}},
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Bergen\"}"}}]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "3 C"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "5 C"}),
+        ];
+        let second = t.render(&msgs, &tools, true, "", &preserve(false)).unwrap();
+        let generated = "Two cities.\n</think>\n\n\
+             <tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n\
+             </function>\n</tool_call>\n\
+             <tool_call>\n<function=get_weather>\n<parameter=city>\nBergen\n</parameter>\n\
+             </function>\n</tool_call><|im_end|>";
+        assert!(
+            second.starts_with(&format!("{first}{generated}")),
+            "{second:?}"
+        );
+        assert!(
+            second.contains(
+                "<|im_start|>user\n<tool_response>\n3 C\n</tool_response>\n\
+                 <tool_response>\n5 C\n</tool_response><|im_end|>\n"
+            ),
+            "{second:?}"
+        );
+        assert!(!second.contains("null"), "{second:?}");
+    }
 }

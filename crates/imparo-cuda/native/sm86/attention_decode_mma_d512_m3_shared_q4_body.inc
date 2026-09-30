@@ -1,5 +1,8 @@
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 
+#if defined(IMPARO_D512_REGISTER_FRAGMENTS)
+    if (n_heads != 8 || n_kv != 2 || kv_width != 1024) return;
+#endif
     if (window != 0 || ring != 0 || start_pos > 0xfffffffdU
             || valid_span != start_pos + 3
             || blockDim.x != 2*kThreads || blockIdx.x >= physical_blocks
@@ -26,9 +29,11 @@
     __shared__ __align__(16) uint8_t packed_k[2][kWarps][16*288];
     __shared__ __align__(16) uint8_t packed_v[2][kWarps][16*288];
 #endif
+#if !defined(IMPARO_D512_REGISTER_FRAGMENTS)
     __shared__ __align__(16) __half2 q_tile[2*kWarps][8 * 8];
     __shared__ __align__(16) __half2 k_tile[kWarps][16 * 8];
     __shared__ __align__(16) __half2 value_tile[kWarps][16 * 8];
+#endif
 #if defined(IMPARO_D512_PAGED)
     __shared__ uint32_t physical_keys[kWarps][kKeysPerWarp];
 #endif
@@ -86,6 +91,27 @@
             KqC16x8 scores{};
 #pragma unroll
             for (uint32_t d0 = 0; d0 < kHeadDim; d0 += 16) {
+#if defined(IMPARO_D512_REGISTER_FRAGMENTS)
+                // ldmatrix.x2 B slots: query column lane/4, D half-pairs
+                // lane%4 and lane%4+4. Q is already scaled/rounded to F16.
+                KqB8x8 query_b;
+                query_b.x[0] = __float2half2_rn(0.0f);
+                query_b.x[1] = __float2half2_rn(0.0f);
+                const uint32_t column = lane >> 2;
+                const uint32_t head = kvh * kGqaHeads + column % kGqaHeads;
+                if (column < livecols && head < n_heads) {
+                    const uint32_t query_row = role ? 2u : column / kGqaHeads;
+                    const __half * qp = q
+                        + (uint64_t(query_row) * n_heads + head) * kHeadDim
+                        + d0 + 2 * (lane & 3u);
+                    query_b.x[0] = *reinterpret_cast<const __half2 *>(qp);
+                    query_b.x[1] = *reinterpret_cast<const __half2 *>(qp + 8);
+                }
+                const Half16x8 key_a = direct_packed_q4_fragment(
+                    packed_k[stage][subwarp], group, subwarp, lane,
+                    valid_span, d0);
+                mma_kq_ncols8(scores, key_a, query_b);
+#else
                 for (uint32_t e = lane; e < 8 * 8; e += 32) {
                     const uint32_t column = e >> 3;
                     const uint32_t pair = e & 7;
@@ -142,6 +168,7 @@
                 load_half16x8(key_a, k_tile[subwarp], 8, lane);
                 mma_kq_ncols8(scores, key_a, query_b);
                 __syncthreads();
+#endif
             }
 
             float max_new[2] = {running_max[0], running_max[1]};
@@ -188,8 +215,13 @@
             const float scale1 = exp_ftz(running_max[1] - max_new[1]);
             running_max[0] = max_new[0];
             running_max[1] = max_new[1];
+#if defined(IMPARO_D512_REGISTER_FRAGMENTS)
+            running_sum[0] = fmaf(scale0, running_sum[0], rowsum_add[0]);
+            running_sum[1] = fmaf(scale1, running_sum[1], rowsum_add[1]);
+#else
             running_sum[0] = running_sum[0] * scale0 + rowsum_add[0];
             running_sum[1] = running_sum[1] * scale1 + rowsum_add[1];
+#endif
 
             const __half2 half_scale = __floats2half2_rn(scale0, scale1);
 #pragma unroll
@@ -205,6 +237,21 @@
 #pragma unroll
             for (uint32_t output_tile = 0;
                  output_tile < kOutputTiles; ++output_tile) {
+#if defined(IMPARO_D512_REGISTER_FRAGMENTS)
+                // Start with the original row-major V fragment, transpose
+                // each 8x8 submatrix, then preserve load_half16x8_trans's
+                // explicit destination swap x1/x2.
+                const Half16x8 row_major = direct_packed_q4_fragment(
+                    packed_v[stage][subwarp], group, subwarp, lane,
+                    valid_span, output_tile * 16);
+                Half16x8 value_a;
+                value_a.x[0] = movmatrix_transpose(row_major.x[0]);
+                value_a.x[1] = movmatrix_transpose(row_major.x[2]);
+                value_a.x[2] = movmatrix_transpose(row_major.x[1]);
+                value_a.x[3] = movmatrix_transpose(row_major.x[3]);
+                mma_vp_ncols8(
+                    numerator[output_tile], value_a, probabilities);
+#else
                 if(role==0) {
                 for (uint32_t e = lane; e < 16 * 8; e += 32) {
                     const uint32_t key_row = e >> 3;
@@ -248,7 +295,9 @@
                 mma_vp_ncols8(
                     numerator[output_tile], value_a, probabilities);
                 __syncthreads();
+#endif
             }
+
         }
 
 #pragma unroll

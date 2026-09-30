@@ -41,11 +41,11 @@ pub fn prof_log(phase: &str, wall_ms: f64) {
         p.barriers,
         1e6 * p.gpu_s / (p.cbs.max(1) as f64)
     );
-    let total: f64 = p.categories.iter().map(|(_, t, _)| *t).sum();
+    let total: f64 = p.categories.iter().map(|(_, t, _, _)| *t).sum();
     if total <= 0.0 {
         let mut c = p.categories;
-        c.sort_by_key(|(_, _, calls)| std::cmp::Reverse(*calls));
-        for (name, _, calls) in &c {
+        c.sort_by_key(|(_, _, calls, _)| std::cmp::Reverse(*calls));
+        for (name, _, calls, _) in &c {
             eprintln!("[prof]   {name:<15} calls={calls}");
         }
         return;
@@ -59,9 +59,35 @@ pub fn prof_log(phase: &str, wall_ms: f64) {
     // understates a SERIAL category by exactly that much (2026-09-09; the qwen35 delta
     // rule printed 1.9 ms/token that way against a real 4.0, and the skip-and-diff had
     // said 3.9 all along).
-    for (name, t, calls) in &cats {
+    // WEIGHT BYTES OVER TIME, where the site declared the bytes. A duration says a class is
+    // big; GB/s says whether it is slow, and only the second one names a lever. Blank when
+    // the class declares no bytes -- not 0, which would read as a measured zero.
+    //
+    // WEIGHT bytes, so the rate means what you want at ONE TOKEN and not at many. A
+    // prefill dispatch reads its weights once and uses them for every token in the chunk,
+    // so the same kernel reads 130 GB/s at decode and 1.6 at a 512-token chunk without
+    // anything being wrong. Read this column on a decode profile; on a prefill one it
+    // ranks nothing.
+    //
+    // THE COLUMN IS THE CLASS'S OWN RATE, and it does not need a correction. Under
+    // IMPARO_PROF_ENC each dispatch gets its own encoder, which looked like it should
+    // inflate small ones -- but the check is the total: on LFM2.5-8B-A1B (2026-09-21) the
+    // per-class times sum to 10.87 ms/token against a real 11.15, with gpu_busy at 95% of
+    // wall. There is no per-dispatch floor to subtract; the sum would exceed the token if
+    // there were.
+    //
+    // Where it disagrees with a skip-and-diff, check that the skip is HONOURED before
+    // believing either. moe_route reads 0.35 ms/token here and 0.047 from a skip-and-diff,
+    // and the skip is the wrong one: no PC_MOE_ROUTE dispatch site has a skip guard, so
+    // IMPARO_SKIP_CAT=moe_route skips nothing and 0.047 was run-to-run noise.
+    for (name, t, calls, bytes) in &cats {
+        let bw = if *bytes > 0 {
+            format!("{:7.1} GB/s", *bytes as f64 / t.max(1e-12) / 1e9)
+        } else {
+            "           ".to_string()
+        };
         eprintln!(
-            "[prof]   {name:<15} gpu_ms={:8.1}  of_sum={:5.1}%  calls={calls}",
+            "[prof]   {name:<15} gpu_ms={:8.1}  of_sum={:5.1}%  {bw}  calls={calls}",
             t * 1e3,
             100.0 * t / total.max(1e-9),
         );
@@ -93,12 +119,17 @@ pub fn log_footprint(stage: &str) {
     }
     let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
     let gpu = active().map_or(0, imparo_backend::Backend::allocated_bytes);
+    // The KV tier's resident bytes: on Metal wired memory that the footprint does not count.
+    let kv = active().map_or(0, imparo_backend::Backend::kv_committed_bytes);
     eprintln!(
-        "[imparo] footprint after {stage:<18} {:.1} MiB  gpu={:.1} MiB",
+        "[imparo] footprint after {stage:<18} {:.1} MiB  gpu={:.1} MiB  kv={:.1} MiB",
         mib(imparo_host::footprint_bytes()),
-        mib(gpu)
+        mib(gpu),
+        mib(kv)
     );
 }
+
+pub use imparo_host::AutoreleaseScope;
 
 /// Ask the allocator to return freed pages to the OS (imparo-host); safe at a request
 /// boundary.

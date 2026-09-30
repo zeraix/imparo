@@ -113,8 +113,46 @@ pub fn row_codec(ggml_type: u32) -> Option<RowCodec> {
         22 => iq2_s,
         23 => iq4_xs,
         29 => iq1_m,
+        30 => bf16,
+        143 => ptq1_0,
         _ => return None,
     })
+}
+
+// PrismML-Eng/llama.cpp prism-b10683-d8f26ee, ggml-quants.c
+// dequantize_row_ptq1_0 and ggml-common.h define the format (MIT).
+// There are 16 interleaved bytes encoding 80 trits, then 8 encoding 40,
+// then two tail bytes encoding eight. The scale is LAST, at byte 26.
+fn ptq1_0(row: &[u8], out: &mut [f32]) {
+    assert_eq!(
+        out.len() % 128,
+        0,
+        "PTQ1_0 row must contain complete blocks"
+    );
+    assert_eq!(row.len(), out.len() / 128 * 28, "PTQ1_0 byte count");
+    for (block, dst) in row.chunks_exact(28).zip(out.chunks_exact_mut(128)) {
+        let d = f16_at(block, 26);
+        for (k, value) in dst.iter_mut().enumerate() {
+            let (byte, trit) = if k < 80 {
+                (k % 16, k / 16)
+            } else if k < 120 {
+                (16 + (k - 80) % 8, (k - 80) / 8)
+            } else {
+                (24 + (k - 120) % 2, (k - 120) / 2)
+            };
+            let pow3 = [1_u8, 3, 9, 27, 81][trit];
+            let shifted = block[byte].wrapping_mul(pow3);
+            let code = (u16::from(shifted) * 3) >> 8;
+            *value = (f32::from(code) - 1.0) * d;
+        }
+    }
+}
+
+fn bf16(row: &[u8], out: &mut [f32]) {
+    assert_eq!(row.len(), out.len() * 2, "BF16 byte count");
+    for (b, v) in row.chunks_exact(2).zip(out) {
+        *v = f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
+    }
 }
 
 const QK: usize = 32;
@@ -1633,3 +1671,102 @@ const IQ1S_GRID: [u16; 2048] = [
     0xaa08, 0xaa0a, 0xaa20, 0xaa22, 0xaa28, 0xaa2a, 0xaa51, 0xaa54, 0xaa56, 0xaa80,
     0xaa82, 0xaa88, 0xaa8a, 0xaa95, 0xaaa0, 0xaaa2, 0xaaa8, 0xaaaa,
 ];
+
+#[cfg(test)]
+mod bonsai_codec_tests {
+    use super::*;
+
+    // Encode independent base-3 digits first; this oracle does not reverse the
+    // multiplication/shift implementation used by the decoder.
+    fn encode(digits: &[u8]) -> u8 {
+        let mut code = digits.iter().fold(0_u16, |a, &v| a * 3 + u16::from(v));
+        if digits.len() == 4 {
+            code *= 3;
+        }
+        (code * 256).div_ceil(243) as u8
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // small integers, exact in f32
+    fn ptq1_all_five_trit_words_and_tail_words() {
+        for word in 0..243_u16 {
+            let digits: Vec<u8> = [81, 27, 9, 3, 1]
+                .iter()
+                .map(|&p| ((word / p) % 3) as u8)
+                .collect();
+            let mut block = [0_u8; 28];
+            block[..24].fill(encode(&digits));
+            block[24..26].fill(encode(&digits[..4]));
+            block[26..].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            let mut out = [0.0; 128];
+            ptq1_0(&block, &mut out);
+            for n in 0..5 {
+                assert!(
+                    out[n * 16..(n + 1) * 16]
+                        .iter()
+                        .all(|&v| v == f32::from(digits[n]) - 1.0)
+                );
+            }
+            for n in 0..5 {
+                assert!(
+                    out[80 + n * 8..80 + (n + 1) * 8]
+                        .iter()
+                        .all(|&v| v == f32::from(digits[n]) - 1.0)
+                );
+            }
+            for n in 0..4 {
+                assert!(
+                    out[120 + n * 2..120 + (n + 1) * 2]
+                        .iter()
+                        .all(|&v| v == f32::from(digits[n]) - 1.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ptq1_real_input_widths_preserve_block_scales_and_row_order() {
+        for width in [5120, 6144, 17408] {
+            let mut bytes = vec![0; width / 128 * 28];
+            let mut want = vec![0.0; width];
+            for (b, block) in bytes.chunks_exact_mut(28).enumerate() {
+                let scale_bits = [0x0000_u16, 0x3400, 0x3c00, 0x4000][b % 4];
+                let scale = f16_to_f32(scale_bits);
+                let digits: Vec<u8> =
+                    (0..128).map(|i| ((i * 7 + b) % 3) as u8).collect();
+                for m in 0..16 {
+                    block[m] =
+                        encode(&(0..5).map(|n| digits[m + n * 16]).collect::<Vec<_>>());
+                }
+                for m in 0..8 {
+                    block[16 + m] = encode(
+                        &(0..5).map(|n| digits[80 + m + n * 8]).collect::<Vec<_>>(),
+                    );
+                }
+                for m in 0..2 {
+                    block[24 + m] = encode(
+                        &(0..4).map(|n| digits[120 + m + n * 2]).collect::<Vec<_>>(),
+                    );
+                }
+                block[26..].copy_from_slice(&scale_bits.to_le_bytes());
+                for i in 0..128 {
+                    want[b * 128 + i] = (f32::from(digits[i]) - 1.0) * scale;
+                }
+            }
+            let mut got = vec![0.0; width];
+            row_codec(143).unwrap()(&bytes, &mut got);
+            assert_eq!(got, want, "PTQ1_0 width {width}");
+        }
+    }
+
+    #[test]
+    fn bf16_preserves_exact_bits() {
+        let words = [0_u16, 0x8000, 0x3f80, 0xbf80, 0x0001, 0x7f80, 0x7fc1];
+        let bytes: Vec<_> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut values = [0.0; 7];
+        row_codec(30).unwrap()(&bytes, &mut values);
+        for (a, b) in values.iter().zip(words) {
+            assert_eq!(a.to_bits(), u32::from(b) << 16);
+        }
+    }
+}

@@ -1,4 +1,6 @@
 #pragma once
+#include <cassert>
+#include <type_traits>
 
 // Ampere Q4_0 x Q8_1 MMQ. One CTA owns a 128x128 output tile and stages 256
 // K values at a time. The layout intentionally mirrors the hardware hierarchy:
@@ -267,6 +269,8 @@ __device__ __forceinline__ int unpack_q4_nibbles(uint32_t nibbles) {
     return int((nibbles & 0x07070707u) | sign_fill);
 }
 
+#include "mmq_q4_q8_1_packed_stage.cuh"
+
 // Move one aligned activation vector directly from global to shared memory.
 // Avoiding the four-register round trip is especially valuable in Stream-K,
 // whose accumulator set already puts substantial pressure on SM86 registers.
@@ -321,9 +325,10 @@ __device__ __forceinline__ void stage_activation_async(
 // and the physical Stream-K route share exactly the same arithmetic contract.
 template <uint32_t Rows, uint32_t RowFragments, bool DoubleBuffer,
           bool FullK, bool FullRows, uint32_t StageBlocks = 8,
-          bool CooperativeQ4 = false, uint32_t TokenTile = kTokens>
+          bool CooperativeQ4 = false, uint32_t TokenTile = kTokens,
+          typename Weight = const uint8_t *>
 __device__ __forceinline__ void compute_segment(
-        const uint8_t * __restrict__ w,
+        Weight w,
         const BlockQ8_1Mmq * __restrict__ x,
         int8_t * sx, int8_t * sy,
         float (&partial)[(TokenTile / 4) * RowFragments],
@@ -378,78 +383,84 @@ __device__ __forceinline__ void compute_segment(
         }
         commit_async_copies();
 
-        // Assign a complete Q4 block to each logical loader.  The old word-wise
-        // mapping repeated the 64-bit row/block address calculation four times
-        // and needed a per-word scale predicate.  Keeping all four packed words
-        // together preserves the exact shared layout and MMA order while making
-        // the global-memory transform substantially cheaper.
-        constexpr uint32_t packed_block_count = Rows * StageBlocks;
-        if constexpr (CooperativeQ4) {
-            constexpr uint32_t packed_word_count = packed_block_count * 4;
-            for (uint32_t linear = tid; linear < packed_word_count;
-                 linear += kWarps * 32) {
-                const uint32_t packed_block = linear / 4;
-                const uint32_t word = linear % 4;
-                const uint32_t qblock = packed_block % StageBlocks;
-                const uint32_t local_row = packed_block / StageBlocks;
-                const uint32_t row = tile_row + local_row;
-                const uint32_t kb = stage_block + qblock;
-                uint32_t packed = 0x88888888u;
-                float scale = 0.0f;
-                if ((FullRows || row < n_out) && (FullK || kb < segment_end)) {
-                    const uint8_t * block =
-                        w + (uint64_t(row) * blocks + kb) * 18;
-                    const uint16_t * qs =
-                        reinterpret_cast<const uint16_t *>(block + 2);
-                    packed = uint32_t(qs[2 * word])
-                        | (uint32_t(qs[2 * word + 1]) << 16);
-                    if (word == 0) {
-                        scale = __half2float(
-                            *reinterpret_cast<const __half *>(block));
-                    }
-                }
-                int8_t * dst = sx + local_row * WeightStride + qblock * 32;
-                reinterpret_cast<int *>(dst)[word] =
-                    unpack_q4_nibbles(packed);
-                reinterpret_cast<int *>(dst + 16)[word] =
-                    unpack_q4_nibbles(packed >> 4);
-                if (word == 0) {
-                    reinterpret_cast<float *>(sx + local_row * WeightStride
-                        + WeightValues)[qblock] = scale;
-                }
-            }
+        if constexpr (std::is_same<Weight, PackedWeightView>::value) {
+            packed_stage::stage_weights<Rows, StageBlocks, FullK, FullRows>(
+                w, sx, n_out, blocks, tile_row, stage_block, segment_end, tid);
         } else {
-            for (uint32_t linear = tid; linear < packed_block_count;
-                 linear += kWarps * 32) {
-                const uint32_t qblock = linear % StageBlocks;
-                const uint32_t local_row = linear / StageBlocks;
-                const uint32_t row = tile_row + local_row;
-                const uint32_t kb = stage_block + qblock;
-                float scale = 0.0f;
-                const uint16_t * qs = nullptr;
-                if ((FullRows || row < n_out) && (FullK || kb < segment_end)) {
-                    const uint8_t * block =
-                        w + (uint64_t(row) * blocks + kb) * 18;
-                    qs = reinterpret_cast<const uint16_t *>(block + 2);
-                    scale = __half2float(
-                        *reinterpret_cast<const __half *>(block));
-                }
-                int8_t * dst = sx + local_row * WeightStride + qblock * 32;
-#pragma unroll
-                for (uint32_t word = 0; word < 4; ++word) {
+            // Assign a complete Q4 block to each logical loader.  The old word-wise
+            // mapping repeated the 64-bit row/block address calculation four times
+            // and needed a per-word scale predicate.  Keeping all four packed words
+            // together preserves the exact shared layout and MMA order while making
+            // the global-memory transform substantially cheaper.
+            constexpr uint32_t packed_block_count = Rows * StageBlocks;
+            if constexpr (CooperativeQ4) {
+                constexpr uint32_t packed_word_count = packed_block_count * 4;
+                for (uint32_t linear = tid; linear < packed_word_count;
+                     linear += kWarps * 32) {
+                    const uint32_t packed_block = linear / 4;
+                    const uint32_t word = linear % 4;
+                    const uint32_t qblock = packed_block % StageBlocks;
+                    const uint32_t local_row = packed_block / StageBlocks;
+                    const uint32_t row = tile_row + local_row;
+                    const uint32_t kb = stage_block + qblock;
                     uint32_t packed = 0x88888888u;
-                    if (qs) {
+                    float scale = 0.0f;
+                    if ((FullRows || row < n_out) && (FullK || kb < segment_end)) {
+                        const uint8_t * block =
+                            w + (uint64_t(row) * blocks + kb) * 18;
+                        const uint16_t * qs =
+                            reinterpret_cast<const uint16_t *>(block + 2);
                         packed = uint32_t(qs[2 * word])
                             | (uint32_t(qs[2 * word + 1]) << 16);
+                        if (word == 0) {
+                            scale = __half2float(
+                                *reinterpret_cast<const __half *>(block));
+                        }
                     }
+                    int8_t * dst = sx + local_row * WeightStride + qblock * 32;
                     reinterpret_cast<int *>(dst)[word] =
                         unpack_q4_nibbles(packed);
                     reinterpret_cast<int *>(dst + 16)[word] =
                         unpack_q4_nibbles(packed >> 4);
+                    if (word == 0) {
+                        reinterpret_cast<float *>(sx + local_row * WeightStride
+                            + WeightValues)[qblock] = scale;
+                    }
                 }
-                reinterpret_cast<float *>(
-                    sx + local_row * WeightStride + WeightValues)[qblock] = scale;
+            } else {
+                for (uint32_t linear = tid; linear < packed_block_count;
+                     linear += kWarps * 32) {
+                    const uint32_t qblock = linear % StageBlocks;
+                    const uint32_t local_row = linear / StageBlocks;
+                    const uint32_t row = tile_row + local_row;
+                    const uint32_t kb = stage_block + qblock;
+                    float scale = 0.0f;
+                    const uint16_t * qs = nullptr;
+                    if ((FullRows || row < n_out) && (FullK || kb < segment_end)) {
+                        const uint8_t * block =
+                            w + (uint64_t(row) * blocks + kb) * 18;
+                        qs = reinterpret_cast<const uint16_t *>(block + 2);
+                        scale = __half2float(
+                            *reinterpret_cast<const __half *>(block));
+                    }
+                    int8_t * dst = sx + local_row * WeightStride + qblock * 32;
+    #pragma unroll
+                    for (uint32_t word = 0; word < 4; ++word) {
+                        uint32_t packed = 0x88888888u;
+                        if (qs) {
+                            packed = uint32_t(qs[2 * word])
+                                | (uint32_t(qs[2 * word + 1]) << 16);
+                        }
+                        reinterpret_cast<int *>(dst)[word] =
+                            unpack_q4_nibbles(packed);
+                        reinterpret_cast<int *>(dst + 16)[word] =
+                            unpack_q4_nibbles(packed >> 4);
+                    }
+                    reinterpret_cast<float *>(
+                        sx + local_row * WeightStride + WeightValues)[qblock] = scale;
+                }
             }
+
         }
 
         // Large row tiles preload both phases and halve the barrier count. The
@@ -905,10 +916,10 @@ __device__ __forceinline__ uint64_t stream_boundary(
 template <bool DirectEpilogue, uint32_t StageBlocks = 8,
           bool QuantizeEpilogue = false, bool StoreEpilogue = true,
           bool NumericSeams = false, bool CooperativeQ4 = false,
-          bool SingleActivation = false>
+          bool SingleActivation = false, typename Weight = const uint8_t *>
 __launch_bounds__(256, StageBlocks == 4 ? 2 : 1)
 __global__ void q4_q8_1_full_tile(
-        const uint8_t * __restrict__ w,
+        Weight w,
         const BlockQ8_1Mmq * __restrict__ x, float * __restrict__ dst,
         BlockQ8_1Mmq * __restrict__ epilogue_q8,
         uint32_t n_in, uint32_t n_out, uint32_t n_tok, uint32_t work_n_tok,
@@ -1304,10 +1315,10 @@ __global__ void q4_q8_1_full_tile_r64_j256(
 // Physical Stream-K: each resident CTA owns a contiguous range in flattened
 // tile/K space. Complete (or suffix) tiles go directly to the destination; a
 // final prefix is written to the bounded fixup area owned by this CTA.
-template <bool DirectEpilogue, bool FullRows>
+template <bool DirectEpilogue, bool FullRows, typename Weight = const uint8_t *>
 __launch_bounds__(256, 1)
 __global__ void q4_q8_1_stream(
-        const uint8_t * __restrict__ w,
+        Weight w,
         const BlockQ8_1Mmq * __restrict__ x, float * __restrict__ dst,
         float * __restrict__ fixup, uint32_t n_in, uint32_t n_out, uint32_t n_tok,
         uint32_t work_n_tok, uint32_t dst_stride) {
@@ -1535,6 +1546,216 @@ inline uint64_t stream_workspace_bytes(
     return (output + uint64_t(sm_count) * kRows * kTokens) * sizeof(float);
 }
 
+// A single policy decision serves canonical and packed-resident weight readers.
+// It changes neither logical tiles nor the original physical Stream-K K seams.
+struct NumericLaunchSchedule {
+    dim3 grid;
+    uint32_t logical_tiles;
+    uint32_t efficiency;
+    uint32_t physical_blocks;
+    bool canonical_full_tile;
+    bool llama_compat;
+    bool full_tile;
+};
+
+inline NumericLaunchSchedule numeric_launch_schedule(
+        uint32_t n_out, uint32_t n_tok, uint32_t sm_count,
+        uint32_t virtual_token_base, uint32_t llama_compat_requested,
+        uint32_t canonical_full_tile_requested,
+        uint32_t full_tile_min_efficiency) {
+    NumericLaunchSchedule plan{};
+    plan.grid = dim3((n_out + kRows - 1) / kRows,
+                     (n_tok + kTokens - 1) / kTokens);
+    plan.logical_tiles = plan.grid.x * plan.grid.y;
+    const uint32_t nwaves = (plan.logical_tiles + sm_count - 1) / sm_count;
+    plan.efficiency = 100 * plan.logical_tiles / (sm_count * nwaves);
+    plan.canonical_full_tile = canonical_full_tile_requested
+        && n_tok == 512 && virtual_token_base % 512 == 0;
+    plan.llama_compat = llama_compat_requested && !plan.canonical_full_tile;
+    const uint32_t route_efficiency = plan.llama_compat
+        ? 90u : full_tile_min_efficiency;
+    plan.full_tile = !plan.llama_compat && plan.efficiency >= route_efficiency
+        && plan.logical_tiles >= 2 * sm_count && n_out % kRows == 0;
+    const uint32_t physical_route_efficiency = plan.canonical_full_tile
+        ? 90u : route_efficiency;
+    plan.physical_blocks = plan.efficiency >= physical_route_efficiency
+        ? plan.logical_tiles : sm_count;
+    return plan;
+}
+
+template <typename Weight>
+inline bool launch_numeric_normal(
+        Weight w, const BlockQ8_1Mmq * x, float * y,
+        uint32_t n_in, uint32_t n_out, uint32_t n_tok,
+        uint32_t epilogue, uint32_t out_stride, uint32_t row_base,
+        uint32_t sm_count, uint32_t work_n_tok,
+        FullTileVariant full_tile_variant, const NumericLaunchSchedule & plan,
+        float * workspace, BlockQ8_1Mmq * epilogue_q8,
+        cudaStream_t stream, LaunchInfo * info) {
+    const dim3 grid = plan.grid;
+    const uint32_t ntiles = plan.logical_tiles;
+    const uint32_t efficiency = plan.efficiency;
+    const bool llama_compat = plan.llama_compat;
+    // Numeric seam replay stores one physical Stream-K boundary per logical
+    // tile.  Sparse grids can place boundaries too close together for that
+    // representation, so they must stay on the physical Stream-K path.
+    if (plan.full_tile) {
+        const bool compact =
+            full_tile_variant == FullTileVariant::Rows64K256;
+        const bool half_k =
+            full_tile_variant == FullTileVariant::Rows128K128;
+        static const bool cooperative_q4 =
+            std::getenv("IMPARO_CUDA_COOP_Q4") != nullptr;
+        const uint32_t compact_tiles =
+            ((n_out + kCompactRows - 1) / kCompactRows) * grid.y;
+        if (info) {
+            info->route = LaunchRoute::FullTile;
+            info->tile_rows = compact ? kCompactRows : kRows;
+            info->logical_tiles = compact ? compact_tiles : ntiles;
+            info->physical_blocks = info->logical_tiles;
+            const uint32_t compact_waves =
+                (info->logical_tiles + sm_count - 1) / sm_count;
+            info->efficiency = 100 * info->logical_tiles
+                / (sm_count * compact_waves);
+        }
+        if (half_k && epilogue && epilogue_q8) {
+            if (epilogue == 2) {
+                q4_q8_1_full_tile<true, 4, true, false>
+                    <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes, stream>>>(
+                        w, x, y + row_base, epilogue_q8, n_in, n_out, n_tok,
+                        work_n_tok, out_stride, 0);
+            } else {
+                if (cooperative_q4) {
+                    q4_q8_1_full_tile<true, 4, true, true, false, true>
+                        <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
+                            stream>>>(w, x, y + row_base, epilogue_q8,
+                                n_in, n_out, n_tok, work_n_tok, out_stride, 0);
+                } else {
+                    q4_q8_1_full_tile<true, 4, true>
+                        <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
+                            stream>>>(w, x, y + row_base, epilogue_q8,
+                                n_in, n_out, n_tok, work_n_tok, out_stride, 0);
+                }
+            }
+            if (info) info->fused_q8 = true;
+        } else if (half_k && epilogue) {
+            q4_q8_1_full_tile<true, 4><<<ntiles, dim3(32, kWarps),
+                kHalfKSharedBytes, stream>>>(w, x, y + row_base, nullptr,
+                    n_in, n_out, n_tok, work_n_tok, out_stride, 0);
+        } else if (half_k) {
+            if (efficiency < 90) {
+                if (cooperative_q4) {
+                    q4_q8_1_full_tile<false, 4, false, true, true, true>
+                        <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
+                            stream>>>(w, x, y + row_base, nullptr, n_in,
+                                n_out, n_tok, work_n_tok, out_stride, sm_count);
+                } else {
+                    q4_q8_1_full_tile<false, 4, false, true, true>
+                        <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
+                            stream>>>(w, x, y + row_base, nullptr, n_in,
+                                n_out, n_tok, work_n_tok, out_stride, sm_count);
+                }
+            } else {
+                if (cooperative_q4) {
+                    q4_q8_1_full_tile<false, 4, false, true, false, true>
+                        <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
+                            stream>>>(w, x, y + row_base, nullptr, n_in,
+                                n_out, n_tok, work_n_tok, out_stride, 0);
+                } else {
+                    q4_q8_1_full_tile<false, 4>
+                        <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
+                            stream>>>(w, x, y + row_base, nullptr, n_in,
+                                n_out, n_tok, work_n_tok, out_stride, 0);
+                }
+            }
+        } else if (compact && epilogue) {
+            if constexpr (std::is_same<Weight, PackedWeightView>::value) {
+                return false;
+            } else {
+                q4_q8_1_full_tile_r64<true><<<compact_tiles,
+                    dim3(32, kWarps), kCompactSharedBytes, stream>>>(
+                        w, x, y + row_base, nullptr, n_in, n_out, n_tok,
+                        work_n_tok,
+                        out_stride);
+            }
+        } else if (compact) {
+            if constexpr (std::is_same<Weight, PackedWeightView>::value) {
+                return false;
+            } else {
+                q4_q8_1_full_tile_r64<false><<<compact_tiles,
+                    dim3(32, kWarps), kCompactSharedBytes, stream>>>(
+                        w, x, y + row_base, nullptr, n_in, n_out, n_tok,
+                        work_n_tok,
+                        out_stride);
+            }
+        } else if (epilogue) {
+            q4_q8_1_full_tile<true><<<ntiles, dim3(32, kWarps),
+                kSharedBytes, stream>>>(w, x, y + row_base, nullptr, n_in,
+                                       n_out, n_tok, work_n_tok, out_stride, 0);
+        } else {
+            if (efficiency < 90) {
+                q4_q8_1_full_tile<false, 8, false, true, true>
+                    <<<ntiles, dim3(32, kWarps), kSharedBytes, stream>>>(
+                        w, x, y + row_base, nullptr, n_in, n_out, n_tok,
+                        work_n_tok, out_stride, sm_count);
+            } else {
+                q4_q8_1_full_tile<false><<<ntiles, dim3(32, kWarps),
+                    kSharedBytes, stream>>>(w, x, y + row_base, nullptr, n_in,
+                        n_out, n_tok, work_n_tok, out_stride, 0);
+            }
+        }
+        return true;
+    }
+    // The lower architecture-owned threshold admits eligible full-tile grids;
+    // it must not also change the ownership of projections that cannot use that
+    // route. In canonical replay mode those fallbacks stay on the accepted
+    // llama-compatible 90% physical Stream-K policy.
+    const uint32_t stream_grid = plan.physical_blocks;
+    if (info) {
+        info->route = LaunchRoute::PhysicalStreamK;
+        info->physical_blocks = stream_grid;
+    }
+    const bool direct_epilogue = epilogue && stream_grid == ntiles;
+    float * output = epilogue && !direct_epilogue ? workspace : y + row_base;
+    const uint32_t output_stride = epilogue && !direct_epilogue
+        ? n_out : out_stride;
+    float * fixup = workspace + (epilogue && !direct_epilogue
+        ? uint64_t(n_out) * n_tok : 0);
+    const bool compact_stream = !llama_compat && !epilogue && n_out % kRows == 0
+        && full_tile_variant == FullTileVariant::Rows128K128;
+    if (compact_stream) {
+        if constexpr (std::is_same<Weight, PackedWeightView>::value) {
+            return false;
+        } else {
+            q4_q8_1_stream_r64<<<stream_grid * 2, dim3(32, kWarps),
+                kCompactSharedBytes, stream>>>(w, x, output, fixup, n_in,
+                    n_out, n_tok, work_n_tok, output_stride);
+        }
+    } else if (direct_epilogue) {
+        q4_q8_1_stream<true, false><<<stream_grid, dim3(32, kWarps),
+            kSharedBytes, stream>>>(w, x, output, fixup, n_in, n_out,
+                                   n_tok, work_n_tok, output_stride);
+    } else if (n_out % kRows == 0) {
+        q4_q8_1_stream<false, true><<<stream_grid, dim3(32, kWarps),
+            kSharedBytes, stream>>>(w, x, output, fixup, n_in, n_out,
+                                   n_tok, work_n_tok, output_stride);
+    } else {
+        q4_q8_1_stream<false, false><<<stream_grid, dim3(32, kWarps),
+            kSharedBytes, stream>>>(w, x, output, fixup, n_in, n_out,
+                                   n_tok, work_n_tok, output_stride);
+    }
+    if (ntiles % stream_grid != 0) {
+        q4_q8_1_stream_fixup<<<dim3(stream_grid, 4), 128, 0, stream>>>(
+            output, fixup, n_in, n_out, n_tok, output_stride);
+    }
+    if (epilogue && !direct_epilogue) {
+        const uint64_t count = uint64_t(n_out) * n_tok;
+        q4_q8_1_stream_epilogue<<<uint32_t((count + 255) / 256), 256, 0,
+            stream>>>(output, y, n_out, n_tok, out_stride, row_base);
+    }
+    return true;
+}
+
 inline bool launch(const uint8_t * w, const BlockQ8_1Mmq * x, float * y,
                    uint32_t n_in, uint32_t n_out, uint32_t n_tok,
                    uint32_t epilogue, uint32_t out_stride,
@@ -1715,17 +1936,17 @@ inline bool launch(const uint8_t * w, const BlockQ8_1Mmq * x, float * y,
         std::getenv("IMPARO_CUDA_NO_MMQ_TAIL_TRIM") == nullptr;
     const uint32_t work_n_tok = trim_tail ? n_tok
         : ((n_tok + kTokens - 1) / kTokens) * kTokens;
-    const dim3 grid((n_out + kRows - 1) / kRows,
-                    (n_tok + kTokens - 1) / kTokens);
+    const NumericLaunchSchedule plan = numeric_launch_schedule(
+        n_out, n_tok, sm_count, virtual_token_base, llama_compat_requested,
+        canonical_full_tile_requested, full_tile_min_efficiency);
+    const dim3 grid = plan.grid;
     const uint32_t virtual_leading = virtual_schedule
         ? virtual_token_base % kTokens : 0u;
     const dim3 virtual_grid(grid.x,
         (virtual_leading + n_tok + kTokens - 1) / kTokens);
-    const uint32_t ntiles = grid.x * grid.y;
-    const uint32_t nwaves = (ntiles + sm_count - 1) / sm_count;
-    const uint32_t efficiency = 100 * ntiles / (sm_count * nwaves);
-    const bool canonical_full_tile = canonical_full_tile_requested
-        && n_tok == 512 && virtual_token_base % 512 == 0;
+    const uint32_t ntiles = plan.logical_tiles;
+    const uint32_t efficiency = plan.efficiency;
+    const bool canonical_full_tile = plan.canonical_full_tile;
     // A compact output prefix must preserve the reference projection's numeric
     // branch. The initial admitted family is a boundary-free R128/K128 full tile
     // at 512 tokens. Lower physical grid efficiency must not introduce Stream-K
@@ -1752,9 +1973,7 @@ inline bool launch(const uint8_t * w, const BlockQ8_1Mmq * x, float * y,
         }
         return true;
     }
-    const bool llama_compat = llama_compat_requested && !canonical_full_tile;
-    const uint32_t route_efficiency = llama_compat
-        ? 90u : full_tile_min_efficiency;
+    const bool llama_compat = plan.llama_compat;
     if (info) {
         info->tile_rows = kRows;
         info->tile_tokens = kTokens;
@@ -2043,157 +2262,9 @@ inline bool launch(const uint8_t * w, const BlockQ8_1Mmq * x, float * y,
         return true;
     }
     if (stream_k_numeric && workspace) {
-        // Numeric seam replay stores one physical Stream-K boundary per logical
-        // tile.  Sparse grids can place boundaries too close together for that
-        // representation, so they must stay on the physical Stream-K path.
-        if (!llama_compat && efficiency >= route_efficiency
-            && ntiles >= 2 * sm_count
-            && n_out % kRows == 0) {
-            const bool compact =
-                full_tile_variant == FullTileVariant::Rows64K256;
-            const bool half_k =
-                full_tile_variant == FullTileVariant::Rows128K128;
-            static const bool cooperative_q4 =
-                std::getenv("IMPARO_CUDA_COOP_Q4") != nullptr;
-            const uint32_t compact_tiles =
-                ((n_out + kCompactRows - 1) / kCompactRows) * grid.y;
-            if (info) {
-                info->route = LaunchRoute::FullTile;
-                info->tile_rows = compact ? kCompactRows : kRows;
-                info->logical_tiles = compact ? compact_tiles : ntiles;
-                info->physical_blocks = info->logical_tiles;
-                const uint32_t compact_waves =
-                    (info->logical_tiles + sm_count - 1) / sm_count;
-                info->efficiency = 100 * info->logical_tiles
-                    / (sm_count * compact_waves);
-            }
-            if (half_k && epilogue && epilogue_q8) {
-                if (epilogue == 2) {
-                    q4_q8_1_full_tile<true, 4, true, false>
-                        <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes, stream>>>(
-                            w, x, y + row_base, epilogue_q8, n_in, n_out, n_tok,
-                            work_n_tok, out_stride, 0);
-                } else {
-                    if (cooperative_q4) {
-                        q4_q8_1_full_tile<true, 4, true, true, false, true>
-                            <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
-                                stream>>>(w, x, y + row_base, epilogue_q8,
-                                    n_in, n_out, n_tok, work_n_tok, out_stride, 0);
-                    } else {
-                        q4_q8_1_full_tile<true, 4, true>
-                            <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
-                                stream>>>(w, x, y + row_base, epilogue_q8,
-                                    n_in, n_out, n_tok, work_n_tok, out_stride, 0);
-                    }
-                }
-                if (info) info->fused_q8 = true;
-            } else if (half_k && epilogue) {
-                q4_q8_1_full_tile<true, 4><<<ntiles, dim3(32, kWarps),
-                    kHalfKSharedBytes, stream>>>(w, x, y + row_base, nullptr,
-                        n_in, n_out, n_tok, work_n_tok, out_stride, 0);
-            } else if (half_k) {
-                if (efficiency < 90) {
-                    if (cooperative_q4) {
-                        q4_q8_1_full_tile<false, 4, false, true, true, true>
-                            <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
-                                stream>>>(w, x, y + row_base, nullptr, n_in,
-                                    n_out, n_tok, work_n_tok, out_stride, sm_count);
-                    } else {
-                        q4_q8_1_full_tile<false, 4, false, true, true>
-                            <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
-                                stream>>>(w, x, y + row_base, nullptr, n_in,
-                                    n_out, n_tok, work_n_tok, out_stride, sm_count);
-                    }
-                } else {
-                    if (cooperative_q4) {
-                        q4_q8_1_full_tile<false, 4, false, true, false, true>
-                            <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
-                                stream>>>(w, x, y + row_base, nullptr, n_in,
-                                    n_out, n_tok, work_n_tok, out_stride, 0);
-                    } else {
-                        q4_q8_1_full_tile<false, 4>
-                            <<<ntiles, dim3(32, kWarps), kHalfKSharedBytes,
-                                stream>>>(w, x, y + row_base, nullptr, n_in,
-                                    n_out, n_tok, work_n_tok, out_stride, 0);
-                    }
-                }
-            } else if (compact && epilogue) {
-                q4_q8_1_full_tile_r64<true><<<compact_tiles,
-                    dim3(32, kWarps), kCompactSharedBytes, stream>>>(
-                        w, x, y + row_base, nullptr, n_in, n_out, n_tok,
-                        work_n_tok,
-                        out_stride);
-            } else if (compact) {
-                q4_q8_1_full_tile_r64<false><<<compact_tiles,
-                    dim3(32, kWarps), kCompactSharedBytes, stream>>>(
-                        w, x, y + row_base, nullptr, n_in, n_out, n_tok,
-                        work_n_tok,
-                        out_stride);
-            } else if (epilogue) {
-                q4_q8_1_full_tile<true><<<ntiles, dim3(32, kWarps),
-                    kSharedBytes, stream>>>(w, x, y + row_base, nullptr, n_in,
-                                           n_out, n_tok, work_n_tok, out_stride, 0);
-            } else {
-                if (efficiency < 90) {
-                    q4_q8_1_full_tile<false, 8, false, true, true>
-                        <<<ntiles, dim3(32, kWarps), kSharedBytes, stream>>>(
-                            w, x, y + row_base, nullptr, n_in, n_out, n_tok,
-                            work_n_tok, out_stride, sm_count);
-                } else {
-                    q4_q8_1_full_tile<false><<<ntiles, dim3(32, kWarps),
-                        kSharedBytes, stream>>>(w, x, y + row_base, nullptr, n_in,
-                            n_out, n_tok, work_n_tok, out_stride, 0);
-                }
-            }
-            return true;
-        }
-        // The lower architecture-owned threshold admits eligible full-tile grids;
-        // it must not also change the ownership of projections that cannot use that
-        // route. In canonical replay mode those fallbacks stay on the accepted
-        // llama-compatible 90% physical Stream-K policy.
-        const uint32_t physical_route_efficiency = canonical_full_tile
-            ? 90u : route_efficiency;
-        const uint32_t stream_grid = efficiency >= physical_route_efficiency
-            ? ntiles : sm_count;
-        if (info) {
-            info->route = LaunchRoute::PhysicalStreamK;
-            info->physical_blocks = stream_grid;
-        }
-        const bool direct_epilogue = epilogue && stream_grid == ntiles;
-        float * output = epilogue && !direct_epilogue ? workspace : y + row_base;
-        const uint32_t output_stride = epilogue && !direct_epilogue
-            ? n_out : out_stride;
-        float * fixup = workspace + (epilogue && !direct_epilogue
-            ? uint64_t(n_out) * n_tok : 0);
-        const bool compact_stream = !llama_compat && !epilogue && n_out % kRows == 0
-            && full_tile_variant == FullTileVariant::Rows128K128;
-        if (compact_stream) {
-            q4_q8_1_stream_r64<<<stream_grid * 2, dim3(32, kWarps),
-                kCompactSharedBytes, stream>>>(w, x, output, fixup, n_in,
-                    n_out, n_tok, work_n_tok, output_stride);
-        } else if (direct_epilogue) {
-            q4_q8_1_stream<true, false><<<stream_grid, dim3(32, kWarps),
-                kSharedBytes, stream>>>(w, x, output, fixup, n_in, n_out,
-                                       n_tok, work_n_tok, output_stride);
-        } else if (n_out % kRows == 0) {
-            q4_q8_1_stream<false, true><<<stream_grid, dim3(32, kWarps),
-                kSharedBytes, stream>>>(w, x, output, fixup, n_in, n_out,
-                                       n_tok, work_n_tok, output_stride);
-        } else {
-            q4_q8_1_stream<false, false><<<stream_grid, dim3(32, kWarps),
-                kSharedBytes, stream>>>(w, x, output, fixup, n_in, n_out,
-                                       n_tok, work_n_tok, output_stride);
-        }
-        if (ntiles % stream_grid != 0) {
-            q4_q8_1_stream_fixup<<<dim3(stream_grid, 4), 128, 0, stream>>>(
-                output, fixup, n_in, n_out, n_tok, output_stride);
-        }
-        if (epilogue && !direct_epilogue) {
-            const uint64_t count = uint64_t(n_out) * n_tok;
-            q4_q8_1_stream_epilogue<<<uint32_t((count + 255) / 256), 256, 0,
-                stream>>>(output, y, n_out, n_tok, out_stride, row_base);
-        }
-        return true;
+        return launch_numeric_normal(w, x, y, n_in, n_out, n_tok, epilogue,
+            out_stride, row_base, sm_count, work_n_tok, full_tile_variant, plan,
+            workspace, epilogue_q8, stream, info);
     }
     if (info) {
         info->route = LaunchRoute::GridTile;
@@ -2209,6 +2280,86 @@ inline bool launch(const uint8_t * w, const BlockQ8_1Mmq * x, float * y,
             sm_count, stream_k_numeric, 0u, 0u, 0u);
     }
     return true;
+}
+
+// Experimental resident-W4 reader for the already admitted SM86 MMQ policy.
+// A rejected packed view must remain owned by its caller: never reinterpret it
+// as canonical Q4 or retry through launch(const uint8_t *, ...).
+inline bool launch_packed(PackedWeightView w, const BlockQ8_1Mmq * x, float * y,
+                   uint32_t n_in, uint32_t n_out, uint32_t n_tok,
+                   uint32_t epilogue, uint32_t out_stride,
+                   uint32_t row_base, uint32_t sm_count,
+                   uint32_t stream_k_numeric, uint32_t virtual_token_base,
+                   uint32_t virtual_schedule, uint32_t llama_compat_requested,
+                   uint32_t canonical_full_tile_requested,
+                   uint32_t virtual_no_seam_requested,
+                   uint32_t virtual_direct_seam_requested,
+                   uint32_t virtual_async_activation_requested,
+                   uint32_t exact128_token64_requested,
+                   FullTileVariant full_tile_variant,
+                   uint32_t full_tile_min_efficiency,
+                   float * workspace, BlockQ8_1Mmq * epilogue_q8,
+                   cudaStream_t stream, LaunchInfo * info = nullptr,
+                   uint32_t canonical_out = 0) {
+    if (info) *info = {};
+    // These controls are inactive when virtual_schedule=0, including the
+    // established default-on no-seam/direct-seam flags.
+    (void)virtual_no_seam_requested;
+    (void)virtual_direct_seam_requested;
+    (void)virtual_async_activation_requested;
+    (void)exact128_token64_requested;
+    if (!w.words || !w.scales || !x || !y || !workspace || !sm_count
+        || !n_in || n_in % 256 || !n_out || n_out % kRows || n_tok <= 8
+        || !w.packed_n || w.packed_n % kRows || w.row_offset % kRows
+        || w.row_offset > w.packed_n || n_out > w.packed_n - w.row_offset
+        || row_base > out_stride || n_out > out_stride - row_base
+        || !stream_k_numeric || virtual_schedule || canonical_out || epilogue > 2
+        || full_tile_variant != FullTileVariant::Rows128K128
+        || full_tile_min_efficiency != select_full_tile_min_efficiency(86, 0)
+        || std::getenv("IMPARO_CUDA_COOP_Q4")
+        || std::getenv("IMPARO_CUDA_NO_MMQ_TAIL_TRIM")
+        || (reinterpret_cast<uintptr_t>(w.words) & 3u)
+        || (reinterpret_cast<uintptr_t>(w.scales) & 1u)
+        || reinterpret_cast<const uint8_t *>(w.scales)
+            != reinterpret_cast<const uint8_t *>(w.words)
+                + uint64_t(n_in) * w.packed_n / 2) return false;
+    const NumericLaunchSchedule plan = numeric_launch_schedule(
+        n_out, n_tok, sm_count, virtual_token_base, llama_compat_requested,
+        canonical_full_tile_requested, full_tile_min_efficiency);
+    // Preserve the selected route, including its row geometry. Only the ordinary
+    // R128 full tile and R128 physical Stream-K consumers are admitted here.
+    if (!plan.full_tile && !plan.llama_compat && !epilogue) return false;
+    static const bool configured = [] {
+        bool ok = true;
+#define IMPARO_PACKED_MMQ_CONFIG(shared_bytes, ...)         do { const cudaError_t error = cudaFuncSetAttribute(__VA_ARGS__,             cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared_bytes));             ok = (error == cudaSuccess) && ok; } while (false)
+        IMPARO_PACKED_MMQ_CONFIG(kHalfKSharedBytes,
+            (q4_q8_1_full_tile<false, 4, false, true, false, false, false, PackedWeightView>));
+        IMPARO_PACKED_MMQ_CONFIG(kHalfKSharedBytes,
+            (q4_q8_1_full_tile<false, 4, false, true, true, false, false, PackedWeightView>));
+        IMPARO_PACKED_MMQ_CONFIG(kHalfKSharedBytes,
+            (q4_q8_1_full_tile<true, 4, false, true, false, false, false, PackedWeightView>));
+        IMPARO_PACKED_MMQ_CONFIG(kHalfKSharedBytes,
+            (q4_q8_1_full_tile<true, 4, true, true, false, false, false, PackedWeightView>));
+        IMPARO_PACKED_MMQ_CONFIG(kHalfKSharedBytes,
+            (q4_q8_1_full_tile<true, 4, true, false, false, false, false, PackedWeightView>));
+        IMPARO_PACKED_MMQ_CONFIG(kSharedBytes,
+            (q4_q8_1_stream<true, false, PackedWeightView>));
+        IMPARO_PACKED_MMQ_CONFIG(kSharedBytes,
+            (q4_q8_1_stream<false, true, PackedWeightView>));
+#undef IMPARO_PACKED_MMQ_CONFIG
+        if (!ok) cudaGetLastError();
+        return ok;
+    }();
+    if (!configured) return false;
+    if (info) {
+        info->tile_rows = kRows;
+        info->tile_tokens = kTokens;
+        info->logical_tiles = plan.logical_tiles;
+        info->efficiency = plan.efficiency;
+    }
+    return launch_numeric_normal(w, x, y, n_in, n_out, n_tok, epilogue,
+        out_stride, row_base, sm_count, n_tok, full_tile_variant, plan,
+        workspace, epilogue_q8, stream, info);
 }
 
 } // namespace imparo_sm80_mmq

@@ -1,5 +1,6 @@
 #![doc = "Bounded, execution-independent GGUF subset importer for Zeraix."]
 
+pub mod pairing;
 pub mod scan;
 pub mod weights;
 use std::collections::{BTreeMap, HashSet};
@@ -365,6 +366,20 @@ impl Document {
     #[must_use]
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.iter().find(|tensor| tensor.name == name)
+    }
+
+    /// Where this model's tensor data ends: the end of its last tensor.
+    ///
+    /// The model's size, which is not always the mapping's: a paired drafter is mapped after
+    /// the target, and the target's header describes only the target. For every GGUF this
+    /// engine has tuned, this and the file's length are equal.
+    #[must_use]
+    pub fn data_end(&self) -> u64 {
+        self.tensors
+            .iter()
+            .map(|t| t.absolute_offset.saturating_add(t.byte_size))
+            .max()
+            .unwrap_or(self.data_offset)
     }
 }
 
@@ -954,15 +969,7 @@ fn same_opened_identity(
 }
 
 #[cfg(windows)]
-fn same_opened_identity(
-    source: &File,
-    _source_metadata: &fs::Metadata,
-    probe: &File,
-    _probe_metadata: &fs::Metadata,
-) -> Result<bool, GgufError> {
-    // Inlined from the purged zeraix-windows-system (a 21k-line crate serving only
-    // this call): two open handles name the same file iff volume serial + file index
-    // agree, via GetFileInformationByHandle. Kept dependency-free.
+fn windows_opened_stamp(file: &File) -> Result<(u64, u64, u32, u64), GgufError> {
     use std::os::windows::io::AsRawHandle;
     #[repr(C)]
     #[derive(Default)]
@@ -982,17 +989,31 @@ fn same_opened_identity(
         fn GetFileInformationByHandle(h: *mut core::ffi::c_void, out: *mut Info)
         -> i32;
     }
-    let ident = |f: &File| -> Result<(u32, u32, u32), GgufError> {
-        let mut i = Info::default();
-        // SAFETY: a valid open handle and an out-struct of the documented layout.
-        if unsafe { GetFileInformationByHandle(f.as_raw_handle().cast(), &raw mut i) }
-            == 0
-        {
-            return Err(GgufError::Io(std::io::Error::last_os_error().to_string()));
-        }
-        Ok((i.vol, i.idx_hi, i.idx_lo))
-    };
-    Ok(ident(source)? == ident(probe)?)
+    let mut i = Info::default();
+    // SAFETY: a valid open handle and the documented BY_HANDLE_FILE_INFORMATION layout.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut i) }
+        == 0
+    {
+        return Err(GgufError::Io(std::io::Error::last_os_error().to_string()));
+    }
+    Ok((
+        (u64::from(i.size_hi) << 32) | u64::from(i.size_lo),
+        (u64::from(i.wt[1]) << 32) | u64::from(i.wt[0]),
+        i.vol,
+        (u64::from(i.idx_hi) << 32) | u64::from(i.idx_lo),
+    ))
+}
+
+#[cfg(windows)]
+fn same_opened_identity(
+    source: &File,
+    _source_metadata: &fs::Metadata,
+    probe: &File,
+    _probe_metadata: &fs::Metadata,
+) -> Result<bool, GgufError> {
+    let a = windows_opened_stamp(source)?;
+    let b = windows_opened_stamp(probe)?;
+    Ok((a.2, a.3) == (b.2, b.3))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1178,6 +1199,7 @@ pub fn tensor_layout(ggml_type: u32) -> Result<TensorLayout, GgufError> {
         40 => (64, 36, "NVFP4"),
         41 => (128, 18, "Q1_0"),
         42 => (64, 18, "Q2_0"),
+        143 => (128, 28, "PTQ1_0"),
         // imparo-private tile-major kinds are DERIVED, not listed: the layout moves a
         // block's bytes and never adds or drops one, so a TM kind's geometry is exactly
         // its source's. Listing them again would be a second copy of every size and
@@ -1778,6 +1800,15 @@ mod tests {
         }
         bytes.extend_from_slice(&[0_u8; 16]);
         bytes
+    }
+
+    #[test]
+    fn data_end_is_the_end_of_the_last_tensor() {
+        let bytes = fixture();
+        let len = u64::try_from(bytes.len()).unwrap();
+        let document = read_from(Cursor::new(bytes), len).unwrap();
+        assert_eq!(document.data_end(), len);
+        assert_eq!(document.data_end(), document.data_offset + 16);
     }
 
     fn string_array_fixture() -> Vec<u8> {

@@ -491,6 +491,8 @@ mod tests {
             head_dim: 128,
             deep_head_dim: 128,
             n_experts: 0,
+            experts_used: 0,
+            windowed_layers: 0,
             n_layers: 16,
             layer_dispatches: 8,
             weight_kinds: 1,

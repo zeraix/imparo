@@ -166,6 +166,7 @@ pub(crate) fn delta_shape(
 /// # Errors
 /// When a required tensor is absent, or carries a quant no kernel can read.
 pub fn prepare(weights: &Weights, plan: &ModelPlan) -> Result<ModelW, String> {
+    super::weight_basis::ensure_workflow_basis(weights)?;
     let f = Tensors::new(weights);
     let mut layers = Vec::with_capacity(plan.layers.len());
     for l in &plan.layers {

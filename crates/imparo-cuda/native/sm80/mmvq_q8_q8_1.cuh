@@ -1,3 +1,4 @@
+#include "../lfm_retained_policy.cuh"
 #pragma once
 
 // SM80+ Q8_0 x Q8_1 MMVQ numerical route.
@@ -264,11 +265,11 @@ inline void launch_layout(const uint8_t * w, const BlockQ8_1 * x, float * y,
 inline void launch(const uint8_t * w, const BlockQ8_1 * x, float * y,
                    uint32_t n_in, uint32_t n_out, uint32_t n_tok,
                    uint32_t out_stride, uint32_t row_base,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, bool retained_decode_policy = false) {
 #if defined(IMPARO_CUDA_SPECULATIVE)
     const char * short_k = std::getenv("IMPARO_LAB_Q8_SHORT_K_ROWS");
     if (n_tok == 1 && n_in == 256 && n_out != 0
-            && short_k && short_k[0] == '1' && short_k[1] == '\0') {
+            && imparo_lfm_retained::common(retained_decode_policy || (short_k && short_k[0] == '1' && short_k[1] == '\0'))) {
         q8_0_q8_1_short_k<<<(n_out + 3) / 4, dim3(32, 4), 0, stream>>>(
             w, x, y, n_in, n_out, out_stride, row_base);
         static bool traced = false;

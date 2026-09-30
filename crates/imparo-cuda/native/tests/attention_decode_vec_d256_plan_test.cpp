@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <initializer_list>
 
 namespace plan = imparo_sm80_d256_vec_plan;
 
@@ -55,5 +56,19 @@ int main() {
     assert(!plan::geometry(UINT32_MAX, 1, 1023, &invalid));
     assert(!plan::mapping_is_exact_partition(768, 2));
     assert(!plan::mapping_is_exact_partition(1024, 3));
+    uint32_t upper = 0;
+    for (uint32_t start = 512; start <= 765; ++start) {
+        assert(plan::shared_verification_bucket_max(start, 1023, 768, 3, &upper));
+        assert(upper == 765);
+    }
+    for (uint32_t start : {511u, 766u, 767u, 768u})
+        assert(!plan::shared_verification_bucket_max(start, 1023, 768, 3, &upper));
+    assert(plan::shared_verification_bucket_max(1023, 1023, 1024, 4, &upper));
+    assert(upper == UINT32_MAX - 3);
+    assert(plan::shared_verification_bucket_max(UINT32_MAX - 3, 1023, 1024, 4, &upper));
+    assert(!plan::shared_verification_bucket_max(UINT32_MAX - 2, 1023, 1024, 4, &upper));
+    assert(!plan::shared_verification_bucket_max(512, 1023, 768, 4, &upper));
+    assert(!plan::shared_verification_bucket_max(512, 767, 768, 3, &upper));
+    assert(!plan::shared_verification_bucket_max(UINT32_MAX - 1, 1023, 1024, 4, &upper));
     return 0;
 }

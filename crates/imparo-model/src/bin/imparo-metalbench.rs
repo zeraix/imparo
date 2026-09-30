@@ -25,6 +25,27 @@ mod bench {
     use imparo_metal as m;
     use imparo_model::weights::Weights;
 
+    /// The tree delta probe's geometry, IMPARO_BENCH_DELTA_GEOM="k_heads,v_heads,key_dim,value_dim";
+    /// Qwen3.8-27B's recurrent layer when unset.
+    fn bench_delta_geom() -> Result<(usize, usize, usize, usize), String> {
+        let spec = std::env::var("IMPARO_BENCH_DELTA_GEOM")
+            .unwrap_or_else(|_| "16,48,128,128".into());
+        let dims: Vec<usize> = spec
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        match dims[..] {
+            [kh, vh, kd, vd]
+                if kh > 0 && vh > 0 && kd > 0 && vd > 0 && vh % kh == 0 =>
+            {
+                Ok((kh, vh, kd, vd))
+            }
+            _ => Err(format!(
+                "IMPARO_BENCH_DELTA_GEOM={spec}: want k_heads,v_heads,key_dim,value_dim"
+            )),
+        }
+    }
+
     /// Largest absolute difference between two equal-length slices.
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
         assert_eq!(a.len(), b.len(), "compared slices differ in length");
@@ -51,6 +72,12 @@ mod bench {
         if std::env::var("IMPARO_Q8_CHECK").is_ok() {
             m::set_q8_all(1);
         }
+        // THE TREE DELTA PROBE'S HEAD WIDTHS, before enable_gpu builds the library: the delta
+        // kernels are compiled for them, and a plan without a delta layer sets none.
+        if std::env::var_os("IMPARO_BENCH_DELTA_TREE").is_some() {
+            let (_, _, kd, vd) = bench_delta_geom()?;
+            m::set_recurrent_dims(u32::try_from(kd)?, u32::try_from(vd)?);
+        }
         let mut w = Weights::open(&path)?;
         // The plan is what says which activation the epilogue kernels are specialised
         // with, so the bench profiles the pipelines this model would actually run.
@@ -59,7 +86,6 @@ mod bench {
             &mut w,
             &plan,
             plan.config.context_length as usize,
-            imparo_model::prefill_batch(),
         )?;
         if !w.gpu_enabled() {
             return Err("metal not enabled".into());
@@ -196,12 +222,73 @@ mod bench {
                     m::end().map_err(|rc| format!("attention rc={rc}"))?;
                 }
             }
+            // IMPARO_BENCH_ATTN_ROWS=1 also times the row-layout entry, on a chain layout: row t
+            // sees rows 0..=t at position pos + t, the visibility the causal entry synthesises,
+            // so the two times differ only by the masked kernel's own work (plan step 2, A2).
+            // Each arm is warmed, then the arms alternate over two rounds.
+            let rows_env = std::env::var("IMPARO_BENCH_ATTN_ROWS").unwrap_or_default();
+            let rows_arm = rows_env == "1" || rows_env == "float";
+            // IMPARO_BENCH_ATTN_ROWS=float adds a third arm: the row-layout entry with Q kept in
+            // float (function constant 26), on the same chain layout.
+            let float_arm = rows_env == "float";
+            if rows_arm {
+                if !m::supports_row_layout(hd) {
+                    return Err(format!(
+                        "IMPARO_BENCH_ATTN_ROWS: no row-layout entry at head dim {hd}"
+                    )
+                    .into());
+                }
+                m::alloc(
+                    BufId::RowLayout as u32,
+                    (imparo_backend::ROW_LAYOUT_MAX_ROWS
+                        * imparo_backend::ROW_LAYOUT_WORDS
+                        * 4) as u64,
+                )
+                .map_err(|rc| format!("alloc row layout rc={rc}"))?;
+            }
             for &(n_tok, pos) in &geoms {
                 let keys = pos + n_tok;
+                let rows_here = rows_arm && (2..=64).contains(&n_tok);
+                if rows_here {
+                    let width = imparo_backend::ROW_LAYOUT_WORDS;
+                    let mut words = vec![0_u32; n_tok as usize * width];
+                    for t in 0..n_tok as usize {
+                        let row = &mut words[t * width..(t + 1) * width];
+                        let seen = if t >= 63 {
+                            u64::MAX
+                        } else {
+                            (1_u64 << (t + 1)) - 1
+                        };
+                        row[0] = pos + t as u32;
+                        row[1] = t as u32;
+                        row[2] = seen as u32;
+                        row[3] = (seen >> 32) as u32;
+                        for back in 1..=imparo_backend::ROW_LAYOUT_ANCESTORS.min(t) {
+                            row[3 + back] = (t - back) as u32;
+                        }
+                    }
+                    m::write_u32(BufId::RowLayout as u32, 0, &words);
+                }
                 let next_layer = std::cell::Cell::new(0u32);
-                let dispatch = || {
+                // Arm 0 the causal entry, 1 the row-layout entry, 2 the row-layout entry with float Q.
+                let dispatch = |arm: u8| -> bool {
                     let l = next_layer.get();
                     next_layer.set((l + 1) % kv_layers);
+                    if arm > 0 {
+                        return m::attention_rows(
+                            l,
+                            hd,
+                            c.n_heads,
+                            c.n_kv_heads,
+                            kv_width,
+                            pos,
+                            0,
+                            n_tok,
+                            1.0,
+                            BufId::RowLayout as u32,
+                            arm == 2,
+                        );
+                    }
                     m::attention(
                         l,
                         hd,
@@ -214,6 +301,7 @@ mod bench {
                         keys.clamp(1, 8192),
                         0,
                     );
+                    true
                 };
                 // SEVERAL DISPATCHES PER COMMAND BUFFER, time divided by their count, as the
                 // tuner's time_us does. A command buffer carries a fixed GPU-side cost that a
@@ -238,29 +326,490 @@ mod bench {
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .filter(|&r: &usize| r >= 1);
-                let sample =
-                    |reps: usize, floor_us: f64| -> Result<(f64, f64, usize), String> {
-                        let reps = forced_reps.unwrap_or(reps);
-                        let (mut best, mut sum, mut n) = (f64::INFINITY, 0.0, 0usize);
-                        while n < 5 || sum < floor_us {
-                            m::begin();
-                            for _ in 0..reps {
-                                dispatch();
+                let sample = |arm: u8,
+                              reps: usize,
+                              floor_us: f64|
+                 -> Result<(f64, f64, usize), String> {
+                    let reps = forced_reps.unwrap_or(reps);
+                    let (mut best, mut sum, mut n) = (f64::INFINITY, 0.0, 0usize);
+                    while n < 5 || sum < floor_us {
+                        m::begin();
+                        for _ in 0..reps {
+                            if !dispatch(arm) {
+                                let _ = m::end();
+                                return Err(
+                                    "the row-layout attention entry refused".into()
+                                );
                             }
-                            m::end().map_err(|rc| format!("attention rc={rc}"))?;
-                            let us = m::last_gpu_us();
-                            best = best.min(us / reps as f64);
-                            sum += us;
-                            n += 1;
                         }
-                        Ok((best, sum / (n * reps) as f64, n * reps))
-                    };
-                let single = sample(1, 0.0)?;
+                        m::end().map_err(|rc| format!("attention rc={rc}"))?;
+                        let us = m::last_gpu_us();
+                        best = best.min(us / reps as f64);
+                        sum += us;
+                        n += 1;
+                    }
+                    Ok((best, sum / (n * reps) as f64, n * reps))
+                };
+                let arms: &[u8] = match (rows_here, float_arm) {
+                    (true, true) => &[0, 1, 2],
+                    (true, false) => &[0, 1],
+                    _ => &[0],
+                };
+                for &arm in arms {
+                    sample(arm, 1, 0.0)?;
+                }
+                let single = sample(0, 1, 0.0)?;
                 let reps = ((4000.0 / single.0.max(1.0)) as usize).clamp(1, 64);
-                let (best, mean, n) = sample(reps, 300_000.0)?;
-                println!(
-                    "attn probe  n_tok={n_tok} pos={pos} keys={keys}  min {best:.1} us  mean {mean:.1} us  ({n} dispatches, {reps} per buffer)"
+                let rounds = if rows_here { 2 } else { 1 };
+                for round in 1..=rounds {
+                    for &arm in arms {
+                        let (best, mean, n) = sample(arm, reps, 300_000.0)?;
+                        let entry = match (rows_arm, arm) {
+                            (false, _) => String::new(),
+                            (true, 2) => format!("entry=rows_float_q round={round}  "),
+                            (true, 1) => format!("entry=rows round={round}  "),
+                            (true, _) => format!("entry=causal round={round}  "),
+                        };
+                        println!(
+                            "attn probe  {entry}n_tok={n_tok} pos={pos} keys={keys}  min {best:.1} us  mean {mean:.1} us  ({n} dispatches, {reps} per buffer)"
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // ---- GATED DELTA RULE OVER A DRAFT TREE: CHECKED, THEN TIMED BESIDE THE SERIAL RULE --
+        //
+        // IMPARO_BENCH_DELTA_TREE="16,64" checks `imparo_delta_net_tree` two ways -- against
+        // `imparo_cpu::ops::delta_net` run along each node's own path from the same state (the
+        // definition), and bit for bit against `imparo_delta_net` run the same way (the kernel
+        // it mirrors) -- then times it beside `imparo_delta_net` (implementation plan, step 6).
+        // Synthetic rows at IMPARO_BENCH_DELTA_GEOM (Qwen3.8-27B's recurrent layer when unset),
+        // so any model file serves: the head widths were set before init, and two of the file's
+        // F32 tensors stand in for a and dt_bias. A tree is laid depth-first as a verify lays it
+        // -- a chain for the drafter's first choice at every depth, the other nodes branching off
+        // it -- and each size also runs as a plain chain while that fits the kernel's depth.
+        // IMPARO_BENCH_DELTA_TREE_TIME=0 stops after the checks.
+        if let Ok(spec) = std::env::var("IMPARO_BENCH_DELTA_TREE") {
+            use imparo_backend::{ROW_LAYOUT_MAX_ROWS, ROW_LAYOUT_WORDS};
+            let (kh, vh, kd, vd) = bench_delta_geom()?;
+            if !m::supports_gated_delta() {
+                return Err(
+                    "IMPARO_BENCH_DELTA_TREE: no delta pipeline was built".into()
                 );
+            }
+            let sizes: Vec<usize> = spec
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .filter(|&n| n > 0)
+                .collect();
+            let max_n =
+                sizes.iter().copied().max().ok_or(
+                    "IMPARO_BENCH_DELTA_TREE: want node counts, e.g. \"16,64\"",
+                )?;
+            if max_n > ROW_LAYOUT_MAX_ROWS {
+                return Err(format!(
+                    "IMPARO_BENCH_DELTA_TREE: {max_n} nodes; a row layout holds {ROW_LAYOUT_MAX_ROWS}"
+                )
+                .into());
+            }
+            let shape = imparo_model::ops::DeltaShape {
+                k_heads: kh,
+                v_heads: vh,
+                key_dim: kd,
+                value_dim: vd,
+            };
+            let (qkv_width, state_elems, v_width) =
+                (shape.qkv_width(), shape.state_elems(), vh * vd);
+            let (khu, vhu, kdu, vdu) = (kh as u32, vh as u32, kd as u32, vd as u32);
+            let depth_limit = m::delta_tree_depth() as usize;
+            let eps = 1e-6_f32;
+            println!(
+                "-- delta tree probe: k_heads={kh} v_heads={vh} key_dim={kd} value_dim={vd} depth<{depth_limit} --"
+            );
+
+            // Stand-ins for a (whose sign decides whether a head forgets) and dt_bias: the first
+            // F32 tensor with a negative value among its first v_heads, and the first F32 tensor.
+            let pick = |want_negative: bool| {
+                w.tensors
+                    .iter()
+                    .find(|(_, t)| {
+                        let elems: u64 = t.ne[..t.n_dims as usize].iter().product();
+                        t.ggml_type == 0
+                            && elems >= vh as u64
+                            && (!want_negative
+                                || w.f32s(t)[..vh].iter().any(|&x| x < 0.0))
+                    })
+                    .map(|(_, t)| *t)
+            };
+            let (Some(a_t), Some(dt_t)) = (pick(true), pick(false)) else {
+                return Err(
+                    "IMPARO_BENCH_DELTA_TREE: no F32 tensors in the file to stand in for a and dt_bias"
+                        .into(),
+                );
+            };
+            let wa: Vec<f32> = w.f32s(&a_t)[..vh].to_vec();
+            let wdt: Vec<f32> = w.f32s(&dt_t)[..vh].to_vec();
+            let (a_off, dt_off) = (a_t.offset as u64, dt_t.offset as u64);
+
+            // Deterministic rows, xorshift64 into [-1, 1). A head whose stand-in a is positive
+            // would grow its state, so its alpha sits far below zero (decay 1); the others draw
+            // alpha from [-3, 1). The CPU rule takes the gates reduced, as the kernels reduce them.
+            let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+            let mut uniform = move || -> f32 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng >> 40) as f32 / (1_u64 << 24) as f32 * 2.0 - 1.0
+            };
+            let qkv: Vec<f32> = (0..max_n * qkv_width).map(|_| uniform()).collect();
+            let alpha: Vec<f32> = (0..max_n * vh)
+                .map(|i| {
+                    if wa[i % vh] > 0.0 {
+                        -12.0
+                    } else {
+                        2.0 * uniform() - 1.0
+                    }
+                })
+                .collect();
+            let beta_raw: Vec<f32> = (0..max_n * vh).map(|_| 3.0 * uniform()).collect();
+            let s0: Vec<f32> = (0..state_elems).map(|_| 0.3 * uniform()).collect();
+            let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+            let sigmoid = |x: f32| {
+                if x >= 0.0 {
+                    1.0 / (1.0 + (-x).exp())
+                } else {
+                    let e = x.exp();
+                    e / (1.0 + e)
+                }
+            };
+            let log_decay: Vec<f32> = alpha
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| wa[i % vh] * softplus(x + wdt[i % vh]))
+                .collect();
+            let beta: Vec<f32> = beta_raw.iter().map(|&x| sigmoid(x)).collect();
+            for (id, elems, what) in [
+                (BufId::Model0, max_n * qkv_width, "qkv"),
+                (BufId::Model1, max_n * vh, "alpha"),
+                (BufId::Model2, max_n * vh, "beta"),
+                (BufId::Model3, max_n * qkv_width, "path qkv"),
+                (BufId::Model4, max_n * vh, "path alpha"),
+                (BufId::Model5, max_n * vh, "path beta"),
+                (BufId::Recur, 2 * state_elems, "state"),
+                (BufId::O, max_n * v_width, "tree out"),
+                (BufId::Attn, max_n * v_width, "serial out"),
+                (BufId::RowLayout, max_n * ROW_LAYOUT_WORDS, "row layout"),
+            ] {
+                m::alloc(id as u32, (elems * 4) as u64)
+                    .map_err(|rc| format!("alloc {what} rc={rc}"))?;
+            }
+            m::write(BufId::Model0 as u32, 0, &qkv);
+            m::write(BufId::Model1 as u32, 0, &alpha);
+            m::write(BufId::Model2 as u32, 0, &beta_raw);
+            m::write(BufId::Recur as u32, 0, &s0);
+
+            // Parents of an `n`-node tree laid depth-first, the drafter's first choice first: a
+            // chain of `chain` nodes, then the other nodes hung off it, mostly from chain nodes
+            // spread over the depths, every third below the node made just before it while that
+            // stays shallower than `limit`. Children are visited in the order they were made.
+            let draft_tree = |n: usize, chain: usize, limit: usize| -> Vec<i32> {
+                let chain = chain.clamp(1, n);
+                let mut parent: Vec<usize> = vec![usize::MAX];
+                let mut depth: Vec<usize> = vec![0];
+                for i in 1..n {
+                    let p = if i < chain {
+                        i - 1
+                    } else {
+                        let k = i - chain;
+                        if k % 3 == 2 && depth[i - 1] + 1 < limit {
+                            i - 1
+                        } else {
+                            (k * 5) % (chain - 1).max(1)
+                        }
+                    };
+                    parent.push(p);
+                    depth.push(depth[p] + 1);
+                }
+                let mut children = vec![Vec::new(); n];
+                for (i, &p) in parent.iter().enumerate().skip(1) {
+                    children[p].push(i);
+                }
+                let mut order = Vec::with_capacity(n);
+                let mut stack = vec![0_usize];
+                while let Some(v) = stack.pop() {
+                    order.push(v);
+                    stack.extend(children[v].iter().rev().copied());
+                }
+                let mut row_of = vec![0_usize; n];
+                for (row, &v) in order.iter().enumerate() {
+                    row_of[v] = row;
+                }
+                order
+                    .iter()
+                    .map(|&v| if v == 0 { -1 } else { row_of[parent[v]] as i32 })
+                    .collect()
+            };
+            let mut cases: Vec<(String, Vec<u32>)> = Vec::new();
+            for &n in &sizes {
+                let mut shapes: Vec<(&str, Vec<i32>)> = Vec::new();
+                if n <= depth_limit {
+                    shapes.push(("chain", (0..n).map(|i| i as i32 - 1).collect()));
+                }
+                shapes.push((
+                    "tree",
+                    draft_tree(n, (n / 2).clamp(1, depth_limit), depth_limit),
+                ));
+                for (kind, parents) in shapes {
+                    let words = imparo_model::tree_row_layout(0, &parents)?;
+                    let deepest = words
+                        .chunks_exact(ROW_LAYOUT_WORDS)
+                        .map(|r| r[1])
+                        .max()
+                        .unwrap_or(0);
+                    cases.push((format!("{kind} n={n} depth={deepest}"), words));
+                }
+            }
+            let tree = |words: &[u32]| {
+                m::delta_net_tree(
+                    BufId::Model0 as u32,
+                    BufId::Model1 as u32,
+                    BufId::Model2 as u32,
+                    a_off,
+                    dt_off,
+                    BufId::Recur as u32,
+                    0,
+                    BufId::O as u32,
+                    BufId::RowLayout as u32,
+                    words,
+                    khu,
+                    vhu,
+                    kdu,
+                    vdu,
+                    eps,
+                )
+            };
+            // The serial kernel reads plane 0 and writes plane 1, so every dispatch starts from S0.
+            let serial = |qkv_buf: u32, alpha_buf: u32, beta_buf: u32, n_tok: u32| {
+                m::delta_net(
+                    qkv_buf,
+                    alpha_buf,
+                    beta_buf,
+                    a_off,
+                    dt_off,
+                    BufId::Recur as u32,
+                    0,
+                    state_elems as u32,
+                    BufId::Attn as u32,
+                    khu,
+                    vhu,
+                    kdu,
+                    vdu,
+                    n_tok,
+                    eps,
+                    m::NO_EPILOGUE,
+                    0,
+                    m::NO_SNAP,
+                    0,
+                    0,
+                )
+            };
+
+            let mut all_pass = true;
+            for (name, words) in &cases {
+                let n = words.len() / ROW_LAYOUT_WORDS;
+                m::write_u32(BufId::RowLayout as u32, 0, words);
+                m::begin();
+                let accepted = tree(words);
+                m::end().map_err(|rc| format!("{name}: rc={rc}"))?;
+                if !accepted {
+                    return Err(format!(
+                        "{name}: the tree delta kernel refused the layout"
+                    )
+                    .into());
+                }
+                let mut got = vec![0.0_f32; n * v_width];
+                m::read(BufId::O as u32, 0, &mut got);
+                let cpu_start = std::time::Instant::now();
+                let mut want = vec![0.0_f32; n * v_width];
+                let mut serial_rows = vec![0.0_f32; n * v_width];
+                for t in 0..n {
+                    let mut path = vec![t];
+                    let mut at = t;
+                    while words[at * ROW_LAYOUT_WORDS + 1] > 0 {
+                        at = words[at * ROW_LAYOUT_WORDS + 4] as usize;
+                        path.push(at);
+                    }
+                    path.reverse();
+                    let len = path.len();
+                    let gather = |src: &[f32], width: usize| -> Vec<f32> {
+                        path.iter()
+                            .flat_map(|&r| {
+                                src[r * width..(r + 1) * width].iter().copied()
+                            })
+                            .collect()
+                    };
+                    let rows = gather(&qkv, qkv_width);
+                    // The definition: the CPU rule along the node's path from S0.
+                    let mut state = s0.clone();
+                    let mut out = vec![0.0_f32; len * v_width];
+                    imparo_model::ops::delta_net(
+                        &rows,
+                        &gather(&log_decay, vh),
+                        &gather(&beta, vh),
+                        &mut state,
+                        &mut out,
+                        shape,
+                        len,
+                        eps,
+                    );
+                    want[t * v_width..(t + 1) * v_width]
+                        .copy_from_slice(&out[(len - 1) * v_width..]);
+                    // The kernel this one mirrors, along the same path from the same state.
+                    m::write(BufId::Model3 as u32, 0, &rows);
+                    m::write(BufId::Model4 as u32, 0, &gather(&alpha, vh));
+                    m::write(BufId::Model5 as u32, 0, &gather(&beta_raw, vh));
+                    m::begin();
+                    let ran = serial(
+                        BufId::Model3 as u32,
+                        BufId::Model4 as u32,
+                        BufId::Model5 as u32,
+                        len as u32,
+                    );
+                    m::end().map_err(|rc| format!("{name}: serial rc={rc}"))?;
+                    if !ran {
+                        return Err(
+                            format!("{name}: the serial delta kernel refused").into()
+                        );
+                    }
+                    let mut path_out = vec![0.0_f32; len * v_width];
+                    m::read(BufId::Attn as u32, 0, &mut path_out);
+                    serial_rows[t * v_width..(t + 1) * v_width]
+                        .copy_from_slice(&path_out[(len - 1) * v_width..]);
+                }
+                let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1e3;
+                let (mut worst_rel, mut worst_abs, mut largest, mut worst_at) =
+                    (0.0_f64, 0.0_f64, 0.0_f64, 0_usize);
+                for (i, (&g, &c)) in got.iter().zip(&want).enumerate() {
+                    let (g, c) = (f64::from(g), f64::from(c));
+                    let abs = (g - c).abs();
+                    let rel = if g.is_finite() {
+                        abs / c.abs().max(1e-3)
+                    } else {
+                        f64::INFINITY
+                    };
+                    if rel > worst_rel {
+                        worst_rel = rel;
+                        worst_at = i;
+                    }
+                    worst_abs = worst_abs.max(abs);
+                    largest = largest.max(c.abs());
+                }
+                let differ = got
+                    .iter()
+                    .zip(&serial_rows)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let serial_worst = max_abs_diff(&got, &serial_rows);
+                // The CPU bound is the prototype's, not a gate: the CPU rule sums in its own order.
+                let pass = worst_rel < 1e-3;
+                all_pass &= pass;
+                println!(
+                    "delta tree check  {name}  cpu rule: worst_rel={worst_rel:.2e} (node {} value {}) worst_abs={worst_abs:.2e} max|o|={largest:.2e}  serial kernel: {differ}/{} values differ, largest {serial_worst:.2e}  {cpu_ms:.0} ms  {}",
+                    worst_at / v_width,
+                    worst_at % v_width,
+                    got.len(),
+                    if pass { "PASS" } else { "FAIL" }
+                );
+            }
+            if let Some((_, words)) = cases.last()
+                && words.len() >= 2 * ROW_LAYOUT_WORDS
+            {
+                let mut jump = words.clone();
+                jump[ROW_LAYOUT_WORDS + 1] = 2;
+                m::begin();
+                let refused = !tree(&jump);
+                m::end().map_err(|rc| format!("depth jump: rc={rc}"))?;
+                println!(
+                    "delta tree check  a row two levels below the row before it is refused: {refused}"
+                );
+                all_pass &= refused;
+            }
+            if !all_pass {
+                return Err("delta tree check FAILED".into());
+            }
+            if std::env::var("IMPARO_BENCH_DELTA_TREE_TIME").as_deref() == Ok("0") {
+                return Ok(());
+            }
+
+            // Arms: the tree kernel on every case, the serial kernel over the same rows at each
+            // size, and the serial kernel at 1 and 4 rows, what a commit replays.
+            let mut arms: Vec<(String, Option<&[u32]>, u32)> = cases
+                .iter()
+                .map(|(name, words)| {
+                    (format!("tree kernel, {name}"), Some(words.as_slice()), 0)
+                })
+                .collect();
+            for &n in sizes.iter().chain(&[1, 4]) {
+                arms.push((format!("serial kernel, n={n}"), None, n as u32));
+            }
+            let dispatch = |words: Option<&[u32]>, n_tok: u32| -> bool {
+                match words {
+                    Some(words) => tree(words),
+                    None => serial(
+                        BufId::Model0 as u32,
+                        BufId::Model1 as u32,
+                        BufId::Model2 as u32,
+                        n_tok,
+                    ),
+                }
+            };
+            // Several dispatches per command buffer, each buffer about 4 ms, min and mean over
+            // >= 300 ms of GPU time: the attention probe's instrument.
+            let sample = |arm: &(String, Option<&[u32]>, u32),
+                          reps: usize,
+                          floor_us: f64|
+             -> Result<(f64, f64, usize), String> {
+                if let Some(words) = arm.1 {
+                    m::write_u32(BufId::RowLayout as u32, 0, words);
+                }
+                let (mut best, mut sum, mut n) = (f64::INFINITY, 0.0, 0_usize);
+                while n < 5 || sum < floor_us {
+                    m::begin();
+                    for _ in 0..reps {
+                        if !dispatch(arm.1, arm.2) {
+                            let _ = m::end();
+                            return Err(format!("{}: refused", arm.0));
+                        }
+                    }
+                    m::end().map_err(|rc| format!("{}: rc={rc}", arm.0))?;
+                    let us = m::last_gpu_us();
+                    best = best.min(us / reps as f64);
+                    sum += us;
+                    n += 1;
+                }
+                Ok((best, sum / (n * reps) as f64, n * reps))
+            };
+            if let Some(heaviest) = arms.iter().rev().find(|a| a.1.is_some()) {
+                let warm = std::time::Instant::now();
+                while warm.elapsed().as_millis() < 300 {
+                    sample(heaviest, 1, 0.0)?;
+                }
+            }
+            let mut reps = Vec::with_capacity(arms.len());
+            for arm in &arms {
+                let single = sample(arm, 1, 0.0)?;
+                reps.push(((4000.0 / single.0.max(1.0)) as usize).clamp(1, 64));
+            }
+            for round in 1..=2 {
+                for (arm, &r) in arms.iter().zip(&reps) {
+                    let (best, mean, n) = sample(arm, r, 300_000.0)?;
+                    println!(
+                        "delta probe  {:<34} round={round}  min {best:.1} us  mean {mean:.1} us  ({n} dispatches, {r} per buffer)",
+                        arm.0
+                    );
+                }
             }
             return Ok(());
         }
@@ -553,8 +1102,11 @@ mod bench {
                     m::set_gemv_max_tok(if wire == 2 { 8 } else { saved_gemv_max });
                     if wire == 2 {
                         if is_gemm == 1 {
-                            m::set_st_gemm_shape(shape);
-                            m::set_st_gemm_large_shape(shape);
+                            // PINNED, not seated: the engine derives the token tile
+                            // from the seat per dispatch, so seating a shape here would
+                            // check whichever tile the rule widened to rather than the
+                            // one this row names. A pin is exact at every width.
+                            m::set_st_gemm_shape_pin(shape);
                         } else if n_tok == 1 {
                             m::set_q8_decode_rows(cfa);
                             m::set_q8_decode_sgs(cfb);
@@ -882,7 +1434,32 @@ mod bench {
         // mean over >= 300 ms of GPU time, after a 300 ms clock warm-up: the same
         // instrument as the attention probe, because the tuner's decode workload floor
         // (5-10%) cannot resolve the 1-3% the bracket showed and a bracket costs 7 minutes.
+        // IMPARO_BENCH_GEMV_ROWS=N (2..8) times a co-batched step's N rows instead, on the fast
+        // route: the kernel each format's rows take there (a decode-rows GEMV or the GEMM).
         if std::env::var("IMPARO_BENCH_GEMV").is_ok() {
+            let rows: u32 = std::env::var("IMPARO_BENCH_GEMV_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|r| (1..=8).contains(r))
+                .unwrap_or(1);
+            if rows > 1 {
+                m::set_decode_rows(Some(imparo_backend::RowRoute::Fast));
+            }
+            // IMPARO_BENCH_BLK_ROWS_GEMV_MAX=N and IMPARO_BENCH_BLK_ROWS_MMA_MAX=N set the block
+            // formats' crossings for this run, so their decode-rows GEMV and their matrix-unit
+            // rows kernel can be timed on either side of the compiled defaults.
+            if let Some(n) = std::env::var("IMPARO_BENCH_BLK_ROWS_GEMV_MAX")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                m::set_blk_rows_gemv_max(n);
+            }
+            if let Some(n) = std::env::var("IMPARO_BENCH_BLK_ROWS_MMA_MAX")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                m::set_blk_rows_mma_max(n);
+            }
             let mut groups: std::collections::BTreeMap<
                 String,
                 Vec<(u32, u64, u32, u32)>,
@@ -890,6 +1467,15 @@ mod bench {
             let (mut max_in, mut max_out) = (0u64, 0u64);
             for (name, t) in &w.tensors {
                 if t.n_dims != 2 || name == "token_embd.weight" {
+                    continue;
+                }
+                // A block past the plan's layers (Qwen3.8-27B's MTP head, blk.64) is unread:
+                // the fit gives it no segment, so a dispatch on it has no weights to bind.
+                let block = name
+                    .strip_prefix("blk.")
+                    .and_then(|r| r.split('.').next())
+                    .and_then(|b| b.parse::<usize>().ok());
+                if block.is_some_and(|b| b >= plan.layers.len()) {
                     continue;
                 }
                 let Some(kind) = imparo_gguf::weights::weight_kind(t.ggml_type) else {
@@ -923,21 +1509,78 @@ mod bench {
                         .into(),
                 );
             }
-            m::alloc(m::buf::X, max_in * 4).map_err(|e| format!("alloc {e}"))?;
-            m::alloc(m::buf::O, max_out * 4).map_err(|e| format!("alloc {e}"))?;
-            let xin: Vec<f32> =
-                (0..max_in).map(|i| 0.01 + (i % 7) as f32 * 1e-3).collect();
+            // IMPARO_BENCH_ROWS_SEATS=1: time BOTH rows kernels on every (kind, shape) this model
+            // carries and print the tune file's seat lines. This is the measurement the tuner
+            // records -- per tensor, never a step total, which is what a per-format sweep could
+            // only read.
+            if std::env::var("IMPARO_BENCH_ROWS_SEATS").is_ok_and(|v| v == "1") {
+                let flat: Vec<(u32, u64, u32, u32)> =
+                    groups.values().flatten().copied().collect();
+                let seats = m::measure_blk_rows_kernels(&flat, rows)?;
+                println!("-- rows kernel seats at {rows} rows: kind.n_in.n_out --");
+                // TWO TOTALS, and only the second one is a reason to do anything. Summing every
+                // triple where the GEMV wins prices this against a build that never had the
+                // per-format table; what a seat actually BUYS is the difference from what ships,
+                // and the shipped choice is the engine's own answer rather than a list retyped
+                // here.
+                let (mut gemv_wins, mut saved_us, mut over_shipped) =
+                    (0_usize, 0.0_f64, 0.0_f64);
+                for s in &seats {
+                    let seat = s.seat(rows);
+                    let shipped = if m::blk_rows_gemv_max_for(s.wkind) >= rows {
+                        s.gemv_us
+                    } else {
+                        s.mma_us
+                    };
+                    over_shipped +=
+                        (shipped - s.gemv_us.min(s.mma_us)) * f64::from(s.tensors);
+                    if seat != 1 {
+                        gemv_wins += 1;
+                        saved_us += (s.mma_us - s.gemv_us) * f64::from(s.tensors);
+                    }
+                    println!(
+                        "blk_rows.{}.{}.{}={seat}   x{:<3} gemv {:>8.1} us  mma {:>8.1} us  {}",
+                        s.wkind,
+                        s.n_in,
+                        s.n_out,
+                        s.tensors,
+                        s.gemv_us,
+                        s.mma_us,
+                        if seat == 1 { "matrix unit" } else { "GEMV" }
+                    );
+                }
+                println!(
+                    "-- {} triples, the GEMV wins {gemv_wins}. Worth {:.3} ms a step OVER WHAT \
+                     SHIPS (the per-format crossing); {:.3} ms against the matrix unit \
+                     everywhere, which is NOT the number to act on -- it counts tensors the \
+                     per-format table already routes correctly --",
+                    seats.len(),
+                    over_shipped / 1000.0,
+                    saved_us / 1000.0
+                );
+                return Ok(());
+            }
+            // Room for a padded 64-row tile when rows > 1: the GEMM takes a step's rows only where
+            // both operands hold one, as the forward's activation buffers do.
+            let alloc_rows = if rows > 1 { u64::from(rows).max(64) } else { 1 };
+            m::alloc(m::buf::X, alloc_rows * max_in * 4)
+                .map_err(|e| format!("alloc {e}"))?;
+            m::alloc(m::buf::O, alloc_rows * max_out * 4)
+                .map_err(|e| format!("alloc {e}"))?;
+            let xin: Vec<f32> = (0..alloc_rows * max_in)
+                .map(|i| 0.01 + (i % 7) as f32 * 1e-3)
+                .collect();
             m::write(m::buf::X, 0, &xin);
             let first = groups.values().next().unwrap().clone();
             let t0 = std::time::Instant::now();
             while t0.elapsed().as_millis() < 300 {
                 m::begin();
                 for &(wire, off, n_in, n_out) in &first {
-                    m::matmat(wire, off, n_in, n_out, m::buf::X, m::buf::O, 1);
+                    m::matmat(wire, off, n_in, n_out, m::buf::X, m::buf::O, rows);
                 }
                 m::end().map_err(|rc| format!("gemv rc={rc}"))?;
             }
-            println!("-- gemv probe: n_tok=1, min and mean per dispatch --");
+            println!("-- gemv probe: n_tok={rows}, min and mean per dispatch --");
             for (suffix, tensors) in &groups {
                 let sample =
                     |reps: usize, floor_us: f64| -> Result<(f64, f64, usize), String> {
@@ -954,7 +1597,7 @@ mod bench {
                                         n_out,
                                         m::buf::X,
                                         m::buf::O,
-                                        1,
+                                        rows,
                                     );
                                 }
                             }
@@ -966,11 +1609,29 @@ mod bench {
                         }
                         Ok((best, sum / (n * per_buf) as f64, n * per_buf))
                     };
+                let routes_before = m::matmul_routes();
                 let single = sample(1, 0.0)?;
                 let reps = ((4000.0 / (single.0 * tensors.len() as f64).max(1.0))
                     as usize)
                     .clamp(1, 64);
                 let (best, mean, n) = sample(reps, 300_000.0)?;
+                // The kernel this group's dispatches ran: the matmul routes that grew.
+                let routes_after = m::matmul_routes();
+                let mut kernels: Vec<&str> = routes_after
+                    .iter()
+                    .zip(&routes_before)
+                    .filter(|((_, a), (_, b))| a > b)
+                    .map(|((name, _), _)| *name)
+                    .collect();
+                if kernels.is_empty() {
+                    kernels.push("none");
+                }
+                let kernel = kernels.join("+");
+                let flag = if kernel.contains("_fallback") {
+                    "FALLBACK "
+                } else {
+                    ""
+                };
                 let (wire, _, n_in, n_out) = tensors[0];
                 // Bytes per dispatch from the format's block size, so the row carries
                 // the rate the kernel sustained against the 136 GB/s ordinary-grid wall.
@@ -984,7 +1645,7 @@ mod bench {
                     })
                     .map_or(0.0, |(_, tt)| tt.bytes as f64);
                 println!(
-                    "gemv probe  {suffix:<36} kind={wire:<2} {n_in:>5}->{n_out:<6} x{:<2} min {best:>7.1} us  mean {mean:>7.1} us  {:>6.1} GB/s at min  ({n} dispatches)",
+                    "{flag}gemv probe  {suffix:<36} kind={wire:<2} {n_in:>5}->{n_out:<6} x{:<2} min {best:>7.1} us  mean {mean:>7.1} us  {:>6.1} GB/s at min  ({n} dispatches)  kernel={kernel}",
                     tensors.len(),
                     bytes / best / 1e3
                 );

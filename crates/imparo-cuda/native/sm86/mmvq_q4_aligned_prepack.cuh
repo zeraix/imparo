@@ -229,7 +229,7 @@ __global__ void q4_q8_1(const uint8_t * w, const BlockQ8_1 * x, float * y,
             for (uint32_t local_row = 0; local_row < NRows; ++local_row) {
                 const uint32_t row = row0 + local_row;
                 if (row < n_out) {
-
+                    
                     partial[token][local_row] += dot_packed(
                         w, row, block, n_in, n_out, x + uint64_t(token) * blocks + block, iqs);
                 }

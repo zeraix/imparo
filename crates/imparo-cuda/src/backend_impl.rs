@@ -46,12 +46,17 @@ use imparo_backend::{
 use std::path::Path;
 use std::sync::{
     OnceLock,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 static ACTIVATION: AtomicU32 = AtomicU32::new(Epilogue::Gelu as u32);
 static KV_K: AtomicU32 = AtomicU32::new(1);
 static KV_V: AtomicU32 = AtomicU32::new(1);
+// The target owns tuning identity; an appended drafter only extends the mapping.
+static MODEL_BYTES: AtomicU64 = AtomicU64::new(0);
+fn config_model_bytes(target: u64, mapping: u64) -> u64 {
+    if target == 0 { mapping } else { target }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_field_names)] // each field is the SHA-256 of a different thing
 struct CorrectnessModelIdentity {
@@ -177,6 +182,44 @@ fn apply_env_kv_types() {
     crate::context::CudaContext::get().set_kv_types(k, v);
 }
 
+/// Stream exactly the complement of the common planner's Fast segments. File headers,
+/// alignment gaps and non-Fast tensors must not consume unplanned resident bytes.
+#[cfg(any(feature = "cuda-static", test))]
+fn placement_streamed_spans(
+    len: u64,
+    segments: &[imparo_backend::WeightSegment],
+) -> Result<Vec<StreamedWeightSpan>, i32> {
+    if len == 0 {
+        return Err(3);
+    }
+    let mut previous_end = 0;
+    let mut fast_end = 0;
+    let mut streamed = Vec::new();
+    for segment in segments {
+        let end = segment.offset.checked_add(segment.bytes).ok_or(3)?;
+        if segment.bytes == 0 || segment.offset < previous_end || end > len {
+            return Err(3);
+        }
+        previous_end = end;
+        if segment.tier == imparo_backend::WeightTier::Fast {
+            if segment.offset > fast_end {
+                streamed.push(StreamedWeightSpan {
+                    offset: fast_end,
+                    bytes: segment.offset - fast_end,
+                });
+            }
+            fast_end = end;
+        }
+    }
+    if fast_end < len {
+        streamed.push(StreamedWeightSpan {
+            offset: fast_end,
+            bytes: len - fast_end,
+        });
+    }
+    Ok(streamed)
+}
+
 /// Uploads the weight blob; call once before any op. Applies this host's stored
 /// tuned configuration first (unless IMPARO_NO_HOSTCONFIG -- the tuner measures
 /// from compiled defaults), mirroring the Metal backend's init.
@@ -206,7 +249,10 @@ fn init_with_streamed(
     crate::knobs::reset_workflow_defaults();
     capture_cuda_safe_defaults();
     if std::env::var("IMPARO_NO_HOSTCONFIG").is_err() {
-        if let Some(batch) = apply_host_config(weights.len() as u64) {
+        if let Some(batch) = apply_host_config(config_model_bytes(
+            MODEL_BYTES.load(Ordering::Relaxed),
+            weights.len() as u64,
+        )) {
             if std::env::var("IMPARO_BATCH").is_err() {
                 unsafe { std::env::set_var("IMPARO_BATCH", batch.to_string()) };
             }
@@ -413,6 +459,11 @@ fn split_prefill_graph_requested(count: u32) -> bool {
 #[allow(unused_variables)]
 impl Backend for CudaBackend {
     #[cfg(feature = "cuda-speculative")]
+    fn prepare_batch_invariant_q8_v1(&self) -> Result<bool, i32> {
+        // LFM2 target preparation owns serialized access to the selected owner.
+        unsafe { crate::execution::prepare_batch_invariant_q8_v1() }.map(|()| true)
+    }
+    #[cfg(feature = "cuda-speculative")]
     fn set_forward_demand_lab(
         &self,
         ffn_layers: u32,
@@ -586,6 +637,23 @@ impl Backend for CudaBackend {
             rc => Err(rc),
         }
     }
+    fn prepare_projection_phase(&self, decode_or_verify: bool) -> Result<(), i32> {
+        crate::knobs::ptq_prefill_tensorcore_apply_status()?;
+        crate::knobs::weight_transfer_policy_apply_status()?;
+        crate::knobs::e4b_ffn_w4a16_apply_status()?;
+        crate::knobs::e4b_retained_decode_policy_apply_status()?;
+        crate::knobs::lfm_retained_apply_status()?;
+        #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
+        if decode_or_verify && crate::knobs::e4b_ffn_w4a16_enabled() {
+            crate::w4a16_module::prepare()?;
+        }
+        match unsafe {
+            imparo_cuda_prepare_projection_phase(u32::from(decode_or_verify))
+        } {
+            0 => Ok(()),
+            rc => Err(rc),
+        }
+    }
     fn verification_body_begin(
         &self,
         rows: u32,
@@ -610,6 +678,89 @@ impl Backend for CudaBackend {
     // Preserve the common loader's refusal for formats without a CUDA reader.
     fn serves_weight_type(&self, ggml_type: u32) -> bool {
         matches!(ggml_type, 0 | 2 | 8 | 1000)
+            || (cfg!(feature = "cuda-static") && matches!(ggml_type, 30 | 143))
+    }
+    fn register_weight_input_transforms(
+        &self,
+        transforms: &[imparo_backend::WeightInputTransform],
+    ) -> Result<(), String> {
+        if transforms.is_empty() {
+            return Ok(());
+        }
+        #[cfg(feature = "cuda-static")]
+        {
+            for t in transforms {
+                if t.signs.len() != t.width as usize {
+                    return Err("weight basis sign width".into());
+                }
+                let (hd, kh, vh) = t
+                    .permutation
+                    .as_ref()
+                    .map_or((0, 0, 0), |g| (g.head_dim, g.key_heads, g.value_heads));
+                let rc = unsafe {
+                    imparo_cuda_weight_basis_register(
+                        t.weight_offset,
+                        t.width,
+                        t.block_size,
+                        u32::from(t.inverse),
+                        hd,
+                        kh,
+                        vh,
+                        t.signs.as_ptr(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(format!(
+                        "CUDA weight input basis registration rc={rc}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda-static"))]
+        {
+            Err(
+                "CUDA dynamic backend has no admitted weight input basis support"
+                    .into(),
+            )
+        }
+    }
+    fn supports_gated_delta(&self) -> bool {
+        cfg!(feature = "cuda-static")
+    }
+    fn delta_net(&self, op: &imparo_backend::DeltaNet) -> bool {
+        #[cfg(feature = "cuda-static")]
+        {
+            let (snap, snap_off, snap_row) = op
+                .snap
+                .map_or((u32::MAX, 0, 0), |s| (b(s.buf), s.off, s.row));
+            let wire = GatedDeltaWire {
+                a_off: op.a_off,
+                dt_off: op.dt_bias_off,
+                qkv: b(op.qkv),
+                alpha: b(op.alpha),
+                beta: b(op.beta),
+                state: b(op.state),
+                state_off: op.state_off,
+                state_out_off: op.state_out_off,
+                out: b(op.out),
+                snap,
+                snap_off,
+                snap_row,
+                k_heads: op.k_heads,
+                v_heads: op.v_heads,
+                key_dim: op.key_dim,
+                value_dim: op.value_dim,
+                n_tok: op.n_tok,
+                eps: op.eps,
+            };
+            unsafe { imparo_cuda_delta_net_run(&wire) == 0 }
+        }
+        #[cfg(not(feature = "cuda-static"))]
+        {
+            let _ = op;
+            false
+        }
     }
     fn set_batch_geometry(&self, geometry: BatchGeometry) -> Result<(), i32> {
         match unsafe {
@@ -751,7 +902,7 @@ impl Backend for CudaBackend {
                         && std::env::var("IMPARO_OUTPUT_REFERENCE_LAB").as_deref()
                             == Ok("1")))
         });
-        if !enabled {
+        if !enabled && !crate::knobs::e4b_retained_decode_policy_enabled() {
             return Ok(());
         }
         match unsafe {
@@ -1189,27 +1340,43 @@ impl Backend for CudaBackend {
             && activation == Epilogue::Gelu as u32;
         let q8_tm_min_tokens = crate::knobs::q8_tm_silu_private_down_min_tokens();
         let q8_tm_silu = q8_tm_min_tokens != 0
-            && n_tok >= q8_tm_min_tokens
+            && (n_tok >= q8_tm_min_tokens || (1..=16).contains(&n_tok))
             && gate_kind == 3
             && up_kind == 3
             && down_kind == 3
-            && n_tok > 8
+            && n_tok != 0
             && activation == Epilogue::Silu as u32
             && crate::knobs::q8_tm_silu_pair_enabled();
         let q8_canonical_silu = crate::knobs::q8_canonical_sidecar_enabled()
             && ((gate_kind == 2 && up_kind == 2)
                 || (gate_kind == 3
                     && up_kind == 3
-                    && std::env::var_os("IMPARO_LAB_Q8_TM_GATE_UP_CANONICAL_DOWN")
-                        .is_some()))
+                    && (crate::knobs::lfm_retained_domain() != 0
+                        || std::env::var_os(
+                            "IMPARO_LAB_Q8_TM_GATE_UP_CANONICAL_DOWN",
+                        )
+                        .is_some())))
             && (down_kind == 2
                 || (down_kind == 3
                     && gate_kind == 3
                     && up_kind == 3
-                    && std::env::var_os("IMPARO_LAB_Q8_DOWN_TM_ASYNC").is_some()))
-            && n_tok > 8
+                    && match crate::knobs::lfm_retained_domain() {
+                        0 => std::env::var_os("IMPARO_LAB_Q8_DOWN_TM_ASYNC").is_some(),
+                        domain => domain == 1,
+                    }))
+            && n_tok != 0
             && activation == Epilogue::Silu as u32;
-        if !q4_gelu && !q8_tm_silu && !q8_canonical_silu {
+        let w4_gelu = cfg!(target_os = "windows")
+            && crate::knobs::e4b_ffn_w4a16_enabled()
+            && gate_kind == 1
+            && up_kind == 1
+            && down_kind == 1
+            && n_in == 2560
+            && n_mid == 10240
+            && n_out == 2560
+            && (1..=3).contains(&n_tok)
+            && activation == Epilogue::Gelu as u32;
+        if !q4_gelu && !q8_tm_silu && !q8_canonical_silu && !w4_gelu {
             return false;
         }
         unsafe {
@@ -1337,7 +1504,9 @@ impl Backend for CudaBackend {
         idx: BufId,
         n_rows: u32,
     ) -> bool {
-        if !matches!(wkind, 1 | 2) || dst_off != 0 || width % 32 != 0 || n_rows == 0 {
+        let supported = matches!(wkind, 1 | 2)
+            || (cfg!(feature = "cuda-static") && wkind == 39 && width % 128 == 0);
+        if !supported || dst_off != 0 || width % 32 != 0 || n_rows == 0 {
             return false;
         }
         unsafe {
@@ -1627,7 +1796,7 @@ impl Backend for CudaBackend {
             || resid == other
             || width == 0
             || width % 128 != 0
-            || n_row <= 8
+            || n_row == 0
             || row_stride != width
             || base_off != 0
             || w_off == u64::MAX
@@ -1774,8 +1943,9 @@ impl Backend for CudaBackend {
         // v2 deliberately removed `kv_dequant` from the shared Backend trait: cache
         // representation is a backend-owned detail of attention, not model workflow.
         // Native dispatch can defer this producer until a half-cache consumer is chosen.
-        let defer_kv =
-            std::env::var("IMPARO_LAB_DEFER_KV_MATERIALIZATION").as_deref() == Ok("1");
+        let defer_kv = crate::knobs::e4b_retained_decode_policy_enabled()
+            || std::env::var("IMPARO_LAB_DEFER_KV_MATERIALIZATION").as_deref()
+                == Ok("1");
         if n_tok > 1 && !defer_kv {
             let slots = prefill_dequant_slots(start_pos, n_tok, ring);
             unsafe {
@@ -1814,6 +1984,28 @@ impl Backend for CudaBackend {
                 b(BufId::Kdq),
                 b(BufId::Vdq),
             );
+        }
+    }
+    fn copy_strided(
+        &self,
+        dst: BufId,
+        src: BufId,
+        width: u32,
+        src_off: u32,
+        src_stride: u32,
+        n_row: u32,
+    ) {
+        if n_row == 0 || width == 0 {
+            return;
+        }
+        #[cfg(feature = "cuda-static")]
+        unsafe {
+            imparo_cuda_copy_strided(b(dst), b(src), width, src_off, src_stride, n_row);
+        }
+        // Keep dynamic releases on their original ABI and row-by-row semantics.
+        #[cfg(not(feature = "cuda-static"))]
+        for row in 0..n_row {
+            self.copy_range(dst, row * width, src, row * src_stride + src_off, width);
         }
     }
     fn set_activation(&self, act: Epilogue) {
@@ -1887,6 +2079,13 @@ impl Backend for CudaBackend {
     fn argmax(&self, src: BufId, dst: BufId, n: u32) {
         unsafe { imparo_cuda_argmax(b(src), b(dst), n) }
     }
+    fn supports_argmax_rows(&self) -> bool {
+        cfg!(feature = "cuda-speculative")
+    }
+    #[cfg(feature = "cuda-speculative")]
+    fn argmax_rows(&self, src: BufId, dst: BufId, width: u32, rows: u32) {
+        unsafe { crate::tree::argmax_rows(b(src), b(dst), width, rows) }
+    }
     fn supports_greedy_verification(&self) -> bool {
         cfg!(feature = "cuda-speculative") && imparo_cuda_has_greedy_verification()
     }
@@ -1942,6 +2141,43 @@ impl Backend for CudaBackend {
             );
         }
     }
+    fn ple_norm_gather_combine_prefix(
+        &self,
+        proj: BufId,
+        tokens: BufId,
+        norm_offset: u64,
+        table_offset: u64,
+        ple_width: u32,
+        output_layers: u32,
+        source_width: u32,
+        input_scale: f32,
+        eps: f32,
+        emb_scale: f32,
+        comb_scale: f32,
+        n_tok: u32,
+    ) -> bool {
+        if !crate::knobs::e4b_retained_decode_policy_enabled() {
+            return false;
+        }
+        unsafe {
+            imparo_cuda_ple_norm_gather_combine_prefix(
+                b(proj),
+                b(tokens),
+                norm_offset,
+                table_offset,
+                ple_width,
+                output_layers,
+                source_width,
+                input_scale,
+                eps,
+                emb_scale,
+                comb_scale,
+                n_tok,
+            );
+        }
+        true
+    }
+
     fn ple_gather_combine_prefix(
         &self,
         proj: BufId,
@@ -2042,6 +2278,23 @@ impl Backend for CudaBackend {
         kernel: u32,
         n_tok: u32,
     ) {
+        #[cfg(feature = "cuda-static")]
+        if form == ConvForm::PlainSilu {
+            unsafe {
+                imparo_cuda_plain_conv(
+                    b(src),
+                    w_off,
+                    b(state),
+                    state_off,
+                    state_out_off,
+                    b(out),
+                    width,
+                    kernel,
+                    n_tok,
+                );
+            }
+            return;
+        }
         assert_eq!(
             form,
             ConvForm::GatedBcx,
@@ -2081,6 +2334,22 @@ impl Backend for CudaBackend {
         kernel: u32,
         n_tok: u32,
     ) {
+        #[cfg(feature = "cuda-static")]
+        if form == ConvForm::PlainSilu {
+            unsafe {
+                imparo_cuda_plain_conv_snapshot(
+                    b(src),
+                    b(state),
+                    state_off,
+                    b(snap),
+                    snap_off,
+                    width,
+                    kernel,
+                    n_tok,
+                );
+            }
+            return;
+        }
         assert_eq!(
             form,
             ConvForm::GatedBcx,
@@ -2099,19 +2368,36 @@ impl Backend for CudaBackend {
             );
         }
     }
-    /// Part of the gated delta-net set, which CUDA does not serve; `supports_gated_delta`
-    /// is false, so a model refuses before it can be called.
     fn mul_strided_sigmoid(
         &self,
-        _a: BufId,
-        _b: BufId,
-        _width: u32,
-        _b_off: u32,
-        _b_stride: u32,
-        _a_stride: u32,
-        _n_row: u32,
+        a: BufId,
+        other: BufId,
+        width: u32,
+        b_off: u32,
+        b_stride: u32,
+        a_stride: u32,
+        n_row: u32,
     ) {
-        unreachable!("cuda: supports_gated_delta() is false");
+        #[cfg(feature = "cuda-static")]
+        unsafe {
+            imparo_cuda_mul_strided_sigmoid(
+                b(a),
+                b(other),
+                width,
+                b_off,
+                b_stride,
+                a_stride,
+                n_row,
+            );
+        }
+        #[cfg(not(feature = "cuda-static"))]
+        {
+            let _ = (a, other, width, b_off, b_stride, a_stride, n_row);
+            unreachable!("dynamic CUDA has no gated-delta capability");
+        }
+    }
+    fn set_model_bytes(&self, bytes: u64) {
+        MODEL_BYTES.store(bytes, Ordering::Relaxed);
     }
     unsafe fn init_weights(&self, base: *const u8, len: u64) -> Result<(), i32> {
         // CUDA uploads the blob to device memory.
@@ -2127,14 +2413,49 @@ impl Backend for CudaBackend {
         let bytes = unsafe { core::slice::from_raw_parts(base, len as usize) };
         init_with_streamed(bytes, streamed)
     }
-    /// The fast tier is the VRAM (docs/memory-tiers-and-fit.md section 2: the whole card,
-    /// the reserve is computed by the common runtime); 0 / unknown reports None.
+    unsafe fn init_weights_with_placement(
+        &self,
+        base: *const u8,
+        len: u64,
+        placement: &imparo_backend::WeightPlacement,
+    ) -> Result<(), i32> {
+        #[cfg(feature = "cuda-static")]
+        {
+            if base.is_null() || len > isize::MAX as u64 {
+                return Err(3);
+            }
+            let streamed = placement_streamed_spans(len, &placement.segments)?;
+            let budget = &placement.budget;
+            let reserve = budget
+                .reserve_kv
+                .checked_add(budget.reserve_activations)
+                .and_then(|v| v.checked_add(budget.reserve_scratch))
+                .and_then(|v| v.checked_add(budget.margin))
+                .ok_or(3)?;
+            // Static source builds share the planner's runtime reserve. Dynamic
+            // releases keep their existing native ABI and legacy initialization.
+            let rc = unsafe { imparo_cuda_set_placement_reserve(reserve) };
+            if rc != 0 {
+                return Err(rc);
+            }
+            unsafe { self.init_weights_with_residency(base, len, &streamed) }
+        }
+        #[cfg(not(feature = "cuda-static"))]
+        unsafe {
+            self.init_weights_with_residency(base, len, &placement.slow_spans())
+        }
+    }
+    /// Reserve is computed by the common runtime from the memory actually available
+    /// on the selected device, after its CUDA context and stream are initialized.
     fn fast_tier_budget(&self) -> Option<u64> {
-        let total = crate::context::CudaContext::get().memory_info().total;
-        (total > 0).then_some(total)
+        let free = crate::context::CudaContext::get().memory_info().free;
+        (free > 0).then_some(free)
     }
     fn quantized_weight_cache_enabled(&self) -> bool {
-        crate::knobs::prefill_exact128_fast_transaction_enabled()
+        (cfg!(target_os = "windows")
+            && (crate::knobs::e4b_ffn_w4a16_enabled()
+                || crate::knobs::e4b_retained_decode_policy_enabled()))
+            || crate::knobs::prefill_exact128_fast_transaction_enabled()
             || crate::knobs::decode_shadow_cache_enabled()
             || crate::knobs::prefill_down_q4_layer_mask() != 0
             || std::env::var_os("IMPARO_LAB_LFM2_Q8_TM_DOWN_Q4_SHADOW").is_some()
@@ -2205,7 +2526,100 @@ impl Backend for CudaBackend {
 #[cfg(test)]
 mod tests {
     use super::{CudaBackend, kv_code, prefill_dequant_slots};
+
+    #[test]
+    fn config_identity_uses_target_not_appended_mapping() {
+        assert_eq!(super::config_model_bytes(4096, 8192), 4096);
+        assert_eq!(super::config_model_bytes(4096, 4096), 4096);
+        assert_eq!(super::config_model_bytes(0, 4096), 4096);
+    }
+
+    #[test]
+    fn placement_complement_streams_headers_gaps_and_nonfast_tensors() {
+        use imparo_backend::{WeightSegment, WeightTier};
+        let segments = [
+            WeightSegment {
+                offset: 10,
+                bytes: 20,
+                tier: WeightTier::Fast,
+            },
+            WeightSegment {
+                offset: 35,
+                bytes: 10,
+                tier: WeightTier::Slow { layer: 1 },
+            },
+            WeightSegment {
+                offset: 50,
+                bytes: 20,
+                tier: WeightTier::Fast,
+            },
+            WeightSegment {
+                offset: 70,
+                bytes: 10,
+                tier: WeightTier::Fast,
+            },
+            WeightSegment {
+                offset: 90,
+                bytes: 5,
+                tier: WeightTier::HostStaged,
+            },
+        ];
+        let spans = super::placement_streamed_spans(100, &segments).unwrap();
+        let pairs: Vec<_> = spans.iter().map(|s| (s.offset, s.bytes)).collect();
+        assert_eq!(pairs, [(0, 10), (30, 20), (80, 20)]);
+        assert_eq!(100 - spans.iter().map(|s| s.bytes).sum::<u64>(), 50);
+    }
+
+    #[test]
+    fn placement_complement_handles_all_fast_and_all_streamed() {
+        use imparo_backend::{WeightSegment, WeightTier};
+        let fast = [WeightSegment {
+            offset: 0,
+            bytes: 100,
+            tier: WeightTier::Fast,
+        }];
+        assert!(
+            super::placement_streamed_spans(100, &fast)
+                .unwrap()
+                .is_empty()
+        );
+        let slow = [WeightSegment {
+            offset: 10,
+            bytes: 80,
+            tier: WeightTier::HostStaged,
+        }];
+        for segments in [&[][..], &slow[..]] {
+            let spans = super::placement_streamed_spans(100, segments).unwrap();
+            assert_eq!(spans.len(), 1);
+            assert_eq!((spans[0].offset, spans[0].bytes), (0, 100));
+        }
+        assert!(super::placement_streamed_spans(0, &[]).is_err());
+    }
+
+    #[test]
+    fn placement_complement_rejects_invalid_ranges_even_in_slow_tiers() {
+        use imparo_backend::{WeightSegment, WeightTier};
+        let segment = |offset, bytes| WeightSegment {
+            offset,
+            bytes,
+            tier: WeightTier::HostStaged,
+        };
+        for segments in [
+            vec![segment(10, 0)],
+            vec![segment(90, 11)],
+            vec![segment(u64::MAX, 2)],
+            vec![segment(20, 20), segment(10, 5)],
+            vec![segment(10, 20), segment(29, 5)],
+        ] {
+            assert!(super::placement_streamed_spans(100, &segments).is_err());
+        }
+    }
     use imparo_backend::{Backend, Epilogue, PoolAddressing, Tier};
+
+    #[test]
+    fn cuda_keeps_layout_aware_eager_pool_storage() {
+        assert!(!CudaBackend.supports_kv_incremental_commit());
+    }
 
     #[test]
     fn cuda_fuses_only_the_epilogues_its_native_kernels_implement() {

@@ -140,13 +140,7 @@ __device__ __forceinline__ void mma_kq_ncols8(
           "r"(b[0]), "r"(b[1]));
 }
 
-__device__ __forceinline__ __half2 movmatrix_transpose(__half2 value) {
-    int result;
-    const int bits = *reinterpret_cast<const int *>(&value);
-    asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;"
-        : "=r"(result) : "r"(bits));
-    return *reinterpret_cast<__half2 *>(&result);
-}
+using imparo_sm80_mma::movmatrix_transpose;
 
 // Pair adjacent Q columns, then transpose the 16x8 KQ result into the
 // column-major logical 16x8 probability B operand used by V_A x P_B.

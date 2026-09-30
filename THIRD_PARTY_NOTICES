@@ -36,3 +36,22 @@ d64_fa2/vendor/flashinfer/ and d64_fa2/vendor/flashinfer/licenses/.
 The notice source is fixed FlashInfer v0.6.16 commit
 8da13a29c85f7e5b1c81878d933f84ae9fc4afa9; this does not relabel installed
 .post3 headers as byte-identical to that source tag.
+
+Frozen Marlin module
+--------------------
+
+The optional Windows SM86 W4A16 path embeds the fixed vLLM 0.28.0 Marlin
+image from revision 2cf0a6915ce544dc493a0990f2ea38d81601128a, without an
+arithmetic rebuild. Apache-2.0 license text and exact extraction provenance
+are retained together in crates/imparo-cuda/native/sm86/w4a16_marlin/.
+See SOURCE.md there for the selected image and its immutable SHA256.
+
+Gemma assistant cluster assets
+------------------------------
+
+Authors: Google DeepMind. The two assistant tensors under
+crates/imparo-cuda/native/gemma4_mtp_assets/ come from the fixed official
+Gemma QAT assistant revision recorded in SOURCE.md. That file identifies
+the original tensors, lossless dtype conversions, exact hashes and the
+upstream Apache-2.0 model card. Apache-2.0 terms are retained in LICENSE
+beside the assets. These assets do not grant profile quality admission.

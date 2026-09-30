@@ -118,6 +118,8 @@ fn facts(weight_kinds: u64) -> ModelFacts {
         head_dim: 256,
         deep_head_dim: 512,
         n_experts: 0,
+        experts_used: 0,
+        windowed_layers: 0,
         n_layers: 42,
         layer_dispatches: 20,
         weight_kinds,
@@ -245,7 +247,9 @@ fn every_declared_candidate_round_trips_through_its_setter() {
 #[test]
 fn a_boundary_knob_carries_no_candidate_list() {
     for d in MetalBackend.knob_registry() {
-        if let SweepKind::Crossing { ladder, hi, lo } = d.sweep {
+        if let SweepKind::Crossing { ladder, hi, lo }
+        | SweepKind::RowsCrossing { ladder, hi, lo } = d.sweep
+        {
             assert!(
                 d.values.is_empty(),
                 "{}: a Crossing knob must not also carry `values`",

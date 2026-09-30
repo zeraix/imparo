@@ -85,8 +85,8 @@ pub fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> 
 /// # Errors
 ///
 /// Returns an I/O error when the socket cannot be written.
-pub fn json(
-    stream: &mut TcpStream,
+pub fn json<W: Write + ?Sized>(
+    stream: &mut W,
     status: u16,
     value: &serde_json::Value,
 ) -> std::io::Result<()> {
@@ -102,7 +102,7 @@ pub fn json(
 /// # Errors
 ///
 /// Returns an I/O error when the socket cannot be written.
-pub fn sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
+pub fn sse_headers<W: Write + ?Sized>(stream: &mut W) -> std::io::Result<()> {
     stream.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
     stream.flush()
@@ -133,7 +133,10 @@ pub fn sse_frame(buf: &mut Vec<u8>, value: &serde_json::Value) -> std::io::Resul
 /// # Errors
 ///
 /// Returns an I/O error when the socket cannot be written.
-pub fn sse_send(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
+pub fn sse_send<W: Write + ?Sized>(
+    stream: &mut W,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
     if buf.is_empty() {
         return Ok(());
     }
@@ -148,8 +151,68 @@ pub fn sse_send(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()
 /// # Errors
 ///
 /// Returns an I/O error when the socket cannot be written.
-pub fn sse(stream: &mut TcpStream, value: &serde_json::Value) -> std::io::Result<()> {
+pub fn sse<W: Write + ?Sized>(
+    stream: &mut W,
+    value: &serde_json::Value,
+) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(256);
     sse_frame(&mut buf, value)?;
     sse_send(stream, &mut buf)
+}
+
+/// A response written by the engine loop and sent by the connection's own thread, so a slow
+/// or stalled client holds its thread, never the engine. Each `flush` is one message: the
+/// helpers above flush once per response piece and once per token, so the socket sees the
+/// writes it saw when the engine wrote to it directly (task #202).
+pub struct Outbox {
+    buf: Vec<u8>,
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl Outbox {
+    #[must_use]
+    pub fn new(tx: std::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            buf: Vec::with_capacity(512),
+            tx,
+        }
+    }
+}
+
+impl Write for Outbox {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    /// # Errors
+    ///
+    /// `BrokenPipe` once the connection's thread has gone: the client closed the socket, or
+    /// a write to it failed.
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let bytes = std::mem::replace(&mut self.buf, Vec::with_capacity(512));
+        self.tx.send(bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the client has gone")
+        })
+    }
+}
+
+/// The connection's side of an `Outbox`: every message to the socket, until the engine drops
+/// the outbox.
+///
+/// # Errors
+///
+/// Returns an I/O error when the socket cannot be written.
+pub fn pump(
+    stream: &mut TcpStream,
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+) -> std::io::Result<()> {
+    for bytes in rx {
+        stream.write_all(&bytes)?;
+        stream.flush()?;
+    }
+    Ok(())
 }

@@ -98,3 +98,29 @@ pub const MEGA_Q35_U: &[&str] = &[
     "f_dqkv", "f_dgate", "f_alpha", "f_beta", "f_dout",
 ];
 pub const MEGA_Q35_F: &[&str] = &["q_scale"];
+
+// LFM2-MoE: the ROUTED feed-forward as one dispatch -- the residual and the FFN norm, the
+// router's rows, the route (gating, the pick, the weights) formed by every threadgroup from
+// the router's rows, the k experts' gate and up rows, and their down rows summed in slot
+// order with the residual. `g` holds the k experts' activations, one n_ff row each; `scores`
+// the router's rows. Every weight carries its own format word (the down stack is Q6_K on some
+// layers of a Q4_K_M file), and each expert stack its own byte stride. The mixer ran on the
+// dispatch path and left its output in `o`.
+pub const MEGA_L2M_PTR: &[&str] = &[
+    "x", "o", "g", "scores", "w_fn", "w_router", "w_bias", "w_gate", "w_up", "w_down",
+    // The NEXT layer's operator norm, formed from the finished x into `cur`.
+    "w_next", "cur",
+];
+pub const MEGA_L2M_OFF: &[&str] = &[
+    "fn_off", "router_off", "bias_off", "gate_off", "up_off", "down_off", "next_off",
+];
+pub const MEGA_L2M_U: &[&str] = &[
+    "n_ff", "n_expert", "k", "gating", "normalise", "has_bias",
+    "f_gate", "f_up", "f_down", "stride_gate", "stride_up", "stride_down",
+    // k * n_ff: the rows the gated phase strides, declared for the grid's balance rule.
+    "gated_rows",
+    // 1: after a grid barrier every threadgroup forms the next layer's operator norm of x and
+    // writes its slice of `cur` -- the norm dispatch the next layer would run instead.
+    "has_next",
+];
+pub const MEGA_L2M_F: &[&str] = &["w_scale"];
