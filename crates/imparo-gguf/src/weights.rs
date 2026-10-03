@@ -126,6 +126,8 @@ pub const fn q8_0_tm_convertible(n_in: usize, n_out: usize) -> bool {
 /// and are pinned bit-identical by the gates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TmRule {
+    /// Backend-private runtime storage; never emitted by the GGUF repacker.
+    pub split_scales: bool,
     /// The row-major ggml type this rule converts from.
     pub from: u32,
     /// The tile-major type it produces.
@@ -218,6 +220,10 @@ impl TmRule {
         block: usize,
         blocks: usize,
     ) -> usize {
+        if self.split_scales {
+            return ((row / self.unit_rows) * blocks + block) * self.unit_rows * self.payload_bytes()
+                + (row % self.unit_rows) * self.payload_bytes();
+        }
         self.unit_start(row, block, blocks)
             + self.unit_rows * self.scale_bytes()
             + (row % self.unit_rows) * self.payload_bytes()
@@ -232,6 +238,11 @@ impl TmRule {
         blocks: usize,
         _n_out: usize,
     ) -> usize {
+        if self.split_scales {
+            return _n_out * blocks * self.payload_bytes()
+                + (((row / self.unit_rows) * blocks + block) * self.unit_rows
+                    + row % self.unit_rows) * self.scale_bytes();
+        }
         self.unit_start(row, block, blocks)
             + (row % self.unit_rows) * self.scale_bytes()
     }
@@ -378,6 +389,7 @@ pub const GGML_IQ1_M_TM: u32 = 1029;
 /// family refuses the file by name instead of misreading it.
 pub const TM_RULES: [TmRule; 19] = [
     TmRule {
+        split_scales: false,
         from: GGML_Q8_0,
         to: GGML_Q8_0_TM,
         from_name: "Q8_0",
@@ -390,6 +402,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_Q4_0,
         to: GGML_Q4_0_TM,
         from_name: "Q4_0",
@@ -402,6 +415,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &["metal"],
     },
     TmRule {
+        split_scales: false,
         from: GGML_Q4_1,
         to: GGML_Q4_1_TM,
         from_name: "Q4_1",
@@ -415,6 +429,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_Q5_0,
         to: GGML_Q5_0_TM,
         from_name: "Q5_0",
@@ -428,6 +443,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_Q5_1,
         to: GGML_Q5_1_TM,
         from_name: "Q5_1",
@@ -440,6 +456,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_Q2_K,
         to: GGML_Q2_K_TM,
         from_name: "Q2_K",
@@ -453,6 +470,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_Q3_K,
         to: GGML_Q3_K_TM,
         from_name: "Q3_K",
@@ -466,6 +484,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_Q4_K,
         to: GGML_Q4_K_TM,
         from_name: "Q4_K",
@@ -480,6 +499,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_Q5_K,
         to: GGML_Q5_K_TM,
         from_name: "Q5_K",
@@ -492,6 +512,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_Q6_K,
         to: GGML_Q6_K_TM,
         from_name: "Q6_K",
@@ -505,6 +526,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_IQ4_NL,
         to: GGML_IQ4_NL_TM,
         from_name: "IQ4_NL",
@@ -517,6 +539,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_IQ3_S,
         to: GGML_IQ3_S_TM,
         from_name: "IQ3_S",
@@ -535,6 +558,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_IQ4_XS,
         to: GGML_IQ4_XS_TM,
         from_name: "IQ4_XS",
@@ -548,6 +572,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_IQ2_XXS,
         to: GGML_IQ2_XXS_TM,
         from_name: "IQ2_XXS",
@@ -562,6 +587,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_IQ2_XS,
         to: GGML_IQ2_XS_TM,
         from_name: "IQ2_XS",
@@ -575,6 +601,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_IQ2_S,
         to: GGML_IQ2_S_TM,
         from_name: "IQ2_S",
@@ -589,6 +616,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_IQ3_XXS,
         to: GGML_IQ3_XXS_TM,
         from_name: "IQ3_XXS",
@@ -604,6 +632,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_IQ1_S,
         to: GGML_IQ1_S_TM,
         from_name: "IQ1_S",
@@ -619,6 +648,7 @@ pub const TM_RULES: [TmRule; 19] = [
         stack_readers: &[],
     },
     TmRule {
+        split_scales: false,
         from: GGML_IQ1_M,
         to: GGML_IQ1_M_TM,
         from_name: "IQ1_M",
@@ -639,6 +669,16 @@ pub const TM_RULES: [TmRule; 19] = [
 pub fn tm_rule_for(ggml_type: u32) -> Option<&'static TmRule> {
     TM_RULES.iter().find(|r| r.from == ggml_type)
 }
+
+/// Existing CUDA split-plane storage, selected only for a GPU-private runtime copy.
+/// The file codec and TM_RULES remain the per-unit format. The runtime selector and
+/// build identity bind this private representation; the original GGUF is unchanged.
+pub const CUDA_Q8_SPLIT_RULE: TmRule = TmRule {
+    split_scales: true,
+    to_name: "CUDA_Q8_0_TM_SPLIT_V1",
+    readers: &["cuda"],
+    ..TM_RULES[0]
+};
 
 /// The rule that produced this tile-major type, if any.
 #[must_use]

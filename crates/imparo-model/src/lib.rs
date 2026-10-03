@@ -749,6 +749,10 @@ pub struct WorkflowState {
     /// Rows of the batch being encoded when `BufId::RowLayout` describes them (a tree): the
     /// graph reads positions, visibility and ancestors from the layout. 0 for a causal batch.
     pub row_layout: u32,
+    /// Actual submission of the current verification forward, cleared by its
+    /// verifier (tree) or the opt-in chain observer before verification.
+    /// This is transient observation metadata, never reusable slot/cache state.
+    pub(crate) tree_submission: speculative::TreeSubmission,
     /// The route of the co-batched step being encoded (`Workflow::decode_rows`): how the
     /// backend serves its projections' rows.
     pub row_route: imparo_backend::RowRoute,
@@ -776,6 +780,8 @@ pub struct PipeStep {
 /// recurrent buffers -- is the backend's (`Backend::select_slot`).
 #[derive(Clone, Debug, Default)]
 pub struct SlotState {
+    /// Physical window reach belongs to the same conversation as its ring bytes.
+    pub(crate) window_history: window_history::WindowHistory,
     /// Positions filled (`kv::KvRuntime::filled`).
     pub filled: usize,
     /// The recurrent plane cursors (`WorkflowState::recur_plane`, `recur_plane_next`).
@@ -838,6 +844,7 @@ impl WorkflowState {
     /// Exchanges the live per-conversation fields with slot `s`'s saved ones.
     fn slot_swap(&mut self, s: usize) {
         let st = &mut self.slots[s];
+        std::mem::swap(&mut self.window_history, &mut st.window_history);
         std::mem::swap(&mut self.kv_rt.filled, &mut st.filled);
         std::mem::swap(&mut self.recur_plane, &mut st.recur_plane);
         std::mem::swap(&mut self.recur_plane_next, &mut st.recur_plane_next);
@@ -845,6 +852,15 @@ impl WorkflowState {
         std::mem::swap(&mut self.recur_ckpt_at, &mut st.recur_ckpt_at);
         std::mem::swap(&mut self.recur_ckpt_on_device, &mut st.recur_ckpt_on_device);
         std::mem::swap(&mut self.gpu_recur_snap_slots, &mut st.gpu_recur_snap_slots);
+    }
+
+    fn slot_history(&self, slot: u32) -> &window_history::WindowHistory {
+        if slot == self.slot { &self.window_history }
+        else { &self.slots[slot as usize].window_history }
+    }
+    fn slot_history_mut(&mut self, slot: u32) -> &mut window_history::WindowHistory {
+        if slot == self.slot { &mut self.window_history }
+        else { &mut self.slots[slot as usize].window_history }
     }
 
     /// A SYNCHRONOUS decode step succeeded: the plane it wrote is now the state, and the
@@ -910,6 +926,7 @@ impl WorkflowState {
             verification_prefix_tokens: 0,
             gpu_recur_snap_slots: 0,
             row_layout: 0,
+            tree_submission: speculative::TreeSubmission::Unknown,
             row_route: imparo_backend::RowRoute::Fast,
             slots: Vec::new(),
             slot: 0,
@@ -1064,6 +1081,9 @@ pub trait Architecture: Sized + 'static {
     /// `architecture!` from the presence of a `device_rows` row, so a model without one is
     /// refused its slots before any slot buffer is made.
     const DEVICE_ROWS: bool = false;
+    /// KV wire-code pairs whose cache transforms this row workflow implements.
+    /// Backend codec support is checked independently before making slots.
+    const DEVICE_ROWS_KV_CODECS: &'static [(u32, u32)] = &[(1, 1)];
 
     /// The rolling convolution windows in this architecture's recurrent state, which a tree
     /// commit rebuilds from the accepted path. None by default.
@@ -1221,6 +1241,7 @@ macro_rules! architecture {
         $(device_batch:        $device_batch:path,)?
         $(device_prepare:      $device_prepare:path,)?
         $(device_rows:         $device_rows:path,)?
+        $(device_rows_kv_codecs: $device_rows_kv_codecs:expr,)?
         $(buffer_requirements: $buffer_requirements:path,)?
         $(conv_windows:        $conv_windows:path,)?
         $(state_only_output_lab: $state_only_output:expr,)?
@@ -1239,6 +1260,7 @@ macro_rules! architecture {
 
         impl $crate::Architecture for $arch {
             type Weights = $weights;
+            $(const DEVICE_ROWS_KV_CODECS: &'static [(u32, u32)] = $device_rows_kv_codecs;)?
             $(const STATE_ONLY_OUTPUT_LAB: bool = $state_only_output;)?
             $(const DEVICE_ALL_LOGITS: bool = $device_all_logits;)?
             $(const DEVICE_PREFIX_VERIFICATION: bool = $device_prefix_verification;)?
@@ -1482,7 +1504,7 @@ impl<A: Architecture> Workflow<A> {
     ///
     /// # Errors
     /// With a decode step in flight, for an architecture without a co-batched step, for a
-    /// quantized cache (not built yet), a windowed layer without a ring or several window
+    /// cache codec not implemented by that architecture, a windowed layer without a ring or several window
     /// regions per layer, or when the backend has no slots.
     pub fn set_slots(&mut self, n: u32) -> Result<(), String> {
         if n == 0 {
@@ -1491,8 +1513,10 @@ impl<A: Architecture> Workflow<A> {
         if !A::DEVICE_ROWS {
             return Err("co-batched decode is not built for this architecture".into());
         }
-        if kv::KvType::k() != kv::KvType::F16 || kv::KvType::v() != kv::KvType::F16 {
-            return Err("co-batched decode reads an f16 cache only".into());
+        if !A::DEVICE_ROWS_KV_CODECS.contains(&(
+            kv::KvType::k().ggml_id(), kv::KvType::v().ggml_id(),
+        )) {
+            return Err("this architecture's co-batched workflow does not support these KV codecs".into());
         }
         if !self.state.queued.is_empty() {
             return Err("set_slots with a decode step in flight".into());
@@ -1526,6 +1550,25 @@ must be 1"
         }
         Workflow::ensure_gpu_ready(self)?;
         let be = crate::backend::active().ok_or("co-batched decode needs a device")?;
+        // Owning conversation state is necessary but does not prove that the
+        // backend can execute independent decode rows. Do not admit parallel
+        // requests into a partially implemented backend and fail them mid-step.
+        if be.decode_rows_max(imparo_backend::RowRoute::Fast) == 0 {
+            return Err("the backend has no co-batched decode row execution".into());
+        }
+        if !be.supports_argmax_rows() {
+            return Err("the backend has no co-batched per-row argmax".into());
+        }
+        if !be.supports_decode_rows_kv(kv::KvType::k().ggml_id(), kv::KvType::v().ggml_id()) {
+            return Err("the backend does not support these co-batched KV codecs".into());
+        }
+        for (layer, plan) in self.plan.layers.iter().enumerate() {
+            if let Attention::Recurrent { key_dim, value_dim, .. } = plan.attention {
+                if !be.supports_recurrent_slot_rows(key_dim, value_dim) {
+                    return Err(format!("the backend has no co-batched recurrent state consumer for layer {layer}"));
+                }
+            }
+        }
         if !be.set_slots(n, &rings) {
             return Err("the backend has no co-batched decode slots".into());
         }
@@ -1533,7 +1576,9 @@ must be 1"
         if self.state.slots.len() < want {
             // The backend sizes a new slot's buffers like the selected slot's.
             let snap_slots = self.state.gpu_recur_snap_slots;
+            let history = self.state.window_history.empty_for_slot();
             self.state.slots.resize_with(want, || SlotState {
+                window_history: history.clone(),
                 gpu_recur_snap_slots: snap_slots,
                 ..SlotState::default()
             });
@@ -1617,6 +1662,7 @@ must be 1"
         // that describes them stays.
         let st = &mut self.state.slots[s as usize];
         *st = SlotState {
+            window_history: st.window_history.empty_for_slot(),
             gpu_recur_snap_slots: st.gpu_recur_snap_slots,
             ..SlotState::default()
         };
@@ -1680,8 +1726,38 @@ must be 1"
         if batch.is_empty() {
             return Ok(picks);
         }
+        // Preflight every tracked window before publishing any in-flight history.
+        // Ordinary untracked workflows avoid history cloning entirely.
+        let slack = if batch.iter().any(|r| self.state.slot_history(r.slot).enabled()) {
+            imparo_kv::state::window_slack(&kv::KvPoolMember::kv_state_geometry(self))
+        } else { 0 };
+        let mut histories = Vec::new();
+        for row in &batch {
+            let history = self.state.slot_history(row.slot);
+            if !history.enabled() { continue; }
+            let mut prepared = history.clone();
+            let start = row.pos as usize;
+            let (retry, ticket) = prepared.begin_recoverable(start, start + 1, slack)?;
+            histories.push((row.slot, start, prepared, retry, ticket));
+        }
+        for (slot, _, prepared, _, _) in &histories {
+            *self.state.slot_history_mut(*slot) = prepared.clone();
+        }
         self.state.row_route = route;
-        A::device_rows(self, &batch, logits, &mut picks)?;
+        let submitted = A::device_rows(self, &batch, logits, &mut picks).and_then(|()| {
+            crate::gpu_support::snapshot_decode_rows(
+                crate::gpu_support::be(), &batch, self.state.slot, self.plan.recurrent_elems(),
+            )
+        });
+        if let Err(error) = submitted {
+            for (slot, _, _, retry, _) in histories {
+                *self.state.slot_history_mut(slot) = retry;
+            }
+            return Err(error);
+        }
+        for (slot, start, _, _, ticket) in histories {
+            self.state.slot_history(slot).commit(ticket, start, start + 1, slack);
+        }
         for r in &batch {
             let (filled, plane, plane_next, ckpt, ckpt_at, ckpt_on_device) =
                 if r.slot == self.state.slot {

@@ -93,6 +93,7 @@ void invalidate_all_execution_choices() {
         s.q8_src = UINT32_MAX;
         s.q8_layout = UINT32_MAX;
         s.q8_owner_capture_generation = 0;
+        s.moe_gateup_plan_valid = false;
     };
     invalidate(default_execution);
     for (auto & owner : execution_owners) invalidate(*owner.state);
@@ -109,6 +110,7 @@ uint64_t execution_device_bytes(const ExecutionState & s) {
     for (int i = 0; i < B_COUNT; ++i) {
         if (s.bufs[i] && !s.in_arena[i]) total += s.sizes[i];
     }
+    total += conversation_slot_bytes(s.conversation_slots) + conversation_ring_bytes(s);
     total += s.kv_layout.arena_bytes;
     total += s.kv_page_tables.arena_entries * sizeof(uint32_t);
 #if defined(IMPARO_CUDA_ENABLE_CUBLAS_LAB)
@@ -124,6 +126,7 @@ uint64_t execution_owners_device_bytes() {
 }
 
 bool release_execution_storage_checked(ExecutionState & s) {
+    s.moe_gateup_plan_valid = false;
     if (s.tree_capture_active) return false;
     s.tree_replay.reset();
     if (!destroy_decode_graph_checked(s)) return false;
@@ -142,6 +145,7 @@ bool release_execution_storage_checked(ExecutionState & s) {
         p = nullptr;
         return true;
     };
+    if (!release_conversation_slots_checked(s)) return false;
     for (int i = 0; i < B_COUNT; ++i) {
         if (!s.in_arena[i] && !device(s.bufs[i])) return false;
         s.bufs[i] = nullptr;

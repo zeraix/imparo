@@ -99,7 +99,8 @@ inline CUresult initialize_image(const uint8_t* image, std::size_t bytes, int de
     return CUDA_SUCCESS;
 }
 
-// Actual physical M=3, lda=K half elements. Logical M1 must have two zero rows.
+// Physical M=3 by default; M4 reuses the same frozen eight-row tile/reduction.
+// lda=K half elements. Logical M1 must have two zero rows in the M3 route.
 // Owner supplies buffer capacities, same context/stream, immutable packed B/S.
 // Ctmp >=491520 B: no initialization required. locks >=120 B: initialize to zero
 // before first use; successful non-atomic completion resets them. On any failed
@@ -107,15 +108,16 @@ inline CUresult initialize_image(const uint8_t* image, std::size_t bytes, int de
 inline CUresult launch(const Kernel& kernel,
         CUdeviceptr a, CUdeviceptr packed_weight, CUdeviceptr half_scales,
         CUdeviceptr c, CUdeviceptr reduce_tmp, CUdeviceptr locks,
-        int k, int n, CUstream stream) {
+        int k, int n, CUstream stream, int physical_m = kPhysicalM) {
     if (!kernel.module || !kernel.function || !kernel.driver.launch_kernel
         || !a || !packed_weight || !half_scales || !c || !reduce_tmp || !locks
         || ((a | packed_weight | half_scales | c | reduce_tmp) & 15u)
         || (locks & 3u) || kernel.max_shared_memory < 53248
+        || (physical_m != 3 && physical_m != 4)
         || !((k == 2560 && n == 20480) || (k == 10240 && n == 2560)))
         return CUDA_ERROR_INVALID_VALUE;
     CUdeviceptr bias = 0, a_scales = 0, global_scale = 0, zp = 0, g_idx = 0;
-    int groups = k / 32, m = kPhysicalM, lda = k;
+    int groups = k / 32, m = physical_m, lda = k;
     bool has_bias = false, use_atomic_add = false, use_fp32_reduce = true;
     int max_shared = kernel.max_shared_memory;
     static_assert(sizeof(bool) == 1, "Frozen kernel bool ABI is one byte");
@@ -130,11 +132,12 @@ inline CUresult launch(const Kernel& kernel,
 // Runtime-buffer overload; converts addresses only, retaining the exact ABI.
 inline CUresult launch(const Kernel& kernel,
         const void* a, const void* packed_weight, const void* half_scales,
-        void* c, void* reduce_tmp, void* locks, int k, int n, CUstream stream) {
+        void* c, void* reduce_tmp, void* locks, int k, int n, CUstream stream,
+        int physical_m = kPhysicalM) {
     return launch(kernel, reinterpret_cast<CUdeviceptr>(a),
         reinterpret_cast<CUdeviceptr>(packed_weight), reinterpret_cast<CUdeviceptr>(half_scales),
         reinterpret_cast<CUdeviceptr>(c), reinterpret_cast<CUdeviceptr>(reduce_tmp),
-        reinterpret_cast<CUdeviceptr>(locks), k, n, stream);
+        reinterpret_cast<CUdeviceptr>(locks), k, n, stream, physical_m);
 }
 
 // Only after all launches and Graphs referencing this module have completed.

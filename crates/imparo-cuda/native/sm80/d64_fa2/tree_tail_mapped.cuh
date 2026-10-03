@@ -77,10 +77,11 @@ __global__ void splice_v1(const __half*o,const float*ls,__half*tmp,float*tl,cons
  }
 }
 }
-cudaError_t tree_tail_plan_v1(unsigned start,unsigned span,unsigned leaves,unsigned*chunks,unsigned*begin,unsigned*rows,uint64_t*extra){
+cudaError_t tree_tail_plan_v1(unsigned start,unsigned span,unsigned leaves,unsigned*chunks,unsigned*begin,unsigned*rows,uint64_t*extra,unsigned nodes){
  using namespace tree_tail_detail;
- if(!span||span<256||span%128||!leaves||leaves>16||start>UINT32_MAX-16)return cudaErrorInvalidValue;
- *begin=(start/span)*span;*rows=start-*begin+9;*chunks=(start+16+span-1)/span;
+ if(!span||span<256||span%128||nodes<2||nodes>16||!leaves||leaves>nodes||start>UINT32_MAX-16)return cudaErrorInvalidValue;
+ *begin=(start/span)*span;*rows=start-*begin+9;// Nine canonical tail queries remain, even when the logical tree is smaller.
+ *chunks=(uint64_t(start)+std::max(nodes,9u)+span-1)/span;
  const unsigned parts=(*rows+span-1)/span;
  *extra=uint64_t(leaves)*(9ull*QW*sizeof(__half)+2ull*(*rows)*KW*sizeof(__half)+9ull*parts*(QW*sizeof(__half)+32*sizeof(float)));
  // Attributes must be installed by eager preflight, before a replay capture.
@@ -92,14 +93,14 @@ cudaError_t tree_tail_plan_v1(unsigned start,unsigned span,unsigned leaves,unsig
 }
 cudaError_t launch_tree_tail_v1(const float*q,const __half*k,const __half*v,float*out,
  __half*qh,__half*oh,__half*tmp,void*scratch,uint8_t*mask,const int*parents,
- unsigned start,unsigned span,unsigned chunks,unsigned begin,unsigned rows,unsigned leaf_mask,float scale,cudaStream_t stream){
+ unsigned start,unsigned span,unsigned chunks,unsigned begin,unsigned rows,unsigned leaf_mask,float scale,cudaStream_t stream,unsigned nodes){
  using namespace tree_tail_detail;
  unsigned leaves=0;for(unsigned m=leaf_mask;m;m&=m-1)++leaves;
- if(!leaves||leaves>16||begin>start||begin%span||rows!=start-begin+9||chunks!=(start+16+span-1)/span)return cudaErrorInvalidValue;
+ if(!span||nodes<2||nodes>16||!leaves||leaves>nodes||(leaf_mask>>nodes)||begin>start||begin%span||rows!=start-begin+9||chunks!=(uint64_t(start)+std::max(nodes,9u)+span-1)/span)return cudaErrorInvalidValue;
  const unsigned prefix=begin/span,parts=(rows+span-1)/span;
- auto*ls=reinterpret_cast<float*>(tmp+uint64_t(chunks)*16*QW);
- prepare_q<<<(16*QW+255)/256,256,0,stream>>>(q,qh,16*QW,scale);
- PP p(qh,const_cast<__half*>(k),const_cast<__half*>(v),mask,tmp,ls,nullptr,32,8,16,start+16,QW,64,KW,64,64,-1,0.f,1.f,1.f,10000.f);
+ auto*ls=reinterpret_cast<float*>(tmp+uint64_t(chunks)*nodes*QW);
+ prepare_q<<<(nodes*QW+255)/256,256,0,stream>>>(q,qh,nodes*QW,scale);
+ PP p(qh,const_cast<__half*>(k),const_cast<__half*>(v),mask,tmp,ls,nullptr,32,8,nodes,start+nodes,QW,64,KW,64,64,-1,0.f,1.f,1.f,10000.f);
  p.partition_kv=true;p.partition_fixed_span=span;p.batch_invariant_q8_v1=1;
  auto kernel=flashinfer::SinglePrefillWithKVCacheKernel<CT,PP>;void*args[]={&p};
  // The ordinary kernel's output stride is the total number of launched chunks.
@@ -111,8 +112,8 @@ cudaError_t launch_tree_tail_v1(const float*q,const __half*k,const __half*v,floa
  PP tp(tq,tk,tv,nullptr,to,tl,nullptr,32,8,9,rows,QW,64,KW,64,64,-1,0.f,1.f,1.f,10000.f);
  tp.partition_kv=true;tp.partition_fixed_span=span;tp.batch_invariant_q8_v1=1;
  batch_invariant_tree::tail<<<dim3(parts,leaves,8),dim3(32,4,1),sizeof(KT::SharedStorage),stream>>>(tp,rows);
- batch_invariant_tree::splice_v1<<<dim3((QW+255)/256,16),256,0,stream>>>(to,tl,tmp,ls,parents,leaf_mask,chunks,prefix,parts);
- merge_v1<<<16,dim3(8,32),0,stream>>>(tmp,ls,oh,16,chunks,start,span,parents);
- output_f32<<<(16*QW+255)/256,256,0,stream>>>(oh,out,16*QW);return cudaGetLastError();
+ batch_invariant_tree::splice_v1<<<dim3((QW+255)/256,nodes),256,0,stream>>>(to,tl,tmp,ls,parents,leaf_mask,chunks,prefix,parts);
+ merge_v1<<<nodes,dim3(8,32),0,stream>>>(tmp,ls,oh,nodes,chunks,start,span,parents);
+ output_f32<<<(nodes*QW+255)/256,256,0,stream>>>(oh,out,nodes*QW);return cudaGetLastError();
 }
 }

@@ -26,7 +26,7 @@ static std::vector<uint64_t> tree_replay_storage(){
  auto u=[&](uint64_t v){out.push_back(v);};
  p(&e);u(active_execution_owner_id);p(g.stream);p(g.weights);p(g.weights_host);
  u(g.weights_len);u(g.weights_device_bytes);u(g.choice_epoch);u(g.sm_version);
- u(g.kv_type_k);u(g.kv_type_v);u(batch_invariant_q8_v1_active());for(auto k:g.knobs)u(k);
+ u(g.kv_type_k);u(g.kv_type_v);u(batch_invariant_q8_v1_active());u(g.lfm_tree_graph_short);for(auto k:g.knobs)u(k);
   u(imparo_d64_fa2_port::tree_tail_shared_kv_enabled()); // transient tail layout and kernel identity
  for(unsigned i=0;i<B_COUNT;++i){p(e.bufs[i]);u(e.sizes[i]);}
  for(unsigned i=0;i<MAX_LAYERS;++i){p(e.kv_k[i]);p(e.kv_v[i]);u(e.kv_bytes[i]);p(kv_device_page_table(i));}
@@ -171,7 +171,11 @@ extern "C" int imparo_cuda_tree_graph_abort(){
 }
 extern "C" int imparo_cuda_tree_graph_prepare(unsigned*action){
  if(!action)return CUDA_RC_INVALID;*action=0;
- if(!imparo_lfm_retained::long_only(tree_replay_flag("IMPARO_LAB_LFM_TREE_GRAPH")))return 0;
+ // The registered, owner-frozen short policy reuses this exact replay plan.
+ // Default retained policy stays long-only; all storage/kernel guards below apply.
+ const bool short_trial=g.lfm_tree_graph_short==1&&imparo_lfm_retained::domain()==1
+  &&batch_invariant_q8_v1_active();
+ if(!imparo_lfm_retained::long_only(tree_replay_flag("IMPARO_LAB_LFM_TREE_GRAPH"))&&!short_trial)return 0;
  try{
   auto&e=execution();auto*s=imparo_dspark::attached.get();
   if(e.pending_error)return e.pending_error;
@@ -207,12 +211,14 @@ extern "C" int imparo_cuda_tree_graph_prepare(unsigned*action){
   if(!e.tree_replay)e.tree_replay=std::make_shared<TreeReplayState>();
   auto&r=*e.tree_replay;if(r.blocked)return 0;
   if(!r.warmed){r.warmed=true;return 0;}
-  // Reserve the same existing workspace for the maximum tail of this physical
-  // capacity. No new scratch layout or weight format is introduced.
+  // A shared pool holds many conversations, but this graph executes one target
+  // tree. Bound its workspace by that target's admitted logical context; using
+  // the whole pool here silently disables the existing long-context graph.
   const uint64_t extra=geo.batch_invariant
    ?16ull*(9ull*2048*2+2ull*(span+8)*512*2+18ull*(2048*2+32*4))
    :16ull*(2ull*9*2048*2+2ull*span*512*2+9ull*32*4);
-  const uint64_t worst=imparo_d64_fa2_port::workspace_bytes(16,32,capacity,true)+extra;
+  const uint64_t worst=imparo_d64_fa2_port::workspace_bytes(
+   16,32,d64_attention_context_capacity(capacity),true)+extra;
   if(worst>attention_workspace_budget(64)||!ensure_attention_scratch(worst))return 0;
   const uint64_t qbytes=std::max(e.q8_scratch_bytes,e.q8_scratch_next_bytes);
   if(!qbytes||ensure_q8_scratch(qbytes)||!ensure_q8_scratch_next(qbytes))return CUDA_RC_ERROR;

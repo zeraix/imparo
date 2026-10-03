@@ -60,51 +60,7 @@ __global__ void q4_q8_1_decode_rows(
         const uint8_t * __restrict__ w, const BlockQ8_1 * __restrict__ x,
         float * __restrict__ y, uint32_t n_in, uint32_t n_out,
         uint32_t row_base) {
-    static_assert(NWarps == 2 || NWarps == 4 || NWarps == 8,
-                  "registered decode MMVQ warp count");
-    static_assert(NRows == 2 || NRows == 4,
-                  "registered small-K output row group");
-    const uint32_t row0 = NRows * blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    const uint32_t warp = threadIdx.y;
-    const uint32_t tid = warp * 32 + lane;
-    const uint32_t blocks = n_in / 32;
-    const uint32_t iqs = 2 * (tid & 1);
-    float sums[NRows] = {};
-    for (uint32_t block = tid / 2; block < blocks; block += 16 * NWarps) {
-        const BlockQ8_1 * xb = x + block;
-#pragma unroll
-        for (uint32_t local = 0; local < NRows; ++local) {
-            if (row0 + local < n_out) {
-                sums[local] += dot_q4_0_q8_1_half(
-                    w + (uint64_t(row0 + local) * blocks + block) * 18,
-                    xb, iqs);
-            }
-        }
-    }
-    __shared__ float partial[NWarps - 1][NRows][32];
-    if (warp > 0) {
-#pragma unroll
-        for (uint32_t local = 0; local < NRows; ++local) {
-            partial[warp - 1][local][lane] = sums[local];
-        }
-    }
-    __syncthreads();
-    if (warp > 0) return;
-#pragma unroll
-    for (uint32_t other = 0; other < NWarps - 1; ++other) {
-#pragma unroll
-        for (uint32_t local = 0; local < NRows; ++local) {
-            sums[local] += partial[other][local][lane];
-        }
-    }
-#pragma unroll
-    for (uint32_t local = 0; local < NRows; ++local) {
-        sums[local] = warp_sum_xor(sums[local]);
-        if (lane == 0 && row0 + local < n_out) {
-            y[row_base + row0 + local] = sums[local];
-        }
-    }
+#include "mmvq_q4_q8_1_decode_rows_body.inc"
 }
 
 inline void launch_decode(
@@ -578,46 +534,11 @@ inline void launch_tile_major_gated_decode(
 // Decode-only paired projection. The two dot products retain the exact single-MMVQ
 // traversal/reduction order, but share the Q8_1 activation and launch. This is a
 // semantic gated-linear primitive: it contains no model shape or buffer identifiers.
-template <uint32_t NWarps>
+template <uint32_t NWarps, bool Silu = false>
 __global__ void q4_q8_1_gated_decode(
         const uint8_t * gate_w, const uint8_t * up_w,
         const BlockQ8_1 * x, float * y, uint32_t n_in, uint32_t n_out) {
-    static_assert(NWarps == 2 || NWarps == 4 || NWarps == 8,
-                  "registered gated MMVQ warp count");
-    const uint32_t row = blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    const uint32_t warp = threadIdx.y;
-    const uint32_t tid = warp * 32 + lane;
-    const uint32_t blocks = n_in / 32;
-    const uint32_t iqs = 2 * (tid & 1);
-
-    float gate = 0.0f;
-    float up = 0.0f;
-    for (uint32_t block = tid / 2; block < blocks; block += 16 * NWarps) {
-        const BlockQ8_1 * xb = x + block;
-        gate += dot_q4_0_q8_1_half(
-            gate_w + (uint64_t(row) * blocks + block) * 18, xb, iqs);
-        up += dot_q4_0_q8_1_half(
-            up_w + (uint64_t(row) * blocks + block) * 18, xb, iqs);
-    }
-
-    __shared__ float gate_partial[NWarps - 1][32];
-    __shared__ float up_partial[NWarps - 1][32];
-    if (warp > 0) {
-        gate_partial[warp - 1][lane] = gate;
-        up_partial[warp - 1][lane] = up;
-    }
-    __syncthreads();
-    if (warp > 0) return;
-
-#pragma unroll
-    for (uint32_t other = 0; other < NWarps - 1; ++other) {
-        gate += gate_partial[other][lane];
-        up += up_partial[other][lane];
-    }
-    gate = warp_sum_xor(gate);
-    up = warp_sum_xor(up);
-    if (lane == 0 && row < n_out) y[row] = cuda_gelu(gate) * up;
+#include "mmvq_q4_q8_1_gated_decode_body.inc"
 }
 
 inline void launch_gated_decode(

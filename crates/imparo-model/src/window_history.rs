@@ -43,19 +43,26 @@ pub(crate) fn lfm_full_history_control_enabled() -> bool {
     *LFM_FULL_HISTORY_CONTROL.get_or_init(|| false)
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Reach {
     floor: usize,
     end: usize,
     valid: bool,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct WindowHistory {
     enabled: bool,
     region: Cell<usize>,
     regions: RefCell<BTreeMap<usize, Reach>>,
 }
 impl WindowHistory {
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+    /// New/released slots inherit tracking policy, never another request's reach.
+    pub(crate) fn empty_for_slot(&self) -> Self {
+        Self { enabled: self.enabled, ..Self::default() }
+    }
     pub(crate) fn new(windowed: bool) -> Self {
         Self {
             enabled: windowed
@@ -268,6 +275,21 @@ mod tests {
             region: Cell::new(0),
             regions: RefCell::new(BTreeMap::new()),
         }
+    }
+    #[test]
+    fn fresh_slot_inherits_policy_without_borrowing_history() {
+        let original = tracked();
+        let ticket = original.begin(0).unwrap();
+        original.commit(ticket, 0, 512, 512);
+        let fresh = original.empty_for_slot();
+        assert!(fresh.enabled());
+        assert_eq!(fresh.allows(512), Some(false));
+        let ticket = fresh.begin(0).unwrap();
+        fresh.commit(ticket, 0, 20, 512);
+        assert_eq!(fresh.allows(20), Some(true));
+        assert_eq!(fresh.allows(512), Some(false));
+        assert_eq!(original.allows(512), Some(true));
+        assert!(!WindowHistory::default().empty_for_slot().enabled());
     }
     #[test]
     fn failed_step_retries_without_resurrecting_overwritten_floor() {

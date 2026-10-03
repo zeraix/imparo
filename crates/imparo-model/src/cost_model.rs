@@ -582,30 +582,52 @@ impl CostLaw {
     /// sound and cheap, not because a measurement asked for it.
     pub fn refit(&mut self) -> bool {
         let (train, held) = self.split_held();
-        if train.len() < WARM + WARM || held.is_empty() {
+        // EVERY BAND THE LAW SPANS IS JUDGED. The held-out slice comes only from bands with four
+        // samples or more, so a band measured only by its three probes was invisible to the test:
+        // on Qwen3-4B the 5-6 row law held out one 1657-token sample, could not see the 8444 band
+        // where its flat online fit read 28 ms against samples of 34.8 to 35.7, and kept it. A
+        // band too small to spare a sample is judged on the samples the candidate trains on.
+        // With no sample held out at all -- every band is a probe band, the law that most needs
+        // this refit -- that is all of them: both laws were fitted to exactly these samples, so
+        // the comparison is of how well each fits them.
+        let held_bands: std::collections::BTreeSet<usize> =
+            held.iter().map(|&(c, _)| band_of(c as usize)).collect();
+        let mut judged = held.clone();
+        judged.extend(train.iter().copied().filter(|&(c, _)| !held_bands.contains(&band_of(c as usize))));
+        let lo = self.bank.iter().map(|&(c, _)| f64::from(c)).fold(f64::INFINITY, f64::min);
+        let hi = self.bank.iter().map(|&(c, _)| f64::from(c)).fold(0.0, f64::max);
+        if held.is_empty() && hi <= lo * SPAN {
+            return false; // one span of context and nothing held out: no slope to fit
+        }
+        if train.len() <= WARM || judged.is_empty() {
             return false;
         }
-        // THE BANK MUST COVER THE CONTEXTS THE LAW WAS TRAINED ON. The held-out test scores
-        // both laws only at the bank's contexts, so a bank from one band -- a law restored from
-        // a store written before the bank existed -- would replace a law fitted over many with
-        // one that is flat everywhere else.
+        // THE BANK MUST COVER THE CONTEXTS THE LAW WAS TRAINED ON. The test scores both laws only
+        // at the bank's contexts, so a bank from one band -- a law restored from a store written
+        // before the bank existed -- would replace a law fitted over many with one that is flat
+        // everywhere else.
         //
-        //   Correct: bank spans the law's contexts -> the held-out test can judge the law
+        //   Correct: bank spans the law's contexts -> the test can judge the law
         //   Wrong:   samples at 8460..8584 only -> a flat fit wins there -> the 8-row law trained
         //            over 443..8584 prices 8 rows at 35.1 ms at a 1596-token context, where they
         //            take 26.9 (Qwen3-4B, learned widths: the chooser then held 7 rows)
-        let lo = self.bank.iter().map(|&(c, _)| f64::from(c)).fold(f64::INFINITY, f64::min);
-        let hi = self.bank.iter().map(|&(c, _)| f64::from(c)).fold(0.0, f64::max);
         if lo > self.lo_ctx * SPAN || hi * SPAN < self.hi_ctx {
             return false;
         }
+        // CONVERGENCE IS A STEP COUNT, NOT A PASS COUNT. `EPOCHS` passes over a full bank -- the
+        // three quarters of `BANK` per band that train -- is what the refit was sized on; a probe
+        // band of three samples made the same 24 passes 96 steps, and the 9-row law stopped at 48
+        // ms against a measured 56.6. So a sparse bank is passed over until it has had the steps
+        // a full bank of the same span would have.
+        let bands = train.iter().map(|&(c, _)| band_of(c as usize)).collect::<std::collections::BTreeSet<_>>().len();
+        let passes = EPOCHS.max((EPOCHS * (BANK - BANK / 4) * bands).div_ceil(train.len()));
         let mut cand = Self::new();
-        for _ in 0..EPOCHS {
+        for _ in 0..passes {
             for &(c, v) in &train {
                 cand.observe(c as usize, f64::from(v));
             }
         }
-        if cand.score(&held) < self.score(&held) {
+        if cand.score(&judged) < self.score(&judged) {
             // The candidate's own counts describe the replay, not the evidence: the law keeps
             // what it had seen, the span it was trained over and its bank.
             cand.bank = std::mem::take(&mut self.bank);
@@ -762,6 +784,50 @@ impl CostLaw {
 
 #[cfg(test)]
 mod tests {
+    /// A law fitted only from its cold-start probes is refit to them, in every band it spans.
+    #[test]
+    fn a_law_measured_only_by_its_probes_is_refit_to_its_long_context_samples() {
+        // Qwen3-4B, 4 rows: the bank a store held after one warm-up, three probes per band.
+        let bank = [
+            (451, 24.564), (453, 24.203), (456, 25.421), (1597, 26.096), (1606, 25.892),
+            (8447, 34.235), (8446, 34.557), (8448, 34.298),
+        ];
+        let mut law = CostLaw::new();
+        for &(c, v) in &bank {
+            law.observe(c, v);
+        }
+        let before = law.ms(8444).unwrap();
+        assert!(before < 28.0, "the online pass alone left the law flat: {before}");
+        assert!(law.split_held().1.is_empty(), "no band can hold a sample out");
+        assert!(law.refit(), "a sparse law spanning three bands must be refit");
+        let after = law.ms(8444).unwrap();
+        assert!((after - 34.2).abs() < 1.5, "refit law at 8444: {after}, measured 34.2..34.6");
+        assert!((law.ms(451).unwrap() - 24.2).abs() < 1.0, "and still fits the short context");
+        // A probe-only bank in two bands converges too: 96 steps stopped the 9-row law at 48 ms.
+        let mut nine = CostLaw::new();
+        for &(c, v) in &[(551, 36.7), (552, 36.5), (553, 36.3), (8449, 56.6)] {
+            nine.observe(c, v);
+        }
+        assert!(nine.refit());
+        assert!((nine.ms(8444).unwrap() - 56.6).abs() < 1.5, "9 rows at 8444: {}", nine.ms(8444).unwrap());
+        // A band of four holds one out, and the probe band beside it must still be judged.
+        let mut mixed = CostLaw::new();
+        for &(c, v) in &[
+            (1671, 27.1), (1674, 26.2), (1680, 26.8), (1657, 27.6),
+            (8447, 34.8), (8445, 35.5), (8449, 35.7),
+        ] {
+            mixed.observe(c, v);
+        }
+        assert!(mixed.refit(), "the 8444 band was invisible to a 1657-only held-out test");
+        assert!((mixed.ms(8444).unwrap() - 34.8).abs() < 1.5, "5-6 rows at 8444: {}", mixed.ms(8444).unwrap());
+        // A law measured at one context only has no slope to fit, and keeps what it had.
+        let mut flat = CostLaw::new();
+        for &(c, v) in &[(480, 103.5), (512, 102.6), (515, 101.4), (500, 102.0)] {
+            flat.observe(c, v);
+        }
+        assert!(!flat.refit());
+    }
+
     /// The rate a stored and seeded learner reports is the rate it was stored with, in every band,
     /// and it goes on learning from there exactly.
     #[test]

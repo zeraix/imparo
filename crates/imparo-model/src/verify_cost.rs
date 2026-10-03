@@ -306,6 +306,14 @@ pub struct VerifyCost {
     gain: crate::cost_model::MarginGain,
     /// The same scale for the n-gram's and agreed nodes' marginal (design 6.6's g_n).
     gain_n: crate::cost_model::MarginGain,
+    /// THE TWO SCALES BELOW THE REFERENCE WIDTH. `gain` and `gain_n` are learned only from rounds
+    /// wider than the reference, so on a target whose best width IS the reference they rest on
+    /// the few rounds that went wider -- measured, 3 of 1,115 on Qwen3-4B, each realising none of
+    /// its predicted marginal, which drove the fitted line to its floor at 8444 while the 450
+    /// rounds that revealed rows 2-8 showed S right to 0.94. A width below the reference is priced
+    /// by the rows it gives up, and every round reveals those, so they get their own scales.
+    gain_below: crate::cost_model::MarginGain,
+    gain_n_below: crate::cost_model::MarginGain,
     /// The width the chooser held last round, and for how many rounds in a row.
     incumbent: usize,
     held: u64,
@@ -338,6 +346,8 @@ impl VerifyCost {
             at: 0,
             gain: crate::cost_model::MarginGain::default(),
             gain_n: crate::cost_model::MarginGain::default(),
+            gain_below: crate::cost_model::MarginGain::default(),
+            gain_n_below: crate::cost_model::MarginGain::default(),
             incumbent: 0,
             held: 0,
         })
@@ -740,6 +750,37 @@ impl VerifyCost {
         self.gain_n.seed(xx, xy, seen);
     }
 
+    /// The drafter's and the n-gram's marginal scales BELOW the reference width, 1.0 until
+    /// evidenced: `(g_d, g_n)`.
+    #[must_use]
+    pub fn gain_below(&self) -> (f64, f64) {
+        (self.gain_below.at(self.at), self.gain_n_below.at(self.at))
+    }
+
+    /// One round's evidence below the reference: the predicted and realised marginal of the
+    /// rows between the narrowest offered width and the reference (or the round's own width,
+    /// if narrower), the drafter's and the n-gram's.
+    pub fn observe_gain_below(&mut self, ctx: usize, drafter: (f64, f64), ngram: (f64, f64)) {
+        self.gain_below.observe(ctx, drafter.0, drafter.1);
+        self.gain_n_below.observe(ctx, ngram.0, ngram.1);
+    }
+
+    /// The two below-reference scales' state, for the store: `(drafter, n-gram)`.
+    #[must_use]
+    pub fn gain_below_state(&self) -> (([f64; 3], [f64; 2], u64), ([f64; 3], [f64; 2], u64)) {
+        (self.gain_below.state(), self.gain_n_below.state())
+    }
+
+    /// The below-reference scales from the store.
+    pub fn seed_gain_below(
+        &mut self,
+        drafter: ([f64; 3], [f64; 2], u64),
+        ngram: ([f64; 3], [f64; 2], u64),
+    ) {
+        self.gain_below.seed(drafter.0, drafter.1, drafter.2);
+        self.gain_n_below.seed(ngram.0, ngram.1, ngram.2);
+    }
+
     /// THE LEARNED LAWS, to store: `(lo, hi, weights, squared gradients, trained rounds,
     /// lo_ctx, hi_ctx, scale, floor)`, the clock as `(0, 0, ..)`.
     ///
@@ -869,10 +910,544 @@ impl VerifyCost {
     }
 }
 
+/// Passive observations for sessions whose native paths do not yet participate in
+/// the shared budget. Reuse the existing learners without probing or choosing rows.
+/// An entry belongs to one chain/tree path, exact topology and actual submission mode;
+/// equal row counts do not establish equal FFN/attention/recurrent/commit work. The
+/// caller keeps the model/configuration fixed for this request; no layout equivalence
+/// or cross-request cache is inferred here.
+pub struct TreeCostObserver {
+    max_rows: usize,
+    entries: Vec<TreeCostEntry>,
+    samples: std::collections::VecDeque<serde_json::Value>,
+    observed: u64,
+    rejected: u64,
+    untracked_shapes: u64,
+    reported: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservedPath {
+    Chain,
+    Tree,
+}
+
+impl ObservedPath {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chain => "chain",
+            Self::Tree => "tree",
+        }
+    }
+}
+
+struct TreeCostEntry {
+    path: ObservedPath,
+    execution_domain: u64,
+    parents: Vec<i32>,
+    submission: crate::speculative::TreeSubmission,
+    cost: VerifyCost,
+    rate: crate::cost_model::LongRunRate,
+    min_context: usize,
+    max_context: usize,
+    rounds: u64,
+    total_us: f64,
+    accepted: u64,
+}
+
+impl TreeCostObserver {
+    const SHAPES: usize = 32;
+    const SAMPLES: usize = 128;
+
+    /// Session capability, not ROW_LAYOUT_MAX_ROWS or a fabricated 64-row ladder.
+    #[must_use]
+    pub fn new(max_rows: usize) -> Option<Self> {
+        (2..=imparo_backend::ROW_LAYOUT_MAX_ROWS).contains(&max_rows).then(|| Self {
+            max_rows,
+            entries: Vec::new(),
+            samples: std::collections::VecDeque::new(),
+            observed: 0,
+            rejected: 0,
+            untracked_shapes: 0,
+            reported: 0,
+        })
+    }
+
+    pub fn observe(
+        &mut self,
+        tree: &crate::speculative::DraftTree,
+        round: &crate::speculative::TreeRoundTiming,
+    ) {
+        self.observe_in_domain(tree, round, 0);
+    }
+
+    /// The caller's verified execution domain separates actual native routing regimes.
+    /// Zero preserves the original observer contract; a domain does not imply a layout.
+    pub fn observe_in_domain(
+        &mut self,
+        tree: &crate::speculative::DraftTree,
+        round: &crate::speculative::TreeRoundTiming,
+        domain: u64,
+    ) {
+        if tree.tokens.len() != round.rows {
+            self.rejected += 1;
+            return;
+        }
+        self.observe_path(ObservedPath::Tree, domain, &tree.parents, round);
+    }
+
+    /// Observe an ordinary draft-chain round without inventing a DraftTree or its
+    /// value-model features. A one-row stop tail has no VerifyCost class and is rejected.
+    pub fn observe_chain(&mut self, round: &crate::speculative::TreeRoundTiming) {
+        self.observe_chain_in_domain(round, 0);
+    }
+
+    pub fn observe_chain_in_domain(
+        &mut self,
+        round: &crate::speculative::TreeRoundTiming,
+        domain: u64,
+    ) {
+        if !(2..=self.max_rows).contains(&round.rows) {
+            self.rejected += 1;
+            return;
+        }
+        let parents: Vec<i32> = (0..round.rows).map(|row| row as i32 - 1).collect();
+        self.observe_path(ObservedPath::Chain, domain, &parents, round);
+    }
+
+    fn observe_path(
+        &mut self,
+        path: ObservedPath,
+        domain: u64,
+        parents: &[i32],
+        round: &crate::speculative::TreeRoundTiming,
+    ) {
+        use crate::speculative::TreeSubmission;
+        let parts = round.fixed.saturating_add(round.verify).saturating_add(round.commit);
+        if !(2..=self.max_rows).contains(&round.rows)
+            || parents.len() != round.rows
+            || parents.first() != Some(&-1)
+            || parents.iter().enumerate().skip(1)
+                .any(|(i, &p)| usize::try_from(p).map_or(true, |p| p >= i))
+            || round.accepted == 0 || round.accepted > round.rows
+            || round.verify.is_zero() || round.total < parts
+        {
+            self.rejected += 1;
+            return;
+        }
+        self.observed += 1;
+        let mode = match round.submission {
+            TreeSubmission::Unknown => "unknown",
+            TreeSubmission::Ordinary => "ordinary",
+            TreeSubmission::Capture => "capture",
+            TreeSubmission::Replayed => "replayed",
+        };
+        // Capture includes setup, and a final kept path is censored by the output
+        // budget. Both remain visible, but neither teaches a steady-state price.
+        let learn = round.continuing && matches!(round.submission,
+            TreeSubmission::Ordinary | TreeSubmission::Replayed);
+        let mut learned = false;
+        if learn {
+            let entry = self.entries.iter().position(|e|
+                e.path == path && e.execution_domain == domain && e.parents.as_slice() == parents
+                    && e.submission == round.submission);
+            let entry = entry.or_else(|| {
+                if self.entries.len() == Self::SHAPES {
+                    self.untracked_shapes += 1;
+                    return None;
+                }
+                let mut cost = VerifyCost::new(self.max_rows).expect("bounded session rows");
+                // The shared learner records only a step's top. This passive
+                // entry already has an exact observed width, which may fall
+                // between ladder tops; isolate it without probing other rows
+                // or declaring their costs equivalent to this topology's.
+                for top in [round.rows - 1, round.rows] {
+                    if let Some(step) = cost.steps.iter().position(|s| s.lo <= top && top < s.hi) {
+                        VerifyCost::split(&mut cost.steps, step, top);
+                    }
+                }
+                let index = self.entries.len();
+                self.entries.push(TreeCostEntry {
+                    path, execution_domain: domain,
+                    parents: parents.to_vec(), submission: round.submission,
+                    cost,
+                    rate: crate::cost_model::LongRunRate::default(),
+                    min_context: round.context, max_context: round.context,
+                    rounds: 0, total_us: 0.0, accepted: 0,
+                });
+                Some(index)
+            });
+            if let Some(index) = entry {
+                let e = &mut self.entries[index];
+                e.min_context = e.min_context.min(round.context);
+                e.max_context = e.max_context.max(round.context);
+                e.cost.set_context(round.context);
+                // The verify already includes target KV/recurrent commit. The
+                // remainder includes draft, prepare, provider append and host work.
+                e.cost.observe_fixed(round.total - round.verify);
+                e.cost.observe(round.rows, round.verify);
+                e.rate.observe(round.context, round.accepted,
+                    round.total.as_secs_f64() * 1e6);
+                e.rounds += 1;
+                e.total_us += round.total.as_secs_f64() * 1e6;
+                e.accepted = e.accepted.saturating_add(round.accepted as u64);
+                learned = true;
+            }
+        }
+        if self.samples.len() == Self::SAMPLES { self.samples.pop_front(); }
+        self.samples.push_back(serde_json::json!({
+            "path": path.label(), "execution_domain": domain,
+            "context": round.context, "rows": round.rows, "parents": parents,
+            "accepted": round.accepted, "submission": mode,
+            "continuing": round.continuing, "learned": learned,
+            "fixed_us": round.fixed.as_secs_f64() * 1e6,
+            "verify_us": round.verify.as_secs_f64() * 1e6,
+            "commit_us": round.commit.as_secs_f64() * 1e6,
+            "total_us": round.total.as_secs_f64() * 1e6,
+        }));
+    }
+
+    /// Compare only observed, warmed LongRunRate bands. Each candidate remains its
+    /// exact path/rows/topology/submission entry. Sharing a coarse context band does
+    /// not prove matched output quality or a causal benefit from switching. This report
+    /// neither probes an absent path nor changes the provider's frozen configuration.
+    fn shadow_comparisons(&self) -> Vec<serde_json::Value> {
+        let bands: std::collections::BTreeSet<(u64, usize)> = self.entries.iter()
+            .flat_map(|entry| entry.rate.rows().into_iter()
+                .map(move |row| (entry.execution_domain, row.0)))
+            .collect();
+        let mut comparisons = Vec::new();
+        for (domain, band) in bands {
+            // LongRunRate exports its occupied bit-length buckets. Use the first
+            // context of that same bucket solely to query its existing warm-up gate.
+            let context = if band == 0 { 0 } else { 1usize << (band - 1) };
+            let eligible: Vec<_> = self.entries.iter().enumerate()
+                .filter(|(_, entry)| entry.execution_domain == domain)
+                .filter_map(|(index, entry)| entry.rate.at(context)
+                    .filter(|rate| rate.is_finite() && *rate > 0.0)
+                    .map(|rate| (index, entry, rate)))
+                .collect();
+            if !eligible.iter().any(|(_, entry, _)| entry.path == ObservedPath::Chain)
+                || !eligible.iter().any(|(_, entry, _)| entry.path == ObservedPath::Tree)
+            {
+                continue;
+            }
+            let Some(&(best, winner, best_rate)) = eligible.iter()
+                .max_by(|a, b| a.2.total_cmp(&b.2)) else { continue };
+            let candidates: Vec<_> = eligible.iter().map(|&(index, entry, rate)| {
+                serde_json::json!({
+                    "entry": index, "path": entry.path.label(),
+                    "execution_domain": entry.execution_domain,
+                    "rows": entry.parents.len(), "parents": entry.parents,
+                    "submission": format!("{:?}", entry.submission),
+                    "samples": entry.rate.seen(context),
+                    "observed_tokens_per_second": rate * 1e6,
+                })
+            }).collect();
+            comparisons.push(serde_json::json!({
+                "mode": "shadow-only", "context_band": band,
+                "execution_domain": domain,
+                "basis": "observed_full_round_rates", "selection_applied": false,
+                "chosen_entry": best, "chosen_path": winner.path.label(),
+                "chosen_rows": winner.parents.len(),
+                "observed_tokens_per_second": best_rate * 1e6,
+                "candidates": candidates,
+            }));
+        }
+        comparisons
+    }
+
+    /// One bounded request-end report. No file/cache identity and no persistence:
+    /// these laws must never seed another model, config, or submission contract.
+    pub fn take_report(&mut self) -> Option<serde_json::Value> {
+        let count = self.observed + self.rejected;
+        if count == self.reported { return None; }
+        self.reported = count;
+        let entries: Vec<_> = self.entries.iter().map(|e| serde_json::json!({
+            "path": e.path.label(), "rows": e.parents.len(),
+            "execution_domain": e.execution_domain,
+            "parents": e.parents, "submission": format!("{:?}", e.submission),
+            "context_min": e.min_context, "context_max": e.max_context,
+            "context_current": e.cost.context(),
+            "verify_cost": e.cost.report(), "fixed_us": e.cost.fixed_us(),
+            "rate": e.rate.rows(),
+            "rounds": e.rounds, "mean_total_us": e.total_us / e.rounds as f64,
+            "observed_tokens_per_second": e.accepted as f64 * 1e6 / e.total_us,
+        })).collect();
+        Some(serde_json::json!({
+            "version": 1, "passive": true, "max_rows": self.max_rows,
+            "observed": self.observed, "rejected": self.rejected,
+            "untracked_shapes": self.untracked_shapes,
+            "retained_samples": self.samples.len(), "samples": self.samples,
+            "entries": entries,
+            "shadow_only": true, "shadow": self.shadow_comparisons(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PROBES, REFINE_HOLD, VerifyCost, WINDOW};
     use std::time::Duration;
+
+    fn native_round(at: usize) -> (crate::speculative::DraftTree, crate::speculative::TreeRoundTiming) {
+        use crate::speculative::{DraftTree, TreeRoundTiming, TreeSubmission};
+        (DraftTree::plain(vec![1, 2, 3], vec![-1, 0, 1]), TreeRoundTiming {
+            context: at, rows: 3, accepted: 2, submission: TreeSubmission::Ordinary,
+            fixed: Duration::from_micros(2), verify: Duration::from_micros(5),
+            commit: Duration::from_micros(3), total: Duration::from_micros(11),
+            continuing: true,
+        })
+    }
+
+    #[test]
+    fn chain_and_tree_with_identical_rows_and_parents_never_share_a_price() {
+        let mut observer = super::TreeCostObserver::new(4).unwrap();
+        let (tree, round) = native_round(512);
+        observer.observe(&tree, &round);
+        let mut chain = round;
+        chain.total = Duration::from_micros(22);
+        observer.observe_chain(&chain);
+        assert_eq!(observer.entries.len(), 2);
+        let tree_entry = &observer.entries[0];
+        let chain_entry = &observer.entries[1];
+        assert_eq!(tree_entry.parents, chain_entry.parents);
+        assert_eq!(tree_entry.submission, chain_entry.submission);
+        assert_eq!(tree_entry.path, super::ObservedPath::Tree);
+        assert_eq!(chain_entry.path, super::ObservedPath::Chain);
+        assert_eq!(tree_entry.total_us, 11.0);
+        assert_eq!(chain_entry.total_us, 22.0);
+        let report = observer.take_report().unwrap();
+        assert_eq!(report["entries"][0]["path"], "tree");
+        assert_eq!(report["entries"][1]["path"], "chain");
+        assert_eq!(report["samples"][0]["path"], "tree");
+        assert_eq!(report["samples"][1]["path"], "chain");
+        assert!(report["shadow"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shadow_uses_full_round_rate_even_when_verify_alone_favors_the_other_path() {
+        let mut observer = super::TreeCostObserver::new(4).unwrap();
+        let (mut tree, mut chain_round) = native_round(512);
+        chain_round.fixed = Duration::from_micros(1);
+        chain_round.verify = Duration::from_micros(1);
+        chain_round.commit = Duration::from_micros(1);
+        chain_round.total = Duration::from_micros(20);
+        let mut tree_round = chain_round;
+        tree_round.rows = 4;
+        tree_round.accepted = 3;
+        tree_round.verify = Duration::from_micros(10);
+        tree_round.total = Duration::from_micros(15);
+        tree.tokens.push(4);
+        tree.parents.push(0);
+        for _ in 0..8 {
+            observer.observe_chain(&chain_round);
+            observer.observe(&tree, &tree_round);
+        }
+        let report = observer.take_report().unwrap();
+        assert_eq!(report["entries"][0]["mean_total_us"], 20.0);
+        assert_eq!(report["entries"][1]["mean_total_us"], 15.0);
+        let shadow = &report["shadow"][0];
+        assert_eq!(shadow["mode"], "shadow-only");
+        assert_eq!(shadow["chosen_path"], "tree");
+        assert_eq!(shadow["chosen_rows"], 4);
+        let candidates = shadow["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2); // No hypothetical widths or unobserved routes.
+        let chain_rate = candidates[0]["observed_tokens_per_second"].as_f64().unwrap();
+        let tree_rate = candidates[1]["observed_tokens_per_second"].as_f64().unwrap();
+        assert!((chain_rate - 100_000.0).abs() < 1e-6);
+        assert!((tree_rate - 200_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shadow_needs_warmed_chain_and_tree_in_the_same_observed_context_band() {
+        let mut observer = super::TreeCostObserver::new(4).unwrap();
+        let (tree, mut round) = native_round(512);
+        for _ in 0..8 { observer.observe(&tree, &round); }
+        assert!(observer.shadow_comparisons().is_empty());
+        round.context = 1024;
+        for _ in 0..8 { observer.observe_chain(&round); }
+        assert!(observer.shadow_comparisons().is_empty());
+        round.context = 768; // Same existing LongRunRate band as 512.
+        for _ in 0..7 { observer.observe_chain(&round); }
+        assert!(observer.shadow_comparisons().is_empty());
+        observer.observe_chain(&round);
+        let comparisons = observer.shadow_comparisons();
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0]["context_band"], 10);
+    }
+
+    #[test]
+    fn shadow_prefers_chain_when_extra_tree_acceptance_costs_more_per_token() {
+        let mut observer = super::TreeCostObserver::new(3).unwrap();
+        let (tree, chain_round) = native_round(512);
+        let mut tree_round = chain_round;
+        tree_round.accepted = 3;
+        tree_round.total = Duration::from_micros(33);
+        for _ in 0..8 {
+            observer.observe(&tree, &tree_round);
+            observer.observe_chain(&chain_round);
+        }
+        // Identical rows/topology and greater tree acceptance cannot substitute
+        // for whole-round throughput: tree 3/33 loses to chain 2/11.
+        let comparisons = observer.shadow_comparisons();
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0]["chosen_path"], "chain");
+        assert_eq!(comparisons[0]["chosen_rows"], 3);
+        assert_eq!(comparisons[0]["selection_applied"], false);
+        let candidates = comparisons[0]["candidates"].as_array().unwrap();
+        assert_eq!(candidates[0]["rows"], candidates[1]["rows"]);
+        assert_eq!(candidates[0]["parents"], candidates[1]["parents"]);
+    }
+
+    #[test]
+    fn chain_capture_unknown_censored_and_one_row_do_not_teach_costs() {
+        use crate::speculative::TreeSubmission;
+        let mut observer = super::TreeCostObserver::new(4).unwrap();
+        let (_, mut round) = native_round(512);
+        for mode in [TreeSubmission::Capture, TreeSubmission::Unknown] {
+            round.submission = mode;
+            observer.observe_chain(&round);
+        }
+        round.submission = TreeSubmission::Ordinary;
+        round.continuing = false;
+        observer.observe_chain(&round);
+        assert_eq!(observer.observed, 3);
+        assert!(observer.entries.is_empty());
+        assert!(observer.samples.iter().all(|sample| sample["learned"] == false));
+        round.continuing = true;
+        round.rows = 1;
+        round.accepted = 1;
+        observer.observe_chain(&round);
+        assert_eq!(observer.rejected, 1);
+        assert!(observer.entries.is_empty());
+        round.rows = 3;
+        round.submission = TreeSubmission::Ordinary;
+        observer.observe_chain(&round);
+        round.submission = TreeSubmission::Replayed;
+        observer.observe_chain(&round);
+        assert_eq!(observer.entries.len(), 2);
+    }
+
+    #[test]
+    fn execution_domains_never_share_prices_or_shadow_candidates() {
+        let mut observer = super::TreeCostObserver::new(4).unwrap();
+        let (tree, round) = native_round(512);
+        for _ in 0..8 {
+            observer.observe_in_domain(&tree, &round, 1);
+            observer.observe_chain_in_domain(&round, 2);
+        }
+        assert_eq!(observer.entries.len(), 2);
+        assert!(observer.shadow_comparisons().is_empty());
+        for _ in 0..7 { observer.observe_chain_in_domain(&round, 1); }
+        assert!(observer.shadow_comparisons().is_empty());
+        observer.observe_chain_in_domain(&round, 1);
+        let comparisons = observer.shadow_comparisons();
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0]["execution_domain"], 1);
+        assert!(comparisons[0]["candidates"].as_array().unwrap().iter()
+            .all(|entry| entry["execution_domain"] == 1));
+        observer.observe_in_domain(&tree, &round, 2);
+        assert_eq!(observer.entries.len(), 4); // Same tree/rows/parents, distinct domain.
+        observer.observe(&tree, &round);
+        assert_eq!(observer.entries.last().unwrap().execution_domain, 0);
+        let report = observer.take_report().unwrap();
+        assert_eq!(report["entries"][0]["execution_domain"], 1);
+        assert_eq!(report["samples"][1]["execution_domain"], 2);
+    }
+
+    #[test]
+    fn native_full_round_uses_explicit_context_and_includes_append() {
+        let mut observer = super::TreeCostObserver::new(16).unwrap();
+        for at in [512, 518, 525] {
+            let (tree, round) = native_round(at);
+            observer.observe(&tree, &round);
+        }
+        let e = &observer.entries[0];
+        assert_eq!(e.cost.context(), 525);
+        assert_eq!((e.min_context, e.max_context), (512, 525));
+        assert_eq!(e.cost.fixed.min(), Some(6.0)); // total - verify, not draft only
+        assert_eq!(e.cost.steps.last().unwrap().hi, 16);
+        assert_eq!(e.cost.steps.iter().filter(|s| s.seen > 0).count(), 1);
+        assert_eq!(e.rate.seen(512), 3);
+        assert_eq!(observer.take_report().unwrap()["observed"], 3);
+        assert!(observer.take_report().is_none());
+    }
+
+    #[test]
+    fn native_observer_isolates_actual_width_without_losing_non_ladder_samples() {
+        let mut observer = super::TreeCostObserver::new(16).unwrap();
+        let (_, mut round) = native_round(512);
+        for rows in 2..=16 {
+            round.rows = rows;
+            for _ in 0..PROBES {
+                observer.observe_chain(&round);
+            }
+            let entry = observer.entries.last().unwrap();
+            let measured: Vec<_> = entry.cost.steps.iter().filter(|s| s.seen > 0).collect();
+            assert_eq!(measured.len(), 1);
+            assert_eq!((measured[0].lo, measured[0].hi, measured[0].seen), (rows, rows, PROBES));
+            assert_eq!(entry.cost.steps.last().unwrap().hi, 16);
+            let offer = entry.cost.envelope();
+            assert_eq!(offer.len(), 1);
+            assert_eq!(offer[0].0, rows);
+        }
+    }
+
+    #[test]
+    fn native_capture_tail_unknown_and_topology_cannot_pollute_prices() {
+        use crate::speculative::TreeSubmission;
+        let mut observer = super::TreeCostObserver::new(16).unwrap();
+        let (mut tree, mut round) = native_round(512);
+        for mode in [TreeSubmission::Capture, TreeSubmission::Unknown] {
+            round.submission = mode;
+            observer.observe(&tree, &round);
+        }
+        round.submission = TreeSubmission::Ordinary;
+        round.continuing = false;
+        observer.observe(&tree, &round);
+        assert!(observer.entries.is_empty());
+        round.continuing = true;
+        observer.observe(&tree, &round);
+        round.submission = TreeSubmission::Replayed;
+        observer.observe(&tree, &round);
+        tree.parents = vec![-1, 0, 0];
+        observer.observe(&tree, &round);
+        assert_eq!(observer.entries.len(), 3);
+        assert!(observer.entries.iter().all(|e| e.rate.seen(512) == 1));
+    }
+
+    #[test]
+    fn native_observer_rejects_unsupported_rows_and_broken_clock() {
+        let mut observer = super::TreeCostObserver::new(16).unwrap();
+        let (mut tree, mut round) = native_round(512);
+        round.total = Duration::from_micros(9);
+        observer.observe(&tree, &round);
+        round.total = Duration::from_micros(11);
+        tree.parents[2] = 2;
+        observer.observe(&tree, &round);
+        round.rows = 17;
+        observer.observe(&tree, &round);
+        assert_eq!(observer.rejected, 3);
+        assert_eq!(observer.observed, 0);
+        assert!(observer.entries.is_empty());
+    }
+
+    #[test]
+    fn native_observation_storage_is_bounded_and_has_no_seed() {
+        let mut observer = super::TreeCostObserver::new(16).unwrap();
+        let (tree, mut round) = native_round(512);
+        round.continuing = false;
+        for at in 512..800 {
+            round.context = at;
+            observer.observe(&tree, &round);
+        }
+        assert_eq!(observer.samples.len(), super::TreeCostObserver::SAMPLES);
+        assert_eq!(observer.observed, 288);
+        assert!(observer.entries.is_empty());
+        assert!(super::TreeCostObserver::new(1).is_none());
+        assert!(super::TreeCostObserver::new(imparo_backend::ROW_LAYOUT_MAX_ROWS + 1).is_none());
+    }
 
     /// A fresh table over the ladder 2, 4, 8, ... `max`.
     fn table(max: usize) -> VerifyCost {
@@ -1374,4 +1949,3 @@ mod tests {
         assert_eq!(narrower.candidates(), vec![2, 4, 8, 16, 32, 48]);
     }
 }
-

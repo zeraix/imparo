@@ -20,6 +20,7 @@ crate::architecture!(Lfm2Arch => Lfm2 {
     device_batch:        workflow_gpu::batch,
     device_prepare:      workflow_gpu::prepare_device,
     device_rows:         workflow_gpu::rows,
+    device_rows_kv_codecs: &[(1, 1), (8, 8)], // F16/F16 or Q8_0/Q8_0.
     buffer_requirements: workflow_gpu::buffer_requirements,
     conv_windows:        plan::conv_windows,
     // Every device backend runs a verification through this batch: every row's logits (or

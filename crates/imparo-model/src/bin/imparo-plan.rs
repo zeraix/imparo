@@ -102,7 +102,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (suffixes, hd) = if layer.attention.is_attention() {
             let hd = layer.attention.head_dim();
             let owns = layer.kv_source == KvSource::Own;
-            let expect_q = u64::from(c.n_heads) * u64::from(hd);
+            // Qwen35 packs a sigmoid gate beside each query head.
+            let q_widths = if c.architecture == "qwen35" { 2 } else { 1 };
+            let expect_q = u64::from(c.n_heads) * u64::from(hd) * q_widths;
             let expect_kv = u64::from(c.n_kv_heads) * u64::from(hd);
             (
                 vec![

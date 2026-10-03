@@ -2,10 +2,12 @@
 """Per-token decode cost by width policy and context (paper Tables 2 and 4).
 
 Arms: chain (the drafter's block verified as a chain), fixed widths, and the budget (width
-chosen each round from the online cost model). The fitted acceptance model ON and n-gram OFF in
-every arm, so the arms differ only in how the width is chosen. Per (context, prompt) one
-unmeasured budget run learns the stores; every measured run starts from a fresh copy of that
-warmed HOME, so no arm learns from another and all start from the same state. ms/token =
+chosen each round from the online cost model). Every other setting is the same in every arm --
+the fitted acceptance model and its per-request terms on, n-gram OFF -- so the arms differ only in
+how the width is chosen. Unmeasured budget runs learn the store first; every measured run starts
+from a fresh copy of that warmed HOME, so no arm learns from another and all start from the same
+state. With T4_WARM=model (the paper's width table) one store serves every (context, prompt) cell,
+so a fixed width is never measured on a store fitted to the very text it then decodes. ms/token =
 decode_ms / tokens from imparo-forward's `dspark decode` line.
 
 env:   T4_WARM=model learns one store over every prompt before measuring (default: one per prompt);
@@ -41,7 +43,7 @@ def one(out, ctx, prompt, arm, decode, tag, home):
                IMPARO_DSPARK_ROUND="1")
     env.pop("IMPARO_DSPARK_TREE", None); env.pop("IMPARO_DSPARK_OFFSET", None)
     if arm != "budget":
-        env.update(IMPARO_DSPARK_TREE=arm, IMPARO_DSPARK_OFFSET="0")
+        env.update(IMPARO_DSPARK_TREE=arm)
     t0 = time.time()
     with open(f"{out}/{tag}.out", "w") as fo, open(f"{out}/{tag}.err", "w") as fe:
         rc = subprocess.run([f"{REPO}/target/release/imparo-forward", "--decode", str(decode),

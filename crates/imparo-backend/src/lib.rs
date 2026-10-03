@@ -2152,6 +2152,13 @@ pub trait Backend: Sync {
     fn set_decode_rows(&self, _route: Option<RowRoute>) -> bool {
         false
     }
+    /// Hint that one speculative round uses small causal/tree batches. This is
+    /// not an independent-slot co-batch and must not enter its ownership domain
+    /// or disable verification graphs. False leaves the existing route unchanged.
+    /// A backend accepting `true` must also accept `false` to end the hint.
+    fn set_speculative_rows(&self, _on: bool) -> bool {
+        false
+    }
     /// False keeps a row-layout attention from splitting its keys across threadgroups, so a
     /// chain as a row layout computes what the causal forward computes; true restores the
     /// backend's configured split. False: this backend has no split, and nothing changed.
@@ -2163,6 +2170,41 @@ pub trait Backend: Sync {
     /// width (its widest steps on the GEMM), so memory bounds it, not this.
     fn decode_rows_max(&self, _route: RowRoute) -> usize {
         0
+    }
+    /// Cache codecs implemented by this backend's independent row consumers.
+    /// Model workflows separately declare their quantized transforms.
+    fn supports_decode_rows_kv(&self, k: u32, v: u32) -> bool {
+        k == 1 && v == 1
+    }
+    /// Independent slot-state consumers: (0, 0) requests convolution-only support;
+    /// nonzero dimensions additionally require the recurrent matrix operation.
+    fn supports_recurrent_slot_rows(&self, _key_dim:u32, _value_dim:u32)->bool {
+        false
+    }
+    /// Per-position head processing including the existing quantized-cache rotation.
+    #[allow(clippy::too_many_arguments)]
+    fn head_norm_rope_hadamard_at(
+        &self, buf: BufId, w: u64, hd: u32, eps: f32, heads: u32,
+        pos: &[u32], rd: u32, base: f32, freqs: Option<&[f32]>, nrot: u32,
+    ) -> bool {
+        if !self.head_norm_rope_at(buf, w, hd, eps, heads, pos, rd, base, freqs) {
+            return false;
+        }
+        if nrot != 0 { self.hadamard(buf, pos.len() as u32 * heads * hd, nrot); }
+        true
+    }
+    /// K and V retain the one-row fused normalization/rotation arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_head_postprocess_at(
+        &self, k: BufId, v: BufId, w: u64, hd: u32, eps: f32, heads: u32,
+        pos: &[u32], rd: u32, base: f32, freqs: Option<&[f32]>, hk: u32, hv: u32,
+    ) -> bool {
+        if !self.head_norm_rope_hadamard_at(k, w, hd, eps, heads, pos, rd, base, freqs, hk) {
+            return false;
+        }
+        self.rms_norm(v, NO_WEIGHT, hd, eps, pos.len() as u32 * heads, hd, 0);
+        if hv != 0 { self.hadamard(v, pos.len() as u32 * heads * hd, hv); }
+        true
     }
     /// `kv_store` for co-batched rows: row r of `src` is stored at `rows[r].pos` in
     /// `rows[r].slot`'s cache, by the one-row store's kernel. False: nothing was encoded.
@@ -2952,6 +2994,37 @@ pub trait Backend: Sync {
     ) -> bool {
         false
     }
+    /// The same routed gate/up operation with caller-owned temporary storage.
+    /// The contents of scratch are dead on entry and after this operation.
+    /// A provider may use it for gathered input and the up result; existing
+    /// providers retain their pair implementation.
+    ///
+    /// False promises no writes. An execution failure after dispatch must remain
+    /// a backend error and must not authorize the caller's ordinary fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_pair_with_scratch(
+        &self,
+        wkind: u32,
+        gate_off: u64,
+        up_off: u64,
+        expert_stride: u64,
+        src: BufId,
+        dst: BufId,
+        _scratch: BufId,
+        perm: BufId,
+        seg: BufId,
+        n_in: u32,
+        n_out: u32,
+        n_expert: u32,
+        n_tok: u32,
+        rows: u32,
+        prefill_chunk: bool,
+    ) -> bool {
+        self.moe_grouped_pair(
+            wkind, gate_off, up_off, expert_stride, src, dst, perm, seg,
+            n_in, n_out, n_expert, n_tok, rows, prefill_chunk,
+        )
+    }
     /// Each token's expert outputs, summed by routing weight: `dst[t]` is the sum over the
     /// `k` slots of `wgt[inv[t * k + j]] * src[inv[t * k + j]]`, `n_embd` floats a row.
     ///
@@ -3207,6 +3280,16 @@ pub trait Backend: Sync {
         None
     }
 
+    /// Additional conversation-state capacity outside an already allocated KV pool.
+    /// `Some(bytes)` is a bounded, separate slot budget; charging it must not also
+    /// remove KV pages whose storage is already committed. `None` retains the shared
+    /// working-set policy of withholding pool pages. Query at scheduler setup after
+    /// model allocation; native allocation remains the final authority under pressure.
+    fn slot_state_budget_bytes(&self) -> Option<u64> {
+        None
+    }
+
+
     /// Initialize weights under the common runtime's placement. The default hands every
     /// segment outside the fast tier to `init_weights_with_residency` as a span, which is
     /// exactly what a backend without per-tier support did before; a backend that
@@ -3222,6 +3305,16 @@ pub trait Backend: Sync {
     ) -> Result<(), i32> {
         let slow = placement.slow_spans();
         unsafe { self.init_weights_with_residency(base, len, &slow) }
+    }
+
+    /// Whether load-time conversion is implemented. Reading a prepacked file alone
+    /// does not imply the backend transforms canonical weights during loading.
+    /// Use the existing split-plane Q8 codec for Gate/Up fast-tier runtime copies.
+    /// False preserves the common per-unit codec; no file format is redefined.
+    fn q8_split_gate_up_repack(&self) -> bool { false }
+
+    fn supports_load_time_repack(&self) -> bool {
+        false
     }
 
     /// Load-time repack of fast-tier tensors into a backend-private copy

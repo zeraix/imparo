@@ -996,8 +996,17 @@ impl Backend for MetalBackend {
     fn release_slot(&self, slot: u32) -> bool {
         crate::release_slot(slot)
     }
+    fn supports_recurrent_slot_rows(&self, _key_dim:u32, _value_dim:u32)->bool {
+        true
+    }
     fn set_decode_rows(&self, route: Option<imparo_backend::RowRoute>) -> bool {
         crate::set_decode_rows(route);
+        true
+    }
+    fn set_speculative_rows(&self, on: bool) -> bool {
+        // Metal's rows switch only selects projection kernels; it does not
+        // enter CUDA's independent-slot owner domain.
+        crate::set_decode_rows(on.then_some(imparo_backend::RowRoute::Fast));
         true
     }
     fn set_verify_split(&self, on: bool) -> bool {
@@ -1418,6 +1427,9 @@ impl Backend for MetalBackend {
             comb_scale,
             n_tok,
         );
+    }
+    fn supports_load_time_repack(&self) -> bool {
+        true
     }
     fn transform_weights(
         &self,

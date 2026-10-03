@@ -109,3 +109,39 @@ EXPORTS
 
     imparo_cuda_set_weight_transfer_policy
     imparo_cuda_weight_transfer_policy
+    imparo_cuda_cobatch_version
+    imparo_cuda_cobatch_route
+    imparo_cuda_cobatch_head
+    imparo_cuda_cobatch_kv_head
+    imparo_cuda_cobatch_store
+    imparo_cuda_cobatch_attention
+    imparo_cuda_cobatch_conv
+    imparo_cuda_cobatch_delta
+    imparo_cuda_set_slots
+    imparo_cuda_select_slot
+    imparo_cuda_release_slot
+    imparo_cuda_cobatch_committed_runtime
+    imparo_cuda_set_placement_reserve
+    imparo_cuda_delta_net_run
+    imparo_cuda_plain_conv
+    imparo_cuda_plain_conv_snapshot
+    imparo_cuda_mul_strided_sigmoid
+    imparo_cuda_copy_strided
+    imparo_cuda_prepare_projection_phase
+    imparo_cuda_kv_head_postprocess_store
+    imparo_cuda_moe_version
+    imparo_cuda_top_k_rows
+    imparo_cuda_moe_gate
+    imparo_cuda_moe_plan
+    imparo_cuda_moe_grouped
+    imparo_cuda_moe_grouped_pair_v1
+    imparo_cuda_moe_route_v1
+    imparo_cuda_moe_active_experts_v1
+    imparo_cuda_moe_router_f32_v1
+    imparo_cuda_moe_down_mmq_v1
+    imparo_cuda_moe_down_mmvq_v1
+    imparo_cuda_moe_gateup_mmq_v1
+    imparo_cuda_moe_gateup_mmq_pair_v1
+    imparo_cuda_moe_gateup_mmvq_v1
+    imparo_cuda_moe_gateup_mmvq_pair_v1
+    imparo_cuda_moe_combine

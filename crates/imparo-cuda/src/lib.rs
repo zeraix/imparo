@@ -144,7 +144,8 @@ mod loader;
 #[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
 pub use backend_impl::{
     CudaBackend, correctness_receipt_template, install_correctness_identity,
-    prepare_tuner_lab,
+    prepare_tuner_lab, prepare_host_config,
+    prepare_moe_router_scratch, validate_moe_router_scratch,
 };
 
 #[cfg(all(feature = "cuda-speculative", feature = "cuda-dynamic"))]
@@ -166,3 +167,48 @@ pub mod tree;
 mod execution;
 #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
 mod w4a16_module;
+
+#[cfg(all(test, feature = "cuda-speculative"))]
+mod cobatch_tests;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod cobatch;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod moe_api;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod pair_api;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod route_api;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod active_api;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod router_api;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod down_api;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod gateup_api;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod down_mmvq_api;
+
+#[cfg(any(feature = "cuda-static", feature = "cuda-dynamic"))]
+mod gateup_mmvq_api;
+
+#[cfg(test)]
+mod gateup_mmvq_tests;
+
+#[cfg(all(test, feature = "cuda-static"))]
+mod gateup_tests;
+
+#[cfg(all(test, feature = "cuda-static"))]
+mod down_mmvq_tests;
+
+#[cfg(all(test, feature = "cuda-speculative"))]
+mod moe_tests;

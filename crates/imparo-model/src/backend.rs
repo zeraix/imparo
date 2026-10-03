@@ -108,7 +108,7 @@ fn install_cuda_correctness_identity_if_needed(
         &kv,
     );
     if !gate_mode
-        && !imparo_host::selected_config_path(&fp, weights.byte_len()).is_file()
+        && !imparo_host::selected_config_path(&fp, weights.model_bytes()).is_file()
     {
         return Ok(());
     }
@@ -310,14 +310,14 @@ pub fn enable_gpu_with_appended(
             ));
         }
     }
-    let placement = crate::placement::plan_placement(
-        &weights.tensors,
-        appended,
-        plan,
-        capacity,
-        max_batch,
-        be.fast_tier_budget(),
+    let (spread, max_batch, reserve_scratch) = load_time_spread_schedule(
+        be.device_tag().starts_with("cuda"), weights.model_bytes(), max_batch,
+    )?;
+    let placement = crate::placement::plan_placement_schedule(
+        &weights.tensors, appended, plan, capacity, max_batch, be.fast_tier_budget(), spread,
+        reserve_scratch,
     );
+    if spread { eprintln!("[imparo] load-time weight_transfer_policy=2 placement=spread-by-layer-bytes"); }
     eprintln!(
         "[imparo] {}",
         crate::placement::describe(&placement, capacity, max_batch)
@@ -386,6 +386,13 @@ scratch and margin)",
                 "[imparo] {}: weights shared, GPU path enabled",
                 be.device_tag()
             );
+            #[cfg(feature = "cuda-speculative")]
+            if LOAD_TIME_Q8_REPACK_MODE.load(std::sync::atomic::Ordering::Relaxed) == 5 {
+                let registry = cuda_knob_registry();
+                let knob = registry.iter().find(|k| k.name == "mmq_q8_canonical_gate_up_pair")
+                    .ok_or("missing load-time Q8 layout selector")?;
+                (knob.apply)(5);
+            }
             load_time_repack(weights, &placement, be)?;
             #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
             if imparo_cuda::knobs::lfm_retained_execution_enabled() {
@@ -488,7 +495,15 @@ pub fn load_time_rule(
         return None;
     }
     let be = active()?;
-    be.serves_weight_type(rule.to).then_some(rule)
+    if !be.supports_load_time_repack() || !be.serves_weight_type(rule.to) { return None; }
+    if be.q8_split_gate_up_repack() {
+        if ggml_type != 8 || dims.len() != 2 || dims[0] % 256 != 0 || dims[1] % 128 != 0
+            || !(name.ends_with(".ffn_gate.weight") || name.ends_with(".ffn_up.weight")) {
+            return None;
+        }
+        return Some(&imparo_gguf::weights::CUDA_Q8_SPLIT_RULE);
+    }
+    Some(rule)
 }
 
 /// The ggml type a tensor has AFTER load on this backend (the rule's kind when the
@@ -521,6 +536,7 @@ fn load_time_repack(
         })
     };
     let mut names: Vec<String> = Vec::new();
+    let mut selected_rules = Vec::new();
     let mut jobs: Vec<imparo_backend::WeightTransform> = Vec::new();
     let mut skipped_slow = 0_usize;
     for (name, t) in &weights.tensors {
@@ -535,6 +551,7 @@ fn load_time_repack(
             continue;
         }
         names.push(name.clone());
+        selected_rules.push(rule);
         jobs.push(imparo_backend::WeightTransform {
             offset: t.offset as u64,
             bytes: t.bytes as u64,
@@ -567,8 +584,7 @@ fn load_time_repack(
         if !applied[i] {
             continue;
         }
-        let rule = imparo_gguf::weights::tm_rule_for(job.from_type)
-            .expect("job came from a rule");
+        let rule = selected_rules[i];
         if verify {
             let t = weights.tensors[&names[i]];
             let src = weights.raw(&t).to_vec();
@@ -655,50 +671,6 @@ pub fn cuda_knob_registry() -> &'static [imparo_backend::KnobDecl] {
     use imparo_backend::BackendKnobs as _;
     imparo_cuda::CudaBackend.knob_registry()
 }
-/// Explicit laboratory overrides shared by server and correctness CLI.
-/// With neither legacy nor generic lab variable set, normal receipt loading is unchanged.
-#[cfg(feature = "cuda-speculative")]
-pub fn apply_lab_knobs_from_env() -> Result<(), String> {
-    // One existing registry/loader for every laboratory model. Keep the old
-    // DSpark environment name as an alias; conflicting sources are an error.
-    let generic = std::env::var_os("IMPARO_LAB_KNOBS");
-    let legacy = std::env::var_os("IMPARO_DSPARK_KNOBS");
-    if generic.is_some() && legacy.is_some() {
-        return Err(
-            "IMPARO_LAB_KNOBS and IMPARO_DSPARK_KNOBS are mutually exclusive".into(),
-        );
-    }
-    let Some(path) = generic.or(legacy) else {
-        return Ok(());
-    };
-    let values: std::collections::BTreeMap<String, u32> =
-        serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-    let registry = cuda_knob_registry();
-    for (name, value) in values {
-        let knob = registry
-            .iter()
-            .find(|k| k.name == name)
-            .ok_or_else(|| format!("unknown knob {name}"))?;
-        (knob.apply)(value);
-        if (knob.current)() != value {
-            return Err(format!("knob {name} rejected {value}"));
-        }
-        eprintln!("[imparo] lab existing knob {name}={value}");
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "cuda-speculative"))]
-pub fn apply_lab_knobs_from_env() -> Result<(), String> {
-    if std::env::var_os("IMPARO_LAB_KNOBS").is_some()
-        || std::env::var_os("IMPARO_DSPARK_KNOBS").is_some()
-    {
-        return Err("CUDA laboratory knob overrides require cuda-speculative".into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{StreamedWeightSpan, gpu_requested, normalize_streamed_spans};
@@ -790,4 +762,109 @@ mod tests {
                 .is_empty()
         );
     }
+}
+
+#[cfg(feature = "cuda-speculative")]
+static LOAD_TIME_TRANSFER_POLICY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+#[cfg(feature = "cuda-speculative")]
+static LOAD_TIME_Q8_REPACK_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "cuda-speculative")]
+fn lab_knob_values() -> Result<std::collections::BTreeMap<String, u32>, String> {
+    // One existing registry/loader for every laboratory model. Keep the old
+    // DSpark environment name as an alias; conflicting sources are an error.
+    let generic = std::env::var_os("IMPARO_LAB_KNOBS");
+    let legacy = std::env::var_os("IMPARO_DSPARK_KNOBS");
+    if generic.is_some() && legacy.is_some() {
+        return Err(
+            "IMPARO_LAB_KNOBS and IMPARO_DSPARK_KNOBS are mutually exclusive".into(),
+        );
+    }
+    let Some(path) = generic.or(legacy) else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let values: std::collections::BTreeMap<String, u32> =
+        serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    Ok(values)
+}
+
+fn load_time_spread_schedule(
+    cuda: bool, model_bytes: u64, max_batch: usize,
+) -> Result<(bool, usize, u64), String> {
+    #[cfg(any(feature = "cuda", feature = "cuda-dynamic"))]
+    if cuda {
+        let (value, stored_batch) = imparo_cuda::prepare_host_config(model_bytes)?;
+        // Use the same validated snapshot and explicit-override precedence as
+        // native initialization. Fit must not reserve the default batch while
+        // the activation allocator later uses the tuned batch.
+        let max_batch = if std::env::var("IMPARO_BATCH").is_err() {
+            stored_batch.unwrap_or(max_batch)
+        } else { max_batch };
+        #[cfg(feature = "cuda-speculative")]
+        let (value, router_override, down_override, gateup_override, down_mmvq_override, gateup_mmvq_override) = {
+            let values = lab_knob_values()?;
+            LOAD_TIME_Q8_REPACK_MODE.store(values.get("mmq_q8_canonical_gate_up_pair").copied().unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+            (values.get("weight_transfer_policy").copied().unwrap_or(value),
+                values.get("moe_router_f32").copied(), values.get("moe_down_mmq").copied(),
+                values.get("moe_gateup_mmq").copied(), values.get("moe_down_mmvq").copied(),
+                values.get("moe_gateup_mmvq").copied())
+        };
+        #[cfg(not(feature = "cuda-speculative"))]
+        let (router_override, down_override, gateup_override, down_mmvq_override, gateup_mmvq_override) = (None, None, None, None, None);
+        if value > 2 { return Err("invalid load-time weight transfer policy".into()); }
+        let reserve_scratch = imparo_cuda::prepare_moe_router_scratch(router_override, down_override, gateup_override, down_mmvq_override, gateup_mmvq_override)?;
+        #[cfg(feature = "cuda-speculative")]
+        LOAD_TIME_TRANSFER_POLICY.store(value, std::sync::atomic::Ordering::Relaxed);
+        return Ok((value == 2, max_batch, reserve_scratch));
+    }
+    let _ = (cuda, model_bytes);
+    Ok((false, max_batch, 0))
+}
+
+/// Explicit laboratory overrides shared by server and correctness CLI.
+/// With neither legacy nor generic lab variable set, normal receipt loading is unchanged.
+#[cfg(feature = "cuda-speculative")]
+pub fn apply_lab_knobs_from_env() -> Result<(), String> {
+    let values = lab_knob_values()?;
+    imparo_cuda::validate_moe_router_scratch(
+        values.get("moe_router_f32").copied(), values.get("moe_down_mmq").copied(),
+        values.get("moe_gateup_mmq").copied(),
+        values.get("moe_down_mmvq").copied(),
+        values.get("moe_gateup_mmvq").copied(),
+    )?;
+    let layout = LOAD_TIME_Q8_REPACK_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    let requested_layout = values.get("mmq_q8_canonical_gate_up_pair").copied().unwrap_or(layout);
+    if (layout == 5 || requested_layout == 5) && layout != requested_layout {
+        return Err("Q8 layout selector changed after load-time preparation".into());
+    }
+    let planned = LOAD_TIME_TRANSFER_POLICY.load(std::sync::atomic::Ordering::Relaxed);
+    let requested = values.get("weight_transfer_policy").copied().unwrap_or(planned);
+    if (planned == 2 || requested == 2) && planned != requested {
+        return Err("weight transfer policy changed after load-time placement".into());
+    }
+    let registry = cuda_knob_registry();
+    for (name, value) in values {
+        let knob = registry
+            .iter()
+            .find(|k| k.name == name)
+            .ok_or_else(|| format!("unknown knob {name}"))?;
+        (knob.apply)(value);
+        if (knob.current)() != value {
+            return Err(format!("knob {name} rejected {value}"));
+        }
+        eprintln!("[imparo] lab existing knob {name}={value}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda-speculative"))]
+pub fn apply_lab_knobs_from_env() -> Result<(), String> {
+    if std::env::var_os("IMPARO_LAB_KNOBS").is_some()
+        || std::env::var_os("IMPARO_DSPARK_KNOBS").is_some() {
+        return Err("CUDA laboratory knob overrides require cuda-speculative".into());
+    }
+    Ok(())
 }

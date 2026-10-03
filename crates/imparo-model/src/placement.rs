@@ -32,18 +32,20 @@ pub const RESERVE_MARGIN_BYTES: u64 = 256 << 20;
 /// the reserve is never configured, it is computed.
 #[must_use]
 pub fn configured_budget(reported: Option<u64>) -> Option<u64> {
-    let mut total = std::env::var("IMPARO_FAST_TIER_MB")
+    let override_mib = std::env::var("IMPARO_FAST_TIER_MB")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|mb| mb << 20)
-        .or(reported)?;
-    if let Some(head) = std::env::var("IMPARO_FAST_TIER_HEADROOM_MB")
+        .and_then(|v| v.parse::<u64>().ok());
+    let headroom_mib = std::env::var("IMPARO_FAST_TIER_HEADROOM_MB")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        total = total.saturating_sub(head << 20);
-    }
-    Some(total)
+        .and_then(|v| v.parse::<u64>().ok());
+    configured_budget_values(reported, override_mib, headroom_mib)
+}
+
+fn configured_budget_values(
+    reported: Option<u64>, override_mib: Option<u64>, headroom_mib: Option<u64>,
+) -> Option<u64> {
+    let total = override_mib.map(|mb| mb << 20).or(reported)?;
+    Some(total.saturating_sub(headroom_mib.unwrap_or(0) << 20))
 }
 
 /// The KV bytes the configured context needs on the fast tier: full-attention layers hold
@@ -205,6 +207,18 @@ pub fn fit_with_appended(
     budget: TierBudget,
     policy: RowGatheredPolicy,
 ) -> WeightPlacement {
+    fit_with_appended_schedule(tensors, appended, n_layers, row_gathered, budget, policy, false)
+}
+
+fn fit_with_appended_schedule(
+    tensors: &BTreeMap<String, Tensor>,
+    appended: &[(u64, u64)],
+    n_layers: u32,
+    row_gathered: &[&str],
+    budget: TierBudget,
+    policy: RowGatheredPolicy,
+    spread: bool,
+) -> WeightPlacement {
     // The drafter's file starts at or before its first span, and past every model tensor.
     let split = appended.iter().map(|s| s.0).min();
     let mut shared: Vec<(u64, u64)> = appended.to_vec();
@@ -230,45 +244,48 @@ pub fn fit_with_appended(
             tier: WeightTier::Fast,
         });
     }
-    // Whole layers in order while they fit; once one does not, every later one goes to
-    // the slow tier too.
-    let mut fast_layers = 0_u32;
-    let mut overflowed = false;
+    // First retain exactly the original quota within each layer-byte class.
+    // Redistribution changes neither the resident layer count nor its payload budget;
+    // unique-size layers retain their original choice. No architecture/model names.
+    let mut layers = Vec::new();
     for (layer, spans) in per_layer {
         let spans = merge_adjacent(spans, split);
-        // A block past the plan's layers (a multi-token-prediction head the plan drops) is
-        // never read: it takes no fast-tier room, and it is not slow tier either, whose
-        // presence changes how prefill buffers are cut.
+        // Upstream: dropped MTP blocks are unread, not slow-tier weights.
+        // Exclude them before calculating either the original or spread quota.
         if layer >= n_layers {
-            for (off, bytes) in spans {
-                segments.push(WeightSegment {
-                    offset: off,
-                    bytes,
-                    tier: WeightTier::Unread,
-                });
-            }
-            continue;
-        }
-        let layer_bytes: u64 = spans.iter().map(|s| s.1).sum();
-        if !overflowed && fast_bytes + layer_bytes <= budget.weight_budget {
-            fast_bytes += layer_bytes;
-            fast_layers += 1;
-            for (off, bytes) in spans {
-                segments.push(WeightSegment {
-                    offset: off,
-                    bytes,
-                    tier: WeightTier::Fast,
-                });
+            for (offset, bytes) in spans {
+                segments.push(WeightSegment { offset, bytes, tier: WeightTier::Unread });
             }
         } else {
-            overflowed = true;
-            for (off, bytes) in spans {
-                segments.push(WeightSegment {
-                    offset: off,
-                    bytes,
-                    tier: WeightTier::Slow { layer },
-                });
+            layers.push((layer, spans));
+        }
+    }
+    let sizes: Vec<u64> = layers.iter().map(|(_, spans)| spans.iter().map(|s| s.1).sum()).collect();
+    let mut selected = vec![false; layers.len()];
+    let mut prospective = fast_bytes;
+    let mut overflowed = false;
+    for (i, &bytes) in sizes.iter().enumerate() {
+        if !overflowed && prospective.saturating_add(bytes) <= budget.weight_budget {
+            selected[i] = true; prospective += bytes;
+        } else { overflowed = true; }
+    }
+    if spread {
+        let mut classes: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for (i, bytes) in sizes.iter().enumerate() { classes.entry(*bytes).or_default().push(i); }
+        for indices in classes.values() {
+            let cold = indices.iter().filter(|&&i| !selected[i]).count();
+            let count = indices.len();
+            for (position, &i) in indices.iter().enumerate() {
+                selected[i] = (position + 1) * cold / count == position * cold / count;
             }
+        }
+    }
+    let mut fast_layers = 0_u32;
+    for (i, (layer, spans)) in layers.into_iter().enumerate() {
+        if selected[i] { fast_bytes += sizes[i]; fast_layers += 1; }
+        for (off, bytes) in spans {
+            segments.push(WeightSegment { offset: off, bytes,
+                tier: if selected[i] { WeightTier::Fast } else { WeightTier::Slow { layer } } });
         }
     }
     // Tables LAST: a table is bound only from what the fast tier has left after every
@@ -299,6 +316,7 @@ pub fn fit_with_appended(
     // is per distinct resource, and a decode token that touched 31 weight buffers instead
     // of 1 read consistently ~1% slower (2026-09-04). Slow segments stay per layer: that
     // is the granularity a prefetch ring or a per-layer CPU-compute choice works in.
+    let mut merge_room = budget.weight_budget.saturating_sub(fast_bytes);
     let mut merged: Vec<WeightSegment> = Vec::with_capacity(segments.len());
     for s in segments {
         if let Some(last) = merged.last_mut() {
@@ -306,7 +324,9 @@ pub fn fit_with_appended(
             if last.tier == WeightTier::Fast
                 && s.tier == WeightTier::Fast
                 && joins(end, s.offset, split)
+                && (!spread || s.offset - end <= merge_room)
             {
+                if spread { merge_room -= s.offset - end; }
                 last.bytes = s.offset + s.bytes - last.offset;
                 continue;
             }
@@ -332,30 +352,47 @@ pub fn plan_placement(
     max_batch: usize,
     reported_budget: Option<u64>,
 ) -> WeightPlacement {
+    plan_placement_schedule(tensors, appended, plan, capacity, max_batch, reported_budget, false, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_placement_schedule(
+    tensors: &BTreeMap<String, Tensor>,
+    appended: &[(u64, u64)],
+    plan: &ModelPlan,
+    capacity: usize,
+    max_batch: usize,
+    reported_budget: Option<u64>,
+    spread: bool,
+    reserve_scratch: u64,
+) -> WeightPlacement {
     let total = configured_budget(reported_budget);
     let reserve_kv = kv_reserve_bytes(plan, capacity, max_batch);
     let reserve_activations = activation_reserve_bytes(plan, capacity, max_batch);
-    let reserve_scratch = 0;
-    let margin = RESERVE_MARGIN_BYTES;
-    let weight_budget = total.map_or(u64::MAX, |t| {
-        t.saturating_sub(reserve_kv + reserve_activations + reserve_scratch + margin)
-    });
-    let budget = TierBudget {
-        total,
-        reserve_kv,
-        reserve_activations,
-        reserve_scratch,
-        margin,
-        weight_budget,
-    };
-    fit_with_appended(
+    // Scratch is deducted after the user's total/headroom overrides. Deducting
+    // it only from the reported device budget would let an override erase it.
+    let budget = placement_budget(total, reserve_kv, reserve_activations, reserve_scratch);
+    fit_with_appended_schedule(
         tensors,
         appended,
         plan.config.n_layers,
         plan.weight_residency.row_gathered,
         budget,
         configured_row_gathered_policy(),
+        spread,
     )
+}
+
+fn placement_budget(
+    total: Option<u64>, reserve_kv: u64, reserve_activations: u64, reserve_scratch: u64,
+) -> TierBudget {
+    let margin = RESERVE_MARGIN_BYTES;
+    let reserve = reserve_kv.saturating_add(reserve_activations)
+        .saturating_add(reserve_scratch).saturating_add(margin);
+    TierBudget {
+        total, reserve_kv, reserve_activations, reserve_scratch, margin,
+        weight_budget: total.map_or(u64::MAX, |bytes| bytes.saturating_sub(reserve)),
+    }
 }
 
 /// The fast tier's room for KV once the weights are placed: the budget less the fast-tier
@@ -433,6 +470,40 @@ pub fn describe(p: &WeightPlacement, capacity: usize, max_batch: usize) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn router_scratch_survives_explicit_total_and_headroom() {
+        let mib = 1_u64 << 20;
+        // The override replaces the device report, but cannot replace scratch.
+        for reported in [None, Some(8192 * mib)] {
+            let total = configured_budget_values(reported, Some(1024), Some(64));
+            let reserved = placement_budget(total, 128 * mib, 64 * mib, 4 * mib);
+            assert_eq!(reserved.total, Some(960 * mib));
+            assert_eq!(reserved.reserve_scratch, 4 * mib);
+            assert_eq!(reserved.weight_budget, 508 * mib);
+            let ordinary = placement_budget(total, 128 * mib, 64 * mib, 0);
+            assert_eq!(ordinary.weight_budget - reserved.weight_budget, 4 * mib);
+            let placed = WeightPlacement {
+                budget: reserved,
+                segments: vec![WeightSegment {
+                    offset: 0, bytes: 400 * mib, tier: WeightTier::Fast,
+                }],
+                fast_layers: 1, total_layers: 1,
+            };
+            assert_eq!(kv_tier_bytes(&placed), Some(236 * mib));
+        }
+    }
+
+    #[test]
+    fn router_scratch_exhaustion_cannot_wrap_weight_budget() {
+        let mib = 1_u64 << 20;
+        let total = configured_budget_values(Some(8192 * mib), Some(256), None);
+        let budget = placement_budget(total, 0, 0, 4 * mib);
+        assert_eq!(budget.weight_budget, 0);
+        assert_eq!(budget.reserve_scratch, 4 * mib);
+        let reported = placement_budget(Some(1024 * mib), 128 * mib, 64 * mib, 4 * mib);
+        assert_eq!(reported.weight_budget, 572 * mib);
+    }
 
     fn tensor(offset: u64, bytes: u64) -> Tensor {
         Tensor {
@@ -542,6 +613,24 @@ mod tests {
             RowGatheredPolicy::BindIfFits,
         );
         assert!(!describe(&q, 4096, 512).contains("unread"));
+        // Merge regression: ignored MTP weights must not alter the spread quota,
+        // resident payload or slow-tier classification, even under a tight budget.
+        for bytes in [250, u64::MAX] {
+            let reference = fit_with_appended_schedule(
+                &table(), &[], 4, &["big.table"], budget(bytes),
+                RowGatheredPolicy::BindIfFits, true,
+            );
+            let spread = fit_with_appended_schedule(
+                &t, &[], 4, &["big.table"], budget(bytes),
+                RowGatheredPolicy::BindIfFits, true,
+            );
+            assert_eq!(spread.fast_layers, reference.fast_layers);
+            assert_eq!(spread.bytes_in(|v| v == WeightTier::Fast),
+                       reference.bytes_in(|v| v == WeightTier::Fast));
+            assert_eq!(spread.bytes_in(|v| matches!(v, WeightTier::Slow { .. })),
+                       reference.bytes_in(|v| matches!(v, WeightTier::Slow { .. })));
+            assert_eq!(spread.bytes_in(|v| v == WeightTier::Unread), 100);
+        }
     }
 
     #[test]
@@ -666,6 +755,53 @@ mod tests {
         );
         for w in p.segments.windows(2) {
             assert!(w[0].offset + w[0].bytes <= w[1].offset, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn spread_retains_quota_and_covers_shared_staged_and_drafter() {
+        let far=1_u64<<40;
+        let p=fit_with_appended_schedule(&table(), &[(far,300)], 4,
+            &["big.table"], budget(560), RowGatheredPolicy::BindIfFits, true);
+        assert_eq!(p.fast_layers,2);
+        assert_eq!(p.bytes_in(|t| t==WeightTier::Fast),550);
+        assert_eq!(p.bytes_in(|t| t==WeightTier::HostStaged),1000);
+        let slow:Vec<_>=p.segments.iter().filter_map(|s| match s.tier {
+            WeightTier::Slow {layer}=>Some(layer), _=>None }).collect();
+        assert_eq!(slow,vec![1,3]);
+        assert!(p.segments.iter().any(|s| s.offset==far && s.bytes==300 && s.tier==WeightTier::Fast));
+        for t in table().values() {
+            assert_eq!(p.segments.iter().filter(|s|s.offset<=t.offset as u64
+                && s.offset+s.bytes>=t.offset as u64+t.bytes as u64).count(),1);
+        }
+        for pair in p.segments.windows(2) {assert!(pair[0].offset+pair[0].bytes<=pair[1].offset);}
+    }
+
+    #[test]
+    fn spread_does_not_spend_unbudgeted_padding_when_merging() {
+        let mut tensors=BTreeMap::new();
+        for i in 0..4 { tensors.insert(format!("blk.{i}.w"),tensor(i*110,100)); }
+        let p=fit_with_appended_schedule(&tensors,&[],4,&[],budget(400),RowGatheredPolicy::HostStaged,true);
+        assert_eq!(p.fast_layers,4);
+        assert_eq!(p.bytes_in(|t|t==WeightTier::Fast),400);
+    }
+
+    #[test]
+    fn spread_keeps_mixed_size_class_quotas_and_all_fit_behavior() {
+        let mut tensors=BTreeMap::new();
+        for (i,bytes) in [100,200,100,200,100,200,300].into_iter().enumerate() {
+            tensors.insert(format!("blk.{i}.w"),tensor((i as u64+1)*1_000_000,bytes));
+        }
+        for limit in [0,100,300,600,900,1200,u64::MAX] {
+            let a=fit_with_appended_schedule(&tensors,&[],7,&[],budget(limit),RowGatheredPolicy::HostStaged,false);
+            let b=fit_with_appended_schedule(&tensors,&[],7,&[],budget(limit),RowGatheredPolicy::HostStaged,true);
+            assert_eq!(a.fast_layers,b.fast_layers);
+            assert_eq!(a.bytes_in(|t|t==WeightTier::Fast),b.bytes_in(|t|t==WeightTier::Fast));
+            assert!(b.bytes_in(|t|t==WeightTier::Fast)<=limit);
+            for size in [100,200,300] {
+                assert_eq!(a.segments.iter().filter(|s|s.tier==WeightTier::Fast && s.bytes==size).count(),
+                    b.segments.iter().filter(|s|s.tier==WeightTier::Fast && s.bytes==size).count());
+            }
         }
     }
 

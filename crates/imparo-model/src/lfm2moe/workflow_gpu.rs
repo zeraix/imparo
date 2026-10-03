@@ -32,9 +32,8 @@
 //! does not weigh; one buffer for both would run the right experts with the wrong weights on
 //! a biased file, and the text would still read fluently.
 //!
-//! What this file does NOT have, and the dense LFM2 does: the mega program, the
-//! finite-history prefill tails, and the co-batched decode path. Each is a speed facility
-//! measured on that model; none is needed for a forward to be right.
+//! Co-batched decode uses LFM2 row operations and this model's routed feed-forward.
+//! The common workflow owns slot state, checkpoint copies and retirement.
 
 use imparo_backend::BufId;
 
@@ -42,6 +41,7 @@ use crate::gpu_support::{
     BufferRequirement, Placement, be, conv_windows, fuse_epilogue_enabled, gprobe,
     gpu_probe_layer, half_activation_mirror_requirements,
     kv_dequant_scratch_requirements, kvq_mask_on, scores_needed, should_fuse_epilogue,
+    trace_rows,
 };
 use crate::kv::{KvType, effective_workflow_kv_route, had_nrot, ring_mask};
 use crate::lfm2moe::Lfm2Moe;
@@ -389,19 +389,18 @@ fn routed_ffn(
     // The gate and up read the TOKEN's normalised hidden state; the down reads the work
     // rows those two just wrote.
     //
-    // ONE DISPATCH FOR THE THREE when the backend serves it: gate, up and the activation
-    // between them. Both projections read the same hidden state and neither feeds the
-    // other, so this merges two independent grids and does not make up wait for gate --
-    // which is the trade a fused epilogue on the up projection alone would make.
+    // Existing paired providers retain their fused dispatch. A provider that needs
+    // gathered work rows may use U, which is dead until Down writes it below.
     let paired = wkind(gate) == wkind(up)
         && stride(gate)? == stride(up)?
-        && be().moe_grouped_pair(
+        && be().moe_grouped_pair_with_scratch(
             wkind(gate),
             gate.offset as u64,
             up.offset as u64,
             stride(gate)?,
             BufId::Cur,
             BufId::G,
+            BufId::U,
             PERM,
             SEG,
             n_embd,
@@ -1384,5 +1383,445 @@ pub fn batch(
         out.resize(output_words as usize, 0.0);
         be().read(BufId::Logits, 0, out);
     }
+    Ok(())
+}
+
+/// Decode one token per slot using the existing LFM2 row operations and this
+/// model's dense/routed feed-forwards. The common workflow owns slot cursors,
+/// checkpoint copies and retirement; this function only submits the row graph.
+///
+/// # Errors
+/// For unsupported codecs, row operations, routed experts or device failures.
+pub fn rows(
+    wf: &mut Lfm2Moe,
+    rows: &[crate::DecodeRow],
+    logits: Option<&mut Vec<f32>>,
+    picks: &mut Vec<u32>,
+) -> Result<(), String> {
+    let codecs = (KvType::k().ggml_id(), KvType::v().ggml_id());
+    if !<crate::lfm2moe::Lfm2MoeArch as crate::Architecture>::DEVICE_ROWS_KV_CODECS
+        .contains(&codecs)
+        || !be().supports_decode_rows_kv(codecs.0, codecs.1)
+    {
+        return Err("co-batched LFM2MoE decode does not support these KV codecs".into());
+    }
+    if !be().supports_moe() {
+        return Err("co-batched LFM2MoE needs routed feed-forward support".into());
+    }
+    if !be().supports_argmax_rows() {
+        return Err("co-batched decode needs a per-row argmax".into());
+    }
+    let b = u32::try_from(rows.len()).map_err(|_| "too many co-batched rows")?;
+    let most = be().decode_rows_max(wf.state.row_route);
+    if rows.len() > most {
+        return Err(format!(
+            "{} co-batched rows; the {:?} route serves at most {most}",
+            rows.len(),
+            wf.state.row_route
+        ));
+    }
+    // Every row's logits are live: the lm head writes one row per conversation.
+    let output_demand = wf.state.output_demand;
+    wf.state.output_demand = crate::OutputDemand::AllTokens;
+    let fit = wf.gpu_fit_batch(rows.len());
+    wf.state.output_demand = output_demand;
+    fit?;
+    crate::gpu_support::submit_decode_rows(be(), wf.state.row_route, || {
+        encode_rows(wf, rows, b)
+    })?;
+    let mut got = vec![0.0_f32; rows.len()];
+    be().read(BufId::Tmp, 0, &mut got);
+    picks.clear();
+    picks.extend(got.iter().map(|v| v.to_bits()));
+    if let Some(out) = logits {
+        out.resize(rows.len() * wf.plan.config.vocab_size as usize, 0.0);
+        be().read(BufId::Logits, 0, out);
+    }
+    Ok(())
+}
+
+/// The graph of [`rows`], ending with the per-row argmax in `BufId::Tmp`.
+#[allow(clippy::too_many_lines)]
+fn encode_rows(wf: &Lfm2Moe, rows: &[crate::DecodeRow], b: u32) -> Result<(), String> {
+    let c = &wf.plan.config;
+    let n_embd = c.n_embd;
+    let n_head = c.n_heads;
+    let n_kv = c.n_kv_heads;
+    let eps = c.norm_eps;
+    let wkind = |t: &imparo_gguf::weights::Tensor| {
+        imparo_gguf::weights::weight_kind(t.ggml_type).expect("validated at load")
+            as u32
+    };
+    let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
+    let pos: Vec<u32> = rows.iter().map(|r| r.pos).collect();
+    let slot_rows: Vec<imparo_backend::SlotRow> = rows
+        .iter()
+        .map(|r| imparo_backend::SlotRow {
+            slot: r.slot,
+            pos: r.pos,
+        })
+        .collect();
+    let recur = wf.plan.recurrent_layout();
+    let recur_elems = wf.plan.recurrent_elems();
+
+    be().begin_forward(false);
+    be().write_u32(BufId::Tokens, 0, &tokens);
+    let embd_kind = wkind(&wf.w.token_embd);
+    let embd_off = wf.w.token_embd.offset as u64;
+    if !be().gather_rows(
+        embd_kind,
+        embd_off,
+        n_embd,
+        c.vocab_size,
+        1.0,
+        BufId::X,
+        0,
+        BufId::Tokens,
+        b,
+    ) {
+        for (t, &tok) in tokens.iter().enumerate() {
+            be().row(
+                embd_kind,
+                embd_off,
+                n_embd,
+                tok,
+                1.0,
+                BufId::X,
+                t as u32 * n_embd,
+            );
+        }
+    }
+    trace_rows("embd", 0, BufId::X, b, n_embd);
+    let n_layers = wf.plan.layers.len();
+    // The decode seat: every row is a decode row.
+    let flush_every = crate::gpu_support::flush_layers_bounded(1, n_layers);
+    let mut operator_norm_ready = false;
+    for (li, (layer, &(r_off, _, _, _))) in
+        wf.plan.layers.iter().zip(recur.iter()).enumerate()
+    {
+        let lw = &wf.w.layers[li];
+        if !operator_norm_ready {
+            be().rms_norm_from(
+                BufId::Cur,
+                BufId::X,
+                lw.op_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+            );
+        }
+        trace_rows("opnorm", li, BufId::Cur, b, n_embd);
+        match (&lw.mixer, layer.attention) {
+            (
+                MixerW::Attention {
+                    q_norm,
+                    k_norm,
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                },
+                crate::Attention::Full {
+                    head_dim: hd,
+                    rope_base,
+                    rope_dim,
+                },
+            ) => {
+                let qw = n_head * hd;
+                let kw = n_kv * hd;
+                be().matmat(
+                    wkind(wq),
+                    wq.offset as u64,
+                    n_embd,
+                    qw,
+                    BufId::Cur,
+                    BufId::Q,
+                    b,
+                );
+                be().matmat(
+                    wkind(wk),
+                    wk.offset as u64,
+                    n_embd,
+                    kw,
+                    BufId::Cur,
+                    BufId::K,
+                    b,
+                );
+                be().matmat(
+                    wkind(wv),
+                    wv.offset as u64,
+                    n_embd,
+                    kw,
+                    BufId::Cur,
+                    BufId::V,
+                    b,
+                );
+                let ring = ring_mask(layer.attention, wf.state.kv_ring_batch);
+                let max_scores: Vec<u32> =
+                    pos.iter().map(|&p| scores_needed(p, 1, 0)).collect();
+                let heads_served = be().head_norm_rope_hadamard_at(
+                    BufId::Q,
+                    q_norm.offset,
+                    hd,
+                    eps,
+                    n_head,
+                    &pos,
+                    rope_dim,
+                    rope_base,
+                    None,
+                    0,
+                ) && be().head_norm_rope_hadamard_at(
+                    BufId::K,
+                    k_norm.offset,
+                    hd,
+                    eps,
+                    n_kv,
+                    &pos,
+                    rope_dim,
+                    rope_base,
+                    None,
+                    0,
+                );
+                if !heads_served {
+                    return Err(format!(
+                        "co-batched LFM2MoE head transform not served at layer {li}"
+                    ));
+                }
+                let served = be().kv_store_slot_rows(
+                    BufId::K,
+                    li as u32,
+                    kw,
+                    &slot_rows,
+                    false,
+                    ring,
+                ) && be().kv_store_slot_rows(
+                    BufId::V,
+                    li as u32,
+                    kw,
+                    &slot_rows,
+                    true,
+                    ring,
+                ) && be().attention_slot_rows(
+                    li as u32,
+                    hd,
+                    n_head,
+                    n_kv,
+                    kw,
+                    1.0 / (hd as f32).sqrt(),
+                    0,
+                    &slot_rows,
+                    &max_scores,
+                    ring,
+                );
+                if !served {
+                    return Err(format!(
+                        "co-batched attention not served at layer {li}"
+                    ));
+                }
+                be().matmat(
+                    wkind(wo),
+                    wo.offset as u64,
+                    qw,
+                    n_embd,
+                    BufId::Attn,
+                    BufId::O,
+                    b,
+                );
+            }
+            (
+                MixerW::ShortConv {
+                    conv,
+                    in_proj,
+                    out_proj,
+                },
+                crate::Attention::Recurrent { .. },
+            ) => {
+                let kern = u32::try_from(conv.w.len() / n_embd as usize)
+                    .map_err(|_| "conv kernel width")?;
+                be().matmat(
+                    wkind(in_proj),
+                    in_proj.offset as u64,
+                    n_embd,
+                    3 * n_embd,
+                    BufId::Cur,
+                    BCX,
+                    b,
+                );
+                trace_rows("in_proj", li, BCX, b, 3 * n_embd);
+                let conv_rows: Vec<imparo_backend::SlotStateRow> = rows
+                    .iter()
+                    .map(|r| imparo_backend::SlotStateRow {
+                        slot: r.slot,
+                        state_off: r_off + r.plane_in * recur_elems,
+                        state_out_off: r_off + r.plane_out * recur_elems,
+                    })
+                    .collect();
+                if !be().causal_conv_slot_rows(
+                    imparo_backend::ConvForm::GatedBcx,
+                    BCX,
+                    conv.offset,
+                    BufId::Recur,
+                    &conv_rows,
+                    BufId::Attn,
+                    n_embd,
+                    kern,
+                ) {
+                    return Err(format!(
+                        "co-batched convolution not served at layer {li}"
+                    ));
+                }
+                trace_rows("conv", li, BufId::Attn, b, n_embd);
+                be().matmat(
+                    wkind(out_proj),
+                    out_proj.offset as u64,
+                    n_embd,
+                    n_embd,
+                    BufId::Attn,
+                    BufId::O,
+                    b,
+                );
+            }
+            (_, a) => {
+                return Err(format!(
+                    "lfm2moe layer {li}: plan says {a:?} but the weights resolved otherwise"
+                ));
+            }
+        }
+        trace_rows("mix", li, BufId::O, b, n_embd);
+        if !be().add_rms_norm(
+            BufId::Cur,
+            BufId::X,
+            BufId::O,
+            lw.ffn_norm.offset,
+            n_embd,
+            eps,
+            b,
+            n_embd,
+            0,
+        ) {
+            be().add(BufId::X, BufId::O, b * n_embd);
+            be().rms_norm_from(
+                BufId::Cur,
+                BufId::X,
+                lw.ffn_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+            );
+        }
+        match (&lw.ffn, layer.ffn) {
+            (FfnW::Dense { gate, up, down }, Ffn::Dense { hidden, .. }) => {
+                let fused_ffn = be().ffn_gated_down(
+                    wkind(gate),
+                    gate.offset as u64,
+                    wkind(up),
+                    up.offset as u64,
+                    wkind(down),
+                    down.offset as u64,
+                    n_embd,
+                    hidden,
+                    n_embd,
+                    BufId::Cur,
+                    BufId::G,
+                    BufId::O,
+                    b,
+                );
+                if !fused_ffn {
+                    let fused_pair = be().matmat_gated(
+                        wkind(gate),
+                        gate.offset as u64,
+                        wkind(up),
+                        up.offset as u64,
+                        n_embd,
+                        hidden,
+                        BufId::Cur,
+                        BufId::G,
+                        BufId::U,
+                        b,
+                    );
+                    if !fused_pair {
+                        // No activation epilogue on the up projection: a one-row decode never fuses it.
+                        be().matmat(
+                            wkind(gate),
+                            gate.offset as u64,
+                            n_embd,
+                            hidden,
+                            BufId::Cur,
+                            BufId::G,
+                            b,
+                        );
+                        be().matmat(
+                            wkind(up),
+                            up.offset as u64,
+                            n_embd,
+                            hidden,
+                            BufId::Cur,
+                            BufId::U,
+                            b,
+                        );
+                        be().act_mul(BufId::G, BufId::U, b * hidden);
+                    }
+                    be().matmat(
+                        wkind(down),
+                        down.offset as u64,
+                        hidden,
+                        n_embd,
+                        BufId::G,
+                        BufId::O,
+                        b,
+                    );
+                }
+            }
+            (w @ FfnW::Moe { .. }, ffn @ Ffn::Moe { .. }) => {
+                // Independent decode rows are not a prompt chunk. Keep the
+                // existing O output and the row-wise residual/norm below.
+                routed_ffn(w, ffn, n_embd, b, &wkind, li, false, None)?;
+            }
+            _ => {
+                return Err(format!(
+                    "lfm2moe layer {li}: feed-forward plan and weights differ"
+                ));
+            }
+        }
+        operator_norm_ready = li + 1 < n_layers
+            && be().add_rms_norm(
+                BufId::Cur,
+                BufId::X,
+                BufId::O,
+                wf.w.layers[li + 1].op_norm.offset,
+                n_embd,
+                eps,
+                b,
+                n_embd,
+                0,
+            );
+        if !operator_norm_ready {
+            be().add(BufId::X, BufId::O, b * n_embd);
+        }
+        trace_rows("ffn", li, BufId::O, b, n_embd);
+        trace_rows("out", li, BufId::X, b, n_embd);
+        if flush_every > 0 && (li + 1) % flush_every == 0 && li + 1 < n_layers {
+            be().flush();
+        }
+    }
+    be().rms_norm(BufId::X, wf.w.output_norm.offset, n_embd, eps, b, n_embd, 0);
+    be().matmat_from(
+        wkind(&wf.w.head),
+        wf.w.head.offset as u64,
+        n_embd,
+        c.vocab_size,
+        BufId::X,
+        BufId::Logits,
+        b,
+        0,
+    );
+    if let Some(cap) = wf.plan.output.logit_softcap {
+        be().softcap(BufId::Logits, cap, b * c.vocab_size);
+    }
+    be().argmax_rows(BufId::Logits, BufId::Tmp, c.vocab_size, b);
     Ok(())
 }

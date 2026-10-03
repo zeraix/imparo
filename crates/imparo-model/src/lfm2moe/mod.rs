@@ -19,6 +19,8 @@ crate::architecture!(Lfm2MoeArch => Lfm2Moe {
     batch_host:     workflow_cpu::batch,
     device_batch:   workflow_gpu::batch,
     device_prepare: workflow_gpu::prepare_device,
+    device_rows:    workflow_gpu::rows,
+    device_rows_kv_codecs: &[(1, 1)], // F16/F16 only.
     buffer_requirements: workflow_gpu::buffer_requirements,
     // A tree verify rebuilds these windows from the accepted path's kept inputs; without them
     // the windows do not cover the recurrent state and every draft verifies as a chain.

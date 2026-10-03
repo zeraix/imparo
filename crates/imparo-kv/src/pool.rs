@@ -156,6 +156,9 @@ pub struct PoolMode {
     /// Pages one slot's own state takes (`set_slot_pages`): its rings and recurrent buffers,
     /// device memory the tier holds outside its blocks.
     slot_pages: usize,
+    /// Separate, bounded state allocation budget for an already committed device
+    /// KV arena. None keeps shared-memory backends' withheld-page policy.
+    slot_state_budget: Option<usize>,
     /// Slots other than 0 holding their buffers, each charged `slot_pages` withheld pages
     /// (`charge_slot`). Slot 0's state is the load's, counted by the fit.
     charged_slots: BTreeSet<usize>,
@@ -359,6 +362,7 @@ impl PoolMode {
             slot: 0,
             slot_occupants: vec![None],
             slot_pages: 0,
+            slot_state_budget: None,
             charged_slots: BTreeSet::new(),
             pinned: BTreeSet::new(),
             parked: BTreeMap::new(),
@@ -413,7 +417,7 @@ impl PoolMode {
                 *e = None;
             }
         }
-        if self.charged_slots.remove(&s) {
+        if self.charged_slots.remove(&s) && self.slot_state_budget.is_none() {
             // Shrinking what is held back always succeeds.
             let _ = self
                 .resident
@@ -426,6 +430,15 @@ impl PoolMode {
     pub fn set_slot_pages(&mut self, pages: usize) {
         self.slot_pages = pages;
     }
+
+    /// Set an independently backed state capacity, in pool-page byte equivalents.
+    /// Configure only before slots are charged; zero explicitly admits no extra state.
+    pub fn set_slot_state_budget(&mut self, pages: usize) -> bool {
+        if !self.charged_slots.is_empty() { return false; }
+        self.slot_state_budget = Some(pages);
+        true
+    }
+
 
     /// Bytes of one page across every pooled layer: the unit a slot's state is charged in.
     #[must_use]
@@ -445,7 +458,13 @@ impl PoolMode {
         if s == 0 || self.slot_pages == 0 || self.charged_slots.contains(&s) {
             return Ok(true);
         }
-        let want = (self.charged_slots.len() + 1) * self.slot_pages;
+        let Some(want) = self.charged_slots.len().checked_add(1)
+            .and_then(|n| n.checked_mul(self.slot_pages)) else { return Ok(false); };
+        if let Some(budget) = self.slot_state_budget {
+            if want > budget { return Ok(false); }
+            self.charged_slots.insert(s);
+            return Ok(true);
+        }
         loop {
             if self.resident.set_withheld_units(want) {
                 self.charged_slots.insert(s);
@@ -1487,14 +1506,16 @@ impl PoolMode {
         if self.addressing != PoolAddressing::ExplicitHostTransfers {
             return Ok(false);
         }
-        let protected: BTreeSet<UnitId> = self
-            .resident
-            .pool
-            .conversation(&cid(keep))
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect();
+        // An idle label can share sealed units with any live row, not only
+        // the row asking for more space. Never move another row's KV under it.
+        let mut protected = BTreeSet::new();
+        let mut held = self.held_labels();
+        held.push(keep.to_string());
+        for label in held {
+            if let Some(units) = self.resident.pool.conversation(&cid(&label)) {
+                protected.extend(units.iter().copied());
+            }
+        }
         for label in self.recent.clone() {
             if label == keep
                 || self.active.as_deref() == Some(label.as_str())
@@ -1502,9 +1523,7 @@ impl PoolMode {
             {
                 continue;
             }
-            let Some(units) = self.resident.pool.conversation(&cid(&label)) else {
-                continue;
-            };
+            let units = self.resident.pool.conversation(&cid(&label)).unwrap_or(&[]);
             let candidates: BTreeSet<UnitId> = units
                 .iter()
                 .copied()
@@ -1516,19 +1535,28 @@ impl PoolMode {
                         )
                 })
                 .collect();
-            if candidates.is_empty() {
-                continue;
+            let moved = !candidates.is_empty();
+            if moved {
+                let mover = self.active_mover()?;
+                let unit_bytes = u64::try_from(self.unit_bytes())
+                    .map_err(|_| "kv pool: unit byte size exceeds u64".to_string())?;
+                let needed = u64::try_from(candidates.len())
+                    .ok()
+                    .and_then(|count| count.checked_mul(unit_bytes))
+                    .ok_or_else(|| "kv pool: Host capacity request overflow".to_string())?;
+                self.make_host_room_with(mover, needed, keep, store, disk)?;
+                self.demote_units_with(mover, candidates)?;
             }
-            let mover = self.active_mover()?;
-            let unit_bytes = u64::try_from(self.unit_bytes())
-                .map_err(|_| "kv pool: unit byte size exceeds u64".to_string())?;
-            let needed = u64::try_from(candidates.len())
-                .ok()
-                .and_then(|count| count.checked_mul(unit_bytes))
-                .ok_or_else(|| "kv pool: Host capacity request overflow".to_string())?;
-            self.make_host_room_with(mover, needed, keep, store, disk)?;
-            self.demote_units_with(mover, candidates)?;
-            return Ok(true);
+            // Match release_idle: mutable tails have no content identity and
+            // are reprocessed on return. A short idle turn may have ONLY a tail,
+            // so it must remain reclaimable even with no sealed units to move.
+            let tail = self.convs.get_mut(&label)
+                .map_or_else(Vec::new, |conv| std::mem::take(&mut conv.tail));
+            let released_tail = !tail.is_empty();
+            self.release_unsealed(tail);
+            if moved || released_tail {
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -4539,6 +4567,41 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn allocation_reclaims_idle_tail_without_sealed_units() {
+        let mut mode = mode(PoolAddressing::ExplicitHostTransfers, 1);
+        remember_sealed(&mut mode, "short", UnitHash([1; 16]));
+        let tail = mode.resident.alloc_unit().unwrap();
+        mode.drain_lifecycle();
+        let short = mode.convs.get_mut("short").unwrap();
+        short.tokens = vec![1];
+        short.sealed_units = 0;
+        short.hashes.clear();
+        short.spilled_units = 0;
+        short.committed_at = 0;
+        short.tail.push(tail.clone());
+        mode.pin("short");
+        assert!(mode.alloc_units(1, "new", None, None).is_err());
+        assert_eq!(mode.convs["short"].tail, vec![tail.clone()]);
+        mode.unpin("short");
+        assert_eq!(mode.alloc_units(1, "new", None, None).unwrap(), vec![tail]);
+        assert!(mode.convs["short"].tail.is_empty());
+        assert!(mode.convs.contains_key("short"));
+    }
+
+    #[test]
+    fn allocation_keeps_shared_units_of_other_live_rows_on_device() {
+        let mut mode = mode(PoolAddressing::ExplicitHostTransfers, 2);
+        let (unit, hash) = seed(&mut mode, "idle", 1);
+        remember_sealed(&mut mode, "idle", hash);
+        let (shared, hash) = seed(&mut mode, "running", 1);
+        remember_sealed(&mut mode, "running", hash);
+        assert_eq!(unit, shared);
+        mode.pin("running");
+        assert!(!mode.demote_idle_for_allocation("new", None, None).unwrap());
+        assert!(matches!(mode.resident.residency(unit), Some(UnitResidency::Device(_))));
+    }
+
+    #[test]
     fn device_to_host_is_one_conversation_batch() {
         let mut mode = mode(PoolAddressing::ExplicitHostTransfers, 2);
         let (first, _) = seed(&mut mode, "idle", 1);
@@ -5643,6 +5706,27 @@ mod lifecycle_tests {
     /// A slot's own state is charged in withheld pages: fewer are obtainable while it holds
     /// them, an idle conversation's pages are dropped to make room, a running one's never,
     /// and the release gives them back. Slot 0 is never charged.
+    #[test]
+    fn separately_backed_slot_state_preserves_kv_capacity_and_stays_bounded() {
+        let mut mode = mode(PoolAddressing::ExplicitHostTransfers, 2);
+        mode.set_slot_pages(4);
+        assert!(mode.set_slot_state_budget(8));
+        let free = mode.obtainable_units();
+        assert!(mode.charge_slot(1, "a").unwrap());
+        assert!(mode.charge_slot(1, "a").unwrap()); // no double charge
+        assert!(mode.charge_slot(2, "b").unwrap());
+        assert!(!mode.charge_slot(3, "c").unwrap());
+        assert_eq!(mode.obtainable_units(), free);
+        assert!(!mode.set_slot_state_budget(100)); // no live budget replacement
+        mode.slot_released(1);
+        assert!(mode.charge_slot(3, "c").unwrap());
+        assert_eq!(mode.obtainable_units(), free);
+        mode.slot_released(2); mode.slot_released(3);
+        assert!(mode.set_slot_state_budget(0));
+        assert!(!mode.charge_slot(1, "a").unwrap());
+        assert!(mode.charge_slot(0, "a").unwrap()); // load already covers slot 0
+    }
+
     #[test]
     fn a_slot_state_is_charged_in_withheld_pages() {
         let mut mode = mode(PoolAddressing::Shared, 4);

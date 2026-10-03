@@ -131,14 +131,38 @@ __device__ __forceinline__ uint64_t meta_index(
 // Two warps cover the two 16-key halves for all 16 query/head columns. The
 // small reference configuration stages the complete D=512 K dimension at once,
 // so the MMA accumulator walks dimensions 0..511 in increasing order.
+
+// Existing BufId::RowLayout: position/depth/visibility/nearest 8 ancestors.
+// Host validates the four-node tree; logical slots remain ordinary path slots.
+__device__ __forceinline__ uint32_t tree_key(const uint32_t*layout,
+        uint32_t start,uint32_t query,uint32_t key) {
+    const uint32_t*r=layout+query*12;
+    if(key<start || key>r[0])return key;
+    const uint32_t delta=r[1]-(key-start);
+    return start+(delta?r[4+delta-1]:query);
+}
+__device__ __forceinline__ bool tree_group_remaps(const uint32_t*layout,
+        uint32_t start,uint32_t query,uint32_t key0) {
+    const uint32_t*r=layout+query*12;
+    if(key0+16<=start || key0>r[0])return false;
+    #pragma unroll
+    for(unsigned d=0;d<4;d++){
+        const unsigned key=start+d;
+        if(d<=r[1] && key>=key0 && key<key0+16 && tree_key(layout,start,query,key)!=key)return true;
+    }
+    return false;
+}
+
 template <uint32_t HeadDim, uint32_t CacheType, uint32_t GqaHeads = kGqaHeads,
-          bool QueryGrid = false>
-__global__ void scores(
+          bool QueryGrid = false, bool Tree = false>
+__device__ __forceinline__ void scores_body(
         const float * q, const void * kc, float * workspace,
         uint32_t block_base, uint32_t n_heads, uint32_t n_kv,
         uint32_t kv_width, uint32_t start_pos, float qk_scale, uint32_t window,
         uint32_t n_tok, uint32_t ring, uint32_t valid_span,
-        uint32_t kv_span, uint32_t parts, const uint32_t * decode_control) {
+        uint32_t kv_span, uint32_t parts, const uint32_t * decode_control,
+        const uint32_t* layout) {
+static_assert(!Tree || (HeadDim==512 && CacheType==2 && GqaHeads==4 && !QueryGrid), "tree Q4 D512 only");
 static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA factor");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (decode_control) {
@@ -170,6 +194,12 @@ static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA fac
     imparo_sm80_prefill::Float16x16 c{};
     static_assert(HeadDim == 64 || HeadDim == 256 || HeadDim == 512,
         "small FA head dimension");
+    // Prefix uses one original MMA. Only a noncanonical path replays the
+    // intersecting tail group; the source remains a single arithmetic body.
+    const int passes = Tree ? int(n_tok) : 0;
+    for (int selected=-1; selected<passes; ++selected) {
+        if constexpr(Tree) if(selected>=0 && !tree_group_remaps(layout,start_pos,unsigned(selected),key0)) continue;
+        imparo_sm80_prefill::Float16x16 pass_c{};
     for (uint32_t d0 = 0; d0 < HeadDim; d0 += 16) {
         for (uint32_t e = lane; e < 16 * 8; e += 32) {
             const uint32_t qrow = e >> 3;
@@ -189,7 +219,7 @@ static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA fac
             __half2 kval = __float2half2_rn(0.0f);
             if (key < valid_span) {
                 kval = cache_half2<CacheType>(
-                    kc, kv_width, key,
+                    kc, kv_width, Tree && selected>=0 ? tree_key(layout,start_pos,unsigned(selected),key) : key,
                     kvh * HeadDim + d0 + 2 * pair);
             }
             k_tile[warp][qrow * stride + pair] = kval;
@@ -199,8 +229,14 @@ static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA fac
         imparo_sm80_prefill::Half16x8 k_frag;
         imparo_sm80_prefill::load_half16x8(q_frag, q_tile[warp], stride, lane);
         imparo_sm80_prefill::load_half16x8(k_frag, k_tile[warp], stride, lane);
-        imparo_sm80_prefill::mma_qk(c, q_frag, k_frag);
+        imparo_sm80_prefill::mma_qk(pass_c, q_frag, k_frag);
         __syncwarp();
+    }
+        #pragma unroll
+        for(unsigned l=0;l<8;l++){
+            const unsigned token=imparo_sm80_prefill::fragment_q_column(lane,l)/GqaHeads;
+            if(selected<0 || token==unsigned(selected)) c.x[l]=pass_c.x[l];
+        }
     }
 
 #pragma unroll
@@ -208,7 +244,7 @@ static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA fac
         const uint32_t column = imparo_sm80_prefill::fragment_q_column(lane, l);
         const uint32_t key = key0 + imparo_sm80_prefill::fragment_key_row(lane, l);
         const uint32_t token = column / GqaHeads;
-        const uint32_t pos = start_pos + token;
+        const uint32_t pos = Tree && token<n_tok ? layout[token*12] : start_pos + token;
         const uint32_t lo = window > 0 && pos + 1 > window ? pos + 1 - window : 0;
         const uint32_t key_pos = key < valid_span
             ? imparo_sm80_prefill::physical_key_position(
@@ -227,6 +263,30 @@ static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA fac
     (void)n_kv; (void)kv_width; (void)start_pos; (void)qk_scale; (void)window; (void)n_tok;
     (void)ring; (void)valid_span; (void)kv_span; (void)parts; (void)decode_control;
 #endif
+}
+
+
+// Keep production Graph symbols and their parameter lists unchanged.
+template <uint32_t HeadDim, uint32_t CacheType, uint32_t GqaHeads = kGqaHeads,
+          bool QueryGrid = false>
+__global__ void scores(
+        const float*q,const void*kc,float*workspace,uint32_t block_base,
+        uint32_t n_heads,uint32_t n_kv,uint32_t kv_width,uint32_t start_pos,
+        float qk_scale,uint32_t window,uint32_t n_tok,uint32_t ring,
+        uint32_t valid_span,uint32_t kv_span,uint32_t parts,const uint32_t*decode_control) {
+    scores_body<HeadDim,CacheType,GqaHeads,QueryGrid,false>(q,kc,workspace,
+        block_base,n_heads,n_kv,kv_width,start_pos,qk_scale,window,n_tok,ring,
+        valid_span,kv_span,parts,decode_control,nullptr);
+}
+// Lab-only, validated 4-row RowLayout, full attention, contiguous Q4 cache.
+__global__ void scores_tree4(
+        const float*q,const void*kc,float*workspace,uint32_t block_base,
+        uint32_t n_heads,uint32_t n_kv,uint32_t kv_width,uint32_t start_pos,
+        float qk_scale,uint32_t window,uint32_t n_tok,uint32_t ring,
+        uint32_t valid_span,uint32_t kv_span,uint32_t parts,const uint32_t*decode_control,
+        const uint32_t*layout) {
+    scores_body<512,2,4,false,true>(q,kc,workspace,block_base,n_heads,n_kv,
+        kv_width,start_pos,qk_scale,window,n_tok,ring,valid_span,kv_span,parts,decode_control,layout);
 }
 
 template <uint32_t HeadDim, uint32_t CacheType, uint32_t GqaHeads = kGqaHeads>
@@ -433,13 +493,14 @@ __device__ __forceinline__ __half2 load_probability_pair(
 // to the first. Each thread in warp 0 owns eight (query, output-row) cells.
 template <uint32_t HeadDim, uint32_t CacheType, uint32_t OutputTiles,
           uint32_t GqaHeads = kGqaHeads, bool QueryGrid = false, bool F32Numerator = false,
-          bool RegisterPV = false>
-__global__ void values_combine(
+          bool RegisterPV = false, bool Tree = false>
+__device__ __forceinline__ void values_combine_body(
         const void * vc, const float * workspace, float * out,
         uint32_t block_base, uint32_t n_heads, uint32_t n_kv,
         uint32_t kv_width, uint32_t n_tok, uint32_t ring,
         uint32_t valid_span, uint32_t kv_span, uint32_t parts,
-        const uint32_t * decode_control) {
+        const uint32_t * decode_control, uint32_t tree_start, const uint32_t*layout) {
+static_assert(!Tree || (HeadDim==512 && CacheType==2 && OutputTiles==1 && GqaHeads==4 && !QueryGrid && !F32Numerator && !RegisterPV), "tree common short Q4 PV only");
 static_assert(GqaHeads == 2 || GqaHeads == 4 || GqaHeads == 6, "small FA GQA factor");
 static_assert(!RegisterPV || (HeadDim == 512 && CacheType == 2 && OutputTiles == 1
     && GqaHeads == 4 && !QueryGrid && !F32Numerator),
@@ -542,6 +603,16 @@ static_assert(!F32Numerator || (HeadDim == 512 && CacheType == 2 && GqaHeads == 
                 }
             }
             const uint32_t key0 = group * kKeyBatch + partition * 16;
+            // Save after this group's rescale, before its MMA. A repaired
+            // column replaces its result, never adds a second tail product.
+            Numerator before[OutputTiles],after[OutputTiles];
+            if constexpr(Tree) for(unsigned tile=0;tile<OutputTiles;tile++)before[tile]=c[tile];
+            const int passes=Tree?int(n_tok):0;
+            for(int selected=-1;selected<passes;++selected){
+            if constexpr(Tree) if(selected>=0){
+                if(!tree_group_remaps(layout,tree_start,unsigned(selected),key0))continue;
+                for(unsigned tile=0;tile<OutputTiles;tile++)c[tile]=before[tile];
+            }
             if constexpr (RegisterPV) {
                 // Same ldmatrix.x4 row-major slots, loaded directly into registers.
                 const uint32_t row = lane >> 2;
@@ -604,7 +675,11 @@ static_assert(!F32Numerator || (HeadDim == 512 && CacheType == 2 && GqaHeads == 
                             const uint32_t index = kvh * HeadDim + out0
                                 + tile * 16 + 2 * out_pair;
                             if constexpr (CacheType == 2) {
-                                value = cache_half2_q4_scaled(
+                                if constexpr(Tree){
+                                    if(selected>=0) value=cache_half2<CacheType>(
+                                        vc,kv_width,tree_key(layout,tree_start,unsigned(selected),key),index);
+                                    else value=cache_half2_q4_scaled(vc,kv_width,key,index,v_scale[warp][e >> 3]);
+                                }else value = cache_half2_q4_scaled(
                                     vc, kv_width, key, index,
                                     v_scale[warp][e >> 3]);
                             } else {
@@ -628,6 +703,18 @@ static_assert(!F32Numerator || (HeadDim == 512 && CacheType == 2 && GqaHeads == 
                     }
                 }
             }
+            if constexpr(Tree){
+                #pragma unroll
+                for(unsigned tile=0;tile<OutputTiles;tile++){
+                    #pragma unroll
+                    for(unsigned l=0;l<4;l++){
+                        const unsigned token=imparo_sm80_prefill::half_acc_query_column(lane,l)/GqaHeads;
+                        if(selected<0 || token==unsigned(selected))after[tile].x[l]=c[tile].x[l];
+                    }
+                }
+            }
+            } // original group plus only noncanonical query repairs
+            if constexpr(Tree) for(unsigned tile=0;tile<OutputTiles;tile++)c[tile]=after[tile];
             if constexpr (CacheType == 2) {
                 if (group + 1 < group_stop && lane < 16) {
                     const uint32_t key = (group + 1) * kKeyBatch
@@ -746,6 +833,27 @@ static_assert(!F32Numerator || (HeadDim == 512 && CacheType == 2 && GqaHeads == 
     (void)n_kv; (void)kv_width; (void)n_tok; (void)ring; (void)valid_span; (void)kv_span;
     (void)parts; (void)decode_control;
 #endif
+}
+
+
+template <uint32_t HeadDim, uint32_t CacheType, uint32_t OutputTiles,
+          uint32_t GqaHeads = kGqaHeads, bool QueryGrid = false, bool F32Numerator = false,
+          bool RegisterPV = false>
+__global__ void values_combine(
+        const void*vc,const float*workspace,float*out,uint32_t block_base,
+        uint32_t n_heads,uint32_t n_kv,uint32_t kv_width,uint32_t n_tok,
+        uint32_t ring,uint32_t valid_span,uint32_t kv_span,uint32_t parts,
+        const uint32_t*decode_control) {
+    values_combine_body<HeadDim,CacheType,OutputTiles,GqaHeads,QueryGrid,F32Numerator,RegisterPV,false>(
+        vc,workspace,out,block_base,n_heads,n_kv,kv_width,n_tok,ring,valid_span,kv_span,parts,decode_control,0,nullptr);
+}
+__global__ void values_combine_tree4(
+        const void*vc,const float*workspace,float*out,uint32_t block_base,
+        uint32_t n_heads,uint32_t n_kv,uint32_t kv_width,uint32_t n_tok,
+        uint32_t ring,uint32_t valid_span,uint32_t kv_span,uint32_t parts,
+        const uint32_t*decode_control,uint32_t start,const uint32_t*layout) {
+    values_combine_body<512,2,1,4,false,false,false,true>(vc,workspace,out,
+        block_base,n_heads,n_kv,kv_width,n_tok,ring,valid_span,kv_span,parts,decode_control,start,layout);
 }
 
 template <uint32_t HeadDim, uint32_t CacheType, uint32_t OutputTiles,

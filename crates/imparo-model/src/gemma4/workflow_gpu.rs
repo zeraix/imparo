@@ -134,6 +134,10 @@ pub fn batch(
     let ple = wf.plan.embed.per_layer_dim.unwrap_or(0);
     let b = u32::try_from(tokens.len()).map_err(|_| "batch too large".to_string())?;
     let all_logits = wf.state.output_demand.requires_all_positions();
+    let row_argmax = wf.state.output_demand == crate::OutputDemand::RowArgmax;
+    if row_argmax && !be().supports_argmax_rows() {
+        return Err("Gemma4 row argmax is not served by this backend".into());
+    }
     let layer_outputs = wf
         .state
         .layer_outputs
@@ -271,7 +275,12 @@ pub fn batch(
     // Verification keeps its existing Prefill numerical geometry. Prepare the
     // weight layout on the already-active owner before any graph capture/replay.
     // Ordinary Prefill switches back even after a prior decode/verification turn.
-    be().prepare_projection_phase(b <= 3 && (decode || all_logits))
+    // A native four-row tree is also a small verification batch. The phase
+    // hint must reach the normal authenticated module loader before native
+    // packing; a prior ordinary decode is not guaranteed on a cold request.
+    let native_tree_verify = cfg!(feature = "cuda-speculative")
+        && retained_policy && row_argmax && b == 4 && wf.state.row_layout == b;
+    be().prepare_projection_phase((b <= 3 && (decode || all_logits)) || native_tree_verify)
         .map_err(|rc| format!("GPU projection phase prepare failed rc={rc}"))?;
     let replayed = if all_logits
         || gate0_capture_active
@@ -497,10 +506,10 @@ pub fn batch(
         return Ok(());
     }
 
-    // Keep host-staged embedding/PLE outside the graph. Re-encode every body
-    // with current geometry; publish the MTP feature after graph execution.
-    let verification_submission = if greedy_return
-        && b == 3
+    // Keep host-staged embedding/PLE outside the graph. The backend admits
+    // only its fixed, keyed verification tier; publish hidden after execution.
+    let verification_submission = if ((greedy_return && b == 3)
+        || (native_tree_verify && b == 4))
         && !gate0_capture_active
         && gpu_probe_layer() == usize::MAX
     {
@@ -509,6 +518,14 @@ pub fn batch(
     } else {
         imparo_backend::VerificationSubmission::Eager
     };
+    if greedy_return || native_tree_verify {
+        // Record the backend result, including the replay early return below.
+        wf.state.tree_submission = match verification_submission {
+            imparo_backend::VerificationSubmission::Eager => crate::speculative::TreeSubmission::Ordinary,
+            imparo_backend::VerificationSubmission::Capture => crate::speculative::TreeSubmission::Capture,
+            imparo_backend::VerificationSubmission::Replay => crate::speculative::TreeSubmission::Replayed,
+        };
+    }
     let defer_verify_capture =
         verification_submission != imparo_backend::VerificationSubmission::Eager;
     if verification_submission == imparo_backend::VerificationSubmission::Replay {
@@ -517,7 +534,9 @@ pub fn batch(
         if let Some(capture) = &wf.state.layer_outputs {
             capture.record((n_layers - 1) as u32, sp, b, BufId::X)?;
         }
-        out.resize(3, 0.0);
+        // Chain3 returns its three-word greedy transaction; Tree4 retains
+        // RowArgmax and returns one token ID for each physical tree node.
+        out.resize(if native_tree_verify { b as usize } else { 3 }, 0.0);
         be().read(BufId::Tmp, 0, out);
         return Ok(());
     }
@@ -1869,6 +1888,8 @@ pub fn batch(
                 0,
             )
             .map_err(|rc| format!("Gemma4 device greedy verification rc={rc}"))?;
+        } else if row_argmax {
+            be().argmax_rows(BufId::Logits, BufId::Tmp, c.vocab_size, b);
         } else if argmax {
             // The pick runs where the logits already are; only the index crosses back.
             // TMP is free here -- nothing reads it after the layer loop.
@@ -1893,6 +1914,9 @@ pub fn batch(
     }
     if greedy_return {
         out.resize(3, 0.0);
+        be().read(BufId::Tmp, 0, out);
+    } else if row_argmax {
+        out.resize(b as usize, 0.0);
         be().read(BufId::Tmp, 0, out);
     } else if argmax {
         out.resize(1, 0.0);
@@ -1938,8 +1962,8 @@ pub fn rows(
     logits: Option<&mut Vec<f32>>,
     picks: &mut Vec<u32>,
 ) -> Result<(), String> {
-    if KvType::k() != KvType::F16 || KvType::v() != KvType::F16 {
-        return Err("co-batched decode reads an f16 cache only".into());
+    if !be().supports_decode_rows_kv(KvType::k().ggml_id(), KvType::v().ggml_id()) {
+        return Err("co-batched decode does not support these KV codecs".into());
     }
     if !be().supports_argmax_rows() {
         return Err("co-batched decode needs a per-row argmax".into());
@@ -1958,12 +1982,12 @@ pub fn rows(
     let fit = wf.gpu_fit_batch(rows.len());
     wf.state.output_demand = crate::OutputDemand::LastToken;
     fit?;
-    if !be().set_decode_rows(Some(wf.state.row_route)) {
-        return Err("the backend has no decode rows".into());
-    }
-    let encoded = encode_rows(wf, rows, b);
-    be().set_decode_rows(None);
-    encoded?;
+    // Preserve the existing decode weight layout for independent token rows.
+    be().prepare_projection_phase(true)
+        .map_err(|rc| format!("GPU projection phase prepare failed rc={rc}"))?;
+    crate::gpu_support::submit_decode_rows(be(), wf.state.row_route, || {
+        encode_rows(wf, rows, b)
+    })?;
     let mut got = vec![0.0_f32; rows.len()];
     be().read(BufId::Tmp, 0, &mut got);
     picks.clear();
@@ -1979,6 +2003,10 @@ pub fn rows(
 #[allow(clippy::too_many_lines)]
 fn encode_rows(wf: &Gemma4, rows: &[crate::DecodeRow], b: u32) -> Result<(), String> {
     let c = &wf.plan.config;
+    let kv_quant_route = effective_workflow_kv_route(
+        &wf.plan, KvType::k(), KvType::v(), be().kv_quantization_route(),
+        be().kv_quantization_route_override(),
+    )?;
     let mw = &wf.w;
     let n_embd = c.n_embd;
     let n_head = c.n_heads;
@@ -2003,7 +2031,7 @@ fn encode_rows(wf: &Gemma4, rows: &[crate::DecodeRow], b: u32) -> Result<(), Str
         })
         .collect();
 
-    be().begin_forward(false);
+    be().begin_forward(true);
     be().write_u32(BufId::Tokens, 0, &tokens);
     // A host-staged per-layer table: the host copies each row's table row, as it does for a
     // one-row decode.
@@ -2054,37 +2082,48 @@ fn encode_rows(wf: &Gemma4, rows: &[crate::DecodeRow], b: u32) -> Result<(), Str
                 PER_LAYER,
                 b,
             );
-            be().scale(PER_LAYER, 1.0 / embd_scale, b * width);
-            be().rms_norm(
-                PER_LAYER,
-                mw.per_layer_proj_norm.offset,
-                ple,
-                eps,
-                b * c.n_layers,
-                ple,
-                0,
-            );
-            let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
-            if ple_staged {
-                be().ple_gather_combine_staged(
-                    PER_LAYER,
-                    PLE_ROWS,
-                    width,
-                    (f64::from(ple)).sqrt() as f32,
-                    inv_sqrt2,
-                    b,
+            // Inherit the ordinary decode's admitted PLE arithmetic. Splitting
+            // this fusion changes rounding before the per-layer input is consumed.
+            let combined = !ple_staged
+                && be().ple_norm_gather_combine_prefix(
+                    PER_LAYER, BufId::Tokens, mw.per_layer_proj_norm.offset,
+                    pt.offset as u64, ple, c.n_layers, width,
+                    1.0 / embd_scale, eps, (f64::from(ple)).sqrt() as f32,
+                    1.0 / 2.0_f32.sqrt(), b,
                 );
-            } else {
-                be().ple_gather_combine_prefix(
+            if !combined {
+                be().scale(PER_LAYER, 1.0 / embd_scale, b * width);
+                be().rms_norm(
                     PER_LAYER,
-                    BufId::Tokens,
-                    pt.offset as u64,
-                    width,
-                    width,
-                    (f64::from(ple)).sqrt() as f32,
-                    inv_sqrt2,
-                    b,
+                    mw.per_layer_proj_norm.offset,
+                    ple,
+                    eps,
+                    b * c.n_layers,
+                    ple,
+                    0,
                 );
+                let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
+                if ple_staged {
+                    be().ple_gather_combine_staged(
+                        PER_LAYER,
+                        PLE_ROWS,
+                        width,
+                        (f64::from(ple)).sqrt() as f32,
+                        inv_sqrt2,
+                        b,
+                    );
+                } else {
+                    be().ple_gather_combine_prefix(
+                        PER_LAYER,
+                        BufId::Tokens,
+                        pt.offset as u64,
+                        width,
+                        width,
+                        (f64::from(ple)).sqrt() as f32,
+                        inv_sqrt2,
+                        b,
+                    );
+                }
             }
             trace_rows("ple", 0, PER_LAYER, b, width);
         }
@@ -2143,7 +2182,13 @@ fn encode_rows(wf: &Gemma4, rows: &[crate::DecodeRow], b: u32) -> Result<(), Str
             BufId::Q,
             b,
         );
-        if !be().head_norm_rope_at(
+        let hk = if KvType::k() == KvType::F16 { 0 } else {
+            had_nrot("IMPARO_HAD_K", kv_quant_route.key, hd)?
+        };
+        let hv = if KvType::v() == KvType::F16 { 0 } else {
+            had_nrot("IMPARO_HAD_V", kv_quant_route.value, hd)?
+        };
+        if !be().head_norm_rope_hadamard_at(
             BufId::Q,
             lw.attn_q_norm.offset,
             hd,
@@ -2153,6 +2198,7 @@ fn encode_rows(wf: &Gemma4, rows: &[crate::DecodeRow], b: u32) -> Result<(), Str
             rope_dim,
             rope_base,
             rope_freqs,
+            hk,
         ) {
             return Err(format!("co-batched query rope not served at layer {li}"));
         }
@@ -2170,46 +2216,12 @@ fn encode_rows(wf: &Gemma4, rows: &[crate::DecodeRow], b: u32) -> Result<(), Str
                 BufId::Cur,
                 b,
             );
-            // `kv_head_postprocess` without a rotation (f16 cache): K normed and roped at each
-            // row's position, V's weightless norm. K and V are different buffers, so the order
-            // moves no value.
             let ring = ring_mask(layer.attention, wf.state.kv_ring_batch);
-            let served = be().head_norm_rope_at(
-                BufId::K,
-                lw.attn_k_norm.offset,
-                hd,
-                eps,
-                n_kv,
-                &pos,
-                rope_dim,
-                rope_base,
-                rope_freqs,
-            ) && {
-                be().rms_norm(
-                    BufId::V,
-                    imparo_backend::NO_WEIGHT,
-                    hd,
-                    eps,
-                    b * n_kv,
-                    hd,
-                    0,
-                );
-                be().kv_store_slot_rows(
-                    BufId::K,
-                    li as u32,
-                    kv_width,
-                    &slot_rows,
-                    false,
-                    ring,
-                )
-            } && be().kv_store_slot_rows(
-                BufId::V,
-                li as u32,
-                kv_width,
-                &slot_rows,
-                true,
-                ring,
-            );
+            let served = be().kv_head_postprocess_at(
+                BufId::K, BufId::V, lw.attn_k_norm.offset, hd, eps, n_kv,
+                &pos, rope_dim, rope_base, rope_freqs, hk, hv,
+            ) && be().kv_store_slot_rows(BufId::K, li as u32, kv_width, &slot_rows, false, ring)
+              && be().kv_store_slot_rows(BufId::V, li as u32, kv_width, &slot_rows, true, ring);
             if !served {
                 return Err(format!("co-batched KV store not served at layer {li}"));
             }
@@ -2237,6 +2249,7 @@ fn encode_rows(wf: &Gemma4, rows: &[crate::DecodeRow], b: u32) -> Result<(), Str
         ) {
             return Err(format!("co-batched attention not served at layer {li}"));
         }
+        if hv != 0 { be().hadamard(BufId::Attn, b * n_head * hd, hv); }
         trace_rows("attn", li, BufId::Attn, b, n_head * hd);
         be().matmat(
             wkind(&lw.wo),
@@ -2481,8 +2494,7 @@ fn encode_rows(wf: &Gemma4, rows: &[crate::DecodeRow], b: u32) -> Result<(), Str
         be().softcap(BufId::Logits, cap, b * c.vocab_size);
     }
     be().argmax_rows(BufId::Logits, BufId::Tmp, c.vocab_size, b);
-    be().end()
-        .map_err(|rc| format!("gemma4 co-batched step failed rc={rc}"))
+    Ok(())
 }
 
 /// Every activation buffer this model needs for a batch of `b`, and which of them may

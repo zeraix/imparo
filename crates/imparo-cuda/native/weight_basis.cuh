@@ -38,6 +38,40 @@ __global__ void transform(const float *src, float *dst, const int8_t *signs,
         dst[row+logical]=values[i]*scale*(inverse ? float(signs[logical]) : 1.0f);
     }
 }
+// Reuse the runtime's warp-shuffle FWHT mechanism, retaining weight-basis
+// post-normalization and exact pair arithmetic. No attention-basis substitution.
+__global__ void transform1024_warp(const float*src,float*dst,const int8_t*signs,
+ unsigned width,bool inverse,unsigned hd,unsigned kh,unsigned vh) {
+ __shared__ float shared[1024];
+ unsigned t=threadIdx.x,base=blockIdx.x*1024;
+ size_t row=size_t(blockIdx.y)*width;float v[4];
+ #pragma unroll
+ for(unsigned j=0;j<4;j++){unsigned logical=base+t+256*j,source=logical;
+  if(hd){unsigned repeats=vh/kh,h=logical/hd;source=((h%repeats)*kh+h/repeats)*hd+logical%hd;}
+  v[j]=src[row+source]*(inverse?1.0f:float(signs[logical]));
+ }
+ #pragma unroll
+ for(unsigned stride=1;stride<32;stride*=2){
+  #pragma unroll
+  for(unsigned j=0;j<4;j++){float b=__shfl_xor_sync(0xffffffff,v[j],stride);v[j]=(t&stride)?b-v[j]:v[j]+b;}
+ }
+ #pragma unroll
+ for(unsigned stride=32;stride<256;stride*=2){
+  #pragma unroll
+  for(unsigned j=0;j<4;j++)shared[t+256*j]=v[j];
+  __syncthreads();
+  #pragma unroll
+  for(unsigned j=0;j<4;j++){float b=shared[(t^stride)+256*j];v[j]=(t&stride)?b-v[j]:v[j]+b;}
+  __syncthreads();
+ }
+ float a=v[0],b=v[1],c=v[2],d=v[3];
+ v[0]=a+b;v[1]=a-b;v[2]=c+d;v[3]=c-d;
+ a=v[0];b=v[1];c=v[2];d=v[3];
+ v[0]=a+c;v[1]=b+d;v[2]=a-c;v[3]=b-d;
+ #pragma unroll
+ for(unsigned j=0;j<4;j++){unsigned logical=base+t+256*j;dst[row+logical]=v[j]*(1.0f/32.0f)*(inverse?float(signs[logical]):1.0f);}
+}
+
 inline cudaError_t launch(const float *src,float *dst,const int8_t *signs,
         uint32_t width,uint32_t block,uint32_t rows,bool inverse,
         uint32_t head_dim,uint32_t key_heads,uint32_t value_heads,cudaStream_t stream) {
@@ -46,8 +80,13 @@ inline cudaError_t launch(const float *src,float *dst,const int8_t *signs,
             ||(head_dim && (inverse||!key_heads||!value_heads
                 ||value_heads%key_heads||uint64_t(head_dim)*value_heads!=width)))
         return cudaErrorInvalidValue;
-    transform<<<dim3(width/block,rows),256,block*sizeof(float),stream>>>(
-        src,dst,signs,width,block,inverse,head_dim,key_heads,value_heads);
+    if (block == 1024) {
+        transform1024_warp<<<dim3(width/block,rows),256,0,stream>>>(
+            src,dst,signs,width,inverse!=0,head_dim,key_heads,value_heads);
+    } else {
+        transform<<<dim3(width/block,rows),256,block*sizeof(float),stream>>>(
+            src,dst,signs,width,block,inverse,head_dim,key_heads,value_heads);
+    }
     return cudaGetLastError();
 }
 

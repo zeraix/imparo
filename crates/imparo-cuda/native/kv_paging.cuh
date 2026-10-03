@@ -62,6 +62,31 @@ struct PageTableLayer {
     uint64_t arena_offset = 0; // uint32 entries, not bytes
 };
 
+/// Exclusive physical row bound touched by the live logical prefix. The table's
+/// identity-filled tail is valid even beyond installed_len. Host only, with no
+/// allocation; a failed check leaves the caller's extent unchanged.
+inline bool mapped_prefix_rows(
+        const PageTableLayer & table, uint32_t logical_rows, uint64_t * extent) {
+    if (!extent || table.host_shadow.size() != table.capacity) return false;
+    uint32_t pages = 0;
+    if (!checked_page_count(logical_rows, &pages) || pages > table.capacity)
+        return false;
+    uint64_t bound = 0;
+    for (uint32_t page = 0; page < pages; ++page) {
+        const uint32_t entry = table.host_shadow[page];
+        // Device physical_row uses uint32_t addressing: a larger block id would
+        // wrap when shifted. The exclusive endpoint itself may be 2^32.
+        if (entry > table.max_entry || entry > UINT32_MAX / kPageCells)
+            return false;
+        const uint64_t begin = uint64_t(page) * kPageCells;
+        const uint64_t live = std::min(uint64_t(kPageCells), uint64_t(logical_rows) - begin);
+        const uint64_t end = uint64_t(entry) * kPageCells + live;
+        bound = std::max(bound, end);
+    }
+    *extent = bound;
+    return true;
+}
+
 inline bool page_table_requires_mapping(
         const std::vector<uint32_t> & shadow, uint32_t capacity) {
     if (shadow.size() != capacity) return true;

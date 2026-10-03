@@ -508,7 +508,14 @@ placement grid; running the single-resident path"
             );
             None
         }
-        PoolEligibility::Ready(addressing) => match model.kv_prepare_pool() {
+        PoolEligibility::Ready(addressing) => match model.kv_prepare_pool_for_slots(
+            if std::env::var("IMPARO_NO_REUSE").is_ok_and(|v| v == "1") {
+                1
+            } else {
+                parallel.unwrap_or(8).max(1)
+            },
+            model.slot_state_bytes(),
+        ) {
             Ok(()) => {
                 let layers = model.kv_full_layers();
                 let blocks = model.kv_capacity_blocks();
@@ -729,6 +736,14 @@ message alone renders {expect_first} tokens; no checkpoint at the system prompt'
                         .unwrap_or(usize::MAX)
                         .div_ceil(pl.page_bytes().max(1));
                     pl.set_slot_pages(pages);
+                    if let Some(bytes) = imparo_model::backend::active()
+                        .and_then(imparo_backend::Backend::slot_state_budget_bytes)
+                    {
+                        let state_units = usize::try_from(bytes).unwrap_or(usize::MAX)
+                            / pl.page_bytes().max(1);
+                        assert!(pl.set_slot_state_budget(state_units));
+                        eprintln!("[imparo] co-batched state budget: {:.1} MiB outside committed KV pages", bytes as f64 / 1048576.0);
+                    }
                     pages
                 });
                 eprintln!(
@@ -862,8 +877,9 @@ fn note_request_end() {
 /// resident gives nothing back, and the next request starts a new stretch.
 ///
 /// Only where the backend's committed KV follows the blocks in use does a release give memory
-/// back, so elsewhere there is no trimmer. The idle release hands conversations to the disk
-/// tier, so without one only memory pressure releases.
+/// back. Fixed arenas also use a configured idle window to release private CoBatch
+/// slot buffers. The idle release hands conversations to the disk tier, so without
+/// one only memory pressure releases.
 ///
 /// `--kv-idle-s`, else IMPARO_KV_IDLE_S, sets the window (0: release right after every
 /// request); unset, it is the backend's residency hold.
@@ -871,10 +887,10 @@ fn kv_trimmer(engine: &Mutex<Engine>, kv_idle_s: Option<u64>) {
     let Some(be) = imparo_model::backend::active() else {
         return;
     };
-    if !be.kv_commits_on_demand() {
-        return;
-    }
-    let has_disk = sched::lock_engine(engine).disk.is_some();
+    let (has_disk, has_extra_slots) = {
+        let engine = sched::lock_engine(engine);
+        (engine.disk.is_some(), engine.slots > 1)
+    };
     let window = if has_disk {
         kv_idle_s
             .or_else(|| {
@@ -887,6 +903,12 @@ fn kv_trimmer(engine: &Mutex<Engine>, kv_idle_s: Option<u64>) {
     } else {
         None
     };
+    // A fixed KV arena still owns independently releasable conversation buffers.
+    // Honor the configured idle window for those slots too; kv_release remains a
+    // no-op on fixed arenas, while release_slot gives their private state back.
+    if !be.kv_commits_on_demand() && !(has_extra_slots && window.is_some()) {
+        return;
+    }
     match window {
         Some(w) => eprintln!(
             "[imparo] kv idle release: after {} s without a request, or on memory pressure",

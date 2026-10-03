@@ -42,7 +42,12 @@ those files, so its label table carries both spellings.
   ngram-chain                online models + n-gram with ONE child per node (IMPARO_DSPARK_SHAPE=chain)
   complete                   THE COMPLETE FORM: tree + cost model + acceptance model + n-gram fill,
                              with the copy walk's resume and the conversation's earlier text pinned OFF
+  complete-wN                the complete form with the width pinned to N rows (the width table):
+                             every model and the n-gram fill as in complete, only the width fixed
   complete-table             complete plus the stored table
+  complete-classes           the complete form with the 8-bit matrix kernel's row classes in place of
+                             learned widths (IMPARO_DSPARK_CLASSES=declared: Table 10, read only by
+                             the measurement build that still carries the declared classes)
   llama-dspark               llama-server upstream, --spec-type draft-dspark, the same drafter file,
                              upstream's default --spec-draft-n-max (3)
   llama-dspark9              as llama-dspark with --spec-draft-n-max 9, the drafter's trained block
@@ -121,6 +126,12 @@ def load_set(spec):
 def arm_server(arm, outdir, tag):
     log = f"{outdir}/server_{tag}.log"
     env = dict(os.environ)
+    # complete-wN: the complete form with its width pinned to N rows -- the same models, the same
+    # n-gram fill, the same store learning from empty; only the width is not chosen.
+    pinned = re.fullmatch(r"complete-w(\d+)", arm)
+    classes = arm == "complete-classes"
+    if pinned or classes:
+        arm = "complete"
     if arm in (
         "tree16", "budget", "budget-accept", "budget-accept-ngram",
         "budget-accept-ngram-table", "chain", "chain3", "tree-online", "ngram-chain", "complete",
@@ -162,6 +173,11 @@ def arm_server(arm, outdir, tag):
                         "IMPARO_DSPARK_CHAIN_MAX": "3"})
         else:
             env.pop("IMPARO_DSPARK_TREE", None); env.pop("IMPARO_DSPARK_OFFSET", None)
+        if pinned:
+            env["IMPARO_DSPARK_TREE"] = pinned.group(1)
+        env.pop("IMPARO_DSPARK_CLASSES", None)
+        if classes:
+            env["IMPARO_DSPARK_CLASSES"] = "declared"
         cmd = [bin_path("imparo-server"), "-m", TGT, "-c", str(CTX), "--port", str(PORT)]
         if arm != "plain":
             cmd += ["--draft", DRAFT]

@@ -18,8 +18,8 @@
 //!     would be 213 and is not even an integer. A model whose head dim is not the
 //!     embedding width over the head count is exactly the case that silently produces a
 //!     plausible plan.
-//!   - `output.weight` is PRESENT, so the embeddings are not tied. It is a 248320-row
-//!     head, the largest single tensor in the file.
+//!   - Some exports carry an independent `output.weight`; smaller tied-embedding
+//!     models omit it and use `token_embd.weight` for both lookup and output projection.
 //!
 //! The delta-net state is two counts, both derived:
 //!
@@ -57,11 +57,7 @@ pub fn build(
 ) -> Result<ModelPlan, PlanError> {
     let _ = path;
     super::weight_basis::validate_header(document).map_err(PlanError::Inconsistent)?;
-    if document.tensor("output.weight").is_none() {
-        return Err(PlanError::Inconsistent(
-            "qwen35 requires an independent output.weight".into(),
-        ));
-    }
+    let tied_embeddings = document.tensor("output.weight").is_none();
     let blocks = u32_at(document, "qwen35.block_count")?;
     let n_embd = u32_at(document, "qwen35.embedding_length")?;
     let n_ff = u32_at(document, "qwen35.feed_forward_length")?;
@@ -212,10 +208,10 @@ pub fn build(
             per_layer_row_bytes: None,
         },
         kv_storage_basis: crate::KvStorageBasisPolicy::BackendOverrideOrCanonical,
-        // The input table is row-gathered, never used as the independent output head.
-        // Existing placement may stage its few requested rows to preserve VRAM for layers.
+        // A tied table is also the full output projection: retain the common owner
+        // instead of allowing embedding-only row staging, as in the LFM2 plan.
         weight_residency: crate::WeightResidencyPlan {
-            row_gathered: &["token_embd.weight"],
+            row_gathered: if tied_embeddings { &[] } else { &["token_embd.weight"] },
         },
         layers,
         // Neither decode route: the interleave is worth 0.65% at this model's 119 ms step
@@ -227,8 +223,7 @@ pub fn build(
         output: OutputPlan {
             final_norm: true,
             logit_softcap: None,
-            // output.weight IS present, so the head is its own tensor.
-            tied_embeddings: false,
+            tied_embeddings,
         },
     })
 }

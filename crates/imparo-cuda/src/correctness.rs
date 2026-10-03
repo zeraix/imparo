@@ -89,6 +89,18 @@ const LFM_RETAINED_GATES: &[&str] = &[
     "lfm_retained_owner_reuse_isolation",
     "lfm_retained_domain_routes_and_graph",
 ];
+const LFM_SHORT_TREE_GRAPH_GATE: &str = "lfm_retained_short_tree_graph_equivalence";
+const LFM_SHORT_CANDIDATES_GATE: &str = "lfm_retained_short_candidates_equivalence";
+const LFM_SHORT_ACCEPTANCE_GATE: &str = "lfm_retained_short_acceptance_equivalence";
+const LFM_SHORT_ADAPTIVE_GATE: &str = "lfm_retained_short_adaptive_equivalence";
+const MOE_GROUPED_PAIR_GATE: &str = "cuda_moe_q4_grouped_pair_numeric_and_service";
+const MOE_ROUTE_GATE: &str = "cuda_moe_nt1_route_numeric_and_service";
+const MOE_ACTIVE_EXPERTS_GATE: &str = "cuda_moe_active_experts_numeric_and_service";
+const MOE_ROUTER_F32_GATE: &str = "cuda_moe_router_f32_numeric_and_service";
+const MOE_DOWN_MMQ_GATE: &str = "cuda_moe_down_mmq_numeric_and_service";
+const MOE_GATEUP_MMQ_GATE: &str = "cuda_moe_gateup_mmq_numeric_and_service";
+const MOE_DOWN_MMVQ_GATE: &str = "cuda_moe_down_mmvq_numeric_and_service";
+const MOE_GATEUP_MMVQ_GATE: &str = "cuda_moe_gateup_mmvq_numeric_and_service";
 const LFM_RETAINED_KNOBS: &[(&str, u32)] = &[
     ("mmq_q8_canonical_gate_up_pair", 3),
     ("mmq_q8_canonical_load_lanes", 2),
@@ -128,6 +140,55 @@ fn validate_lfm_retained(
     Ok(true)
 }
 
+fn validate_lfm_short_tree_graph(
+    stored: &Stored,
+    identity: &CudaCorrectnessIdentity<'_>,
+) -> Result<bool, String> {
+    if !stored.knobs.iter().any(|(name, value)| {
+        name == crate::knobs::LFM_TREE_GRAPH_SHORT_KNOB && *value == 1
+    }) {
+        return Ok(false);
+    }
+    if stored.batch != Some(512)
+        || !stored.knobs.iter().any(|(name, value)| {
+            name == crate::knobs::LFM_RETAINED_EXECUTION_KNOB && *value == 1
+        })
+    {
+        return Err("short LFM tree Graph requires lfm2_retained_execution=1 and batch512".into());
+    }
+    // Inherit the complete retained SM86/Q8 policy. A registered switch alone
+    // cannot authorize a different KV type, target route, or partial profile.
+    validate_lfm_retained(stored, identity)?;
+    Ok(true)
+}
+
+fn validate_lfm_short_candidates(
+    stored: &Stored,
+    identity: &CudaCorrectnessIdentity<'_>,
+) -> Result<bool, String> {
+    if !stored.knobs.iter().any(|(name, value)| {
+        name == crate::knobs::LFM_TREE_CANDIDATES_KNOB && matches!(*value, 1..=3)
+    }) {
+        return Ok(false);
+    }
+    if stored.batch != Some(512)
+        || !stored.knobs.iter().any(|(name, value)| {
+            name == crate::knobs::LFM_RETAINED_EXECUTION_KNOB && *value == 1
+        })
+    {
+        return Err("short LFM tree candidates require lfm2_retained_execution=1 and batch512".into());
+    }
+    // The model preparation also requires exact capacity1024/domain1. Candidate
+    // selection does not grant a new numerical target or an unbound owner.
+    validate_lfm_retained(stored, identity)?;
+    if stored.knobs.iter().any(|(n, v)| n == crate::knobs::LFM_TREE_CANDIDATES_KNOB && *v == 3)
+        && stored.knobs.iter().any(|(n, v)| n == crate::knobs::LFM_TREE_GRAPH_SHORT_KNOB && *v != 0)
+    {
+        return Err("adaptive CUDA budget requires eager short-domain verification".into());
+    }
+    Ok(true)
+}
+
 const W4A16_CUBIN_SHA256: &str =
     "9521406b46b918c23450e6199ed973149c88fcb2e33e5a7d8348212f7694cf37";
 
@@ -152,14 +213,203 @@ pub const CUDA_PTQ_F16_V3_REQUIRED_GATES: &[(&str, u32)] = &[
     ("ptq_f16_transfer_state", 3),
     ("ptq_f16_bounded_provider", 3),
 ];
-const PTQ_F16_ORACLE_ARGUMENTS: &[&str] = &[
-    "--contract",
-    "ptq-f16-v2",
-    "--quality",
-    "independent-numerics-plus-nonregression",
+pub const CUDA_PTQ_F16_V4_REQUIRED_GATES: &[(&str, u32)] = &[
+    ("ptq_f16_independent_math", 4),
+    ("ptq_f16_model_nonregression", 4),
+    ("ptq_f16_original_failures_report", 4),
+    ("ptq_f16_reset_split_state", 4),
+    ("ptq_f16_three_length_routes", 4),
+    ("ptq_f16_host_config_application", 4),
+    ("ptq_f16_transfer_state", 4),
+    ("ptq_f16_bounded_provider", 4),
+    ("ptq_f16_load_time_placement", 4),
 ];
-const PTQ_F16_ORACLE_MANIFEST_SHA256: &str =
-    "6af8b54178a50772c8084170dfeb1444fdb10e4ef810b5cd15a1a8da5935d1e0";
+// Existing providers only; new receipts bind the measured batch256/512 domains.
+pub const CUDA_PTQ_F16_V5_REQUIRED_GATES: &[(&str, u32)] = &[
+    ("ptq_f16_independent_math", 5),
+    ("ptq_f16_model_nonregression", 5),
+    ("ptq_f16_original_failures_report", 5),
+    ("ptq_f16_reset_split_state", 5),
+    ("ptq_f16_three_length_routes", 5),
+    ("ptq_f16_host_config_application", 5),
+    ("ptq_f16_transfer_state", 5),
+    ("ptq_f16_bounded_provider", 5),
+    ("ptq_f16_load_time_placement", 5),
+    ("ptq_f16_retained_batch", 5),
+];
+// Separate from PTQ/Bonsai: exact current Q8/F16 route, verified per-model.
+pub const CUDA_Q8_F16_GATE_SUITE: &str = "cuda-q8-f16-independent";
+pub const CUDA_Q8_F16_REQUIRED_GATES: &[(&str, u32)] = &[
+    ("q8_f16_independent_math", 1),
+    ("q8_f16_model_nonregression", 1),
+    ("q8_f16_original_failures_report", 1),
+    ("q8_f16_reset_owner_state", 1),
+    ("q8_f16_three_length_routes", 1),
+    ("q8_f16_host_config_application", 1),
+    ("q8_f16_provider_compatibility", 1),
+];
+// Suite v2 retains the independent math/quality contract and adds byte-layout
+// and final-build replay evidence. Version 1 remains the canonical contract.
+pub const CUDA_Q8_F16_LAYOUT_REQUIRED_GATES: &[(&str, u32)] = &[
+    ("q8_f16_independent_math", 1),
+    ("q8_f16_model_nonregression", 1),
+    ("q8_f16_original_failures_report", 1),
+    ("q8_f16_reset_owner_state", 1),
+    ("q8_f16_three_length_routes", 1),
+    ("q8_f16_host_config_application", 1),
+    ("q8_f16_provider_compatibility", 1),
+    ("q8_f16_split_layout", 1),
+    ("q8_f16_incremental_replay", 1),
+];
+const Q8_F16_KNOBS: &[(&str, u32)] = &[
+    ("gemv_warps", 0),
+    ("attn_threads", 0),
+    ("rms_threads", 0),
+    ("mmq_full_rows", 0),
+    ("mmq_full_tile_min_efficiency", 0),
+    ("attn_d256_workspace_mib", 0),
+    ("attn_d512_workspace_mib", 0),
+    ("attn_score_key_groups", 0),
+    ("attn_softmax_warps", 0),
+    ("attn_value_tiles", 0),
+    ("attn_stream_part_cap", 0),
+    ("narrow_gemv_warps", 0),
+    ("narrow_gemv_rows_per_cta", 0),
+    ("narrow_gemv_max_width", 0),
+    ("batch_mmvq_rows_per_cta", 0),
+    ("d512_mma_min_schedule", 1024),
+    ("streamk_numeric", 1),
+    ("mmq_llama_compat", 1),
+    ("mmq_virtual_512", 1),
+    ("mmq_canonical_full_tile", 1),
+    ("rms_norm_add", 1),
+    ("attn_d256_tiled", 1),
+    ("attn_d256_vec", 1),
+    ("attn_d256_virtual_stream", 1),
+    ("attn_d256_fused", 1),
+    ("attn_d512_mma", 1),
+    ("attn_d512_virtual_stream", 1),
+    ("attn_d512_virtual_cell_policy", 0),
+    ("attn_decode_specialized", 1),
+    ("attn_d64_mma_prefill", 1),
+    ("attn_d64_mma_shared_kv_min_tokens", 0),
+    ("ffn_sidecar_min_tokens", 0),
+    ("prefill_exact128_sm86_route", 0),
+    ("prefill_exact128_graph", 0),
+    ("attn_d64_q8_vec", 0),
+    ("attn_d64_q8_gqa4", 0),
+    ("mmvq_q8_tm_decode_silu_pair", 0),
+    ("shortconv_decode_fused", 0),
+    ("decode_graph_q8_producer_reuse", 0),
+    ("mmq_q8_aligned_whole_k", 2),
+    ("mmq_q8_tm_async_weight_stage", 0),
+    ("mmq_q8_tm_silu_pair", 0),
+    ("mmq_q8_tm_silu_q8_sidecar_min_tokens", 0),
+    ("mmq_q8_tm_silu_private_down_min_tokens", 0),
+    ("mmq_q8_tm_gate_up_row_pair_min_tokens", 0),
+    ("decode_ffn_q5_layer_mask", 0),
+    ("decode_down_q4_layer_mask", 0),
+    ("decode_down_q5_layer_mask", 0),
+    ("prefill_projection_q8_d4", 0),
+    ("prefill_down_q4_layer_mask", 0),
+    ("row_local_prefill_tail_rows", 0),
+    ("row_local_prefill_tail_max_tokens", 0),
+    ("prefill_head_post_threads", 0),
+    ("direct_q8_kv_prepare_min_tokens", 0),
+    ("mmq_q8_canonical_gate_up_pair", 4),
+    ("mmq_q8_canonical_load_lanes", 4),
+    ("mmq_q8_canonical_down_large_min_tokens", 0),
+    ("mmq_q8_canonical_down_small_max_tokens", 0),
+    ("prefill_bcx_shortconv_ready", 0),
+    ("e4b_ffn_w4a16", 0),
+    ("weight_transfer_policy", 0),
+    ("ptq_prefill_tensorcore", 4),
+    ("e4b_retained_decode_policy", 0),
+    ("lfm2_retained_execution", 0),
+    ("lfm2_tree_graph_short", 0),
+    ("lfm2_tree_candidates", 0),
+    ("moe_grouped_pair", 0),
+    ("moe_route", 0),
+    ("moe_active_experts", 0),
+    ("moe_router_f32", 0),
+    ("moe_down_mmq", 0),
+    ("moe_gateup_mmq", 0),
+    ("moe_down_mmvq", 0),
+    ("moe_gateup_mmvq", 0),
+    ("finite_history_prefill_tail_rows", 0),
+];
+fn q8_f16_policy(stored: &Stored, identity: &CudaCorrectnessIdentity<'_>) -> Option<GatePolicy> {
+    if identity.kv_k != "f16" || identity.kv_v != "f16" || identity.runtime.device_sm != 86 {
+        return None;
+    }
+    let transfer = match stored.batch { Some(512) => 0, Some(256) => 2, _ => return None };
+    let split = stored.knobs.iter().any(|(n,v)| n == "mmq_q8_canonical_gate_up_pair" && *v == 5);
+    if split && stored.batch != Some(512) { return None; }
+    if !Q8_F16_KNOBS.iter().all(|(name, value)| {
+        let expected = if *name == "weight_transfer_policy" { transfer }
+            else if split && *name == "mmq_q8_canonical_gate_up_pair" { 5 }
+            else { *value };
+        stored.knobs.iter().any(|(n, v)| n == name && *v == expected)
+    }) { return None; }
+    Some(GatePolicy {
+        suite: CUDA_Q8_F16_GATE_SUITE, version: if split { 2 } else { 1 },
+        gates: if split { CUDA_Q8_F16_LAYOUT_REQUIRED_GATES } else { CUDA_Q8_F16_REQUIRED_GATES },
+        oracle_arguments: &["--contract", "q8-f16-v1", "--quality", "independent-numerics-plus-nonregression"],
+        oracle_implementation: "imparo/q8-f16-independent", oracle_revision: "v1",
+        oracle_options_domain: "imparo-cuda-independent-oracle-options",
+        oracle_bundle_manifest_sha256: "046067068ee770ef0e8ea46123efa19fb82047dc48e2591b27258ee0cb384516",
+    })
+}
+
+const PTQ_F16_ORACLE_ARGUMENTS: &[&str] =
+    &["--contract", "ptq-f16-v2", "--quality", "independent-numerics-plus-nonregression"];
+
+pub const CUDA_D64_F16_GATE_SUITE: &str = "cuda-d64-f16-m1-independent";
+pub const CUDA_D64_F16_REQUIRED_GATES: &[(&str, u32)] = &[
+    ("d64_f16_independent_math", 1),
+    ("d64_f16_model_nonregression", 1),
+    ("d64_f16_three_length_routes", 1),
+    ("d64_f16_reset_and_host_config", 1),
+];
+
+// Frozen measured configuration, expressed through the common registry slots.
+// A new model still needs its own model/plan-bound evidence and receipt. This
+// selects no model by name and does not make mode3 a global default.
+fn d64_f16_value(name: &str) -> u32 {
+    match crate::knobs::slot_for_name(name) {
+        Some(23) => 1024,
+        Some(24..=34 | 37) => 1,
+        Some(36) => 3,
+        _ => 0,
+    }
+}
+
+fn d64_f16_policy(stored: &Stored, identity: &CudaCorrectnessIdentity<'_>)
+    -> Result<Option<GatePolicy>, String>
+{
+    if !stored.knobs.iter().any(|(n, v)| n == "attn_decode_specialized" && *v == 3) {
+        return Ok(None);
+    }
+    if identity.runtime.device_sm != 86
+        || identity.kv_k != "f16" || identity.kv_v != "f16"
+        || identity.math_mode != CudaMathMode::Fast
+        || stored.batch != Some(128) || !stored.seats.is_empty()
+        || stored.knobs.iter().any(|(n, v)| if matches!(n.as_str(), crate::knobs::MOE_GROUPED_PAIR_KNOB | crate::knobs::MOE_ROUTE_KNOB | crate::knobs::MOE_ACTIVE_EXPERTS_KNOB | crate::knobs::MOE_ROUTER_F32_KNOB | crate::knobs::MOE_DOWN_MMQ_KNOB | crate::knobs::MOE_GATEUP_MMQ_KNOB | crate::knobs::MOE_DOWN_MMVQ_KNOB | crate::knobs::MOE_GATEUP_MMVQ_KNOB) {
+            *v > 1
+        } else { *v != d64_f16_value(n) })
+    {
+        return Err("D64/F16 M1 mode3 requires the complete measured SM86/F16/fast/batch128 configuration".into());
+    }
+    Ok(Some(GatePolicy {
+        suite: CUDA_D64_F16_GATE_SUITE, version: 1,
+        gates: CUDA_D64_F16_REQUIRED_GATES,
+        oracle_arguments: &["--contract", "d64-f16-m1-v1", "--quality", "independent-numerics-plus-nonregression"],
+        oracle_implementation: "imparo/d64-f16-m1-independent", oracle_revision: "v1",
+        oracle_options_domain: "imparo-cuda-independent-oracle-options",
+        oracle_bundle_manifest_sha256: "3d032c2f3c5cd8768db5a15160c2d27768abd3d41ea71f91e4af6493cd7c26dc",
+    }))
+}
+const PTQ_F16_ORACLE_MANIFEST_SHA256: &str = "6af8b54178a50772c8084170dfeb1444fdb10e4ef810b5cd15a1a8da5935d1e0";
 
 // Admission is for the complete tested configuration. The model/plan/content
 // identity is still bound by the existing receipt; a shape or flag is not proof.
@@ -179,27 +429,16 @@ fn validate_ptq_f16(
         }
         return Ok(());
     }
-    let value = |name: &str| {
-        stored
-            .knobs
-            .iter()
-            .find(|(n, _)| n == name)
-            .map_or(u32::MAX, |(_, v)| *v)
-    };
-    if identity.runtime.device_sm != 86
-        || stored.batch != Some(128)
-        || !matches!(
-            (selected, value(crate::knobs::WEIGHT_TRANSFER_POLICY_KNOB)),
-            (2, 0) | (3, 1)
-        )
-        || value("attn_decode_specialized") != 2
-        || value("attn_d256_tiled") != 2
+    let value = |name: &str| stored.knobs.iter().find(|(n, _)| n == name).map_or(u32::MAX, |(_, v)| *v);
+    let retained_batch = selected == 4 && matches!(stored.batch, Some(256 | 512));
+    if identity.runtime.device_sm != 86 || (stored.batch != Some(128) && !retained_batch)
+        || !matches!((selected, value(crate::knobs::WEIGHT_TRANSFER_POLICY_KNOB)), (2, 0) | (3, 1) | (4, 2))
+        || value("attn_decode_specialized") != 2 || value("attn_d256_tiled") != 2
         || value(crate::knobs::FINITE_HISTORY_KNOB) != 0
         || value(crate::knobs::E4B_FFN_W4A16_KNOB) != 0
         || value(crate::knobs::E4B_RETAINED_DECODE_POLICY_KNOB) != 0
-        || value(crate::knobs::LFM_RETAINED_EXECUTION_KNOB) != 0
-    {
-        return Err("PTQ/F16 requires SM86 batch128 GQA6-2 and an admitted (TC,transfer) pair: (2,0) or (3,1)".into());
+        || value(crate::knobs::LFM_RETAINED_EXECUTION_KNOB) != 0 {
+        return Err("PTQ/F16 requires SM86 GQA6-2 and batch128 pairs (2,0)/(3,1)/(4,2), or separately receipted batch256/512 pair (4,2)".into());
     }
     Ok(())
 }
@@ -322,6 +561,43 @@ pub fn expected_correctness(
     )
 }
 
+/// Only the isolated, unreceipted loader may admit this fixed Tree4 experiment.
+/// Production loading and receipt templates continue to use `expected_correctness`.
+pub(crate) fn expected_correctness_for_isolated_gate(
+    candidate: &UntrustedStoredConfig<'_>,
+    identity: &CudaCorrectnessIdentity<'_>,
+) -> Result<ExpectedCorrectness, String> {
+    expected_correctness_for_isolated_gate_with_env(
+        candidate.exact_bytes(), candidate.stored(), identity, std::env::vars_os(),
+    )
+}
+
+fn expected_correctness_for_isolated_gate_with_env(
+    exact_bytes: &[u8],
+    stored: &Stored,
+    identity: &CudaCorrectnessIdentity<'_>,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<ExpectedCorrectness, String> {
+    let mut environment: Vec<_> = environment.into_iter().collect();
+    let exact = |key: &str, value: &str| {
+        environment.iter().any(|(k, v)| k == key && v == value)
+    };
+    let isolated_tree4 = cfg!(all(feature = "cuda-speculative", target_os = "windows"))
+        && exact("IMPARO_CORRECTNESS_GATE", "1")
+        && exact("IMPARO_DSPARK_TREE", "4")
+        && exact("IMPARO_LAB_E4B_TREE_FFN_M4", "1")
+        && exact("IMPARO_LAB_Q4_FULL_TILE_ROWS", "1")
+        && identity.runtime.device_sm == 86
+        && identity.kv_k == "q4_0" && identity.kv_v == "q4_0"
+        && stored.knobs.iter().any(|(name, value)| {
+            name == crate::knobs::E4B_RETAINED_DECODE_POLICY_KNOB && *value == 1
+        });
+    if isolated_tree4 {
+        environment.retain(|(key, _)| key != "IMPARO_LAB_Q4_FULL_TILE_ROWS");
+    }
+    expected_correctness_with_env(exact_bytes, stored, identity, environment)
+}
+
 /// Produce the unsigned receipt emitted by `--correctness-template`.
 ///
 /// Only the external fixed-gate sealer may turn the placeholders into passing evidence
@@ -362,15 +638,60 @@ fn expected_correctness_with_env(
     validate_identity(identity)?;
     let mut policy = gate_policy(identity)?;
     let values = validate_candidate(stored)?;
-    validate_ptq_f16(stored, identity)?;
-    if identity.kv_k == "f16"
-        && stored
-            .knobs
-            .iter()
-            .any(|(n, v)| n == crate::knobs::PTQ_PREFILL_TENSORCORE_KNOB && *v == 3)
-    {
+    let lfm_short_tree_graph = validate_lfm_short_tree_graph(stored, identity)?;
+    let lfm_short_candidates = validate_lfm_short_candidates(stored, identity)?;
+    let d64_f16 = d64_f16_policy(stored, identity)?;
+    let moe_pair = stored.knobs.iter().any(|(n, v)| n == crate::knobs::MOE_GROUPED_PAIR_KNOB && *v == 1);
+    if moe_pair && d64_f16.is_none() {
+        return Err("MoE paired Q4 provider currently requires the retained D64/F16/batch128 domain".into());
+    }
+    let moe_route = stored.knobs.iter().any(|(n, v)| n == crate::knobs::MOE_ROUTE_KNOB && *v == 1);
+    if moe_route && d64_f16.is_none() {
+        return Err("MoE nt1 route provider currently requires the retained D64/F16/batch128 domain".into());
+    }
+    let moe_active = stored.knobs.iter().any(|(n, v)| n == crate::knobs::MOE_ACTIVE_EXPERTS_KNOB && *v == 1);
+    if moe_active && d64_f16.is_none() {
+        return Err("MoE active experts currently require the retained D64/F16/batch128 domain".into());
+    }
+    let moe_router = stored.knobs.iter().any(|(n, v)| n == crate::knobs::MOE_ROUTER_F32_KNOB && *v == 1);
+    if moe_router && (d64_f16.is_none() || !cfg!(feature = "cuda-static")) {
+        return Err("MoE F32 router requires the source-build retained SM86/D64/F16/batch128 domain".into());
+    }
+    let moe_down = stored.knobs.iter().any(|(n, v)| n == crate::knobs::MOE_DOWN_MMQ_KNOB && *v == 1);
+    if moe_down && (d64_f16.is_none() || !cfg!(feature = "cuda-static")) {
+        return Err("MoE Down MMQ requires the source-build retained SM86/D64/F16/batch128 domain".into());
+    }
+    let moe_gateup = stored.knobs.iter().any(|(n, v)| n == crate::knobs::MOE_GATEUP_MMQ_KNOB && *v == 1);
+    if moe_gateup && (d64_f16.is_none() || !cfg!(feature = "cuda-static")) {
+        return Err("MoE GateUp MMQ requires the source-build retained SM86/D64/F16/batch128 domain".into());
+    }
+    let moe_down_mmvq = stored.knobs.iter().any(|(n, v)| n == crate::knobs::MOE_DOWN_MMVQ_KNOB && *v == 1);
+    if moe_down_mmvq && (d64_f16.is_none() || !cfg!(feature = "cuda-static")) {
+        return Err("MoE Down MMVQ requires the source-build retained SM86/D64/F16/batch128 domain".into());
+    }
+    let moe_gateup_mmvq = stored.knobs.iter().any(|(n, v)| n == crate::knobs::MOE_GATEUP_MMVQ_KNOB && *v == 1);
+    if moe_gateup_mmvq && (d64_f16.is_none() || !cfg!(feature = "cuda-static")) {
+        return Err("MoE GateUp MMVQ requires the source-build retained SM86/D64/F16/batch128 domain".into());
+    }
+    let q8_f16 = q8_f16_policy(stored, identity);
+    if let Some(qualified) = d64_f16.or(q8_f16) { policy = qualified; }
+    else { validate_ptq_f16(stored, identity)?; }
+    if d64_f16.is_none() && q8_f16.is_none() && identity.kv_k == "f16" && stored.knobs.iter().any(|(n, v)| {
+        n == crate::knobs::PTQ_PREFILL_TENSORCORE_KNOB && *v == 3
+    }) {
         policy.version = 3;
         policy.gates = CUDA_PTQ_F16_V3_REQUIRED_GATES;
+    }
+    if d64_f16.is_none() && q8_f16.is_none() && identity.kv_k == "f16" && stored.knobs.iter().any(|(n, v)| {
+        n == crate::knobs::PTQ_PREFILL_TENSORCORE_KNOB && *v == 4
+    }) {
+        if matches!(stored.batch, Some(256 | 512)) {
+            policy.version = 5;
+            policy.gates = CUDA_PTQ_F16_V5_REQUIRED_GATES;
+        } else {
+            policy.version = 4;
+            policy.gates = CUDA_PTQ_F16_V4_REQUIRED_GATES;
+        }
     }
     let lfm_retained = validate_lfm_retained(stored, identity)?;
     let lfm_short_domain = lfm_retained && stored.batch == Some(512);
@@ -512,6 +833,56 @@ fn expected_correctness_with_env(
             gate_id: "lfm_retained_short_domain_bounds".into(),
             gate_version: 1,
         });
+    }
+    if lfm_short_tree_graph {
+        // New requirements are not evidence. The sealer must prove identical
+        // target/DSpark output, state ownership and actual short Graph replay.
+        required_gates.push(GateRequirement {
+            gate_id: LFM_SHORT_TREE_GRAPH_GATE.into(),
+            gate_version: 1,
+        });
+    }
+    if lfm_short_candidates {
+        required_gates.push(GateRequirement {
+            gate_id: if stored.knobs.iter().any(|(name, value)| {
+                name == crate::knobs::LFM_TREE_CANDIDATES_KNOB && *value == 3
+            }) {
+                LFM_SHORT_ADAPTIVE_GATE
+            } else if stored.knobs.iter().any(|(name, value)| {
+                name == crate::knobs::LFM_TREE_CANDIDATES_KNOB && *value == 2
+            }) {
+                LFM_SHORT_ACCEPTANCE_GATE
+            } else {
+                LFM_SHORT_CANDIDATES_GATE
+            }.into(),
+            gate_version: if stored.knobs.iter().any(|(name, value)| {
+                name == crate::knobs::LFM_TREE_CANDIDATES_KNOB && *value == 3
+            }) { 2 } else { 1 },
+        });
+    }
+    if moe_pair {
+        required_gates.push(GateRequirement { gate_id: MOE_GROUPED_PAIR_GATE.into(), gate_version: 1 });
+    }
+    if moe_route {
+        required_gates.push(GateRequirement { gate_id: MOE_ROUTE_GATE.into(), gate_version: 1 });
+    }
+    if moe_active {
+        required_gates.push(GateRequirement { gate_id: MOE_ACTIVE_EXPERTS_GATE.into(), gate_version: 1 });
+    }
+    if moe_router {
+        required_gates.push(GateRequirement { gate_id: MOE_ROUTER_F32_GATE.into(), gate_version: 1 });
+    }
+    if moe_down {
+        required_gates.push(GateRequirement { gate_id: MOE_DOWN_MMQ_GATE.into(), gate_version: 1 });
+    }
+    if moe_gateup {
+        required_gates.push(GateRequirement { gate_id: MOE_GATEUP_MMQ_GATE.into(), gate_version: 1 });
+    }
+    if moe_down_mmvq {
+        required_gates.push(GateRequirement { gate_id: MOE_DOWN_MMVQ_GATE.into(), gate_version: 1 });
+    }
+    if moe_gateup_mmvq {
+        required_gates.push(GateRequirement { gate_id: MOE_GATEUP_MMVQ_GATE.into(), gate_version: 1 });
     }
     let space_version = CudaBackend.space_version();
     if CUDA_SELECTOR_VERSION == space_version {
@@ -747,9 +1118,15 @@ fn validate_candidate(stored: &Stored) -> Result<Vec<u32>, String> {
                 declaration.name
             ));
         }
+        // This callback only freezes a load-time layout during micro tuning.
+        // Its persisted domain remains the fixed declared list; q8_f16_policy
+        // separately requires the exact complete profile and additional gates.
+        let fixed_q8_layout_guard = declaration.name == "mmq_q8_canonical_gate_up_pair"
+            && declaration.values == [0, 1, 2, 3, 4, 5]
+            && declaration.sweep == SweepKind::Values;
         if declaration.legal.is_some()
             || declaration.derive.is_some()
-            || declaration.candidates.is_some()
+            || (declaration.candidates.is_some() && !fixed_q8_layout_guard)
         {
             return Err(format!(
                 "CUDA knob {} needs an explicit correctness-policy validator",
@@ -860,7 +1237,7 @@ fn route_parameters_sha256(
     {
         canonical.string(
             "w4a16_prefill_lifecycle",
-            "mode2:domain1=cold-canonical-first-decode-pack-warm-packed;domain2+domain3+unbound=canonical-packed-v1",
+            "mode2:domain1+domain2+domain3=cold-canonical-first-decode-pack-warm-packed-aligned512;unbound=canonical-packed-v2",
         );
         canonical.string(
             "w4a16_packed_prefill_reader",
@@ -896,8 +1273,64 @@ fn route_parameters_sha256(
             "lfm_retained_model",
             "sm86-sm30-q8kv-h2048-f10752-l30-h32-kv8-d64",
         );
-        canonical.string("lfm_retained_domains", "1024:batch512-gu3-down3-async-owner-reuse-activation-reuse;6656:batch1920-gu3-down2-bounded-tail;16896:batch1920-gu3-down2-bounded-tail-treegraph-sharedkv-workspace96mib");
+        canonical.string("lfm_retained_domains", "1024:batch512-gu3-down3-async-owner-reuse-activation-reuse-bounded-tail3;6656:batch1920-gu3-down2-bounded-tail;16896:batch1920-gu3-down2-bounded-tail-treegraph-sharedkv-workspace96mib");
         canonical.string("lfm_retained_common", "target-v1;draft-legacy;frontier-tree16;postlayer-tail64;boundary-resume;draft-cache-resume;device-greedy;canonical-live2;m9-k3;m9-row-owner;q8-shortk;parallel-qk-graph;pv-querywarp");
+    }
+    if stored.knobs.iter().any(|(name, value)| {
+        name == crate::knobs::LFM_TREE_GRAPH_SHORT_KNOB && *value == 1
+    }) {
+        canonical.string(
+            "lfm_short_tree_graph",
+            "v1:retained-domain1-capacity1024-batch512-sm86-q8kv-native-tree16;existing-owner-storage-attention-guards;warm-capture-replay;ordinary-fallback",
+        );
+    }
+    if stored.knobs.iter().any(|(name, value)| {
+        name == crate::knobs::LFM_TREE_CANDIDATES_KNOB && *value == 1
+    }) {
+        canonical.string(
+            "lfm_short_tree_candidates",
+            "v1:retained-domain1-capacity1024-batch512-sm86-q8kv;cached-beam33;shared-tree16-selection-and-ngram;target-verify-required;owner-frozen",
+        );
+    }
+    if stored.knobs.iter().any(|(name, value)| {
+        name == crate::knobs::LFM_TREE_CANDIDATES_KNOB && *value == 2
+    }) {
+        canonical.string(
+            "lfm_short_tree_acceptance",
+            "v1:retained-domain1-capacity1024-batch512-sm86-q8kv;cached-beam33;complete-parent-top4;real-head-features;fresh-derived-accept-model;shared-tree16-selection-and-ngram;target-verify-required;owner-frozen",
+        );
+    }
+    if stored.knobs.iter().any(|(name, value)| {
+        name == crate::knobs::LFM_TREE_CANDIDATES_KNOB && *value == 3
+    }) {
+        canonical.string("lfm_short_tree_acceptance",
+            "v2:retained-domain1-capacity1024-batch512-sm86-q8kv;cached-beam33;complete-parent-top4;real-head-features;typed-cache-restore-only-matching;otherwise-fresh-derived-no-offline-prior;shared-tree16-selection-and-ngram;target-verify-required;owner-frozen");
+        canonical.string("lfm_short_tree_adaptive",
+            "v2:shared-v2-learned-widths2..16;depth8;eager16-top4;whole-successful-round-cost;exclude-cold-capture-tail;typed-cache-runtime-model-live-knobs-session-capacity-and-learner-source-bound;restore-only-matching-verifycost-longrunrate-acceptmodel;request-state-reset;common-ngram");
+    }
+    if stored.knobs.iter().any(|(name, value)| name == crate::knobs::MOE_GROUPED_PAIR_KNOB && *value == 1) {
+        canonical.string("moe_grouped_pair", "v1:resident-canonical-q4;existing-lane-fma-warp-sum-silu;perm-seg-token-to-work-rows;optional-extension;refusal-before-write");
+    }
+    if stored.knobs.iter().any(|(name, value)| name == crate::knobs::MOE_ROUTE_KNOB && *value == 1) {
+        canonical.string("moe_route", "v1:nt1-ne256-k8;existing-gate-stable-warp-topk-counting-plan-order;bias-selection-only-resident;all-eight-buffers-distinct;optional-extension;refusal-before-write");
+    }
+    if stored.knobs.iter().any(|(name, value)| name == crate::knobs::MOE_ACTIVE_EXPERTS_KNOB && *value == 1) {
+        canonical.string("moe_active_experts", "v1:nt1-resident-canonical-q4;ascending-active-expert-seg-tail;existing-grouped-pair-down-math;real-expert-weight-offset;execution-owner-epoch-capture-generation-bound;forward-boundary-control;optional-extension-fallback");
+    }
+    if stored.knobs.iter().any(|(name, value)| name == crate::knobs::MOE_ROUTER_F32_KNOB && *value == 1) {
+        canonical.string("moe_router_f32", "v2:source-sm86;nt1-k2048-n32-stride32-base0;f32-pedantic-cublas-existing-provider;no-half-tf32-conversion;no-cobatch-no-capture;owner-bound-forward-control;shared-scratch-4194304-bytes;safe-grow-to-existing-ptq-owner;optional-extension-fallback;independent-routing-numerics");
+    }
+    if stored.knobs.iter().any(|(name, value)| name == crate::knobs::MOE_DOWN_MMQ_KNOB && *value == 1) {
+        canonical.string("moe_down_mmq", "v1:source-sm86;nt128-rows512-ne32-top4-k1792-n2048-work1;resident-canonical-q4-q8_1-ds4;existing-quantize-mmq-compute-segment;real-expert-seg-bounds;f32-output;eager-no-cobatch-no-capture;owner-bound-forward-control;scratch-1048576-bytes-additive-to-router;optional-extension-fallback;independent-numerics-and-quality");
+    }
+    if stored.knobs.iter().any(|(name, value)| name == crate::knobs::MOE_GATEUP_MMQ_KNOB && *value == 1) {
+        canonical.string("moe_gateup_mmq", "v1:source-sm86;nt128-rows512-ne32-top4-k2048-n1792;resident-canonical-q4-q8_1-ds4;existing-tree-commit-gather-quantize-mmq-compute-segment-silu;explicit-u-workspace-reused-for-gather-and-up;perm-zero-before-plan-owner-epoch-physical-range-bound;real-expert-seg-bounds;f32-output;eager-no-cobatch-no-capture;owner-bound-forward-control;shared-q8-scratch-max-with-down-additive-to-router;only-minus70-allows-fallback;independent-numerics-and-quality");
+    }
+    if stored.knobs.iter().any(|(name, value)| name == crate::knobs::MOE_DOWN_MMVQ_KNOB && *value == 1) {
+        canonical.string("moe_down_mmvq", "v1:source-sm86;nt1-rows4-ne32-top4-k1792-n2048-work1-stride2064384;resident-canonical-q4-q8_1;existing-row-quantize-and-decode-rows-warp4-rows2-body;half-scale-and-sum-correction;device-seg-real-expert-offset;f32-output;eager-no-cobatch-no-capture;owner-bound-forward-control;shared-q8-scratch-8064-bytes-max-with-prefill-mmq-additive-to-router;optional-control-extension-fallback;independent-numerics-and-quality");
+    }
+    if stored.knobs.iter().any(|(name, value)| name == crate::knobs::MOE_GATEUP_MMVQ_KNOB && *value == 1) {
+        canonical.string("moe_gateup_mmvq", "v1:source-sm86;nt1-rows4-ne32-top4-k2048-n1792-stride2064384;resident-canonical-q4-q8_1;existing-one-row-quantize-and-gated-decode-warp4-body;original-silu-helper-fused;half-scale-and-sum-correction;device-perm-seg-real-expert-offset;invalid-perm-writes-zero;f32-output;open-active-decode-eager-no-cobatch-no-capture;owner-bound-forward-control;shared-q8-scratch-2304-bytes-max-with-other-moe-q8-additive-to-router;abi-scratch-unused-no-u-allocation;only-minus70-allows-fallback;independent-numerics-and-quality");
     }
     canonical.finish()
 }
@@ -993,6 +1426,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn q8_f16_split_receipt_requires_additional_gates_and_batch512() {
+        let runtime = runtime_fixture();
+        let mut id = identity(&runtime); id.kv_k = "f16"; id.kv_v = "f16";
+        let mut stored = Stored::default(); stored.batch = Some(512);
+        stored.knobs = Q8_F16_KNOBS.iter().map(|(n,v)| ((*n).into(), *v)).collect();
+        assert_eq!(q8_f16_policy(&stored, &id).unwrap().version, 1);
+        stored.knobs.iter_mut().find(|(n,_)| n == "mmq_q8_canonical_gate_up_pair").unwrap().1 = 5;
+        let policy = q8_f16_policy(&stored, &id).unwrap();
+        assert_eq!(policy.version, 2);
+        assert_eq!(policy.gates, CUDA_Q8_F16_LAYOUT_REQUIRED_GATES);
+        assert_eq!(policy.oracle_revision, "v1");
+        stored.batch = Some(256);
+        stored.knobs.iter_mut().find(|(n,_)| n == "weight_transfer_policy").unwrap().1 = 2;
+        assert!(q8_f16_policy(&stored, &id).is_none());
+    }
+
+    #[test]
+    fn q8_f16_receipt_is_separate_and_exact() {
+        let runtime = runtime_fixture();
+        let mut id = identity(&runtime); id.kv_k = "f16"; id.kv_v = "f16";
+        let mut stored = Stored::default();
+        stored.batch = Some(512);
+        stored.knobs = Q8_F16_KNOBS.iter().map(|(n,v)| ((*n).into(), *v)).collect();
+        assert_eq!(q8_f16_policy(&stored, &id).unwrap().suite, CUDA_Q8_F16_GATE_SUITE);
+        assert!(validate_ptq_f16(&stored, &id).is_err());
+        stored.knobs.iter_mut().find(|(n,_)| n == "prefill_projection_q8_d4").unwrap().1 = 2;
+        assert!(q8_f16_policy(&stored, &id).is_none());
+        assert!(validate_candidate(&Stored { batch: Some(512), knobs: Q8_F16_KNOBS.iter().map(|(n,v)| ((*n).into(), *v)).collect(), ..Stored::default() }).is_ok());
+    }
+
     fn alternate_value(declaration: &imparo_backend::KnobDecl, current: u32) -> u32 {
         match declaration.sweep {
             SweepKind::Values | SweepKind::External => declaration
@@ -1037,6 +1501,7 @@ mod tests {
                 })
                 .collect(),
             batch: Some(512),
+            seats: Vec::new(),
             path: std::path::PathBuf::default(),
         }
     }
@@ -1065,6 +1530,87 @@ mod tests {
             }
         }
         c
+    }
+
+    #[test]
+    fn d64_f16_receipt_requires_exact_configuration_and_all_evidence() {
+        use imparo_host::correctness::validate_receipt;
+        let runtime = runtime_fixture();
+        let mut id = identity(&runtime);
+        id.kv_k = "f16";
+        id.kv_v = "f16";
+        let mut c = stored();
+        c.batch = Some(128);
+        for (n, v) in &mut c.knobs { *v = d64_f16_value(n); }
+        let expected = build(b"d64", &c, &id).unwrap();
+        assert_eq!(expected.gate_suite, CUDA_D64_F16_GATE_SUITE);
+        assert_eq!(expected.oracle.options_sha256,
+            "13550204d4cc0fafbd95f6a7e3ab3cfcd074e5eae5f0a559651ad90aea6bd34a");
+        assert!(!validate_receipt(Some(&receipt_skeleton(&expected)), &expected).allows(&expected.routes[0]));
+        for (gate, _) in CUDA_D64_F16_REQUIRED_GATES {
+            let mut receipt = passing(&expected);
+            receipt.gates.retain(|g| g.gate_id != *gate);
+            assert!(!validate_receipt(Some(&receipt), &expected).allows(&expected.routes[0]));
+        }
+        for (i, decl) in CUDA_KNOBS.iter().enumerate() {
+            // Removing the selector deliberately chooses a different policy;
+            // every other changed knob must fail this policy closed.
+            if decl.name == "attn_decode_specialized" { continue; }
+            let mut changed = c.clone();
+            changed.knobs[i].1 = alternate_value(decl, changed.knobs[i].1);
+            if matches!(decl.name, crate::knobs::MOE_GROUPED_PAIR_KNOB | crate::knobs::MOE_ROUTE_KNOB | crate::knobs::MOE_ACTIVE_EXPERTS_KNOB | crate::knobs::MOE_ROUTER_F32_KNOB | crate::knobs::MOE_DOWN_MMQ_KNOB | crate::knobs::MOE_GATEUP_MMQ_KNOB | crate::knobs::MOE_DOWN_MMVQ_KNOB | crate::knobs::MOE_GATEUP_MMVQ_KNOB) {
+                if matches!(decl.name, crate::knobs::MOE_ROUTER_F32_KNOB | crate::knobs::MOE_DOWN_MMQ_KNOB | crate::knobs::MOE_GATEUP_MMQ_KNOB | crate::knobs::MOE_DOWN_MMVQ_KNOB | crate::knobs::MOE_GATEUP_MMVQ_KNOB) && !cfg!(feature = "cuda-static") {
+                    assert!(build(b"d64", &changed, &id).is_err());
+                    continue;
+                }
+                let paired = build(b"d64", &changed, &id).unwrap();
+                assert_ne!(expected.routes[0].parameters_sha256, paired.routes[0].parameters_sha256);
+                let extra_gate = match decl.name {
+                    crate::knobs::MOE_GROUPED_PAIR_KNOB => MOE_GROUPED_PAIR_GATE,
+                    crate::knobs::MOE_ROUTE_KNOB => MOE_ROUTE_GATE,
+                    crate::knobs::MOE_ROUTER_F32_KNOB => MOE_ROUTER_F32_GATE,
+                    crate::knobs::MOE_DOWN_MMQ_KNOB => MOE_DOWN_MMQ_GATE,
+                    crate::knobs::MOE_GATEUP_MMQ_KNOB => MOE_GATEUP_MMQ_GATE,
+                    crate::knobs::MOE_DOWN_MMVQ_KNOB => MOE_DOWN_MMVQ_GATE,
+                    crate::knobs::MOE_GATEUP_MMVQ_KNOB => MOE_GATEUP_MMVQ_GATE,
+                    _ => MOE_ACTIVE_EXPERTS_GATE,
+                };
+                assert!(paired.required_gates.iter().any(|g| g.gate_id == extra_gate));
+                assert!(!validate_receipt(Some(&passing(&expected)), &paired).allows(&paired.routes[0]));
+                let mut missing=passing(&paired);
+                missing.gates.retain(|g| g.gate_id != extra_gate);
+                assert!(!validate_receipt(Some(&missing), &paired).allows(&paired.routes[0]));
+                continue;
+            }
+            assert!(build(b"changed", &changed, &id).is_err(), "{}", decl.name);
+        }
+        let mut combined = c.clone();
+        for (name, value) in &mut combined.knobs {
+            if matches!(name.as_str(), crate::knobs::MOE_GROUPED_PAIR_KNOB | crate::knobs::MOE_ROUTE_KNOB | crate::knobs::MOE_ACTIVE_EXPERTS_KNOB) { *value=1; }
+            if matches!(name.as_str(), crate::knobs::MOE_ROUTER_F32_KNOB | crate::knobs::MOE_DOWN_MMQ_KNOB | crate::knobs::MOE_GATEUP_MMQ_KNOB | crate::knobs::MOE_DOWN_MMVQ_KNOB | crate::knobs::MOE_GATEUP_MMVQ_KNOB) && cfg!(feature = "cuda-static") { *value=1; }
+        }
+        let combined = build(b"d64", &combined, &id).unwrap();
+        assert!(validate_receipt(Some(&passing(&combined)), &combined).allows(&combined.routes[0]));
+        for gate in [MOE_GROUPED_PAIR_GATE, MOE_ROUTE_GATE, MOE_ACTIVE_EXPERTS_GATE, MOE_ROUTER_F32_GATE, MOE_DOWN_MMQ_GATE, MOE_GATEUP_MMQ_GATE, MOE_DOWN_MMVQ_GATE, MOE_GATEUP_MMVQ_GATE] {
+            if matches!(gate, MOE_ROUTER_F32_GATE | MOE_DOWN_MMQ_GATE | MOE_GATEUP_MMQ_GATE | MOE_DOWN_MMVQ_GATE | MOE_GATEUP_MMVQ_GATE) && !cfg!(feature = "cuda-static") { continue; }
+            assert!(combined.required_gates.iter().any(|g| g.gate_id == gate));
+            let mut missing = passing(&combined);
+            missing.gates.retain(|g| g.gate_id != gate);
+            assert!(!validate_receipt(Some(&missing), &combined).allows(&combined.routes[0]));
+        }
+        c.batch = Some(512);
+        assert!(build(b"batch", &c, &id).is_err());
+        c.batch = Some(128);
+        for kv in ["q8_0", "q4_0"] {
+            let bad = CudaCorrectnessIdentity { kv_k: kv, kv_v: kv, ..id };
+            assert!(build(b"kv", &c, &bad).is_err());
+        }
+        let bad = CudaCorrectnessIdentity { math_mode: CudaMathMode::Precise, ..id };
+        assert!(build(b"math", &c, &bad).is_err());
+        let mut other = runtime_fixture();
+        other.device_sm = 120;
+        let bad = CudaCorrectnessIdentity { runtime: &other, ..id };
+        assert!(build(b"sm", &c, &bad).is_err());
     }
 
     #[test]
@@ -1178,6 +1724,68 @@ mod tests {
     }
 
     #[test]
+    fn moe_router_and_mmq_cannot_borrow_qwen_or_ptq_policy() {
+        let runtime = runtime_fixture();
+        let mut id = identity(&runtime); id.kv_k = "f16"; id.kv_v = "f16";
+        for selected in [crate::knobs::MOE_ROUTER_F32_KNOB, crate::knobs::MOE_DOWN_MMQ_KNOB, crate::knobs::MOE_GATEUP_MMQ_KNOB, crate::knobs::MOE_DOWN_MMVQ_KNOB, crate::knobs::MOE_GATEUP_MMVQ_KNOB] {
+        let mut qwen = Stored { batch: Some(512), knobs: Q8_F16_KNOBS.iter()
+            .map(|(n,v)| ((*n).into(), *v)).collect(), ..Stored::default() };
+        assert!(build(b"qwen", &qwen, &id).is_ok());
+        qwen.knobs.iter_mut().find(|(n,_)| n == selected).unwrap().1 = 1;
+        assert!(build(b"qwen-router", &qwen, &id).is_err());
+        let mut ptq = ptq_stored();
+        ptq.knobs.iter_mut().find(|(n,_)| n == crate::knobs::PTQ_PREFILL_TENSORCORE_KNOB).unwrap().1 = 4;
+        ptq.knobs.iter_mut().find(|(n,_)| n == crate::knobs::WEIGHT_TRANSFER_POLICY_KNOB).unwrap().1 = 2;
+        assert!(build(b"ptq", &ptq, &id).is_ok());
+        ptq.knobs.iter_mut().find(|(n,_)| n == selected).unwrap().1 = 1;
+        assert!(build(b"ptq-router", &ptq, &id).is_err());
+        }
+    }
+
+    #[test]
+    fn ptq_packed_projection_requires_complete_v4_contract() {
+        use imparo_host::correctness::validate_receipt;
+        let runtime=runtime_fixture();let mut id=identity(&runtime);id.kv_k="f16";id.kv_v="f16";
+        let mut c=ptq_stored();let old=build(b"old",&c,&id).unwrap();
+        c.knobs.iter_mut().find(|(n,_)|n==crate::knobs::PTQ_PREFILL_TENSORCORE_KNOB).unwrap().1=4;
+        assert!(build(b"partial",&c,&id).is_err());
+        c.knobs.iter_mut().find(|(n,_)|n==crate::knobs::WEIGHT_TRANSFER_POLICY_KNOB).unwrap().1=2;
+        let current=build(b"new",&c,&id).unwrap();assert_eq!(current.gate_suite_version,4);
+        assert_eq!(current.required_gates.len(),CUDA_PTQ_F16_V4_REQUIRED_GATES.len());
+        assert!(!validate_receipt(Some(&passing(&old)),&current).allows(&current.routes[0]));
+        for (gate,_) in CUDA_PTQ_F16_V4_REQUIRED_GATES {
+            let mut absent=passing(&current);absent.gates.retain(|g|g.gate_id!=*gate);
+            assert!(!validate_receipt(Some(&absent),&current).allows(&current.routes[0]));
+        }
+    }
+
+    #[test]
+    fn ptq_retained_batches_reject_old_cross_batch_and_incomplete_receipts() {
+        use imparo_host::correctness::validate_receipt;
+        let runtime = runtime_fixture();
+        let mut id = identity(&runtime); id.kv_k = "f16"; id.kv_v = "f16";
+        let mut c = ptq_stored();
+        c.knobs.iter_mut().find(|(n,_)| n == crate::knobs::PTQ_PREFILL_TENSORCORE_KNOB).unwrap().1 = 4;
+        c.knobs.iter_mut().find(|(n,_)| n == crate::knobs::WEIGHT_TRANSFER_POLICY_KNOB).unwrap().1 = 2;
+        let old = build(b"old128", &c, &id).unwrap();
+        c.batch = Some(256); let short = build(b"short256", &c, &id).unwrap();
+        c.batch = Some(512); let wide = build(b"wide512", &c, &id).unwrap();
+        for expected in [&short, &wide] {
+            assert_eq!(expected.gate_suite_version, 5);
+            assert!(!validate_receipt(Some(&passing(&old)), expected).allows(&expected.routes[0]));
+            for (gate, _) in CUDA_PTQ_F16_V5_REQUIRED_GATES {
+                let mut incomplete = passing(expected);
+                incomplete.gates.retain(|g| g.gate_id != *gate);
+                assert!(!validate_receipt(Some(&incomplete), expected).allows(&expected.routes[0]));
+            }
+        }
+        assert!(!validate_receipt(Some(&passing(&short)), &wide).allows(&wide.routes[0]));
+        for batch in [1, 95, 192, 255, 257, 499, 513, 1024] {
+            c.batch = Some(batch); assert!(build(b"unmeasured", &c, &id).is_err());
+        }
+    }
+
+    #[test]
     fn ptq_f16_rejects_old_kv_wrong_hardware_partial_config_and_other_workflows() {
         let runtime = runtime_fixture();
         let candidate = ptq_stored();
@@ -1191,21 +1799,13 @@ mod tests {
                     .contains("cannot borrow")
             );
         }
-        let mut id = identity(&runtime);
-        id.kv_k = "f16";
-        id.kv_v = "f16";
-        for (name, value) in [
-            ("ptq_prefill_tensorcore", 0),
-            ("ptq_prefill_tensorcore", 1),
-            ("attn_decode_specialized", 1),
-            ("attn_d256_tiled", 0),
-            ("finite_history_prefill_tail_rows", 64),
-            ("e4b_ffn_w4a16", 1),
-            ("e4b_retained_decode_policy", 1),
-            ("lfm2_retained_execution", 1),
-        ] {
-            let mut changed = candidate.clone();
-            changed.knobs.iter_mut().find(|(n, _)| n == name).unwrap().1 = value;
+        let mut id = identity(&runtime); id.kv_k = "f16"; id.kv_v = "f16";
+        for (name, value) in [("ptq_prefill_tensorcore", 0), ("ptq_prefill_tensorcore", 1),
+                ("ptq_prefill_tensorcore", 4), ("weight_transfer_policy", 2), // Candidates cannot borrow existing whole-model receipts.
+                ("attn_decode_specialized", 1), ("attn_d256_tiled", 0),
+                ("finite_history_prefill_tail_rows", 64), ("e4b_ffn_w4a16", 1),
+                ("e4b_retained_decode_policy", 1), ("lfm2_retained_execution", 1)] {
+            let mut changed = candidate.clone(); changed.knobs.iter_mut().find(|(n, _)| n == name).unwrap().1 = value;
             assert!(build(b"ptq", &changed, &id).is_err(), "{name}={value}");
         }
         let mut changed = candidate.clone();
@@ -1355,6 +1955,50 @@ mod tests {
         ));
         candidate.knobs[index].1 = 3;
         assert!(build(b"invalid mode", &candidate, &identity(&runtime)).is_err());
+    }
+
+    #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
+    #[test]
+    fn isolated_tree4_full_tiles_exception_is_gate_only() {
+        let runtime = runtime_fixture();
+        let input = identity(&runtime);
+        let mut candidate = stored();
+        for (name, value) in &mut candidate.knobs {
+            match name.as_str() {
+                "e4b_retained_decode_policy" | "e4b_ffn_w4a16" => *value = 1,
+                "attn_d512_mma" => *value = 3,
+                _ => {},
+            }
+        }
+        let env: Vec<(OsString, OsString)> = [
+            ("IMPARO_CORRECTNESS_GATE", "1"), ("IMPARO_DSPARK_TREE", "4"),
+            ("IMPARO_LAB_E4B_TREE_FFN_M4", "1"), ("IMPARO_LAB_Q4_FULL_TILE_ROWS", "1"),
+        ].into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+        let check = |c: &Stored, i: &CudaCorrectnessIdentity<'_>, e: Vec<(OsString, OsString)>| {
+            expected_correctness_for_isolated_gate_with_env(b"isolated", c, i, e)
+        };
+        assert!(check(&candidate, &input, env.clone()).is_ok());
+        // The exact same environment remains forbidden at the production entry.
+        assert!(expected_correctness_with_env(b"isolated", &candidate, &input, env.clone()).is_err());
+        for missing in ["IMPARO_CORRECTNESS_GATE", "IMPARO_DSPARK_TREE", "IMPARO_LAB_E4B_TREE_FFN_M4"] {
+            let mut e = env.clone(); e.retain(|(k, _)| k != missing);
+            assert!(check(&candidate, &input, e).is_err(), "missing {missing}");
+        }
+        for (key, _) in &env {
+            let mut e = env.clone(); e.iter_mut().find(|(k, _)| k == key).unwrap().1 = "0".into();
+            assert!(check(&candidate, &input, e).is_err(), "wrong {key:?}");
+        }
+        let mut other = env.clone();
+        other.push(("IMPARO_LAB_Q8_SHORT_K_ROWS".into(), "1".into()));
+        assert!(check(&candidate, &input, other).is_err());
+        let mut other_runtime = runtime_fixture(); other_runtime.device_sm = 89;
+        assert!(check(&candidate, &identity(&other_runtime), env.clone()).is_err());
+        for (k, v) in [("f16", "q4_0"), ("q4_0", "q8_0")] {
+            let mut other = input; other.kv_k = k; other.kv_v = v;
+            assert!(check(&candidate, &other, env.clone()).is_err());
+        }
+        candidate.knobs.iter_mut().find(|(n, _)| n == crate::knobs::E4B_RETAINED_DECODE_POLICY_KNOB).unwrap().1 = 0;
+        assert!(check(&candidate, &input, env).is_err());
     }
 
     #[cfg(all(feature = "cuda-speculative", target_os = "windows"))]
@@ -1931,6 +2575,284 @@ mod tests {
 
     #[cfg(feature = "cuda-speculative")]
     #[test]
+    fn lfm_short_tree_graph_binds_identity_and_requires_its_own_evidence() {
+        use imparo_host::correctness::{
+            ReceiptDecision, ReceiptRejection, validate_receipt,
+        };
+        let runtime = runtime_fixture();
+        let mut input = identity(&runtime);
+        input.kv_k = "q8_0";
+        input.kv_v = "q8_0";
+        let mut candidate = lfm_retained_fixture(512);
+        let off = build(b"same short graph fixture", &candidate, &input).unwrap();
+        candidate.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_TREE_GRAPH_SHORT_KNOB
+        }).unwrap().1 = 1;
+        let on = build(b"same short graph fixture", &candidate, &input).unwrap();
+        assert_eq!(off.routes[0].domain_sha256, on.routes[0].domain_sha256);
+        assert_ne!(off.routes[0].parameters_sha256, on.routes[0].parameters_sha256);
+        assert_eq!(on.required_gates.len(), off.required_gates.len() + 1);
+        assert_eq!(&on.required_gates[..off.required_gates.len()], &off.required_gates);
+        let gate = on.required_gates.last().unwrap();
+        assert_eq!(gate.gate_id, LFM_SHORT_TREE_GRAPH_GATE);
+        assert_eq!(gate.gate_version, 1);
+
+        // A template must never manufacture the new execution proof.
+        let skeleton = receipt_skeleton(&on);
+        assert!(skeleton.gates.iter().all(|evidence| !evidence.passed));
+        let mut missing = passing(&on);
+        missing.gates.retain(|gate| gate.gate_id != LFM_SHORT_TREE_GRAPH_GATE);
+        assert!(matches!(
+            validate_receipt(Some(&missing), &on),
+            ReceiptDecision::SafeFallback(ReceiptRejection::MissingGate(ref gate))
+                if gate.gate_id == LFM_SHORT_TREE_GRAPH_GATE && gate.gate_version == 1
+        ));
+        // Relabelling the old receipt cannot authorize a changed selector.
+        assert!(!validate_receipt(Some(&passing(&off)), &on).allows(&on.routes[0]));
+        assert!(validate_receipt(Some(&passing(&on)), &on).allows(&on.routes[0]));
+
+        for value in ["0", "1"] {
+            let error = expected_correctness_with_env(
+                b"same short graph fixture", &candidate, &input,
+                [(OsString::from("IMPARO_LAB_LFM_TREE_GRAPH"), OsString::from(value))],
+            ).unwrap_err();
+            assert!(error.contains("not receiptable"));
+        }
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
+    fn lfm_short_tree_graph_rejects_unbound_wide_and_incomplete_profiles() {
+        let runtime = runtime_fixture();
+        let mut input = identity(&runtime);
+        input.kv_k = "q8_0";
+        input.kv_v = "q8_0";
+        let mut candidate = lfm_retained_fixture(512);
+        candidate.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_TREE_GRAPH_SHORT_KNOB
+        }).unwrap().1 = 1;
+        assert_eq!(validate_lfm_short_tree_graph(&candidate, &input), Ok(true));
+
+        let mut unbound = candidate.clone();
+        unbound.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_RETAINED_EXECUTION_KNOB
+        }).unwrap().1 = 0;
+        assert!(build(b"unbound", &unbound, &input).unwrap_err()
+            .contains("lfm2_retained_execution=1"));
+        for batch in [128, 511, 513, 1024, 1920, 2048] {
+            let mut wide = candidate.clone();
+            wide.batch = Some(batch);
+            assert!(build(b"wrong batch", &wide, &input).unwrap_err()
+                .contains("batch512"), "batch={batch}");
+        }
+        for (name, _) in LFM_RETAINED_KNOBS {
+            let mut incomplete = candidate.clone();
+            incomplete.knobs.iter_mut().find(|(n, _)| n == name).unwrap().1 += 1;
+            assert!(validate_lfm_short_tree_graph(&incomplete, &input).is_err(),
+                "missing {name}");
+        }
+        for (k, v) in [("q4_0", "q4_0"), ("f16", "f16"), ("q8_0", "f16")] {
+            let mut other_kv = input;
+            other_kv.kv_k = k;
+            other_kv.kv_v = v;
+            assert!(validate_lfm_short_tree_graph(&candidate, &other_kv).is_err());
+        }
+        let mut other_runtime = runtime_fixture();
+        other_runtime.device_sm = 89;
+        let mut other_gpu = input;
+        other_gpu.runtime = &other_runtime;
+        assert!(validate_lfm_short_tree_graph(&candidate, &other_gpu).is_err());
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
+    fn lfm_short_candidates_bind_identity_and_require_separate_evidence() {
+        use imparo_host::correctness::{ReceiptDecision, ReceiptRejection, validate_receipt};
+        let runtime = runtime_fixture();
+        let mut input = identity(&runtime);
+        input.kv_k = "q8_0";
+        input.kv_v = "q8_0";
+        let mut candidate = lfm_retained_fixture(512);
+        let off = build(b"same candidates fixture", &candidate, &input).unwrap();
+        candidate.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_TREE_CANDIDATES_KNOB
+        }).unwrap().1 = 1;
+        let on = build(b"same candidates fixture", &candidate, &input).unwrap();
+        assert_eq!(off.routes[0].domain_sha256, on.routes[0].domain_sha256);
+        assert_ne!(off.routes[0].parameters_sha256, on.routes[0].parameters_sha256);
+        assert_eq!(on.required_gates.len(), off.required_gates.len() + 1);
+        let gate = on.required_gates.last().unwrap();
+        assert_eq!(gate.gate_id, LFM_SHORT_CANDIDATES_GATE);
+        assert_eq!(gate.gate_version, 1);
+        assert!(receipt_skeleton(&on).gates.iter().all(|evidence| !evidence.passed));
+        assert!(!validate_receipt(Some(&passing(&off)), &on).allows(&on.routes[0]));
+        let mut missing = passing(&on);
+        missing.gates.retain(|gate| gate.gate_id != LFM_SHORT_CANDIDATES_GATE);
+        assert!(matches!(
+            validate_receipt(Some(&missing), &on),
+            ReceiptDecision::SafeFallback(ReceiptRejection::MissingGate(ref gate))
+                if gate.gate_id == LFM_SHORT_CANDIDATES_GATE && gate.gate_version == 1
+        ));
+        assert!(validate_receipt(Some(&passing(&on)), &on).allows(&on.routes[0]));
+        for variable in ["IMPARO_LAB_LFM_TREE_GRAPH", "IMPARO_LAB_DSPARK_TREE16"] {
+            assert!(expected_correctness_with_env(
+                b"fixture", &candidate, &input,
+                [(OsString::from(variable), OsString::from("1"))],
+            ).is_err());
+        }
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
+    fn lfm_short_acceptance_cannot_inherit_candidates_receipt_or_gate() {
+        use imparo_host::correctness::{ReceiptDecision, ReceiptRejection, validate_receipt};
+        let runtime = runtime_fixture();
+        let mut input = identity(&runtime);
+        input.kv_k = "q8_0";
+        input.kv_v = "q8_0";
+        let mut candidate = lfm_retained_fixture(512);
+        let off = build(b"same acceptance fixture", &candidate, &input).unwrap();
+        candidate.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_TREE_CANDIDATES_KNOB
+        }).unwrap().1 = 1;
+        let previous = build(b"same acceptance fixture", &candidate, &input).unwrap();
+        candidate.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_TREE_CANDIDATES_KNOB
+        }).unwrap().1 = 2;
+        let accepted = build(b"same acceptance fixture", &candidate, &input).unwrap();
+        assert_eq!(previous.routes[0].domain_sha256, accepted.routes[0].domain_sha256);
+        assert_ne!(previous.routes[0].parameters_sha256, accepted.routes[0].parameters_sha256);
+        assert_eq!(accepted.required_gates.len(), previous.required_gates.len());
+        assert!(accepted.required_gates.iter().all(|gate| gate.gate_id != LFM_SHORT_CANDIDATES_GATE));
+        let gate = accepted.required_gates.last().unwrap();
+        assert_eq!(gate.gate_id, LFM_SHORT_ACCEPTANCE_GATE);
+        assert_eq!(gate.gate_version, 1);
+        assert!(receipt_skeleton(&accepted).gates.iter().all(|evidence| !evidence.passed));
+        for old in [&off, &previous] {
+            assert!(!validate_receipt(Some(&passing(old)), &accepted).allows(&accepted.routes[0]));
+        }
+        // A mode1 proof relabelled with mode2's identity still lacks its evidence.
+        let mut missing = passing(&accepted);
+        missing.gates.iter_mut().find(|gate| gate.gate_id == LFM_SHORT_ACCEPTANCE_GATE)
+            .unwrap().gate_id = LFM_SHORT_CANDIDATES_GATE.into();
+        assert!(matches!(
+            validate_receipt(Some(&missing), &accepted),
+            ReceiptDecision::SafeFallback(ReceiptRejection::MissingGate(ref gate))
+                if gate.gate_id == LFM_SHORT_ACCEPTANCE_GATE && gate.gate_version == 1
+        ));
+        assert!(validate_receipt(Some(&passing(&accepted)), &accepted).allows(&accepted.routes[0]));
+        for variable in ["IMPARO_LAB_LFM_TREE_GRAPH", "IMPARO_LAB_DSPARK_TREE16"] {
+            assert!(expected_correctness_with_env(
+                b"fixture", &candidate, &input,
+                [(OsString::from(variable), OsString::from("1"))],
+            ).is_err());
+        }
+        candidate.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_TREE_CANDIDATES_KNOB
+        }).unwrap().1 = 4;
+        assert!(build(b"invalid mode", &candidate, &input).is_err());
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
+    fn lfm_short_adaptive_typed_cache_requires_v2_evidence() {
+        use imparo_host::correctness::{ReceiptDecision, ReceiptRejection, validate_receipt};
+        let runtime = runtime_fixture();
+        let mut input = identity(&runtime);
+        input.kv_k = "q8_0";
+        input.kv_v = "q8_0";
+        let mut candidate = lfm_retained_fixture(512);
+        candidate.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_TREE_CANDIDATES_KNOB
+        }).unwrap().1 = 2;
+        let fresh = build(b"same cache fixture", &candidate, &input).unwrap();
+        candidate.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_TREE_CANDIDATES_KNOB
+        }).unwrap().1 = 3;
+        let cached = build(b"same cache fixture", &candidate, &input).unwrap();
+        assert_eq!(fresh.routes[0].domain_sha256, cached.routes[0].domain_sha256);
+        assert_ne!(fresh.routes[0].parameters_sha256, cached.routes[0].parameters_sha256);
+        assert!(!validate_receipt(Some(&passing(&fresh)), &cached).allows(&cached.routes[0]));
+        let gate = cached.required_gates.iter().find(|gate| gate.gate_id == LFM_SHORT_ADAPTIVE_GATE).unwrap();
+        assert_eq!(gate.gate_version, 2);
+        // Even copying the current route identity cannot promote the old
+        // request-local evidence into proof of typed cross-request restoration.
+        let mut old = passing(&cached);
+        old.gates.iter_mut().find(|gate| gate.gate_id == LFM_SHORT_ADAPTIVE_GATE)
+            .unwrap().gate_version = 1;
+        assert!(matches!(
+            validate_receipt(Some(&old), &cached),
+            ReceiptDecision::SafeFallback(ReceiptRejection::MissingGate(ref gate))
+                if gate.gate_id == LFM_SHORT_ADAPTIVE_GATE && gate.gate_version == 2
+        ));
+        assert!(validate_receipt(Some(&passing(&cached)), &cached).allows(&cached.routes[0]));
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
+    fn lfm_short_candidates_reject_unbound_wide_or_different_target() {
+        let runtime = runtime_fixture();
+        let mut input = identity(&runtime);
+        input.kv_k = "q8_0";
+        input.kv_v = "q8_0";
+        for mode in [1, 2, 3] {
+        let mut candidate = lfm_retained_fixture(512);
+        candidate.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_TREE_CANDIDATES_KNOB
+        }).unwrap().1 = mode;
+        assert_eq!(validate_lfm_short_candidates(&candidate, &input), Ok(true));
+        let mut unbound = candidate.clone();
+        unbound.knobs.iter_mut().find(|(name, _)| {
+            name == crate::knobs::LFM_RETAINED_EXECUTION_KNOB
+        }).unwrap().1 = 0;
+        assert!(build(b"unbound", &unbound, &input).is_err());
+        for batch in [128, 511, 513, 1024, 1920, 2048] {
+            let mut wide = candidate.clone();
+            wide.batch = Some(batch);
+            assert!(build(b"wide", &wide, &input).is_err(), "batch={batch}");
+        }
+        for (name, _) in LFM_RETAINED_KNOBS {
+            let mut incomplete = candidate.clone();
+            incomplete.knobs.iter_mut().find(|(n, _)| n == name).unwrap().1 += 1;
+            assert!(validate_lfm_short_candidates(&incomplete, &input).is_err(), "{name}");
+        }
+        for (k, v) in [("q4_0", "q4_0"), ("f16", "f16"), ("q8_0", "f16")] {
+            let mut other = input;
+            other.kv_k = k;
+            other.kv_v = v;
+            assert!(validate_lfm_short_candidates(&candidate, &other).is_err());
+        }
+        let mut other_runtime = runtime_fixture();
+        other_runtime.device_sm = 89;
+        let mut other = input;
+        other.runtime = &other_runtime;
+        assert!(validate_lfm_short_candidates(&candidate, &other).is_err());
+        }
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
+    fn adaptive_budget_requires_own_evidence_and_eager_cost_domain() {
+        use imparo_host::correctness::validate_receipt;
+        let runtime=runtime_fixture();
+        let mut input=identity(&runtime);
+        input.kv_k="q8_0";input.kv_v="q8_0";
+        let mut stored=lfm_retained_fixture(512);
+        let set=|s:&mut Stored,value| s.knobs.iter_mut().find(|(n,_)|
+            n==crate::knobs::LFM_TREE_CANDIDATES_KNOB).unwrap().1=value;
+        set(&mut stored,2);
+        let old=build(b"adaptive fixture",&stored,&input).unwrap();
+        set(&mut stored,3);
+        let new=build(b"adaptive fixture",&stored,&input).unwrap();
+        assert_ne!(old.routes[0].parameters_sha256,new.routes[0].parameters_sha256);
+        assert_eq!(new.required_gates.last().unwrap().gate_id,LFM_SHORT_ADAPTIVE_GATE);
+        assert!(!validate_receipt(Some(&passing(&old)),&new).allows(&new.routes[0]));
+        stored.knobs.iter_mut().find(|(n,_)|n==crate::knobs::LFM_TREE_GRAPH_SHORT_KNOB).unwrap().1=1;
+        assert!(build(b"mixed execution costs",&stored,&input).is_err());
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
     fn lfm_retained_domain_contract_preserves_exact_short_and_wide_requirements() {
         use imparo_host::correctness::{
             ReceiptDecision, ReceiptRejection, validate_receipt,
@@ -2136,7 +3058,17 @@ mod tests {
             if matches!(
                 declaration.name,
                 crate::knobs::LFM_RETAINED_EXECUTION_KNOB
+                    | crate::knobs::LFM_TREE_GRAPH_SHORT_KNOB
+                    | crate::knobs::LFM_TREE_CANDIDATES_KNOB
                     | crate::knobs::PTQ_PREFILL_TENSORCORE_KNOB
+                    | crate::knobs::MOE_GROUPED_PAIR_KNOB
+                    | crate::knobs::MOE_ROUTE_KNOB
+                    | crate::knobs::MOE_ACTIVE_EXPERTS_KNOB
+                    | crate::knobs::MOE_ROUTER_F32_KNOB
+                    | crate::knobs::MOE_DOWN_MMQ_KNOB
+                    | crate::knobs::MOE_GATEUP_MMQ_KNOB
+                    | crate::knobs::MOE_DOWN_MMVQ_KNOB
+                    | crate::knobs::MOE_GATEUP_MMVQ_KNOB
             ) {
                 continue;
             }

@@ -1,9 +1,10 @@
 //! One Rust call surface for statically linked and runtime-loaded CUDA backends.
 
 use core::ffi::c_void;
+#[cfg(any(feature="cuda-static", feature="cuda-dynamic"))]
+pub(crate) use crate::cobatch::native::*;
 
-// Source-build bring-up interface; dynamic releases retain their existing ABI and
-// advertise no Bonsai/DeltaNet capability until native admission is complete.
+// Recurrent operation layout shared by source builds and the optional CoBatch extension.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GatedDeltaWire {
@@ -28,16 +29,9 @@ pub(crate) struct GatedDeltaWire {
 }
 #[cfg(feature = "cuda-static")]
 unsafe extern "C" {
-    // Static-only extension: runtime-loaded backends retain the existing row-copy ABI.
-    pub(crate) fn imparo_cuda_copy_strided(
-        dst: u32,
-        src: u32,
-        width: u32,
-        src_off: u32,
-        src_stride: u32,
-        n_row: u32,
-    );
-    pub(crate) fn imparo_cuda_set_placement_reserve(bytes: u64) -> i32;
+
+    pub(crate) fn imparo_cuda_repack_q8_split(off: u64, bytes: u64, n_in: u32, n_out: u32) -> i32;
+    pub(crate) fn imparo_cuda_read_resident_weight(off: u64, dst: *mut u8, bytes: u64) -> i32;
     pub(crate) fn imparo_cuda_weight_basis_register(
         offset: u64,
         width: u32,
@@ -48,37 +42,7 @@ unsafe extern "C" {
         value_heads: u32,
         signs: *const i8,
     ) -> i32;
-    pub(crate) fn imparo_cuda_delta_net_run(op: *const GatedDeltaWire) -> i32;
-    pub(crate) fn imparo_cuda_plain_conv(
-        src: u32,
-        w_off: u64,
-        state: u32,
-        state_off: u32,
-        state_out_off: u32,
-        out: u32,
-        width: u32,
-        kernel: u32,
-        n_tok: u32,
-    );
-    pub(crate) fn imparo_cuda_plain_conv_snapshot(
-        src: u32,
-        state: u32,
-        state_off: u32,
-        snap: u32,
-        snap_off: u32,
-        width: u32,
-        kernel: u32,
-        n_tok: u32,
-    );
-    pub(crate) fn imparo_cuda_mul_strided_sigmoid(
-        a: u32,
-        b: u32,
-        width: u32,
-        b_off: u32,
-        b_stride: u32,
-        a_stride: u32,
-        n_rows: u32,
-    );
+
 }
 
 #[repr(C)]
@@ -606,6 +570,7 @@ mod imp {
             total: *mut u64,
             allocated: *mut u64,
         ) -> i32;
+
         pub(crate) fn imparo_cuda_weights_resident() -> u32;
         pub(crate) fn imparo_cuda_runtime_identity(
             out: *mut super::RuntimeIdentityWire,
@@ -1352,6 +1317,11 @@ mod imp_dynamic {
         };
     }
     fields!(declare_api);
+
+    /// Resolve an optional extension on the already resolved, ABI-checked library.
+    pub(crate) fn optional_backend_symbol(name: &'static [u8])->Option<*mut c_void> {
+        api().ok()?._library.symbol(name).ok()
+    }
 
     // Optional extension: old dynamic libraries stay valid with policy disabled.
     type WeightTransferSetFn = unsafe extern "C" fn(u32) -> i32;

@@ -9,7 +9,8 @@
 #               full    the speculative arms on the core subset (the first conversation of every
 #                       category, half of each single-category source: 87 of 148 turns)
 #               check
-#               widths  table4.py: chain / fixed 8, 12, 16 / chosen at 443, 1596, 8444 keys
+#               widths  table4.py: chain / fixed 8, 12, 16 / chosen at 443, 1596, 8444 keys, every
+#                       arm from one store learned over all nine (context, prompt) cells
 #               survey  survey.py: verify ms by pinned width and context
 #               figs    AdaSpark and the cost-model arm with the round, score and chooser probes
 #                       on, smoke subset (rounds, not turns, are the unit; not timed results)
@@ -74,7 +75,7 @@ model() {  # name speculative-arms prompt-set env...
   for kv in "$@"; do
     case $kv in AGENTIC_TARGET=*) tgt=${kv#*=};; AGENTIC_DRAFT=*) draft=${kv#*=};; esac
   done
-  step ${m}_widths env SURVEY_MODEL="$tgt" SURVEY_DRAFT="$draft" PROMPT_SET=$pset \
+  step ${m}_widths env T4_WARM=model SURVEY_MODEL="$tgt" SURVEY_DRAFT="$draft" PROMPT_SET=$pset \
     python3 -u $H/table4.py $OUT/${m}_widths chain,8,12,16,budget 443,1596,8444 A,B,C 256 2
   step ${m}_survey env SURVEY_MODEL="$tgt" SURVEY_DRAFT="$draft" PROMPT_SET=$pset \
     python3 -u $H/survey.py $OUT/${m}_survey 2,4,6,8,10,12,16,20,24,32,40,48 443,1596,8444 128 2

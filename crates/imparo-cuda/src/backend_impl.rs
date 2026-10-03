@@ -54,6 +54,24 @@ static KV_K: AtomicU32 = AtomicU32::new(1);
 static KV_V: AtomicU32 = AtomicU32::new(1);
 // The target owns tuning identity; an appended drafter only extends the mapping.
 static MODEL_BYTES: AtomicU64 = AtomicU64::new(0);
+static SLOT_RUNTIME_RESERVE: AtomicU64 = AtomicU64::new(u64::MAX);
+static SLOT_KV_RESERVE: AtomicU64 = AtomicU64::new(0);
+static SLOT_ACTIVATION_RESERVE: AtomicU64 = AtomicU64::new(0);
+
+fn slot_budget_after_commits(
+    free: u64,
+    reserve: u64,
+    kv_reserve: u64,
+    activation_reserve: u64,
+    kv_committed: u64,
+    activations_committed: u64,
+) -> u64 {
+    let outstanding = reserve
+        .saturating_sub(kv_reserve.min(kv_committed))
+        .saturating_sub(activation_reserve.min(activations_committed));
+    free.saturating_sub(outstanding)
+}
+
 fn config_model_bytes(target: u64, mapping: u64) -> u64 {
     if target == 0 { mapping } else { target }
 }
@@ -66,6 +84,63 @@ struct CorrectnessModelIdentity {
 }
 
 static CORRECTNESS_MODEL_IDENTITY: OnceLock<CorrectnessModelIdentity> = OnceLock::new();
+
+// This is a cache identity, not permission to select a numerical route. The model
+// layer adds its session geometry and learner contract before it reads or writes.
+fn dspark_backend_config_key(
+    host_fingerprint: &str,
+    model_bytes: u64,
+    model: CorrectnessModelIdentity,
+    runtime: &crate::CudaRuntimeIdentity,
+    kv: (u32, u32),
+    math_mode: &str,
+    knobs: &[(&str, u32)],
+) -> Option<(String, u64)> {
+    if host_fingerprint.is_empty() || model_bytes == 0 || knobs.is_empty()
+        || model.model_sha256 == [0; 32] || model.model_plan_sha256 == [0; 32]
+        || model.kv_layout_sha256 == [0; 32] || runtime.device_uuid == [0; 16]
+        || runtime.device_sm == 0 || runtime.driver_version == 0
+        || runtime.runtime_version == 0 || runtime.backend_abi == 0
+        || runtime.backend_build_sha256 == [0; 32]
+        || runtime.backend_artifact_sha256 == Some([0; 32])
+        || !matches!(kv.0, 1 | 2 | 8) || !matches!(kv.1, 1 | 2 | 8)
+        || !matches!(math_mode, "fast" | "precise")
+    {
+        return None;
+    }
+    let mut canonical = Vec::new();
+    let mut field = |name: &str, value: &[u8]| {
+        canonical.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(name.as_bytes());
+        canonical.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(value);
+    };
+    field("domain", b"imparo-cuda-dspark-backend-cache-v1");
+    field("host", host_fingerprint.as_bytes());
+    field("model_bytes", &model_bytes.to_le_bytes());
+    field("model_sha256", &model.model_sha256);
+    field("model_plan_sha256", &model.model_plan_sha256);
+    field("kv_layout_sha256", &model.kv_layout_sha256);
+    field("device_uuid", &runtime.device_uuid);
+    field("device_sm", &runtime.device_sm.to_le_bytes());
+    field("driver_version", &runtime.driver_version.to_le_bytes());
+    field("runtime_version", &runtime.runtime_version.to_le_bytes());
+    field("backend_abi", &runtime.backend_abi.to_le_bytes());
+    field("backend_build_sha256", &runtime.backend_build_sha256);
+    field("backend_artifact_sha256", runtime.backend_artifact_sha256.as_ref().map_or(&[][..], |hash| &hash[..]));
+    field("kv_k", &kv.0.to_le_bytes());
+    field("kv_v", &kv.1.to_le_bytes());
+    field("math_mode", math_mode.as_bytes());
+    field("registry_len", &(knobs.len() as u64).to_le_bytes());
+    for (name, value) in knobs {
+        field("knob_name", name.as_bytes());
+        field("knob_value", &value.to_le_bytes());
+    }
+    // Do not expose the host's |space=v tag: the generic cache reader otherwise
+    // searches older spaces, whose measured prices and feature contracts differ.
+    Some((format!("cuda-dspark-cache-v1:{}", imparo_host::receipted_config::config_sha256(&canonical)), model_bytes))
+}
+
 // Captured immediately after native SM discovery and before any stored config is
 // applied. A future same-process reload must start here; otherwise a rejected second
 // config could leave numerical knobs from an earlier admitted receipt live.
@@ -184,7 +259,6 @@ fn apply_env_kv_types() {
 
 /// Stream exactly the complement of the common planner's Fast segments. File headers,
 /// alignment gaps and non-Fast tensors must not consume unplanned resident bytes.
-#[cfg(any(feature = "cuda-static", test))]
 fn placement_streamed_spans(
     len: u64,
     segments: &[imparo_backend::WeightSegment],
@@ -261,18 +335,162 @@ fn init_with_streamed(
     Ok(())
 }
 
-/// Registry-driven config apply -- the CUDA analogue of imparo-metal's: every stored
-/// key goes through the registry's declared hook, so a knob the tuner writes cannot
-/// be silently dropped here. UNVERIFIED on real hardware, like the rest of this crate.
-#[must_use]
-pub fn apply_host_config(model_bytes: u64) -> Option<usize> {
+// The validated snapshot is selected BEFORE common weight placement and consumed
+// after native initialization. Reading it twice could select different layouts and
+// kernels when a tuning file is replaced during model load.
+static PLANNED_TRANSFER_POLICY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+static PREPARED_HOST_CONFIG: std::sync::Mutex<Option<(u64, Option<imparo_host::Stored>)>> =
+    std::sync::Mutex::new(None);
+
+const MOE_ROUTER_SCRATCH_BYTES: u64 = 4 << 20;
+const MOE_DOWN_SCRATCH_BYTES: u64 = 1 << 20;
+const MOE_GATEUP_SCRATCH_BYTES: u64 = 1_179_648;
+const MOE_DOWN_MMVQ_SCRATCH_BYTES: u64 = 8_064;
+const MOE_GATEUP_MMVQ_SCRATCH_BYTES: u64 = 2_304;
+#[derive(Clone, Copy)]
+struct MoeRouterScratchPlan {
+    host_router: u32,
+    host_down: u32,
+    host_gateup: u32,
+    host_down_mmvq: u32,
+    host_gateup_mmvq: u32,
+    router: u32,
+    down: u32,
+    gateup: u32,
+    down_mmvq: u32,
+    gateup_mmvq: u32,
+}
+impl MoeRouterScratchPlan {
+    fn new(
+        host_router: u32, host_down: u32, host_gateup: u32, host_down_mmvq: u32, host_gateup_mmvq: u32,
+        router_override: Option<u32>, down_override: Option<u32>, gateup_override: Option<u32>,
+        down_mmvq_override: Option<u32>, gateup_mmvq_override: Option<u32>,
+    ) -> Result<Self, String> {
+        let router = router_override.unwrap_or(host_router);
+        let down = down_override.unwrap_or(host_down);
+        let gateup = gateup_override.unwrap_or(host_gateup);
+        let down_mmvq = down_mmvq_override.unwrap_or(host_down_mmvq);
+        let gateup_mmvq = gateup_mmvq_override.unwrap_or(host_gateup_mmvq);
+        if host_router > 1 || router > 1 {
+            return Err("invalid load-time moe_router_f32 value".into());
+        }
+        if host_down > 1 || down > 1 {
+            return Err("invalid load-time moe_down_mmq value".into());
+        }
+        if host_gateup > 1 || gateup > 1 {
+            return Err("invalid load-time moe_gateup_mmq value".into());
+        }
+        if host_down_mmvq > 1 || down_mmvq > 1 {
+            return Err("invalid load-time moe_down_mmvq value".into());
+        }
+        if host_gateup_mmvq > 1 || gateup_mmvq > 1 {
+            return Err("invalid load-time moe_gateup_mmvq value".into());
+        }
+        Ok(Self { host_router, host_down, host_gateup, host_down_mmvq, host_gateup_mmvq,
+            router, down, gateup, down_mmvq, gateup_mmvq })
+    }
+    fn bytes(self) -> u64 {
+        // Prefill and decode Gate/Up and Down share one Q8 allocation in stream order.
+        u64::from(self.router) * MOE_ROUTER_SCRATCH_BYTES
+            + (u64::from(self.down) * MOE_DOWN_SCRATCH_BYTES)
+                .max(u64::from(self.gateup) * MOE_GATEUP_SCRATCH_BYTES)
+                .max(u64::from(self.down_mmvq) * MOE_DOWN_MMVQ_SCRATCH_BYTES)
+                .max(u64::from(self.gateup_mmvq) * MOE_GATEUP_MMVQ_SCRATCH_BYTES)
+    }
+    fn validate(self, router_override: Option<u32>, down_override: Option<u32>, gateup_override: Option<u32>,
+        down_mmvq_override: Option<u32>, gateup_mmvq_override: Option<u32>) -> Result<(), String> {
+        let requested = Self::new(self.host_router, self.host_down, self.host_gateup, self.host_down_mmvq, self.host_gateup_mmvq,
+            router_override, down_override, gateup_override, down_mmvq_override, gateup_mmvq_override)?;
+        if requested.router != self.router {
+            return Err("moe_router_f32 changed after load-time placement".into());
+        }
+        if requested.down != self.down {
+            return Err("moe_down_mmq changed after load-time placement".into());
+        }
+        if requested.gateup != self.gateup {
+            return Err("moe_gateup_mmq changed after load-time placement".into());
+        }
+        if requested.down_mmvq != self.down_mmvq {
+            return Err("moe_down_mmvq changed after load-time placement".into());
+        }
+        if requested.gateup_mmvq != self.gateup_mmvq {
+            return Err("moe_gateup_mmvq changed after load-time placement".into());
+        }
+        Ok(())
+    }
+}
+static PLANNED_MOE_ROUTER: std::sync::Mutex<Option<MoeRouterScratchPlan>> =
+    std::sync::Mutex::new(None);
+
+/// Bind MoE's fixed owner storage before placement, using the prepared host
+/// snapshot and the same explicit laboratory override that will be applied later.
+pub fn prepare_moe_router_scratch(
+    router_override: Option<u32>, down_override: Option<u32>, gateup_override: Option<u32>,
+    down_mmvq_override: Option<u32>, gateup_mmvq_override: Option<u32>,
+) -> Result<u64, String> {
+    let mut planned = PLANNED_MOE_ROUTER.lock()
+        .map_err(|_| "CUDA router load config lock poisoned")?;
+    let snapshot = planned.as_ref().ok_or("CUDA host config was not prepared")?;
+    let plan = MoeRouterScratchPlan::new(
+        snapshot.host_router, snapshot.host_down, snapshot.host_gateup, snapshot.host_down_mmvq, snapshot.host_gateup_mmvq,
+        router_override, down_override, gateup_override, down_mmvq_override, gateup_mmvq_override,
+    )?;
+    let bytes = plan.bytes();
+    *planned = Some(plan);
+    Ok(bytes)
+}
+
+/// A changed override must not enable an allocation omitted from the placement.
+pub fn validate_moe_router_scratch(
+    router_override: Option<u32>, down_override: Option<u32>, gateup_override: Option<u32>,
+    down_mmvq_override: Option<u32>, gateup_mmvq_override: Option<u32>,
+) -> Result<(), String> {
+    let planned = PLANNED_MOE_ROUTER.lock()
+        .map_err(|_| "CUDA router load config lock poisoned")?;
+    match *planned {
+        Some(plan) => plan.validate(router_override, down_override, gateup_override, down_mmvq_override, gateup_mmvq_override),
+        None if router_override.unwrap_or(0) == 0 && down_override.unwrap_or(0) == 0
+            && gateup_override.unwrap_or(0) == 0 && down_mmvq_override.unwrap_or(0) == 0
+            && gateup_mmvq_override.unwrap_or(0) == 0 => Ok(()),
+        None => Err("MoE scratch selectors require load-time placement".into()),
+    }
+}
+
+pub fn prepare_host_config(model_bytes: u64) -> Result<(u32, Option<usize>), String> {
+    apply_env_kv_types();
+    let stored = if std::env::var_os("IMPARO_NO_HOSTCONFIG").is_some() {
+        None
+    } else { read_host_config(model_bytes) };
+    let policy = stored.as_ref().and_then(|s| s.knobs.iter()
+        .find(|(name, _)| name == crate::knobs::WEIGHT_TRANSFER_POLICY_KNOB))
+        .map_or(0, |(_, value)| *value);
+    let batch = stored.as_ref().and_then(|s| s.batch);
+    let router = stored.as_ref().and_then(|s| s.knobs.iter()
+        .find(|(name, _)| name == "moe_router_f32"))
+        .map_or(0, |(_, value)| *value);
+    let down = stored.as_ref().and_then(|s| s.knobs.iter()
+        .find(|(name, _)| name == "moe_down_mmq"))
+        .map_or(0, |(_, value)| *value);
+    let gateup = stored.as_ref().and_then(|s| s.knobs.iter()
+        .find(|(name, _)| name == "moe_gateup_mmq"))
+        .map_or(0, |(_, value)| *value);
+    let down_mmvq = stored.as_ref().and_then(|s| s.knobs.iter()
+        .find(|(name, _)| name == "moe_down_mmvq"))
+        .map_or(0, |(_, value)| *value);
+    let gateup_mmvq = stored.as_ref().and_then(|s| s.knobs.iter()
+        .find(|(name, _)| name == "moe_gateup_mmvq"))
+        .map_or(0, |(_, value)| *value);
+    *PLANNED_MOE_ROUTER.lock().map_err(|_| "CUDA router load config lock poisoned")? =
+        Some(MoeRouterScratchPlan::new(router, down, gateup, down_mmvq, gateup_mmvq, None, None, None, None, None)?);
+    PLANNED_TRANSFER_POLICY.store(policy, Ordering::Relaxed);
+    *PREPARED_HOST_CONFIG.lock().map_err(|_| "CUDA load config lock poisoned")? =
+        Some((model_bytes, stored));
+    Ok((policy, batch))
+}
+
+fn read_host_config(model_bytes: u64) -> Option<imparo_host::Stored> {
     use imparo_backend::BackendKnobs as _;
-
-    // Reset before every lookup and before every possible early return. Startup and a
-    // future hot reload therefore share the same fail-closed behavior: missing/torn/
-    // stale receipts cannot retain a numerical route admitted by an older snapshot.
-    reset_cuda_safe_defaults();
-
     let space = CudaBackend.space_version();
     let kv = configured_kv_tag();
     let fp = imparo_host::fingerprint_for("cuda", space, &kv);
@@ -310,7 +528,7 @@ pub fn apply_host_config(model_bytes: u64) -> Option<usize> {
             model_bytes,
             ("cuda", space, &kv),
             |candidate| {
-                crate::correctness::expected_correctness(candidate, &correctness)
+                crate::correctness::expected_correctness_for_isolated_gate(candidate, &correctness)
             },
         );
         let (stored, expected) = match result {
@@ -359,6 +577,41 @@ pub fn apply_host_config(model_bytes: u64) -> Option<usize> {
         stored
     };
 
+    Some(stored)
+}
+
+/// Registry-driven config apply -- the CUDA analogue of imparo-metal's: every stored
+/// key goes through the registry's declared hook, so a knob the tuner writes cannot
+/// be silently dropped here. UNVERIFIED on real hardware, like the rest of this crate.
+#[must_use]
+pub fn apply_host_config(model_bytes: u64) -> Option<usize> {
+    use imparo_backend::BackendKnobs as _;
+
+    // Reset before every lookup and before every possible early return. Startup and a
+    // future hot reload therefore share the same fail-closed behavior: missing/torn/
+    // stale receipts cannot retain a numerical route admitted by an older snapshot.
+    reset_cuda_safe_defaults();
+
+    let prepared = PREPARED_HOST_CONFIG.lock().ok()?.take();
+    let stored = match prepared {
+        Some((expected_bytes, stored)) => {
+            if expected_bytes != model_bytes {
+                eprintln!("[imparo] CUDA load config model changed; using safe defaults");
+                return None;
+            }
+            stored?
+        }
+        None => read_host_config(model_bytes)?,
+    };
+    let planned = PLANNED_TRANSFER_POLICY.load(Ordering::Relaxed);
+    let selected = stored.knobs.iter().find(|(name, _)| name == crate::knobs::WEIGHT_TRANSFER_POLICY_KNOB)
+        .map_or(0, |(_, value)| *value);
+    if (planned == 2 || selected == 2) && planned != selected {
+        eprintln!("[imparo] CUDA transfer layout changed after placement; using safe defaults");
+        return None;
+    }
+    let config_path = imparo_host::selected_config_path(
+        &imparo_host::fingerprint_for("cuda", CudaBackend.space_version(), &configured_kv_tag()), model_bytes);
     let registry = CudaBackend.knob_registry();
     if stored.knobs.iter().any(|(name, _)| {
         !registry
@@ -458,6 +711,170 @@ fn split_prefill_graph_requested(count: u32) -> bool {
 
 #[allow(unused_variables)]
 impl Backend for CudaBackend {
+    fn config_key(&self) -> Option<(String, u64)> {
+        use imparo_backend::BackendKnobs as _;
+        let model = *CORRECTNESS_MODEL_IDENTITY.get()?;
+        let runtime = crate::runtime_identity().ok()?;
+        let kv = (KV_K.load(Ordering::Relaxed), KV_V.load(Ordering::Relaxed));
+        let host = imparo_host::fingerprint_for(
+            "cuda", self.space_version(),
+            &imparo_host::canonical_kv_tag(kv_name(kv.0), kv_name(kv.1)),
+        );
+        // Read the effective registry here, after load-time lab overrides. A file
+        // snapshot alone can describe a different route from the one being timed.
+        let knobs: Vec<_> = self.knob_registry().iter()
+            .map(|declaration| (declaration.name, (declaration.current)())).collect();
+        dspark_backend_config_key(&host, MODEL_BYTES.load(Ordering::Relaxed), model,
+            &runtime, kv, crate::CUDA_MATH_MODE, &knobs)
+    }
+
+    fn supports_moe(&self) -> bool { crate::moe_api::available() }
+    fn supports_top_k_rows(&self, k: u32) -> bool { crate::moe_api::available() && (1..=8).contains(&k) }
+    fn top_k_rows(&self, src: BufId, dst: BufId, width: u32, rows: u32, k: u32) -> bool {
+        unsafe { crate::moe_api::imparo_cuda_top_k_rows(src as u32,dst as u32,width,rows,k)==0 }
+    }
+    fn moe_gate(&self,scores:BufId,probs:BufId,sel:BufId,bias:u64,nt:u32,ne:u32,gating:imparo_backend::ExpertGating)->bool {
+        let gating=match gating {imparo_backend::ExpertGating::Softmax=>0,imparo_backend::ExpertGating::Sigmoid=>1};
+        unsafe {crate::moe_api::imparo_cuda_moe_gate(scores as u32,probs as u32,sel as u32,bias,nt,ne,gating)==0}
+    }
+    fn moe_plan(&self,top:BufId,probs:BufId,perm:BufId,wgt:BufId,seg:BufId,inv:BufId,nt:u32,ne:u32,k:u32,norm:bool,scale:f32)->bool {
+        unsafe {crate::moe_api::imparo_cuda_moe_plan(top as u32,probs as u32,perm as u32,wgt as u32,seg as u32,inv as u32,nt,ne,k,u32::from(norm),scale)==0}
+    }
+    fn moe_route(&self,scores:BufId,probs:BufId,sel:BufId,top:BufId,perm:BufId,wgt:BufId,seg:BufId,inv:BufId,bias:u64,nt:u32,ne:u32,k:u32,gating:imparo_backend::ExpertGating,norm:bool,scale:f32)->bool {
+        if !crate::knobs::moe_route_enabled() || nt != 1 { return false; }
+        let gating=match gating {imparo_backend::ExpertGating::Softmax=>0,imparo_backend::ExpertGating::Sigmoid=>1};
+        let handled=unsafe {crate::route_api::imparo_cuda_moe_route_v1(scores as u32,probs as u32,sel as u32,top as u32,perm as u32,wgt as u32,seg as u32,inv as u32,bias,nt,ne,k,gating,u32::from(norm),scale)==0};
+        if handled {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[imparo] moe-route actual route nt={nt} ne={ne} k={k}");
+            }
+        }
+        handled
+    }
+    fn moe_grouped(&self,kind:u32,off:u64,stride:u64,src:BufId,dst:BufId,perm:BufId,seg:BufId,ni:u32,no:u32,ne:u32,nt:u32,rows:u32,work:bool,_prefill_chunk:bool)->bool {
+        // CUDA's grouped kernel uses the same per-row FMA and warp reduction
+        // at every token/work-row count, so prompt chunks need no alternate route.
+        unsafe {crate::moe_api::imparo_cuda_moe_grouped(kind,off,stride,src as u32,dst as u32,perm as u32,seg as u32,ni,no,ne,nt,rows,u32::from(work))==0}
+    }
+    fn moe_grouped_pair(&self,kind:u32,gate_off:u64,up_off:u64,stride:u64,src:BufId,dst:BufId,perm:BufId,seg:BufId,ni:u32,no:u32,ne:u32,nt:u32,rows:u32,_prefill_chunk:bool)->bool {
+        if !crate::knobs::moe_grouped_pair_enabled()
+            || ACTIVATION.load(Ordering::Relaxed) != Epilogue::Silu as u32
+            || kind != 1
+        {
+            return false;
+        }
+        // Same token-to-work routing for prefill and decode; resident canonical
+        // Q4 only. Missing optional support leaves the ordinary path available.
+        let handled=unsafe {crate::pair_api::imparo_cuda_moe_grouped_pair_v1(kind,gate_off,up_off,stride,src as u32,dst as u32,perm as u32,seg as u32,ni,no,ne,nt,rows)==0};
+        if handled {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[imparo] moe-grouped-pair actual route kind={kind} nt={nt} ni={ni} no={no}");
+            }
+        }
+        handled
+    }
+    fn moe_grouped_pair_with_scratch(
+        &self, kind:u32, gate_off:u64, up_off:u64, stride:u64,
+        src:BufId, dst:BufId, scratch:BufId, perm:BufId, seg:BufId,
+        ni:u32, no:u32, ne:u32, nt:u32, rows:u32, prefill_chunk:bool,
+    )->bool {
+        if crate::knobs::moe_gateup_mmvq_enabled()
+            && ACTIVATION.load(Ordering::Relaxed) == Epilogue::Silu as u32
+            && kind == 1
+        {
+            match unsafe { crate::gateup_mmvq_api::try_pair(
+                kind, gate_off, up_off, stride, src as u32, dst as u32,
+                scratch as u32, perm as u32, seg as u32, ni, no, ne, nt, rows,
+            ) } {
+                Ok(true) => return true,
+                Ok(false) => {}, // Only -70 permits the next provider to run.
+                Err(rc) => {
+                    // Native keeps this failure pending; never overwrite it by
+                    // executing a different arithmetic provider after admission.
+                    eprintln!("[imparo] CUDA Gate/Up MMVQ failed ({rc}); fallback suppressed");
+                    return true;
+                }
+            }
+        }
+        if crate::knobs::moe_gateup_mmq_enabled()
+            && ACTIVATION.load(Ordering::Relaxed) == Epilogue::Silu as u32
+            && kind == 1
+        {
+            match unsafe { crate::gateup_api::try_pair(
+                kind, gate_off, up_off, stride, src as u32, dst as u32,
+                scratch as u32, perm as u32, seg as u32, ni, no, ne, nt, rows,
+            ) } {
+                Ok(true) => return true,
+                Ok(false) => {}, // Only the optional -70 refusal authorizes fallback.
+                Err(rc) => {
+                    // Native records every non-refusal error in this owner's pending
+                    // status. Returning handled prevents a second provider from
+                    // overwriting the failed operation before end reports the error.
+                    eprintln!("[imparo] CUDA Gate/Up MMQ failed ({rc}); fallback suppressed");
+                    return true;
+                }
+            }
+        }
+        self.moe_grouped_pair(kind, gate_off, up_off, stride, src, dst,
+            perm, seg, ni, no, ne, nt, rows, prefill_chunk)
+    }
+    fn moe_combine(&self,src:BufId,wgt:BufId,inv:BufId,dst:BufId,width:u32,k:u32,nt:u32)->bool {
+        unsafe {crate::moe_api::imparo_cuda_moe_combine(src as u32,wgt as u32,inv as u32,dst as u32,width,k,nt)==0}
+    }
+
+    fn set_decode_rows(&self, route: Option<imparo_backend::RowRoute>) -> bool {
+        crate::cobatch::route(route)
+    }
+    fn decode_rows_max(&self, route: imparo_backend::RowRoute) -> usize {
+        if !crate::cobatch::available() {return 0;}
+        match route { imparo_backend::RowRoute::Fast => 64, imparo_backend::RowRoute::Exact => 0 }
+    }
+    fn head_norm_rope_at(&self, buf:BufId,w_off:u64,head_dim:u32,eps:f32,n_heads:u32,
+        pos:&[u32],rope_dim:u32,rope_base:f32,freqs:Option<&[f32]>)->bool {
+        crate::cobatch::head(b(buf),w_off,head_dim,eps,n_heads,pos,rope_dim,rope_base,freqs,0)
+    }
+    fn kv_store_slot_rows(&self,src:BufId,layer:u32,width:u32,rows:&[imparo_backend::SlotRow],is_v:bool,ring:u32)->bool {
+        crate::cobatch::store(b(src),layer,width,rows,is_v,ring)
+    }
+    fn attention_slot_rows(&self,layer:u32,head_dim:u32,n_heads:u32,n_kv:u32,kv_width:u32,
+        scale:f32,window:u32,rows:&[imparo_backend::SlotRow],max_scores:&[u32],ring:u32)->bool {
+        max_scores.len()==rows.len() && crate::cobatch::attention(layer,head_dim,n_heads,n_kv,kv_width,scale,window,rows,ring)
+    }
+
+    fn supports_decode_rows_kv(&self, k:u32, v:u32)->bool {
+        crate::cobatch::available() && matches!((k,v),(1,1)|(2,2)|(8,8))
+    }
+    fn head_norm_rope_hadamard_at(&self,buf:BufId,w:u64,hd:u32,eps:f32,heads:u32,
+        pos:&[u32],rd:u32,base:f32,freqs:Option<&[f32]>,nrot:u32)->bool {
+        crate::cobatch::head(buf as u32,w,hd,eps,heads,pos,rd,base,freqs,nrot)
+    }
+    fn kv_head_postprocess_at(&self,k:BufId,v:BufId,w:u64,hd:u32,eps:f32,heads:u32,
+        pos:&[u32],rd:u32,base:f32,freqs:Option<&[f32]>,hk:u32,hv:u32)->bool {
+        crate::cobatch::kv_head(k as u32,v as u32,w,hd,eps,heads,pos,rd,base,freqs,hk,hv)
+    }
+    fn supports_recurrent_slot_rows(&self, key_dim:u32, value_dim:u32)->bool {
+        crate::cobatch::available() && matches!((key_dim,value_dim),(0,0)|(128,128))
+    }
+    fn causal_conv_slot_rows(&self,form:ConvForm,src:BufId,w:u64,state:BufId,
+        rows:&[imparo_backend::SlotStateRow],out:BufId,width:u32,kernel:u32)->bool {
+        crate::cobatch::conv(form,b(src),w,b(state),rows,b(out),width,kernel)
+    }
+    fn delta_net_slot_rows(&self,op:&imparo_backend::DeltaNet,rows:&[imparo_backend::SlotStateRow])->bool {
+        crate::cobatch::delta(op,rows)
+    }
+    fn set_slots(&self, n: u32, ring_layers: &[u32]) -> bool {
+        let Ok(count) = u32::try_from(ring_layers.len()) else { return false; };
+        unsafe { imparo_cuda_set_slots(n, ring_layers.as_ptr(), count) == 0 }
+    }
+    fn select_slot(&self, slot: u32) -> bool {
+        unsafe { imparo_cuda_select_slot(slot) == 0 }
+    }
+    fn release_slot(&self, slot: u32) -> bool {
+        unsafe { imparo_cuda_release_slot(slot) == 0 }
+    }
+
     #[cfg(feature = "cuda-speculative")]
     fn prepare_batch_invariant_q8_v1(&self) -> Result<bool, i32> {
         // LFM2 target preparation owns serialized access to the selected owner.
@@ -566,9 +983,21 @@ impl Backend for CudaBackend {
         }
     }
     fn begin(&self) {
+        crate::active_api::apply_at_boundary().expect("CUDA MoE policy change outside a closed forward boundary");
+        crate::router_api::apply_at_boundary().expect("CUDA router policy change outside a closed forward boundary");
+        crate::down_api::apply_at_boundary().expect("CUDA Down MMQ policy change outside a closed forward boundary");
+        crate::gateup_api::apply_at_boundary().expect("CUDA Gate/Up MMQ policy change outside a closed forward boundary");
+        crate::down_mmvq_api::apply_at_boundary().expect("CUDA Down MMVQ policy change outside a closed forward boundary");
+        crate::gateup_mmvq_api::apply_at_boundary().expect("CUDA Gate/Up MMVQ policy change outside a closed forward boundary");
         unsafe { imparo_cuda_begin() }
     }
     fn begin_forward(&self, decode: bool) {
+        crate::active_api::apply_at_boundary().expect("CUDA MoE policy change outside a closed forward boundary");
+        crate::router_api::apply_at_boundary().expect("CUDA router policy change outside a closed forward boundary");
+        crate::down_api::apply_at_boundary().expect("CUDA Down MMQ policy change outside a closed forward boundary");
+        crate::gateup_api::apply_at_boundary().expect("CUDA Gate/Up MMQ policy change outside a closed forward boundary");
+        crate::down_mmvq_api::apply_at_boundary().expect("CUDA Down MMVQ policy change outside a closed forward boundary");
+        crate::gateup_mmvq_api::apply_at_boundary().expect("CUDA Gate/Up MMVQ policy change outside a closed forward boundary");
         unsafe { imparo_cuda_begin_forward(u32::from(decode)) }
     }
     fn decode_prepare(
@@ -577,6 +1006,12 @@ impl Backend for CudaBackend {
         start_pos: u32,
         argmax: bool,
     ) -> Result<bool, i32> {
+        crate::active_api::apply_at_boundary()?;
+        crate::router_api::apply_at_boundary()?;
+        crate::down_api::apply_at_boundary()?;
+        crate::gateup_api::apply_at_boundary()?;
+        crate::down_mmvq_api::apply_at_boundary()?;
+        crate::gateup_mmvq_api::apply_at_boundary()?;
         match unsafe { imparo_cuda_decode_prepare(token, start_pos, u32::from(argmax)) }
         {
             0 => Ok(false),
@@ -591,6 +1026,12 @@ impl Backend for CudaBackend {
         start_pos: u32,
         argmax: bool,
     ) -> Result<bool, i32> {
+        crate::active_api::apply_at_boundary()?;
+        crate::router_api::apply_at_boundary()?;
+        crate::down_api::apply_at_boundary()?;
+        crate::gateup_api::apply_at_boundary()?;
+        crate::down_mmvq_api::apply_at_boundary()?;
+        crate::gateup_mmvq_api::apply_at_boundary()?;
         let count = u32::try_from(tokens.len()).map_err(|_| 3)?;
         // Generic/diagnostic sidecars remain outside Graph. The receipted exact-128
         // route may enter through its versioned safe-off knob or the explicit lab
@@ -619,6 +1060,12 @@ impl Backend for CudaBackend {
         start_pos: u32,
         argmax: bool,
     ) -> Result<bool, i32> {
+        crate::active_api::apply_at_boundary()?;
+        crate::router_api::apply_at_boundary()?;
+        crate::down_api::apply_at_boundary()?;
+        crate::gateup_api::apply_at_boundary()?;
+        crate::down_mmvq_api::apply_at_boundary()?;
+        crate::gateup_mmvq_api::apply_at_boundary()?;
         let count = u32::try_from(tokens.len()).map_err(|_| 3)?;
         if !split_prefill_graph_requested(count) {
             return Ok(false);
@@ -678,7 +1125,44 @@ impl Backend for CudaBackend {
     // Preserve the common loader's refusal for formats without a CUDA reader.
     fn serves_weight_type(&self, ggml_type: u32) -> bool {
         matches!(ggml_type, 0 | 2 | 8 | 1000)
+            || (ggml_type == 14 && crate::moe_api::available())
             || (cfg!(feature = "cuda-static") && matches!(ggml_type, 30 | 143))
+    }
+    fn q8_split_gate_up_repack(&self) -> bool {
+        crate::knobs::q8_split_gate_up_repack_enabled()
+    }
+    fn supports_load_time_repack(&self) -> bool { self.q8_split_gate_up_repack() }
+    fn transform_weights(&self, jobs: &[imparo_backend::WeightTransform]) -> Result<Vec<bool>, String> {
+        if jobs.is_empty() { return Ok(Vec::new()); }
+        if !self.q8_split_gate_up_repack() { return Ok(vec![false; jobs.len()]); }
+        #[cfg(feature = "cuda-static")]
+        {
+            let mut applied = Vec::with_capacity(jobs.len());
+            for job in jobs {
+                let expected = u64::from(job.n_in / 32).checked_mul(34)
+                    .and_then(|v| v.checked_mul(u64::from(job.n_out)));
+                if job.from_type != 8 || job.to_type != 1000 || expected != Some(job.bytes)
+                    || job.n_in == 0 || job.n_out == 0 || job.n_in % 256 != 0 || job.n_out % 128 != 0
+                    || job.layout.block_elems != 32 || job.layout.block_bytes != 34
+                    || job.layout.unit_rows != 8 || job.layout.n_scale_spans != 1
+                    || job.layout.n_spans != 2 || job.layout.span_off[..2] != [0, 2]
+                    || job.layout.span_len[..2] != [2, 32] {
+                    return Err("CUDA private Q8 repack layout/size mismatch".into());
+                }
+                let rc = unsafe { imparo_cuda_repack_q8_split(job.offset, job.bytes, job.n_in, job.n_out) };
+                if rc != 0 { return Err(format!("CUDA private Q8 repack rc={rc}")); }
+                applied.push(true);
+            }
+            Ok(applied)
+        }
+        #[cfg(not(feature = "cuda-static"))]
+        { Err("private Q8 repack needs source-built CUDA".into()) }
+    }
+    fn read_weight_bytes(&self, off: u64, dst: &mut [u8]) -> bool {
+        #[cfg(feature = "cuda-static")]
+        { unsafe { imparo_cuda_read_resident_weight(off, dst.as_mut_ptr(), dst.len() as u64) == 0 } }
+        #[cfg(not(feature = "cuda-static"))]
+        { let _ = (off, dst); false }
     }
     fn register_weight_input_transforms(
         &self,
@@ -726,10 +1210,9 @@ impl Backend for CudaBackend {
         }
     }
     fn supports_gated_delta(&self) -> bool {
-        cfg!(feature = "cuda-static")
+        crate::cobatch::available()
     }
     fn delta_net(&self, op: &imparo_backend::DeltaNet) -> bool {
-        #[cfg(feature = "cuda-static")]
         {
             let (snap, snap_off, snap_row) = op
                 .snap
@@ -755,11 +1238,6 @@ impl Backend for CudaBackend {
                 eps: op.eps,
             };
             unsafe { imparo_cuda_delta_net_run(&wire) == 0 }
-        }
-        #[cfg(not(feature = "cuda-static"))]
-        {
-            let _ = op;
-            false
         }
     }
     fn set_batch_geometry(&self, geometry: BatchGeometry) -> Result<(), i32> {
@@ -1352,10 +1830,8 @@ impl Backend for CudaBackend {
                 || (gate_kind == 3
                     && up_kind == 3
                     && (crate::knobs::lfm_retained_domain() != 0
-                        || std::env::var_os(
-                            "IMPARO_LAB_Q8_TM_GATE_UP_CANONICAL_DOWN",
-                        )
-                        .is_some())))
+                        || crate::knobs::q8_split_gate_up_repack_enabled()
+                        || std::env::var_os("IMPARO_LAB_Q8_TM_GATE_UP_CANONICAL_DOWN").is_some())))
             && (down_kind == 2
                 || (down_kind == 3
                     && gate_kind == 3
@@ -1374,7 +1850,9 @@ impl Backend for CudaBackend {
             && n_in == 2560
             && n_mid == 10240
             && n_out == 2560
-            && (1..=3).contains(&n_tok)
+            // The native owner admits >3 only for independent CoBatch rows;
+            // ordinary Prefill still declines and keeps its selected provider.
+            && (1..=64).contains(&n_tok)
             && activation == Epilogue::Gelu as u32;
         if !q4_gelu && !q8_tm_silu && !q8_canonical_silu && !w4_gelu {
             return false;
@@ -1505,6 +1983,7 @@ impl Backend for CudaBackend {
         n_rows: u32,
     ) -> bool {
         let supported = matches!(wkind, 1 | 2)
+            || (wkind == 7 && width % 256 == 0 && crate::moe_api::available())
             || (cfg!(feature = "cuda-static") && wkind == 39 && width % 128 == 0);
         if !supported || dst_off != 0 || width % 32 != 0 || n_rows == 0 {
             return false;
@@ -1998,12 +2477,11 @@ impl Backend for CudaBackend {
         if n_row == 0 || width == 0 {
             return;
         }
-        #[cfg(feature = "cuda-static")]
-        unsafe {
-            imparo_cuda_copy_strided(b(dst), b(src), width, src_off, src_stride, n_row);
+        if crate::cobatch::available() {
+            unsafe {imparo_cuda_copy_strided(b(dst), b(src), width, src_off, src_stride, n_row);}
+            return;
         }
-        // Keep dynamic releases on their original ABI and row-by-row semantics.
-        #[cfg(not(feature = "cuda-static"))]
+        // Legacy plugins retain their row-by-row copy implementation.
         for row in 0..n_row {
             self.copy_range(dst, row * width, src, row * src_stride + src_off, width);
         }
@@ -2080,11 +2558,11 @@ impl Backend for CudaBackend {
         unsafe { imparo_cuda_argmax(b(src), b(dst), n) }
     }
     fn supports_argmax_rows(&self) -> bool {
-        cfg!(feature = "cuda-speculative")
+        crate::cobatch::available()
     }
-    #[cfg(feature = "cuda-speculative")]
     fn argmax_rows(&self, src: BufId, dst: BufId, width: u32, rows: u32) {
-        unsafe { crate::tree::argmax_rows(b(src), b(dst), width, rows) }
+        assert!(self.supports_argmax_rows(), "CUDA backend has no per-row argmax");
+        unsafe {imparo_cuda_argmax_rows(b(src), b(dst), width, rows)}
     }
     fn supports_greedy_verification(&self) -> bool {
         cfg!(feature = "cuda-speculative") && imparo_cuda_has_greedy_verification()
@@ -2278,8 +2756,8 @@ impl Backend for CudaBackend {
         kernel: u32,
         n_tok: u32,
     ) {
-        #[cfg(feature = "cuda-static")]
         if form == ConvForm::PlainSilu {
+            assert!(self.supports_gated_delta(), "CUDA plugin has no plain convolution capability");
             unsafe {
                 imparo_cuda_plain_conv(
                     b(src),
@@ -2334,8 +2812,8 @@ impl Backend for CudaBackend {
         kernel: u32,
         n_tok: u32,
     ) {
-        #[cfg(feature = "cuda-static")]
         if form == ConvForm::PlainSilu {
+            assert!(self.supports_gated_delta(), "CUDA plugin has no plain convolution capability");
             unsafe {
                 imparo_cuda_plain_conv_snapshot(
                     b(src),
@@ -2378,7 +2856,7 @@ impl Backend for CudaBackend {
         a_stride: u32,
         n_row: u32,
     ) {
-        #[cfg(feature = "cuda-static")]
+        assert!(self.supports_gated_delta(), "CUDA plugin has no gated-delta capability");
         unsafe {
             imparo_cuda_mul_strided_sigmoid(
                 b(a),
@@ -2389,11 +2867,6 @@ impl Backend for CudaBackend {
                 a_stride,
                 n_row,
             );
-        }
-        #[cfg(not(feature = "cuda-static"))]
-        {
-            let _ = (a, other, width, b_off, b_stride, a_stride, n_row);
-            unreachable!("dynamic CUDA has no gated-delta capability");
         }
     }
     fn set_model_bytes(&self, bytes: u64) {
@@ -2419,7 +2892,9 @@ impl Backend for CudaBackend {
         len: u64,
         placement: &imparo_backend::WeightPlacement,
     ) -> Result<(), i32> {
-        #[cfg(feature = "cuda-static")]
+        if !crate::cobatch::available() {
+            return unsafe {self.init_weights_with_residency(base,len,&placement.slow_spans())};
+        }
         {
             if base.is_null() || len > isize::MAX as u64 {
                 return Err(3);
@@ -2432,17 +2907,16 @@ impl Backend for CudaBackend {
                 .and_then(|v| v.checked_add(budget.reserve_scratch))
                 .and_then(|v| v.checked_add(budget.margin))
                 .ok_or(3)?;
-            // Static source builds share the planner's runtime reserve. Dynamic
-            // releases keep their existing native ABI and legacy initialization.
+            // Source and admitted plugin builds share the planner's runtime reserve.
             let rc = unsafe { imparo_cuda_set_placement_reserve(reserve) };
             if rc != 0 {
                 return Err(rc);
             }
-            unsafe { self.init_weights_with_residency(base, len, &streamed) }
-        }
-        #[cfg(not(feature = "cuda-static"))]
-        unsafe {
-            self.init_weights_with_residency(base, len, &placement.slow_spans())
+            unsafe { self.init_weights_with_residency(base, len, &streamed) }?;
+            SLOT_KV_RESERVE.store(budget.reserve_kv, Ordering::Relaxed);
+            SLOT_ACTIVATION_RESERVE.store(budget.reserve_activations, Ordering::Relaxed);
+            SLOT_RUNTIME_RESERVE.store(reserve, Ordering::Relaxed);
+            Ok(())
         }
     }
     /// Reserve is computed by the common runtime from the memory actually available
@@ -2451,6 +2925,26 @@ impl Backend for CudaBackend {
         let free = crate::context::CudaContext::get().memory_info().free;
         (free > 0).then_some(free)
     }
+    fn slot_state_budget_bytes(&self) -> Option<u64> {
+        // cudaMemGetInfo already excludes committed KV/activation allocations.
+        // Reserve only the unmatched part of those same planner categories, plus
+        // all scratch and margin; never credit weights or other slots' state.
+        let mut kv = 0;
+        let mut activations = 0;
+        if unsafe { imparo_cuda_cobatch_committed_runtime(&mut kv, &mut activations) } != 0 {
+            return Some(0);
+        }
+        let free = crate::context::CudaContext::get().memory_info().free;
+        Some(slot_budget_after_commits(
+            free,
+            SLOT_RUNTIME_RESERVE.load(Ordering::Relaxed),
+            SLOT_KV_RESERVE.load(Ordering::Relaxed),
+            SLOT_ACTIVATION_RESERVE.load(Ordering::Relaxed),
+            kv,
+            activations,
+        ))
+    }
+
     fn quantized_weight_cache_enabled(&self) -> bool {
         (cfg!(target_os = "windows")
             && (crate::knobs::e4b_ffn_w4a16_enabled()
@@ -2528,10 +3022,220 @@ mod tests {
     use super::{CudaBackend, kv_code, prefill_dequant_slots};
 
     #[test]
+    fn moe_scratch_uses_host_snapshot_and_explicit_overrides() {
+        use super::MoeRouterScratchPlan as Plan;
+        for (router, down, gateup, down_mmvq, bytes) in [
+            (0, 0, 0, 0, 0), (1, 0, 0, 0, 4_194_304),
+            (0, 1, 0, 0, 1_048_576), (0, 0, 1, 0, 1_179_648),
+            (0, 1, 1, 0, 1_179_648), (1, 1, 0, 0, 5_242_880),
+            (1, 0, 1, 0, 5_373_952), (1, 1, 1, 0, 5_373_952),
+            (0, 0, 0, 1, 8_064), (1, 0, 0, 1, 4_202_368),
+            (0, 1, 0, 1, 1_048_576), (0, 0, 1, 1, 1_179_648),
+            (0, 1, 1, 1, 1_179_648), (1, 1, 0, 1, 5_242_880),
+            (1, 0, 1, 1, 5_373_952), (1, 1, 1, 1, 5_373_952),
+        ] {
+            assert_eq!(Plan::new(router, down, gateup, down_mmvq, 0, None, None, None, None, None).unwrap().bytes(), bytes);
+        }
+        assert_eq!(Plan::new(0, 0, 0, 0, 0, Some(1), Some(1), Some(1), Some(1), None).unwrap().bytes(), 5_373_952);
+        assert_eq!(Plan::new(1, 1, 1, 1, 0, Some(0), None, None, None, None).unwrap().bytes(), 1_179_648);
+        assert_eq!(Plan::new(1, 1, 1, 1, 0, None, Some(0), None, None, None).unwrap().bytes(), 5_373_952);
+        assert_eq!(Plan::new(1, 1, 1, 1, 0, None, None, Some(0), None, None).unwrap().bytes(), 5_242_880);
+        assert_eq!(Plan::new(1, 1, 1, 1, 0, Some(0), Some(0), Some(0), None, None).unwrap().bytes(), 8_064);
+        assert_eq!(Plan::new(1, 1, 1, 1, 0, Some(0), Some(0), Some(0), Some(0), None).unwrap().bytes(), 0);
+        assert!(Plan::new(2, 0, 0, 0, 0, Some(0), None, None, None, None).is_err());
+        assert!(Plan::new(0, 2, 0, 0, 0, None, Some(0), None, None, None).is_err());
+        assert!(Plan::new(0, 0, 2, 0, 0, None, None, Some(0), None, None).is_err());
+        assert!(Plan::new(0, 0, 0, 2, 0, None, None, None, Some(0), None).is_err());
+        assert!(Plan::new(0, 0, 0, 0, 0, Some(2), None, None, None, None).is_err());
+        assert!(Plan::new(0, 0, 0, 0, 0, None, Some(2), None, None, None).is_err());
+        assert!(Plan::new(0, 0, 0, 0, 0, None, None, Some(2), None, None).is_err());
+        assert!(Plan::new(0, 0, 0, 0, 0, None, None, None, Some(2), None).is_err());
+    }
+
+    #[test]
+    fn moe_scratch_rejects_changed_or_removed_load_time_overrides() {
+        use super::MoeRouterScratchPlan as Plan;
+        let enabled = Plan::new(0, 0, 0, 0, 0, Some(1), Some(1), Some(1), Some(1), None).unwrap();
+        assert!(enabled.validate(Some(1), Some(1), Some(1), Some(1), None).is_ok());
+        for value in [None, Some(0)] {
+            assert!(enabled.validate(value, Some(1), Some(1), Some(1), None).is_err());
+            assert!(enabled.validate(Some(1), value, Some(1), Some(1), None).is_err());
+            assert!(enabled.validate(Some(1), Some(1), value, Some(1), None).is_err());
+            assert!(enabled.validate(Some(1), Some(1), Some(1), value, None).is_err());
+        }
+        let disabled = Plan::new(1, 1, 1, 1, 0, Some(0), Some(0), Some(0), Some(0), None).unwrap();
+        assert!(disabled.validate(Some(0), Some(0), Some(0), Some(0), None).is_ok());
+        assert!(disabled.validate(None, Some(0), Some(0), Some(0), None).is_err());
+        assert!(disabled.validate(Some(0), None, Some(0), Some(0), None).is_err());
+        assert!(disabled.validate(Some(0), Some(0), None, Some(0), None).is_err());
+        assert!(disabled.validate(Some(0), Some(0), Some(0), None, None).is_err());
+        let zero = Plan::new(0, 0, 0, 0, 0, None, None, None, None, None).unwrap();
+        assert!(zero.validate(Some(1), None, None, None, None).is_err());
+        assert!(zero.validate(None, Some(1), None, None, None).is_err());
+        assert!(zero.validate(None, None, Some(1), None, None).is_err());
+        assert!(zero.validate(None, None, None, Some(1), None).is_err());
+        assert!(Plan::new(1, 1, 1, 1, 0, None, None, None, None, None).unwrap().validate(None, None, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn down_only_scratch_cannot_be_reassigned_after_placement() {
+        use super::MoeRouterScratchPlan as Plan;
+        let down_only = Plan::new(0, 0, 0, 0, 0, None, Some(1), None, None, None).unwrap();
+        assert_eq!(down_only.bytes(), 1_048_576);
+        assert!(down_only.validate(None, Some(1), None, None, None).is_ok());
+        assert!(down_only.validate(None, None, None, None, None).is_err());
+        assert!(down_only.validate(Some(1), Some(0), None, None, None).is_err());
+        assert!(down_only.validate(None, Some(0), Some(1), None, None).is_err());
+        assert!(down_only.validate(None, Some(1), None, Some(1), None).is_err());
+    }
+
+    #[test]
+    fn shared_gateup_down_capacity_does_not_allow_selector_drift() {
+        use super::MoeRouterScratchPlan as Plan;
+        let both = Plan::new(0, 1, 1, 0, 0, None, None, None, None, None).unwrap();
+        let gateup_only = Plan::new(0, 0, 1, 0, 0, None, None, None, None, None).unwrap();
+        let all_q8 = Plan::new(0, 1, 1, 1, 0, None, None, None, None, None).unwrap();
+        assert_eq!(both.bytes(), gateup_only.bytes());
+        assert_eq!(both.bytes(), all_q8.bytes());
+        assert_eq!(both.bytes(), 1_179_648);
+        assert!(both.validate(None, Some(0), None, None, None).is_err());
+        assert!(gateup_only.validate(None, Some(1), None, None, None).is_err());
+        assert!(both.validate(None, None, None, Some(1), None).is_err());
+        assert!(all_q8.validate(None, None, None, Some(0), None).is_err());
+    }
+
+    #[test]
+    fn decode_down_only_scratch_keeps_its_load_time_selector() {
+        use super::MoeRouterScratchPlan as Plan;
+        let decode_only = Plan::new(0, 0, 0, 0, 0, None, None, None, Some(1), None).unwrap();
+        assert_eq!(decode_only.bytes(), 8_064);
+        assert!(decode_only.validate(None, None, None, Some(1), None).is_ok());
+        assert!(decode_only.validate(None, None, None, None, None).is_err());
+        assert!(decode_only.validate(None, None, None, Some(0), None).is_err());
+        assert!(decode_only.validate(None, Some(1), None, Some(1), None).is_err());
+        assert!(decode_only.validate(None, None, Some(1), Some(1), None).is_err());
+    }
+
+    #[test]
+    fn gateup_mmvq_scratch_is_shared_and_rejects_selector_drift() {
+        use super::MoeRouterScratchPlan as Plan;
+        let only = Plan::new(0, 0, 0, 0, 1, None, None, None, None, None).unwrap();
+        assert_eq!(only.bytes(), 2_304);
+        assert!(only.validate(None, None, None, None, None).is_ok());
+        assert!(only.validate(None, None, None, None, Some(0)).is_err());
+        let explicit = Plan::new(0, 0, 0, 0, 0, None, None, None, None, Some(1)).unwrap();
+        assert_eq!(explicit.bytes(), 2_304);
+        assert!(explicit.validate(None, None, None, None, Some(1)).is_ok());
+        assert!(explicit.validate(None, None, None, None, None).is_err());
+        let disabled = Plan::new(0, 0, 0, 0, 1, None, None, None, None, Some(0)).unwrap();
+        assert_eq!(disabled.bytes(), 0);
+        assert!(disabled.validate(None, None, None, None, None).is_err());
+        for (router, down, gateup, down_mmvq, bytes) in [
+            (0, 0, 0, 1, 8_064), (0, 1, 0, 0, 1_048_576),
+            (0, 0, 1, 0, 1_179_648), (1, 1, 1, 1, 5_373_952),
+        ] {
+            let off = Plan::new(router, down, gateup, down_mmvq, 0, None, None, None, None, None).unwrap();
+            let on = Plan::new(router, down, gateup, down_mmvq, 1, None, None, None, None, None).unwrap();
+            assert_eq!(off.bytes(), bytes);
+            assert_eq!(on.bytes(), bytes);
+            assert!(off.validate(None, None, None, None, Some(1)).is_err());
+            assert!(on.validate(None, None, None, None, Some(0)).is_err());
+        }
+        assert_eq!(Plan::new(1, 0, 0, 0, 1, None, None, None, None, None).unwrap().bytes(), 4_196_608);
+        assert!(Plan::new(0, 0, 0, 0, 2, None, None, None, None, Some(0)).is_err());
+        assert!(Plan::new(0, 0, 0, 0, 0, None, None, None, None, Some(2)).is_err());
+    }
+
+    #[test]
+    fn reading_prepacked_weights_does_not_advertise_load_time_conversion() {
+        use imparo_backend::Backend;
+        let backend = CudaBackend;
+        assert!(backend.serves_weight_type(1000));
+        assert!(!backend.supports_load_time_repack());
+        assert!(backend.transform_weights(&[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn config_identity_uses_target_not_appended_mapping() {
         assert_eq!(super::config_model_bytes(4096, 8192), 4096);
         assert_eq!(super::config_model_bytes(4096, 4096), 4096);
         assert_eq!(super::config_model_bytes(0, 4096), 4096);
+    }
+
+    #[test]
+    fn dspark_cache_key_binds_effective_execution_and_rejects_missing_identity() {
+        use super::{CorrectnessModelIdentity, dspark_backend_config_key};
+        let model = CorrectnessModelIdentity {
+            model_sha256: [1; 32], model_plan_sha256: [2; 32], kv_layout_sha256: [3; 32],
+        };
+        let runtime = crate::CudaRuntimeIdentity {
+            device_uuid: [4; 16], device_sm: 86, driver_version: 12_080,
+            runtime_version: 12_080, backend_abi: 1, backend_build_sha256: [5; 32],
+            backend_artifact_sha256: Some([6; 32]),
+        };
+        let knobs = [("lfm2_tree_candidates", 3), ("mmq_tile", 2)];
+        let key = |m, r: &crate::CudaRuntimeIdentity| {
+            dspark_backend_config_key("host|space=v96|kv=q8", 4096, m, r, (8, 8), "fast", &knobs)
+        };
+        let baseline = key(model, &runtime).unwrap();
+        assert_eq!(baseline, key(model, &runtime).unwrap());
+        assert_eq!(baseline.1, 4096);
+        assert!(baseline.0.starts_with("cuda-dspark-cache-v1:"));
+        assert!(!baseline.0.contains("|space=v"));
+        for field in 0..3 {
+            let mut changed = model;
+            let hash = match field {
+                0 => &mut changed.model_sha256,
+                1 => &mut changed.model_plan_sha256,
+                _ => &mut changed.kv_layout_sha256,
+            };
+            *hash = [9; 32];
+            assert_ne!(baseline, key(changed, &runtime).unwrap());
+            let hash = match field {
+                0 => &mut changed.model_sha256,
+                1 => &mut changed.model_plan_sha256,
+                _ => &mut changed.kv_layout_sha256,
+            };
+            *hash = [0; 32];
+            assert!(key(changed, &runtime).is_none());
+        }
+        for field in 0..7 {
+            let mut changed = runtime.clone();
+            match field {
+                0 => changed.device_uuid = [9; 16],
+                1 => changed.device_sm = 89,
+                2 => changed.driver_version += 1,
+                3 => changed.runtime_version += 1,
+                4 => changed.backend_abi += 1,
+                5 => changed.backend_build_sha256 = [9; 32],
+                _ => changed.backend_artifact_sha256 = None,
+            }
+            assert_ne!(baseline, key(model, &changed).unwrap());
+            match field {
+                0 => changed.device_uuid = [0; 16],
+                1 => changed.device_sm = 0,
+                2 => changed.driver_version = 0,
+                3 => changed.runtime_version = 0,
+                4 => changed.backend_abi = 0,
+                5 => changed.backend_build_sha256 = [0; 32],
+                _ => changed.backend_artifact_sha256 = Some([0; 32]),
+            }
+            assert!(key(model, &changed).is_none());
+        }
+        for (host, bytes, kv, math, values) in [
+            ("other|space=v96|kv=q8", 4096, (8, 8), "fast", knobs),
+            ("host|space=v97|kv=q8", 4096, (8, 8), "fast", knobs),
+            ("host|space=v96|kv=q8", 8192, (8, 8), "fast", knobs),
+            ("host|space=v96|kv=q8", 4096, (1, 8), "fast", knobs),
+            ("host|space=v96|kv=q8", 4096, (8, 2), "fast", knobs),
+            ("host|space=v96|kv=q8", 4096, (8, 8), "precise", knobs),
+            ("host|space=v96|kv=q8", 4096, (8, 8), "fast", [("lfm2_tree_candidates", 2), ("mmq_tile", 2)]),
+        ] {
+            assert_ne!(baseline, dspark_backend_config_key(host, bytes, model, &runtime, kv, math, &values).unwrap());
+        }
+        assert!(dspark_backend_config_key("host", 0, model, &runtime, (8, 8), "fast", &knobs).is_none());
+        assert!(dspark_backend_config_key("host", 4096, model, &runtime, (0, 8), "fast", &knobs).is_none());
+        assert!(dspark_backend_config_key("host", 4096, model, &runtime, (8, 8), "unknown", &knobs).is_none());
     }
 
     #[test]
@@ -2615,6 +3319,20 @@ mod tests {
         }
     }
     use imparo_backend::{Backend, Epilogue, PoolAddressing, Tier};
+
+    #[test]
+    fn slot_budget_credits_only_matching_committed_categories() {
+        use super::slot_budget_after_commits as budget;
+        // 500 KV + 100 activations + 50 scratch + 150 margin.
+        assert_eq!(budget(400, 800, 500, 100, 500, 100), 200);
+        assert_eq!(budget(400, 800, 500, 100, 250, 100), 0);
+        assert_eq!(budget(900, 800, 500, 100, 250, 50), 400);
+        // Excess allocations do not spend the scratch/margin reserve.
+        assert_eq!(budget(400, 800, 500, 100, 1000, 1000), 200);
+        assert_eq!(budget(100, 800, 500, 100, 500, 100), 0);
+        // No installed plan fails closed.
+        assert_eq!(budget(900, u64::MAX, 0, 0, 500, 100), 0);
+    }
 
     #[test]
     fn cuda_keeps_layout_aware_eager_pool_storage() {

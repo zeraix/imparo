@@ -235,7 +235,12 @@ pub fn slug(fp: &str) -> String {
 /// Windows commonly has no `HOME`; `USERPROFILE` is the required fallback there.
 #[must_use]
 pub fn config_dir() -> PathBuf {
-    config_dir_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+    std::env::var_os("IMPARO_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map_or_else(
+            || config_dir_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE")),
+            PathBuf::from,
+        )
 }
 
 fn config_dir_from(
@@ -532,6 +537,12 @@ pub struct VerifyCostTable {
     pub gain: ([f64; 3], [f64; 2], u64),
     /// The same scale for the n-gram's and agreed nodes' marginal (design 6.6's g_n).
     pub gain_n: ([f64; 3], [f64; 2], u64),
+    /// The two scales BELOW the reference width: what the rows between the narrowest offered
+    /// width and the reference are worth. Every round reveals them, so they are fitted on a
+    /// different sample from `gain` and `gain_n`, which only a round wider than the reference
+    /// reveals.
+    pub gain_below: ([f64; 3], [f64; 2], u64),
+    pub gain_n_below: ([f64; 3], [f64; 2], u64),
     /// The long-run rate by context band. Stored because the server's provider lives for one
     /// request, and a rate that starts cold every request never leaves its warm-up.
     pub rate: Vec<RateRow>,
@@ -594,6 +605,8 @@ pub fn parse_verify_cost(body: &str, fp: &str) -> Option<VerifyCostTable> {
     let mut banks: Vec<VerifyCostBankRow> = Vec::new();
     let mut gain = ([0.0_f64; 3], [0.0_f64; 2], 0_u64);
     let mut gain_n = ([0.0_f64; 3], [0.0_f64; 2], 0_u64);
+    let mut gain_below = ([0.0_f64; 3], [0.0_f64; 2], 0_u64);
+    let mut gain_n_below = ([0.0_f64; 3], [0.0_f64; 2], 0_u64);
     let mut rate: Vec<RateRow> = Vec::new();
     let mut accept: Option<AcceptRow> = None;
     for line in body.lines() {
@@ -606,7 +619,7 @@ pub fn parse_verify_cost(body: &str, fp: &str) -> Option<VerifyCostTable> {
             // Five fitted scalars and a count. A line of any other width is from a
             // build whose gain had a different shape; it is DROPPED, not reinterpreted,
             // and the reader falls back to the prior (no correction).
-            "gain" | "gain_n" => {
+            "gain" | "gain_n" | "gain_below" | "gain_n_below" => {
                 let f: Vec<&str> = v.trim().split(',').collect();
                 if let [x0, x1, x2, y0, y1, seen] = f[..] {
                     let n: Vec<f64> = [x0, x1, x2, y0, y1]
@@ -616,10 +629,11 @@ pub fn parse_verify_cost(body: &str, fp: &str) -> Option<VerifyCostTable> {
                         .collect();
                     if let (5, Ok(c)) = (n.len(), seen.parse::<u64>()) {
                         let g = ([n[0], n[1], n[2]], [n[3], n[4]], c);
-                        if k.trim() == "gain" {
-                            gain = g;
-                        } else {
-                            gain_n = g;
+                        match k.trim() {
+                            "gain" => gain = g,
+                            "gain_n" => gain_n = g,
+                            "gain_below" => gain_below = g,
+                            _ => gain_n_below = g,
                         }
                     }
                 }
@@ -769,6 +783,8 @@ pub fn parse_verify_cost(body: &str, fp: &str) -> Option<VerifyCostTable> {
         banks,
         gain,
         gain_n,
+        gain_below,
+        gain_n_below,
         rate,
         accept,
     })
@@ -829,7 +845,12 @@ pub fn verify_cost_body(
     for (lo, hi, us, seen) in &table.steps {
         let _ = writeln!(body, "step={lo},{hi},{us:.1},{seen}");
     }
-    for (name, (gxx, gxy, gs)) in [("gain", table.gain), ("gain_n", table.gain_n)] {
+    for (name, (gxx, gxy, gs)) in [
+        ("gain", table.gain),
+        ("gain_n", table.gain_n),
+        ("gain_below", table.gain_below),
+        ("gain_n_below", table.gain_n_below),
+    ] {
         if gs > 0 {
             let g: Vec<String> = gxx
                 .iter()
@@ -1359,6 +1380,8 @@ blk_rows.21.5120.10240=x
             // the value model's scale rides the same round trip
             gain: ([2.431, -0.118, 0.409], [2.150, -0.061], 41),
             gain_n: ([0.52, 0.018, 0.001], [0.61, 0.004], 9),
+            gain_below: ([3.25, 0.21, 0.07], [3.31, 0.19], 57),
+            gain_n_below: ([0.11, 0.002, 0.0004], [0.09, 0.001], 4),
             rate: vec![(10, 311.25, 1.25e7, 90), (14, 0.1 + 0.2, 3.0e6 / 7.0, 12)],
             accept: Some(super::AcceptRow {
                 top_k: 8,
@@ -1422,6 +1445,16 @@ blk_rows.21.5120.10240=x
         assert!(
             (back.gain_n.1[0] - table.gain_n.1[0]).abs() < 1e-5,
             "the n-gram gain did not round-trip"
+        );
+        assert_eq!(
+            (back.gain_below.2, back.gain_n_below.2),
+            (table.gain_below.2, table.gain_n_below.2),
+            "a below-reference gain's count was dropped"
+        );
+        assert!(
+            (back.gain_below.1[0] - table.gain_below.1[0]).abs() < 1e-5
+                && (back.gain_n_below.0[2] - table.gain_n_below.0[2]).abs() < 1e-5,
+            "a below-reference gain did not round-trip"
         );
 
         // The learners' state comes back BIT FOR BIT: a stored sum that rounds moves the learner

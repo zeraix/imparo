@@ -5,7 +5,6 @@
 #
 #   per model: {m}_chain         agentic.py, the chain arms on the evaluation subset
 #                                (chain3 on every target; chain, the full block, on the LFM2.5 pair)
-#              {m}_widths_chain  table4.py, the chain column of the width table
 #
 # usage: run_chain.sh OUTDIR [MODEL ...]   MODEL in lfm26 moekm q4b (default: all three)
 set -u
@@ -37,26 +36,11 @@ agentic() {  # tag arms env...
   [ $rc = 0 ] && [ $ck = 0 ] || { cat $OUT/$tag.check | tee -a $OUT/RUN.log; say "RUN_CHAIN STOPPED at $tag"; exit 1; }
 }
 
-step() {  # tag command...
-  local tag=$1
-  shift
-  say "=== $tag start $(date '+%m-%d %H:%M:%S')"
-  "$@" > $OUT/$tag.log 2>&1
-  local rc=$?
-  say "EXIT $tag=$rc $(date '+%m-%d %H:%M:%S')"
-  [ $rc = 0 ] || { tail -5 $OUT/$tag.log | tee -a $OUT/RUN.log; say "RUN_CHAIN STOPPED at $tag"; exit 1; }
-}
 
 model() {  # name chain-arms prompt-set env...
   local m=$1 arms=$2 pset=$3
   shift 3
   agentic ${m}_chain $arms "$@"
-  local tgt draft
-  for kv in "$@"; do
-    case $kv in AGENTIC_TARGET=*) tgt=${kv#*=};; AGENTIC_DRAFT=*) draft=${kv#*=};; esac
-  done
-  step ${m}_widths_chain env SURVEY_MODEL="$tgt" SURVEY_DRAFT="$draft" PROMPT_SET=$pset \
-    python3 -u $H/table4.py $OUT/${m}_widths_chain chain 443,1596,8444 A,B,C 256 2
 }
 
 for m in $MODELS; do

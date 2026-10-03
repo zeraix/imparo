@@ -1,7 +1,9 @@
 //! Gemma4 QAT assistant adapter over the shared greedy scheduler and target KV.
 //! Explicit owner-lab pairing only; dense Q8 head, two proposals, no cached resume.
 use crate::{
-    Attention, KvSource, Model, ModelPlan, speculative::DraftProvider, weights::Weights,
+    Attention, KvSource, Model, ModelPlan,
+    speculative::{DraftProvider, DraftTree},
+    weights::Weights,
 };
 use imparo_cuda::gemma4_mtp::{Config, Layer};
 use imparo_gguf::{Document, MetadataValue, Scalar};
@@ -11,6 +13,53 @@ use std::sync::{
 };
 
 const BLOCK: usize = 3;
+pub(crate) const TREE4_PARENTS: [i32; 4] = [-1, 0, 1, 0];
+const TREE4_DELAYED_PARENTS: [i32; 4] = [-1, 0, 1, 1];
+pub(crate) fn tree4_delayed_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("IMPARO_LAB_E4B_TREE_DELAYED").as_deref() == Ok("1"))
+}
+pub(crate) fn tree4_parents() -> &'static [i32; 4] {
+    if tree4_delayed_enabled() { &TREE4_DELAYED_PARENTS } else { &TREE4_PARENTS }
+}
+pub(crate) fn tree4_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("IMPARO_DSPARK_TREE").as_deref() == Ok("4"))
+}
+pub(crate) fn tree4_fits(start: usize, capacity: usize, cell: usize) -> bool {
+    capacity == 1024
+        && (512..=765).contains(&start)
+        && cell != 0
+        && TREE4_PARENTS.len() <= cell - start % cell
+}
+fn tree4_from_chain(anchor: u32, chain: &[u32], alternate: u32, stops: &[u32], delayed: bool) -> Option<DraftTree> {
+    if chain.len() != BLOCK - 1
+        || alternate == chain[usize::from(delayed)]
+        || chain.iter().chain(std::iter::once(&alternate)).any(|id| stops.contains(id))
+    {
+        return None;
+    }
+    Some(DraftTree::plain(
+        vec![anchor, chain[0], chain[1], alternate],
+        if delayed { TREE4_DELAYED_PARENTS.to_vec() } else { TREE4_PARENTS.to_vec() },
+    ))
+}
+// Mirror the existing short-verification boundary contract, not a new tuning
+// policy. The four-node tree has only three logical positions. An eager chain
+// crossing a 32-position seam cannot price an eager non-crossing batch.
+fn cost_domain(start: usize, rows: usize) -> u64 {
+    if start >= 1023 { return 3; }
+    let last = start.saturating_add(rows.min(BLOCK).saturating_sub(1));
+    if start / 32 == last / 32 { 1 } else { 2 }
+}
+fn selected_chain(ids: &[u32; 4], vocab: u32) -> Result<[u32; 2], String> {
+    if ids.iter().any(|&id| id >= vocab) || ids[2] == ids[3]
+        || (ids[0] != ids[2] && ids[0] != ids[3])
+    {
+        return Err("MTP selected chain outside candidate contract".into());
+    }
+    Ok([ids[0], ids[1]])
+}
 const ASSISTANT_SHA256: &str =
     "4216d488258de0b66204f51b662cea2b75c643ebbd874672bdc75236d1003b9f";
 
@@ -390,6 +439,14 @@ pub struct Provider {
     poison: Option<String>,
     minimum_probability: Option<f32>,
     confidence_trace: bool,
+    tree_round: Option<(usize, u32, [u32; 3])>,
+    tree_trace_done: bool,
+    chain_selector: bool,
+    selector_rounds: usize,
+    selector_swaps: usize,
+    // Request-local and diagnostic only. Never inherit another model/config's
+    // prices and never make a tree proposal merely to populate a cost table.
+    cost: Option<crate::verify_cost::TreeCostObserver>,
     _serial: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl Provider {
@@ -427,6 +484,16 @@ impl Provider {
         } else {
             None
         };
+        let chain_selector = std::env::var("IMPARO_LAB_E4B_CHAIN_SELECTOR").as_deref() == Ok("1");
+        if chain_selector && (tree4_enabled() || minimum_probability.is_some()
+            || !crate::e4b_retained_decode_policy_enabled()
+            || descriptor.capacity != 1024 || descriptor.config.target_embedding_kind != 1
+            || descriptor.config.target_hidden != 2560
+            || crate::kv::KvType::k() != crate::kv::KvType::Q4_0
+            || crate::kv::KvType::v() != crate::kv::KvType::Q4_0)
+        {
+            return Err("MTP chain selector requires exclusive retained short E4B Q4 route".into());
+        }
         if target.state().host_forward
             || target
                 .state()
@@ -469,6 +536,13 @@ impl Provider {
             poison: None,
             minimum_probability,
             confidence_trace,
+            tree_round: None,
+            tree_trace_done: false,
+            chain_selector,
+            selector_rounds: 0,
+            selector_swaps: 0,
+            cost: (std::env::var("IMPARO_DSPARK_CLOCK").as_deref() == Ok("1"))
+                .then(|| crate::verify_cost::TreeCostObserver::new(4)).flatten(),
             _serial: std::marker::PhantomData,
         })
     }
@@ -488,8 +562,86 @@ impl Provider {
         }
         result
     }
+    fn commit_inputs(
+        &mut self,
+        start: usize,
+        inputs: &[u32],
+        path: Option<&[i32]>,
+    ) -> Result<(), String> {
+        self.ready()?;
+        let end = start
+            .checked_add(inputs.len())
+            .ok_or("MTP commit position overflow")?;
+        if start != self.history
+            || inputs.is_empty()
+            || inputs.len() > self.descriptor.config.batch_capacity as usize
+            || end > self.descriptor.capacity
+            || inputs.iter().any(|&x| x >= self.descriptor.config.vocab)
+        {
+            return Err("MTP accepted-prefix commit invalid".into());
+        }
+        if let Some(path) = path {
+            if path.len() != inputs.len()
+                || path.iter().any(|&node| {
+                    usize::try_from(node)
+                        .ok()
+                        .filter(|&node| node < self.descriptor.config.batch_capacity as usize)
+                        .and_then(|node| start.checked_add(node))
+                        .is_none_or(|position| position >= self.descriptor.capacity)
+                })
+            {
+                return self.checked(Err("MTP accepted-tree commit invalid".into()));
+            }
+        }
+        let native_start = u32::try_from(start).map_err(|_| "MTP commit overflow")?;
+        let result = unsafe {
+            match path {
+                Some(path) => imparo_cuda::gemma4_mtp::append_tree(native_start, path),
+                None => imparo_cuda::gemma4_mtp::append(native_start, inputs.len() as u32),
+            }
+        };
+        self.checked(result)?;
+        self.history = end;
+        Ok(())
+    }
 }
 impl DraftProvider for Provider {
+    fn observes_chain_round(&self) -> bool { self.cost.is_some() }
+    fn observe_chain_round(&mut self, timing: &crate::speculative::TreeRoundTiming) {
+        // A different candidate policy changes round yield/cost even at the
+        // same target shape. Keep its diagnostic prices out of ordinary Chain3.
+        let selector_domain = if self.chain_selector && (512..=765).contains(&timing.context) { 1 << 16 } else { 0 };
+        if let Some(cost) = self.cost.as_mut() {
+            cost.observe_chain_in_domain(timing, cost_domain(timing.context, timing.rows) | selector_domain);
+        }
+    }
+    fn observe_tree_round(&mut self, tree: &DraftTree, timing: &crate::speculative::TreeRoundTiming) {
+        if let Some(cost) = self.cost.as_mut() {
+            cost.observe_in_domain(tree, timing, cost_domain(timing.context, timing.rows));
+        }
+    }
+    fn tree_proposal(
+        &mut self,
+        start: usize,
+        anchor: u32,
+        chain: &[u32],
+        stops: &[u32],
+    ) -> Result<Option<DraftTree>, String> {
+        let Some((draft_start, draft_anchor, ids)) = self.tree_round.take() else {
+            return Ok(None);
+        };
+        if draft_start != start || draft_anchor != anchor || chain != &ids[..2] {
+            return self.checked(Err("MTP tree proposal differs from its chain".into()))
+                .map(|()| None);
+        }
+        let delayed = tree4_delayed_enabled();
+        let tree = tree4_from_chain(anchor, chain, ids[2], stops, delayed);
+        if tree.is_some() && !self.tree_trace_done {
+            eprintln!("[gemma4-mtp-tree4] start={start} nodes=4 parents={:?} assistant_forwards=2 original_chain=preserved delayed={delayed}", tree4_parents());
+            self.tree_trace_done = true;
+        }
+        Ok(tree)
+    }
     fn block_size(&self) -> usize {
         BLOCK
     }
@@ -501,6 +653,9 @@ impl DraftProvider for Provider {
             e.store(false, Ordering::Relaxed);
         }
         self.history = 0;
+        self.tree_round = None;
+        self.selector_rounds = 0;
+        self.selector_swaps = 0;
         Ok(())
     }
     fn set_capture(&mut self, enabled: bool) -> Result<(), String> {
@@ -553,8 +708,46 @@ impl DraftProvider for Provider {
         anchor: u32,
     ) -> Result<Vec<u32>, String> {
         self.ready()?;
+        self.tree_round = None;
         if self.history != start || anchor >= self.descriptor.config.vocab {
             return Err("MTP history/anchor mismatch".into());
+        }
+        if self.chain_selector && (512..=765).contains(&start) {
+            let mut ids = [0_u32; 4];
+            let result = unsafe { imparo_cuda::gemma4_mtp::generate_selected(start as u32, anchor, &mut ids) };
+            self.checked(result)?;
+            let chain = match selected_chain(&ids, self.descriptor.config.vocab) {
+                Ok(chain) => chain,
+                Err(error) => return self.checked(Err(error)).map(|()| Vec::new()),
+            };
+            self.selector_rounds += 1;
+            self.selector_swaps += usize::from(ids[0] != ids[2]);
+            if std::env::var("IMPARO_LAB_DRAFT_ACCEPTANCE_TRACE").as_deref() == Ok("1") {
+                eprintln!("[mtp-chain-selector] start={start} original={} alternate={} selected={}", ids[2], ids[3], ids[0]);
+            }
+            return Ok(chain.to_vec());
+        }
+        if tree4_enabled()
+            && crate::e4b_retained_decode_policy_enabled()
+            && self.minimum_probability.is_none()
+            && self.descriptor.config.batch_capacity >= 4
+            && crate::kv::KvType::k() == crate::kv::KvType::Q4_0
+            && crate::kv::KvType::v() == crate::kv::KvType::Q4_0
+            && tree4_fits(start, self.descriptor.capacity, crate::prefill_batch().max(1))
+        {
+            let mut ids = [0_u32; 3];
+            let result = unsafe {
+                imparo_cuda::gemma4_mtp::generate_tree4(start as u32, anchor, &mut ids)
+            };
+            self.checked(result)?;
+            if ids.iter().any(|&id| id >= self.descriptor.config.vocab)
+                || ids[usize::from(tree4_delayed_enabled())] == ids[2]
+            {
+                return self.checked(Err("MTP tree prediction outside contract".into()))
+                    .map(|()| Vec::new());
+            }
+            self.tree_round = Some((start, anchor, ids));
+            return Ok(ids[..2].to_vec());
         }
         let mut ids = [0_u32; 2];
         let result = unsafe {
@@ -617,27 +810,24 @@ impl DraftProvider for Provider {
         Ok(Some(ids.to_vec()))
     }
     fn commit(&mut self, start: usize, inputs: &[u32]) -> Result<(), String> {
-        self.ready()?;
-        let end = start
-            .checked_add(inputs.len())
-            .ok_or("MTP commit position overflow")?;
-        if start != self.history
-            || inputs.is_empty()
-            || inputs.len() > self.descriptor.config.batch_capacity as usize
-            || end > self.descriptor.capacity
-            || inputs.iter().any(|&x| x >= self.descriptor.config.vocab)
-        {
-            return Err("MTP accepted-prefix commit invalid".into());
-        }
-        let result = unsafe {
-            imparo_cuda::gemma4_mtp::append(
-                u32::try_from(start).map_err(|_| "MTP commit overflow")?,
-                inputs.len() as u32,
-            )
-        };
-        self.checked(result)?;
-        self.history = end;
-        Ok(())
+        self.commit_inputs(start, inputs, None)
+    }
+    fn commit_tree(
+        &mut self,
+        start: usize,
+        inputs: &[u32],
+        path: &[i32],
+        _next: u32,
+    ) -> Result<(), String> {
+        self.commit_inputs(start, inputs, Some(path))
+    }
+    fn keep_tree(
+        &mut self,
+        start: usize,
+        inputs: &[u32],
+        path: &[i32],
+    ) -> Result<(), String> {
+        self.commit_inputs(start, inputs, Some(path))
     }
     fn finish(&mut self) -> Result<(), String> {
         if let Some(e) = &self.enabled {
@@ -649,6 +839,12 @@ impl DraftProvider for Provider {
             }
             self.live = false;
             self.enabled = None;
+            if self.chain_selector {
+                eprintln!("[mtp-chain-selector-summary] rounds={} swaps={} target_rows=3", self.selector_rounds, self.selector_swaps);
+            }
+        }
+        if let Some(report) = self.cost.as_mut().and_then(|cost| cost.take_report()) {
+            eprintln!("[gemma4-mtp-cost] {report}");
         }
         Ok(())
     }
@@ -837,6 +1033,69 @@ impl Pairing {
             (Err(e), Ok(())) => Err(e),
             (Ok(()), Err(e)) => Err(format!("MTP teardown: {e}")),
             (Err(e), Err(c)) => Err(format!("{e}; MTP teardown: {c}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TREE4_PARENTS, TREE4_DELAYED_PARENTS, tree4_fits, tree4_from_chain};
+
+    #[test]
+    fn selector_never_emits_a_candidate_outside_the_verified_pair() {
+        assert_eq!(super::selected_chain(&[7, 9, 7, 8], 10).unwrap(), [7, 9]);
+        assert_eq!(super::selected_chain(&[8, 6, 7, 8], 10).unwrap(), [8, 6]);
+        for ids in [[6, 9, 7, 8], [7, 9, 7, 7], [7, 10, 7, 8], [7, 9, 7, 10]] {
+            assert!(super::selected_chain(&ids, 10).is_err());
+        }
+    }
+
+    #[test]
+    fn cost_domains_keep_boundary_fallback_apart_from_common_short_work() {
+        for rows in [3, 4] {
+            assert_eq!(super::cost_domain(541, rows), 1);
+            assert_eq!(super::cost_domain(542, rows), 2);
+            assert_eq!(super::cost_domain(543, rows), 2);
+            assert_eq!(super::cost_domain(544, rows), 1);
+            assert_eq!(super::cost_domain(1023, rows), 3);
+        }
+        assert_eq!(super::cost_domain(542, 2), 1);
+    }
+
+    #[test]
+    fn tree4_preserves_the_chain_and_adds_only_the_first_sibling() {
+        let tree = tree4_from_chain(10, &[11, 12], 20, &[], false).unwrap();
+        assert_eq!(tree.tokens, [10, 11, 12, 20]);
+        assert_eq!(tree.parents, TREE4_PARENTS);
+        // Equal token IDs under different parents remain distinct candidates.
+        assert!(tree4_from_chain(10, &[11, 12], 12, &[], false).is_some());
+        assert!(tree4_from_chain(10, &[11, 12], 11, &[], false).is_none());
+        for stop in [11, 12, 20] {
+            assert!(tree4_from_chain(10, &[11, 12], 20, &[stop], false).is_none());
+        }
+    }
+
+    #[test]
+    fn delayed_tree4_preserves_two_steps_and_deduplicates_only_the_second_sibling() {
+        let tree = tree4_from_chain(10, &[11, 12], 20, &[], true).unwrap();
+        assert_eq!(tree.tokens, [10, 11, 12, 20]);
+        assert_eq!(tree.parents, TREE4_DELAYED_PARENTS);
+        assert!(tree4_from_chain(10, &[11, 12], 11, &[], true).is_some());
+        assert!(tree4_from_chain(10, &[11, 12], 12, &[], true).is_none());
+        for stop in [11, 12, 20] {
+            assert!(tree4_from_chain(10, &[11, 12], 20, &[stop], true).is_none());
+        }
+    }
+
+    #[test]
+    fn tree4_never_extends_beyond_the_admitted_short_schedule_or_cell() {
+        assert!(tree4_fits(512, 1024, 512));
+        assert!(tree4_fits(765, 1024, 512));
+        for (start, capacity, cell) in [
+            (511, 1024, 512), (766, 1024, 512), (512, 2048, 512),
+            (765, 1024, 256), (512, 1024, 0),
+        ] {
+            assert!(!tree4_fits(start, capacity, cell));
         }
     }
 }

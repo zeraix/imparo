@@ -19,8 +19,8 @@ constexpr uint64_t workspace_bytes(unsigned nt, unsigned nh, unsigned valid,
 static_assert(workspace_bytes(9, 32, 16640, true) == 2544768);
 static_assert(workspace_bytes(512, 32, 16384, false) == 4194304);
 cudaError_t launch_batch_invariant_v1(const float*q,const __half*k,const __half*v,float*out,__half*qh,__half*oh,__half*tmp,unsigned nt,unsigned valid,float scale,unsigned span,cudaStream_t stream);
-cudaError_t tree_tail_plan_v1(unsigned start,unsigned span,unsigned leaves,unsigned*chunks,unsigned*begin,unsigned*tail,uint64_t*extra);
-cudaError_t launch_tree_tail_v1(const float*q,const __half*k,const __half*v,float*out,__half*qh,__half*oh,__half*tmp,void*scratch,uint8_t*mask,const int*parents,unsigned start,unsigned span,unsigned chunks,unsigned begin,unsigned tail,unsigned leaf_mask,float scale,cudaStream_t stream);
+cudaError_t tree_tail_plan_v1(unsigned start,unsigned span,unsigned leaves,unsigned*chunks,unsigned*begin,unsigned*tail,uint64_t*extra,unsigned nodes);
+cudaError_t launch_tree_tail_v1(const float*q,const __half*k,const __half*v,float*out,__half*qh,__half*oh,__half*tmp,void*scratch,uint8_t*mask,const int*parents,unsigned start,unsigned span,unsigned chunks,unsigned begin,unsigned tail,unsigned leaf_mask,float scale,cudaStream_t stream,unsigned nodes);
 cudaError_t launch(const float*q,const __half*k,const __half*v,float*out,__half*qh,__half*oh,__half*tmp,unsigned nt,unsigned nh,unsigned nk,unsigned valid,float scale,bool causal,cudaStream_t stream,unsigned fixed_span=0);
 cudaError_t launch_mask(const float*q,const __half*k,const __half*v,float*out,__half*qh,__half*oh,__half*tmp,unsigned nt,unsigned nh,unsigned nk,unsigned valid,float scale,uint8_t*mask,cudaStream_t stream,unsigned partition_reference_len,unsigned fixed_span);
 cudaError_t tree_tail_plan(unsigned start,unsigned fixed_span,unsigned leaves,unsigned*chunks,unsigned*begin,unsigned*tail,uint64_t*extra);

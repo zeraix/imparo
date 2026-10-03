@@ -3,6 +3,9 @@
 #include "ptq1_tc.cuh"
 #include "weight_basis.cuh"
 #include "gated_delta.cuh"
+#if defined(IMPARO_CUDA_ENABLE_PTQ_CUBLAS)
+#include "bf16_bounded_gemm.cuh"
+#endif
 
 static bool buffer_slice(uint32_t id, uint64_t byte_offset, uint64_t bytes, uint8_t **out);
 
@@ -54,6 +57,97 @@ static int launch_weight_basis(const WeightBasisNative &b,const float*x,float*y,
         b.inverse!=0,b.head_dim,b.key_heads,b.value_heads,g.stream);
     return rc==cudaSuccess?0:CUDA_RC_ERROR;
 }
+#if defined(IMPARO_CUDA_ENABLE_PTQ_CUBLAS)
+static bool ensure_bounded_projection_owner(
+        uint64_t required_bytes=imparo_cuda_ptq1_gemm::storage_bytes) {
+    auto& e=execution();
+    auto& scratch=e.ptq_gemm;
+    if(e.graph_capturing||e.prefill_capture_active||e.tree_capture_active) {
+        set_pending(CUDA_RC_INVALID,"bounded PTQ GEMM capture not admitted");return false;
+    }
+    const bool grow=!scratch.storage || scratch.bytes<required_bytes;
+    if(!grow && scratch.handle)return true;
+    if(e.graph_leases) {
+        set_pending(CUDA_RC_INVALID,"bounded PTQ GEMM owner growth while borrowed");return false;
+    }
+    cublasHandle_t next_handle=scratch.handle;
+    if(!next_handle && cublasCreate(&next_handle)!=CUBLAS_STATUS_SUCCESS) {
+        set_pending(CUDA_RC_ERROR,"bounded PTQ GEMM handle");return false;
+    }
+    void* next_storage=nullptr;
+    const auto fail=[&](int rc,const char* reason) {
+        if(next_storage)cudaFree(next_storage);
+        if(!scratch.handle)cublasDestroy(next_handle);
+        set_pending(rc,reason);return false;
+    };
+    if(grow) {
+        const int rc=alloc_raw(&next_storage,required_bytes,"bounded PTQ GEMM scratch");
+        if(rc)return fail(rc,"bounded PTQ GEMM scratch");
+        if(scratch.storage) {
+            // A previous GEMM can still reference the old workspace. Allocate
+            // first, then retire it only after the owner's stream has finished.
+            if(cudaStreamSynchronize(g.stream)!=cudaSuccess)
+                return fail(CUDA_RC_ERROR,"bounded PTQ GEMM scratch retirement sync");
+            if(cudaFree(scratch.storage)!=cudaSuccess)
+                return fail(CUDA_RC_ERROR,"bounded PTQ GEMM scratch retirement");
+        }
+        scratch.storage=next_storage;
+        scratch.bytes=required_bytes;
+    }
+    scratch.handle=next_handle;
+    return true;
+}
+// Reuse the existing provider under an independent MoE shape/owner contract.
+static bool moe_router_f32_projection(const uint8_t*w,const float*x,float*y,
+        uint32_t k,uint32_t n,uint32_t m,uint32_t stride,uint32_t base) {
+    auto& e=execution();
+    if(!e.moe_router_f32 || g.sm_version!=86 || k!=2048 || n!=32 || m!=1
+            || stride!=32 || base!=0 || e.epilogue || e.cobatch_rows) return false;
+    // This candidate has only an eager numerical contract. Never silently record
+    // a different arithmetic route inside a graph while the policy is enabled.
+    if(e.graph_capturing || e.prefill_capture_active || e.tree_capture_active) {
+        set_pending(CUDA_RC_INVALID,"MoE F32 router capture not admitted");return true;
+    }
+    if(!ensure_bounded_projection_owner(imparo_cuda_ptq1_gemm::workspace_bytes)) return true;
+    const auto err=imparo_cuda_bf16_gemm::launch(e.ptq_gemm,w,x,y,k,n,m,
+        stride,base,g.stream,true);
+    if(err!=cudaSuccess) {set_pending(CUDA_RC_ERROR,"MoE F32 router GEMM launch");return true;}
+    if(!e.moe_router_f32_logged) {
+        std::fprintf(stderr,"[imparo] moe-router-f32 actual route k=%u n=%u m=%u f32-pedantic=1 scratch=%llu\n",
+            k,n,m,static_cast<unsigned long long>(e.ptq_gemm.bytes));
+        e.moe_router_f32_logged=true;
+    }
+    return true;
+}
+// Qwen's existing policy 4 and shape contract stay independent.
+static bool bounded_f32_projection(const uint8_t*w,const float*x,float*y,
+        uint32_t k,uint32_t n,uint32_t m,uint32_t stride,uint32_t base) {
+    if(g.sm_version!=86 || k!=2560 || n!=32 || stride!=32 || base!=0
+            || m==0 || m>512 || execution().epilogue) return false;
+    g.ptq_prefill_tensorcore_frozen=true;
+    if(g.ptq_prefill_tensorcore!=4) return false;
+    if(!ensure_bounded_projection_owner()) return true;
+    // Independent decode rows retain the admitted M1 reduction geometry.
+    // cuBLAS may choose a different reduction for M>1, even in pedantic mode;
+    // these small recurrent gates must match each conversation's lone step.
+    // Other projections remain batched and ordinary prefill keeps its GEMM.
+    const uint32_t rows_per_call=execution().cobatch_rows ? 1 : m;
+    for(uint32_t row=0;row<m;row+=rows_per_call) {
+        const auto err=imparo_cuda_bf16_gemm::launch(execution().ptq_gemm,w,
+            x+uint64_t(row)*k,y+uint64_t(row)*stride,
+            k,n,rows_per_call,stride,base,g.stream,true);
+        if(err!=cudaSuccess) {set_pending(CUDA_RC_ERROR,"bounded F32 GEMM launch");return true;}
+    }
+    const uint32_t route=m==1 ? 1u<<28 : 1u<<27;
+    if(!(g.ptq_prefill_tensorcore_trace_mask&route)) {
+        std::fprintf(stderr,"[imparo] f32_projection actual route k=%u n=%u m=%u bounded-cublas=f32-pedantic shared-scratch=%llu\n",k,n,m,
+            static_cast<unsigned long long>(execution().ptq_gemm.bytes));
+        g.ptq_prefill_tensorcore_trace_mask|=route;
+    }
+    return true;
+}
+#endif
+
 static void bonsai_matmat(uint32_t kind,uint64_t off,uint32_t k,uint32_t n,
         uint32_t src,uint32_t dst,uint32_t m,uint32_t src_row) {
     uint8_t *xb=nullptr,*yb=nullptr;
@@ -88,7 +182,8 @@ static void bonsai_matmat(uint32_t kind,uint64_t off,uint32_t k,uint32_t n,
     // M<=8, BF16 and unlisted shapes retain their existing implementation.
     uint32_t tc_route = 0;
     if (g.ptq_prefill_tensorcore && g.sm_version >= 80
-        && kind == 39 && m > 8 && m <= 128) {
+        && kind == 39 && m > 8
+        && (m <= 128 || (g.ptq_prefill_tensorcore == 4 && m <= 512))) {
         if (k == 5120 && n == 17408) tc_route = 1u;
         else if (k == 17408 && n == 5120) tc_route = 2u;
         else if (g.ptq_prefill_tensorcore >= 2 && g.sm_version == 86) {
@@ -100,23 +195,18 @@ static void bonsai_matmat(uint32_t kind,uint64_t off,uint32_t k,uint32_t n,
         }
     }
 #if defined(IMPARO_CUDA_ENABLE_PTQ_CUBLAS)
-    // Policy 3 changes only the two FFN geometries at substantial M; all other
-    // policy-2 projections and small/tail batches retain their checked provider.
-    const bool bounded_gemm=g.ptq_prefill_tensorcore==3 && (tc_route==1u||tc_route==2u)
-        && m>=96 && m<=128;
-    if(bounded_gemm) {
-        auto& scratch=execution().ptq_gemm;
-        if(execution().graph_capturing||execution().prefill_capture_active||execution().tree_capture_active) {
-            set_pending(CUDA_RC_INVALID,"bounded PTQ GEMM capture not admitted");return;
-        }
-        if(!scratch.handle && cublasCreate(&scratch.handle)!=CUBLAS_STATUS_SUCCESS) {
-            scratch.handle=nullptr;set_pending(CUDA_RC_ERROR,"bounded PTQ GEMM handle");return;
-        }
-        if(!scratch.storage) {
-            const int rc=alloc_raw(&scratch.storage,imparo_cuda_ptq1_gemm::storage_bytes,"bounded PTQ GEMM scratch");
-            if(rc){set_pending(rc,"bounded PTQ GEMM scratch");return;}
-            scratch.bytes=imparo_cuda_ptq1_gemm::storage_bytes;
-        }
+    // Policy 3 retains the admitted FFN-only domain. Experimental policy 4
+    // reuses the same owner/scratch/provider for the independently screened
+    // policy-2 projection geometries. Policy 4 admits up to four M128 row tiles
+    // per weight tile; small batches and other shapes retain their provider.
+    const bool bounded_gemm=((g.ptq_prefill_tensorcore==3 && (tc_route==1u||tc_route==2u))
+        || (g.ptq_prefill_tensorcore==4 && tc_route!=0)) && m>=96 && m<=512;
+    // Exact BF16 -> F32 expansion shares the current bounded owner. The
+    // tiny GDN gates retain F32 input/accumulation/output and disable TF32.
+    const bool bounded_bf16=g.ptq_prefill_tensorcore==4 && g.sm_version==86
+        && kind==40 && k==5120 && n==48 && m>=96 && m<=512 && !basis;
+    if(bounded_gemm || bounded_bf16) {
+        if(!ensure_bounded_projection_owner()) return;
     }
 #endif
     MatmatEventScope profile(kind,k,n,m,0);
@@ -126,6 +216,18 @@ static void bonsai_matmat(uint32_t kind,uint64_t off,uint32_t k,uint32_t n,
         int rc=weight_slice(off+uint64_t(base)*row_bytes,uint64_t(rows)*row_bytes,&w);
         if(rc){set_pending(rc,"Bonsai packed weight slice");return;}
 #if defined(IMPARO_CUDA_ENABLE_PTQ_CUBLAS)
+        if(bounded_bf16) {
+            const auto err=imparo_cuda_bf16_gemm::launch(execution().ptq_gemm,w,x,
+                reinterpret_cast<float*>(yb),k,rows,m,n,base,g.stream);
+            if(err!=cudaSuccess){set_pending(CUDA_RC_ERROR,"bounded BF16 GEMM launch");return;}
+            constexpr uint32_t route=1u<<29;
+            if(!(g.ptq_prefill_tensorcore_trace_mask&route)) {
+                std::fprintf(stderr,"[imparo] bf16_prefill actual route k=%u n=%u m=%u bounded-cublas=f32-pedantic shared-scratch=%llu\n",k,n,m,
+                    static_cast<unsigned long long>(execution().ptq_gemm.bytes));
+                g.ptq_prefill_tensorcore_trace_mask|=route;
+            }
+            continue;
+        }
         if(bounded_gemm) {
             const auto err=imparo_cuda_ptq1_gemm::launch(execution().ptq_gemm,w,x,
                 reinterpret_cast<float*>(yb),k,rows,m,n,base,g.stream);

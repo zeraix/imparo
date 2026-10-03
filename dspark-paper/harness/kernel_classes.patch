@@ -1,0 +1,959 @@
+diff --git a/crates/imparo-backend/src/lib.rs b/crates/imparo-backend/src/lib.rs
+--- a/crates/imparo-backend/src/lib.rs
++++ b/crates/imparo-backend/src/lib.rs
+@@ -1804,6 +1804,27 @@
+         None
+     }
+ 
++    /// What a `matmat` of `n_tok` rows PAYS FOR, as one opaque number, or `None` when this
++    /// backend does not declare it.
++    ///
++    /// Two row counts with the same class run the same kernel over the same padded rows, so
++    /// they cost the same; the cost can only step where the class changes. A caller that has
++    /// to CHOOSE a row count -- a speculative verify sizing its tree -- needs exactly this and
++    /// nothing more: it measures one row count per class and knows every other row count in
++    /// that class for free, without a cost model and without a copy of the backend's tiling
++    /// rule that would drift from it.
++    ///
++    /// The value is opaque. A caller compares classes for equality and never reads one.
++    ///
++    /// A backend may answer finer than its own cost (two classes that measure the same), which
++    /// costs the caller one extra measurement. It must never answer COARSER: that would tell a
++    /// caller two row counts cost the same when they do not.
++    ///
++    /// `None` means the backend has not declared where its cost steps, and a caller that needs
++    /// to know must not invent a ladder.
++    fn matmat_row_class(&self, _wkind: WeightKindWire, _n_tok: u32) -> Option<u64> {
++        None
++    }
+     fn matmat(
+         &self,
+         wkind: WeightKindWire,
+diff --git a/crates/imparo-host/src/lib.rs b/crates/imparo-host/src/lib.rs
+--- a/crates/imparo-host/src/lib.rs
++++ b/crates/imparo-host/src/lib.rs
+@@ -568,9 +568,9 @@
+ /// The engine's learned files -- the verify-cost table and the DSpark dictionary -- are keyed
+ /// by the tune file's fingerprint, and the fingerprint names the search space. So a space
+ /// bump started both empty: adding one knob threw away every round the engine had learned
+-/// from. Neither file depends on the space. The cost table carries the widths it learned, and
+-/// the engine seeds its costs from it only when this build's ladder holds them; the dictionary
+-/// holds the user's text. So when this space has no file, the newest older
++/// from. Neither file depends on the space. The cost table carries the row classes it was
++/// measured under, and the engine seeds its costs from it only when those classes are this
++/// build's; the dictionary holds the user's text. So when this space has no file, the newest older
+ /// space's is read, as the tune file is (`read_for_device`), and the engine writes its next
+ /// save under the current key.
+ fn space_candidates(fp: &str) -> Vec<String> {
+@@ -827,11 +827,11 @@
+     );
+     let _ = writeln!(
+         body,
+-        "# A reader must check `step` ranges against its own ladder of widths and discard"
++        "# A reader must check `step` ranges against the backend's row classes and discard"
+     );
+     let _ = writeln!(
+         body,
+-        "# the file when one does not fit (a build with a different widest verify)."
++        "# the file when they differ (a retune can move them)."
+     );
+     let _ = writeln!(body, "fingerprint={fp}");
+     let _ = writeln!(body, "model_bytes={model_bytes}");
+diff --git a/crates/imparo-metal/native/imparo_metal.mm b/crates/imparo-metal/native/imparo_metal.mm
+--- a/crates/imparo-metal/native/imparo_metal.mm
++++ b/crates/imparo-metal/native/imparo_metal.mm
+@@ -6931,6 +6931,42 @@
+                       ST_GEMM_SHAPES[shape][2], ST_GEMM_SHAPES[shape][3], fell_back};
+ }
+ 
++// WHAT A BATCH OF n_tok ROWS PAYS FOR, as one opaque number.
++//
++// Two row counts with the same class run the same tile over the same MMA token tiles, so
++// they cost the same; the cost can only move where the class changes. A caller choosing a
++// row count needs exactly that -- not a cost model, only the places the cost can step --
++// and the tile table stays here, where it already lives, instead of being restated.
++//
++//   tile          q8_tile's answer for n_tok
++//   token tiles   ceil(n_tok / 8), the MMA tile the kernel walks in (TOKEN_TILES = TOKENS/8)
++//
++// THE CLASS IS DELIBERATELY FINER THAN THE COST. The pad skip's real grain is one
++// SIMDGROUP's token rows, which is 8 times the simdgroup's tile count -- a template
++// parameter of the kernel, not a column of the shape table. Splitting on 8 instead can
++// only ever SPLIT a flat range in two, never MERGE two different costs, so a caller pays
++// one extra measurement where the pad skip is coarse and is never told that two row counts
++// cost the same when they do not. The wrong direction is the expensive one.
++//
++// Measured on LFM2, a 30-layer verify at a 443-token context: rows 2/4/6/8 read 29.3 /
++// 29.5 / 29.7 / 28.9 ms, rows 10/12/16 read 33.0 / 33.2 / 32.4, rows 20/24/32 read 45.3 /
++// 45.5 / 44.6 -- flat inside a class to under 1 ms, and every step lands where this changes.
++extern "C" uint64_t imparo_metal_matmat_row_class(uint32_t wkind, uint32_t n_tok) {
++    if (n_tok == 0u) { return 0u; }
++    // Only the Q8 families (2 = row-major, 3 = tile-major) take the tiled st_gemm route
++    // whose padding this answers. Every other kind goes to rt_gemm, whose narrow tile is a
++    // different table and has not been read against a measurement here; 0 says so rather
++    // than guessing, and a caller that needs to know must not invent a ladder.
++    if (wkind != 2u && wkind != 3u) { return 0u; }
++    // At or below the GEMV boundary the dispatch is not this GEMM at all -- it is the
++    // one-row kernel, whose cost is per row with no tile to pad to. Each width is its own
++    // class, tagged apart from every tile class.
++    if (n_tok <= g_gemv_max_tok) { return (1ull << 63) | (uint64_t)n_tok; }
++    const uint32_t shape = q8_tile(n_tok);
++    const uint32_t tiles = (n_tok + 7u) / 8u;
++    return ((uint64_t)shape << 32) | (uint64_t)tiles;
++}
++
+ // Test hook: the shape this dispatch would use.
+ extern "C" uint32_t imparo_metal_q8_pick_shape(uint32_t n_tok, uint32_t n_in) {
+     return q8_geometry(n_tok, n_in).shape;
+diff --git a/crates/imparo-metal/src/backend_impl.rs b/crates/imparo-metal/src/backend_impl.rs
+--- a/crates/imparo-metal/src/backend_impl.rs
++++ b/crates/imparo-metal/src/backend_impl.rs
+@@ -249,6 +249,12 @@
+     fn config_key(&self) -> Option<(String, u64)> {
+         crate::config_key()
+     }
++    fn matmat_row_class(&self, wkind: WeightKindWire, n_tok: u32) -> Option<u64> {
++        match crate::matmat_row_class(wkind, n_tok) {
++            0 => None,
++            c => Some(c),
++        }
++    }
+     fn matmat(
+         &self,
+         wkind: WeightKindWire,
+diff --git a/crates/imparo-metal/src/lib.rs b/crates/imparo-metal/src/lib.rs
+--- a/crates/imparo-metal/src/lib.rs
++++ b/crates/imparo-metal/src/lib.rs
+@@ -385,6 +385,7 @@
+     fn imparo_metal_q8_full_tiles() -> u32;
+     fn imparo_metal_set_q8_all(on: u32);
+     fn imparo_metal_st_gemm_shapes() -> u32;
++    fn imparo_metal_matmat_row_class(wkind: u32, n_tok: u32) -> u64;
+     fn imparo_metal_set_q8_design(v: u32);
+     fn imparo_metal_q8_design() -> u32;
+     fn imparo_metal_q8_design_legal(v: u32) -> u32;
+@@ -1752,6 +1753,17 @@
+ #[must_use]
+ pub fn q8_pick_shape(n_tok: u32, n_in: u32) -> u32 {
+     unsafe { imparo_metal_q8_pick_shape(n_tok, n_in) }
++}
++
++/// What a `matmat` of `n_tok` rows PAYS FOR, as one opaque number, or 0 when this build
++/// does not declare it: two row counts with the same class run the same kernel over the
++/// same padded rows, so they cost the same.
++///
++/// The native side owns the arithmetic and the reasoning; see
++/// `imparo_metal_matmat_row_class`.
++#[must_use]
++pub fn matmat_row_class(wkind: u32, n_tok: u32) -> u64 {
++    unsafe { imparo_metal_matmat_row_class(wkind, n_tok) }
+ }
+ 
+ /// PIN the prefill tile to one shape, over both the stored config and the derived rule.
+diff --git a/crates/imparo-model/src/cost_model.rs b/crates/imparo-model/src/cost_model.rs
+--- a/crates/imparo-model/src/cost_model.rs
++++ b/crates/imparo-model/src/cost_model.rs
+@@ -1572,7 +1572,7 @@
+             println!("ctx {c}: one process {:.2}  restored per process {:.2}", one.ms(c).unwrap(), restored.ms(c).unwrap());
+         }
+         // a batch fit over the same samples, the bands interleaved (the last 16 of each band)
+-        let mut bands: std::collections::BTreeMap<u32, Vec<(usize, f64)>> = std::collections::BTreeMap::new();
++        let mut bands: std::collections::BTreeMap<u32, Vec<(usize, f64)>> = Default::default();
+         for line in text.lines().filter(|l| *l != "RESTORE") {
+             let mut it = line.split_whitespace();
+             let c: usize = it.next().unwrap().parse().unwrap();
+diff --git a/crates/imparo-model/src/dspark.rs b/crates/imparo-model/src/dspark.rs
+--- a/crates/imparo-model/src/dspark.rs
++++ b/crates/imparo-model/src/dspark.rs
+@@ -754,6 +754,15 @@
+     ) -> Result<Option<Candidates>, String> {
+         Ok(None)
+     }
++    /// What a verify of `n_tok` rows PAYS FOR on this session's backend, as one opaque
++    /// number, or `None` when the backend does not declare it (`Backend::matmat_row_class`).
++    ///
++    /// Row counts sharing a class cost the same, so the budget only ever has to time one
++    /// count per class. `None` means no table and no budget search (design 9's untuned
++    /// host).
++    fn verify_row_class(&self, _n_tok: usize) -> Option<u64> {
++        None
++    }
+     /// Free rows an `append` needs past its own rows when no draft follows it, or `None` when
+     /// the session takes no such append: its history then ends at the last round that another
+     /// round drafted from.
+@@ -907,17 +916,27 @@
+         tokens: Option<Vec<u32>>,
+         boundary_resume: bool,
+     ) -> Self {
+-        // THE TABLE'S STEPS ARE LEARNED from served rounds (`VerifyCost::new`): a ladder of
+-        // widths, split where a width inside a step could be chosen.
+-        let mut cost = crate::verify_cost::VerifyCost::new(imparo_backend::ROW_LAYOUT_MAX_ROWS);
++        // THE TABLE'S STEPS ARE LEARNED from served rounds (`VerifyCost::learned`): a ladder of
++        // widths, split where a step is measured next to the width in use. `IMPARO_DSPARK_CLASSES
++        // =declared` takes them from the backend instead, through the session, before it moves
++        // into the struct -- the control arm, and the only form a backend that declares nothing
++        // could not run.
++        let mut cost = if classes_declared() {
++            crate::verify_cost::VerifyCost::from_classes(
++                imparo_backend::ROW_LAYOUT_MAX_ROWS,
++                |n| session.verify_row_class(n),
++            )
++        } else {
++            crate::verify_cost::VerifyCost::learned(imparo_backend::ROW_LAYOUT_MAX_ROWS)
++        };
+         // SEED FROM THE LAST RUN so a restart does not spend its first rounds re-probing.
+-        // The stored file is keyed the way the tuner's config is keyed, so a retune reads its
+-        // own file, and it carries the widths the last run split; a file whose widths this
+-        // build's ladder cannot hold is refused whole rather than mixed.
++        // The stored file is keyed the way the tuner's config is keyed, and carries the
++        // class boundaries it was measured under; a retune that moved the GEMM tile seat
++        // moves them, and the table is then refused whole rather than mixed.
+         let key = crate::gpu_support::be().config_key();
+-        // ONE READ of the stored table. The cost side seeds from it only when this build's
+-        // ladder holds its widths; the long-run rate and the acceptance model are not kernel
+-        // measurements, so they seed from it either way.
++        // ONE READ of the stored table. The cost side seeds from it only when its row classes are
++        // this build's; the long-run rate and the acceptance model are not kernel measurements,
++        // so they seed from it either way.
+         let stored = key.as_ref().and_then(|(fp, model_bytes)| {
+             imparo_host::read_verify_cost(fp, *model_bytes)
+         });
+@@ -937,8 +956,8 @@
+                 cost.seed_gain_below(table.gain_below, table.gain_n_below);
+             } else {
+                 eprintln!(
+-                    "[imparo] dspark verify cost: the stored table's widths do not fit \
+-                     this build's ladder; measuring again"
++                    "[imparo] dspark verify cost: the stored table's row classes are \
++                     not this build's; measuring again"
+                 );
+             }
+         }
+@@ -1351,8 +1370,8 @@
+             None => None,
+             Some(TreeWidth::Fixed(n)) => Some(TreeBudget::Fixed { nodes: n, offset }),
+             Some(TreeWidth::Budget) => match self.cost.as_ref() {
+-                // No table -- the widest verify leaves no width to choose: nothing to probe and
+-                // nothing to choose from, so the round falls back to the chain.
++                // No table: nothing to probe and nothing to choose from, so the round falls
++                // back to the chain rather than guessing a width (design 9's untuned host).
+                 None => None,
+                 Some(cost) => {
+                     let probe = cost.probe();
+@@ -1469,10 +1488,10 @@
+             .filter(|&(n, _)| n <= room)
+             .collect();
+         let capped = widths.len() < all_widths.len();
+-        // THE WIDTH THE GAINS ARE MEASURED FROM. The table offers narrower widths as it finds
+-        // them; the gains must keep measuring the marginal above the same width, or the value
+-        // model changes under the cost model's feet (`Choice::base_rows`).
+-        let narrow = gain_reference(&widths);
++        // THE WIDTH THE GAINS ARE MEASURED FROM. A learned table offers narrower widths as it
++        // finds them; the gains must keep measuring the marginal above the same width, or the
++        // value model changes under the cost model's feet (`Choice::base_rows`).
++        let narrow = gain_reference(&widths, self.cost.as_ref().is_some_and(crate::verify_cost::VerifyCost::is_learned));
+         // WHO PRICES THIS ROUND. The model's probabilities carry the request's intercept, so a
+         // round it prices applies no offset on top; otherwise today's estimate takes today's.
+         let today_offset = self.offset_value();
+@@ -1610,7 +1629,7 @@
+         if tree.s.len() > 1 {
+             let hold = self.hold;
+             let rho = if rate_rule_on() { self.rate.at(start) } else { None };
+-            if let Some(cost) = self.cost.as_mut() {
++            if let Some(cost) = self.cost.as_mut().filter(|c| c.is_learned()) {
+                 if let Some(held_us) = cost.cost_us(hold) {
+                     let choice = crate::speculative::Choice {
+                         widths: &widths,
+@@ -2241,6 +2260,28 @@
+         }
+         level1_candidates(block, start).map(Some)
+     }
++    /// EVERY weight kind's answer, combined.
++    ///
++    /// The verify runs the target's projections and this session does not hold the target's
++    /// weight kinds -- its own tensors come from the drafter file. Combining over every kind
++    /// the backend declares gives a partition at least as FINE as the one the target's kind
++    /// would give, which is the safe direction: a finer class costs one extra measurement,
++    /// a coarser one would price two different row counts the same.
++    fn verify_row_class(&self, n_tok: usize) -> Option<u64> {
++        let be = crate::gpu_support::be();
++        let n = u32::try_from(n_tok).ok()?;
++        let mut acc: Option<u64> = None;
++        for (kind, _) in imparo_gguf::weights::wire_kind_types() {
++            let Some(c) = be.matmat_row_class(kind, n) else {
++                continue;
++            };
++            // FNV-1a over the declared classes: equal combined values mean every kind
++            // answered equally, which is the partition wanted.
++            let h = acc.unwrap_or(0xcbf2_9ce4_8422_2325);
++            acc = Some((h ^ c).wrapping_mul(0x0000_0100_0000_01b3));
++        }
++        acc
++    }
+     /// An append writes its own rows only, at positions the target's forward has just written.
+     fn tail_room(&self) -> Option<usize> {
+         Some(0)
+@@ -2794,16 +2835,31 @@
+     *ON.get_or_init(|| std::env::var("IMPARO_DSPARK_OFFSET").as_deref() != Ok("0"))
+ }
+ 
+-/// THE WIDTH THE GAINS ARE MEASURED FROM: the narrowest offered width of at least this many rows.
+-/// It is a reference, not a tuned value: the gain only needs a width that stays put while the table
+-/// splits narrower ones in. 8 is a width every target offered when the backend declared the classes
+-/// (the top of the 8-bit kernel's first tile), so gains stored then still measure the same marginal.
++/// Whether the budget prices a round's time at the process's long-run rate, rho, instead of the
++/// round's own ratio (design 6.6, theory item 1). The rate is measured either way; this decides
++/// only whether the width decision reads it.
++///
++/// ON by default since its gate: 16 held-out prompts, two interleaved rounds, non-inferiority.
++///
++/// ```text
++///   rho - ratio   -0.39% +- 0.46% ms/token   upper 95% bound +0.37%, margin +1.0%   answers 32/32 equal
++/// ```
++///
++/// The widths moved most at 12k-16k tokens of context, where the ratio rule sat on 8 rows and the
++/// rate widened to 9-13; that is also where the only consistent gains were.
++///
++/// THE WIDTH A LEARNED TABLE'S GAINS ARE MEASURED FROM: the narrowest offered width of at least
++/// this many rows. 8 is the narrowest width every declared table offered here (the 8-bit kernel's
++/// first class), so the learned and declared tables measure the same marginal.
+ const GAIN_BASE_ROWS: usize = 8;
+ 
+-/// The marginal's reference width (`Choice::base_rows`): the narrowest offered width of at least
+-/// `GAIN_BASE_ROWS`, or the narrowest offered when none is that wide.
+-fn gain_reference(widths: &[(usize, f64)]) -> usize {
++/// The marginal's reference width (`Choice::base_rows`): the narrowest offered width for a declared
++/// table, and for a learned one the narrowest offered width of at least `GAIN_BASE_ROWS`.
++fn gain_reference(widths: &[(usize, f64)], learned: bool) -> usize {
+     let first = widths.first().map_or(0, |&(n, _)| n);
++    if !learned {
++        return first;
++    }
+     widths
+         .iter()
+         .map(|&(n, _)| n)
+@@ -2811,19 +2867,27 @@
+         .unwrap_or(first)
+ }
+ 
+-/// Whether the budget prices a round's time at the process's long-run rate, rho, instead of the
+-/// round's own ratio (design 6.6, theory item 1). The rate is measured either way; this decides
+-/// only whether the width decision reads it.
++/// WHERE THE COST TABLE'S STEPS COME FROM. Unset or `learned`: from served rounds
++/// (`VerifyCost::learned`). `declared`: from the backend's matrix-kernel classes, the control arm
++/// the learned widths are measured against -- and which only the 8-bit kernel declares, so every
++/// other format borrows its partition.
+ ///
+-/// ON by default since its gate: 16 held-out prompts, two interleaved rounds, non-inferiority.
++/// Learned is the default on the A/B (build 2578a978, budget arm, 9 cells x 2 repeats, D L D L,
++/// store learned once per model; dspark-paper/runs/ab_classes7), learned over declared ms/token:
+ ///
+ /// ```text
+-///   rho - ratio   -0.39% +- 0.46% ms/token   upper 95% bound +0.37%, margin +1.0%   answers 32/32 equal
++///   LFM2.5-2.6B Q8     -0.8%     LFM2.5-8B-A1B      -4.1%
++///   Qwen3-4B Q4_K_M    +0.15%    Qwen3-8B Q4_K_M    +0.15%
+ /// ```
+ ///
+-/// The widths moved most at 12k-16k tokens of context, where the ratio rule sat on 8 rows and the
+-/// rate widened to 9-13; that is also where the only consistent gains were.
+-///
++/// It lost 2.3-3.4% on the Qwen3 targets until each law kept a bank of samples per context band
++/// (`CostLaw::bank`): the online law had mispriced the 8-row width at short context, and the
++/// chooser held 6 or 7 rows instead.
++fn classes_declared() -> bool {
++    static DECLARED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *DECLARED.get_or_init(|| std::env::var("IMPARO_DSPARK_CLASSES").as_deref() == Ok("declared"))
++}
++
+ /// `IMPARO_DSPARK_RHO=0` turns it off for an A/B.
+ fn rate_rule_on() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+diff --git a/crates/imparo-model/src/verify_cost.rs b/crates/imparo-model/src/verify_cost.rs
+--- a/crates/imparo-model/src/verify_cost.rs
++++ b/crates/imparo-model/src/verify_cost.rs
+@@ -16,33 +16,17 @@
+ //! it runs at, so the only cost is having run at a row count that was not optimal, for the
+ //! handful of rounds it takes to fill the table once.
+ //!
+-//! WHAT MAKES IT A HANDFUL. A matrix kernel pads to its tile, so T is flat over a range of
+-//! row counts and steps between ranges, and within a flat range S grows while T does not --
+-//! design 6.3's own observation -- which means only the LARGEST row count of a range is ever
+-//! worth running. The table calls such a range a STEP (or class) and prices it at its top.
++//! WHAT MAKES IT A HANDFUL. The backend declares a COST CLASS per row count
++//! (`Backend::matmat_row_class`): two row counts in one class run the same kernel over the
++//! same padded rows. So T is flat inside a class and can only step between classes, and
++//! within a flat step S grows while T does not -- design 6.3's own observation -- which
++//! means only the LARGEST row count of each class is ever worth running. On LFM2 with the
++//! tuned seat that is about nine counts between 2 and 64, not sixty-three.
+ //!
+-//! Measured (LFM2, 30-layer verify, 443-token context, one engine run per row count): rows
++//! Measured (30-layer verify, 443-token context, one engine run per row count): rows
+ //! 2/4/6/8 read 29.3 / 29.5 / 29.7 / 28.9 ms, rows 10/12/16 read 33.0 / 33.2 / 32.4, rows
+-//! 20/24/32 read 45.3 / 45.5 / 44.6. Flat inside a range to under 1 ms and not rising with n.
+-//!
+-//! THE STEPS ARE LEARNED, NOT DECLARED. The table starts from a ladder of widths (2, 4, 8, ...
+-//! up to the widest verify) and splits an interval only where a width inside it could be
+-//! chosen (`refine`), so it needs nothing from the backend but the rounds it serves.
+-//!
+-//! Rejected: the backend declaring its tile classes per row count. Only the 8-bit kernel ever
+-//! declared them, so every 4-bit and routed target borrowed that kernel's partition. Measured
+-//! against it (dspark-paper/runs/ab_classes7: 9 cells x 2 repeats, store learned once per model;
+-//! f55a73de is the last commit with both arms), learned over declared ms/token:
+-//!
+-//! ```text
+-//!   LFM2.5-2.6B Q8     -0.8%     LFM2.5-8B-A1B      -4.1%
+-//!   Qwen3-4B Q4_K_M    +0.15%    Qwen3-8B Q4_K_M    +0.15%
+-//! ```
+-//!
+-//! The Qwen3 targets tie because 8 rows is the best width there at every context, and the
+-//! declared partition happened to hold 8. They lost 2.3-3.4% until each law kept a bank of
+-//! samples per context band (`CostLaw::bank`): the online law had mispriced 8 rows at short
+-//! context, and the chooser held 6 or 7 rows instead.
++//! 20/24/32 read 45.3 / 45.5 / 44.6. Flat inside a class to under 1 ms and not rising with
++//! n; every step lands on a class boundary.
+ 
+ //! THE ESTIMATOR. Inside a class the cost is a constant plus noise, and the noise is
+ //! ONE-SIDED: a browser taking the GPU, a cold pipeline, a thermal drop all make a round
+@@ -156,9 +140,9 @@
+     /// within a window, which is what a rigid law cannot do and must not try to.
+     ratios: Vec<f64>,
+     ratio_next: usize,
+-    /// Samples that came back below this step's top while it was still being probed -- the
+-    /// round asked for the top and the tree had fewer nodes -- and whether that has happened
+-    /// `PROBES` times, which makes the top a width no round can build.
++    /// LEARNED STEPS ONLY: samples that came back below this step's top while it was still
++    /// being probed -- the round asked for the top and the tree had fewer nodes -- and whether
++    /// that has happened `PROBES` times, which makes the top a width no round can build.
+     short: u64,
+     unreachable: bool,
+ }
+@@ -314,19 +298,29 @@
+     /// by the rows it gives up, and every round reveals those, so they get their own scales.
+     gain_below: crate::cost_model::MarginGain,
+     gain_n_below: crate::cost_model::MarginGain,
++    /// LEARNED, not declared: the steps started from a ladder and are split where the
++    /// measurements show a step (`refine`). A declared table's steps are the backend's classes
++    /// and never move.
++    learned: bool,
+     /// The width the chooser held last round, and for how many rounds in a row.
+     incumbent: usize,
+     held: u64,
+ }
+ 
+ impl VerifyCost {
+-    /// A table that LEARNS WHERE THE COST STEPS: one step per width of a ladder (2, 4, 8, ...
+-    /// up to `max_rows`), each covering the widths down to the one below it. `refine` splits an
+-    /// interval next to the width in use when a width inside it could be chosen, so the widths
+-    /// the chooser can pick become finer exactly where the choice is made. `None` when
+-    /// `max_rows` leaves no width to choose.
++    /// A table that LEARNS WHERE THE COST STEPS instead of asking the backend: one step per
++    /// width of a ladder (2, 4, 8, ... up to `max_rows`), each covering the widths down to
++    /// the one below it. `refine` splits an interval next to the width in use when its two
++    /// ends cost different amounts, so the widths the chooser can pick become finer exactly
++    /// where the choice is made.
++    ///
++    /// ```text
++    ///   declared: classes = the kernel's tiles         needs the backend to know them
++    ///   learned:  classes = ladder, split where a step  needs nothing but served rounds
++    ///             is measured next to the chosen width
++    /// ```
+     #[must_use]
+-    pub fn new(max_rows: usize) -> Option<Self> {
++    pub fn learned(max_rows: usize) -> Option<Self> {
+         if max_rows < LADDER_START {
+             return None;
+         }
+@@ -348,11 +342,18 @@
+             gain_n: crate::cost_model::MarginGain::default(),
+             gain_below: crate::cost_model::MarginGain::default(),
+             gain_n_below: crate::cost_model::MarginGain::default(),
++            learned: true,
+             incumbent: 0,
+             held: 0,
+         })
+     }
+ 
++    /// Whether the steps are learned (`learned`) rather than declared (`from_classes`).
++    #[must_use]
++    pub fn is_learned(&self) -> bool {
++        self.learned
++    }
++
+     /// SPLITS AN INTERVAL ONLY WHERE A WIDTH INSIDE IT COULD BE CHOSEN. Called once per round,
+     /// after the chooser, with the width it holds and `could_beat(rows, us)`: whether `rows`
+     /// verified in `us` would clear the chooser's own switching bar against the held width.
+@@ -378,6 +379,9 @@
+         incumbent: usize,
+         could_beat: impl Fn(usize, f64) -> bool,
+     ) -> Option<usize> {
++        if !self.learned {
++            return None;
++        }
+         if incumbent == self.incumbent {
+             self.held += 1;
+         } else {
+@@ -421,15 +425,62 @@
+         steps.insert(b, Step::blank(lo, m));
+     }
+ 
++    /// The steps between 2 and `max_rows`, from the backend's cost classes.
++    ///
++    /// `class(n)` is the backend's answer for a verify of n rows. `None` at any row count
++    /// means the backend does not declare where its cost steps, and there is no table: a
++    /// caller must not invent a ladder, and design 9 says an untuned host drafts a chain
++    /// under the guard with no budget search.
++    #[must_use]
++    pub fn from_classes(
++        max_rows: usize,
++        class: impl Fn(usize) -> Option<u64>,
++    ) -> Option<Self> {
++        if max_rows < 2 {
++            return None;
++        }
++        let mut steps: Vec<Step> = Vec::new();
++        let mut last: Option<u64> = None;
++        for n in 2..=max_rows {
++            let c = class(n)?;
++            match (last, steps.last_mut()) {
++                (Some(prev), Some(step)) if prev == c => step.hi = n,
++                _ => steps.push(Step::blank(n, n)),
++            }
++            last = Some(c);
++        }
++        Some(Self {
++            steps,
++            fixed: Step::blank(0, 0),
++            base: None,
++            scale: 1.0,
++            at: 0,
++            gain: crate::cost_model::MarginGain::default(),
++            gain_n: crate::cost_model::MarginGain::default(),
++            gain_below: crate::cost_model::MarginGain::default(),
++            gain_n_below: crate::cost_model::MarginGain::default(),
++            learned: false,
++            incumbent: 0,
++            held: 0,
++        })
++    }
++
+     /// Folds in what a verify of `rows` rows took.
+     ///
+-    /// A STEP IS PRICED AT ITS TOP ONLY. Between two measured widths nothing says a narrower
+-    /// width costs what the top does, and a narrower sample would price the top below what it
+-    /// costs; so a row count that is not a step's top is not recorded. A probe that could not
+-    /// build its width is `unreached`'s business, told when the tree is built.
++    /// A row count with no step of its own -- one nothing would choose, such as a pinned
++    /// tree width -- folds into the class that holds it, which is the same cost by
++    /// construction.
+     pub fn observe(&mut self, rows: usize, elapsed: std::time::Duration) {
+         let (us, scale, at) = (elapsed.as_secs_f64() * 1e6, self.scale, self.at);
+-        if let Some(step) = self.steps.iter_mut().find(|s| s.hi == rows) {
++        let learned = self.learned;
++        if let Some(step) = self.steps.iter_mut().find(|s| rows >= s.lo && rows <= s.hi) {
++            // A LEARNED STEP IS PRICED AT ITS TOP ONLY. Inside a declared class every width
++            // costs the same by the backend's word; between two learned widths nothing says
++            // so, and a narrower sample would price the top below what it costs. A probe that
++            // could not build its width is `unreached`'s business, told when the tree is built.
++            if learned && rows != step.hi {
++                return;
++            }
+             step.observe(us, scale, at);
+         }
+     }
+@@ -451,7 +502,7 @@
+     /// step goes. ANY OTHER STEP a tree keeps falling short of is a width no round builds; after
+     /// `PROBES` such rounds `probe` stops asking for it, or every round would become one.
+     pub fn unreached(&mut self, asked: usize, built: usize) {
+-        if built >= asked {
++        if !self.learned || built >= asked {
+             return;
+         }
+         let last = self.steps.len().saturating_sub(1);
+@@ -582,10 +633,9 @@
+ 
+     /// Seeds the classes from a stored table, so a restarted engine does not re-probe.
+     ///
+-    /// The stored widths are split into this build's ladder first, and every stored range
+-    /// must then be one of its steps, entry for entry. A file that names any other range --
+-    /// one written by a build with a different widest verify -- is refused whole rather than
+-    /// mixed. Returns whether it took.
++    /// The ranges must match the classes THIS build derived, entry for entry. A stored file
++    /// whose boundaries differ was measured under a different GEMM tile seat -- a retune
++    /// moves them -- and is refused whole rather than mixed regimes. Returns whether it took.
+     ///
+     /// A seeded class starts with ONE sample and the scale at 1. The stored number is what
+     /// the machine did last time, at whatever context that run reached; it is a start, not a
+@@ -596,26 +646,28 @@
+             .copied()
+             .filter(|(lo, hi, _, _)| !(*lo == 0 && *hi == 0))
+             .collect();
+-        // THE WIDTHS THE STORED RUN HAD SPLIT ARE RESTORED FIRST: every stored top that is not
++        // A LEARNED TABLE FIRST RESTORES THE WIDTHS IT HAD SPLIT: every stored top that is not
+         // yet a step is split in, on a copy, so the check below sees the same steps the stored
+         // run had -- and a refused file still changes nothing.
+         let mut steps = self.steps.clone();
+-        let ladder: Vec<usize> = steps.iter().map(|s| s.hi).collect();
+-        let mut tops: Vec<usize> = classes.iter().map(|c| c.1).collect();
+-        tops.sort_unstable();
+-        tops.dedup();
+-        for &h in &tops {
+-            if let Some(b) = steps.iter().position(|s| s.lo <= h && h < s.hi) {
+-                Self::split(&mut steps, b, h);
++        if self.learned {
++            let ladder: Vec<usize> = steps.iter().map(|s| s.hi).collect();
++            let mut tops: Vec<usize> = classes.iter().map(|c| c.1).collect();
++            tops.sort_unstable();
++            tops.dedup();
++            for &h in &tops {
++                if let Some(b) = steps.iter().position(|s| s.lo <= h && h < s.hi) {
++                    Self::split(&mut steps, b, h);
++                }
+             }
+-        }
+-        // THE STORED REACH. A split always leaves the step above it stored with its samples,
+-        // and the ladder is probed from the narrow end, so a widest stored top that is not a
+-        // ladder width can only be the reach the widest step learned (`unreached`): nothing
+-        // above it is built, and nothing above it is kept.
+-        if let Some(&widest) = tops.last() {
+-            if !ladder.contains(&widest) {
+-                steps.retain(|s| s.lo <= widest);
++            // THE STORED REACH. A split always leaves the step above it stored with its samples,
++            // and the ladder is probed from the narrow end, so a widest stored top that is not a
++            // ladder width can only be the reach the widest step learned (`unreached`): nothing
++            // above it is built, and nothing above it is kept.
++            if let Some(&widest) = tops.last() {
++                if !ladder.contains(&widest) {
++                    steps.retain(|s| s.lo <= widest);
++                }
+             }
+         }
+         // EVERY STORED CLASS MUST BE ONE OF THIS BUILD'S, checked before anything is taken, so a
+@@ -915,9 +967,21 @@
+     use super::{PROBES, REFINE_HOLD, VerifyCost, WINDOW};
+     use std::time::Duration;
+ 
+-    /// A fresh table over the ladder 2, 4, 8, ... `max`.
++    /// A stand-in for the shipped LFM2 seat: the tile widens at 8, 16, 32 and 64 rows, and
++    /// the MMA's 8-row token tile splits each of those in turn.
++    fn lfm2_like(n: usize) -> u64 {
++        let tile: u64 = match n {
++            0..=8 => 8,
++            9..=16 => 16,
++            17..=32 => 32,
++            _ => 64,
++        };
++        (tile << 32) | (n as u64).div_ceil(8)
++    }
++
+     fn table(max: usize) -> VerifyCost {
+-        VerifyCost::new(max).expect("a ladder")
++        VerifyCost::from_classes(max, |n| Some(lfm2_like(n)))
++            .expect("a declared backend")
+     }
+ 
+     /// THE PRICE IS A FITTED QUANTILE NOW, NOT A MEASURED MINIMUM. `cost_model`'s law
+@@ -949,22 +1013,18 @@
+     }
+ 
+     #[test]
+-    fn the_table_starts_from_the_ladder_and_probes_it_narrow_first() {
+-        let mut t = table(64);
+-        assert_eq!(t.candidates(), vec![2, 4, 8, 16, 32, 64]);
++    fn steps_are_the_classes_and_probe_runs_their_top() {
++        let mut t = table(32);
++        assert_eq!(t.candidates(), vec![8, 16, 24, 32]);
+         assert_eq!(t.cost_us(2), None);
+-        assert_eq!(t.probe(), Some(2));
+-        feed(&mut t, 2, 12, PROBES as usize);
+-        feed(&mut t, 4, 13, PROBES as usize);
++        assert_eq!(t.probe(), Some(8));
+         feed(&mut t, 8, 29, PROBES as usize);
+         assert_eq!(t.probe(), Some(16));
+-        // Every row count up to a measured top is priced by the cheapest step that holds it.
+-        near(t.cost_us(3), 13_000.0);
+-        for n in 5..=8 {
++        // Every row count inside the class is priced at the class's measurement.
++        for n in 2..=8 {
+             near(t.cost_us(n), 29_000.0);
+         }
+         assert_eq!(t.cost_us(9), None);
+-        assert!(VerifyCost::new(1).is_none());
+     }
+ 
+     #[test]
+@@ -1091,7 +1151,7 @@
+             for (ctx, base) in [(443usize, 29u64), (1596, 30), (8444, 35)] {
+                 t.set_context(ctx);
+                 t.observe_fixed(Duration::from_millis(9));
+-                for (rows, add) in [(8u64, 0u64), (16, 4), (32, 16)] {
++                for (rows, add) in [(8u64, 0u64), (16, 4), (24, 16), (32, 16)] {
+                     t.observe(rows as usize, Duration::from_millis(base + add));
+                 }
+             }
+@@ -1122,27 +1182,28 @@
+         assert!((t.scale() - 2.0).abs() < 1e-9, "scale {}", t.scale());
+     }
+ 
+-    /// A restart starts where the last run finished.
++    /// A restart starts where the last run finished, and a retune that moved the classes
++    /// throws the file away instead of mixing regimes.
+     #[test]
+-    fn a_stored_table_seeds_a_restart() {
++    fn a_stored_table_seeds_a_restart_and_a_moved_class_refuses_it() {
+         let mut t = table(32);
+-        for (rows, ms) in [(2, 28), (4, 28), (8, 29), (16, 33), (32, 45)] {
++        for (rows, ms) in [(8, 29), (16, 33), (24, 45), (32, 45)] {
+             feed(&mut t, rows, ms, PROBES as usize);
+         }
+         // A table with no fixed cost is not complete: the budget would run on design 6.3's
+         // ratio, which is the thing this table exists to correct. It is stored all the same,
+-        // so a restart does not measure the five widths again.
+-        assert_eq!(t.probe(), Some(2), "the fixed cost still needs its samples");
++        // so a restart does not measure the four classes again.
++        assert_eq!(t.probe(), Some(8), "the fixed cost still needs its samples");
+         assert_eq!(
+             t.rows().len(),
+-            5,
++            4,
+             "the measured classes are stored before the clock"
+         );
+         for _ in 0..PROBES {
+             t.observe_fixed(Duration::from_millis(9));
+         }
+         let stored = t.rows();
+-        assert_eq!(stored.len(), 6, "five classes and the round's fixed cost");
++        assert_eq!(stored.len(), 5, "four classes and the round's fixed cost");
+ 
+         let mut fresh = table(32);
+         assert!(
+@@ -1151,9 +1212,19 @@
+         );
+         assert!(fresh.seed(&stored));
+         assert_eq!(fresh.probe(), None, "a seeded table needs no probe rounds");
+-        near(fresh.cost_us(2), 28_000.0);
++        near(fresh.cost_us(2), 29_000.0);
+         near(fresh.cost_us(24), 45_000.0);
+         near(fresh.fixed_us(), 9_000.0);
++
++        // The same host after a retune that moved the tile seat: different classes.
++        let mut moved = VerifyCost::from_classes(32, |n| Some((n as u64).div_ceil(16)))
++            .expect("a declared backend");
++        assert!(!moved.seed(&stored));
++        assert_eq!(
++            moved.probe(),
++            Some(16),
++            "refused, so it probes from scratch"
++        );
+     }
+ 
+     /// A probe cut off by the end of a request RESUMES after a restart: the classes it finished
+@@ -1161,9 +1232,9 @@
+     #[test]
+     fn a_half_probed_table_resumes_its_probe_after_a_restart() {
+         let mut t = table(32);
+-        feed(&mut t, 2, 29, PROBES as usize);
+-        feed(&mut t, 4, 30, 1);
+-        assert_eq!(t.probe(), Some(4));
++        feed(&mut t, 8, 29, PROBES as usize);
++        feed(&mut t, 16, 33, 1);
++        assert_eq!(t.probe(), Some(16));
+         let stored = t.rows();
+         assert_eq!(
+             stored.len(),
+@@ -1177,41 +1248,43 @@
+         while let Some(rows) = fresh.probe() {
+             probed.push(rows);
+             match rows {
+-                // the clock's own probe runs at the narrowest width: its rounds time the fixed cost
+-                2 => fresh.observe_fixed(Duration::from_millis(9)),
+-                w => feed(&mut fresh, w, 30 + w as u64, 1),
++                16 => feed(&mut fresh, 16, 33, 1),
++                24 => feed(&mut fresh, 24, 45, 1),
++                32 => feed(&mut fresh, 32, 45, 1),
++                // the clock's own probe: its rounds time the fixed cost
++                _ => fresh.observe_fixed(Duration::from_millis(9)),
+             }
+-            assert!(probed.len() < 30, "the probe did not end: {probed:?}");
++            assert!(probed.len() < 20, "the probe did not end: {probed:?}");
+         }
+-        let mut want = vec![4; PROBES as usize - 1];
+-        for w in [8, 16, 32] {
+-            want.extend(vec![w; PROBES as usize]);
+-        }
+-        want.extend(vec![2; PROBES as usize]);
++        let short = PROBES as usize - 1;
++        let mut want = vec![16; short];
++        want.extend(vec![24; PROBES as usize]);
++        want.extend(vec![32; PROBES as usize]);
++        want.extend(vec![8; PROBES as usize]);
+         assert_eq!(
+             probed, want,
+-            "the 2-row class was probed again, or 4 started over"
++            "the 8-row class was probed again, or 16 started over"
+         );
+-        near(fresh.cost_us(2), 29_000.0);
++        near(fresh.cost_us(8), 29_000.0);
+     }
+ 
+     /// A class a wider one beats on price is not offered at all: sending its rows would
+     /// pay ITS cost, not the cheaper one the monotone price quotes.
+     #[test]
+     fn the_envelope_drops_a_class_a_wider_one_beats() {
+-        let mut t = table(64);
++        let mut t = table(32);
+         feed(&mut t, 8, 29, PROBES as usize);
+         feed(&mut t, 16, 33, PROBES as usize);
+-        feed(&mut t, 32, 79, PROBES as usize); // the 64-token tile's inversion
+-        feed(&mut t, 64, 67, PROBES as usize);
++        feed(&mut t, 24, 79, PROBES as usize); // the 64-token tile's inversion
++        feed(&mut t, 32, 67, PROBES as usize);
+         // The SHAPE is exact -- which classes survive -- and the prices are the law's.
+         let offered: Vec<usize> = t.envelope().iter().map(|&(n, _)| n).collect();
+         assert_eq!(
+             offered,
+-            vec![8, 16, 64],
+-            "32 rows at 79 ms is beaten by 64 rows at 67"
++            vec![8, 16, 32],
++            "24 rows at 79 ms is beaten by 32 rows at 67"
+         );
+-        for (n, want) in [(8, 29_000.0), (16, 33_000.0), (64, 67_000.0)] {
++        for (n, want) in [(8, 29_000.0), (16, 33_000.0), (32, 67_000.0)] {
+             near(
+                 t.envelope()
+                     .iter()
+@@ -1224,10 +1297,16 @@
+         near(t.cost_us(24), 67_000.0);
+     }
+ 
+-    /// A table with every ladder width priced from `ms(width)` and its clock ticked, so `probe`
+-    /// has nothing left to ask for.
++    #[test]
++    fn a_backend_that_declares_nothing_yields_no_table() {
++        assert!(VerifyCost::from_classes(32, |_| None).is_none());
++        assert!(VerifyCost::from_classes(1, |n| Some(lfm2_like(n))).is_none());
++    }
++
++    /// A learned table with every ladder width priced from `ms(width)` and its clock ticked, so
++    /// `probe` has nothing left to ask for.
+     fn learned_full(ms: impl Fn(usize) -> u64) -> VerifyCost {
+-        let mut t = table(64);
++        let mut t = VerifyCost::learned(64).expect("a ladder");
+         for w in t.candidates() {
+             feed(&mut t, w, ms(w), PROBES as usize);
+         }
+@@ -1277,6 +1356,15 @@
+     }
+ 
+     #[test]
++    fn a_learned_table_starts_from_the_ladder_and_probes_it() {
++        let t = VerifyCost::learned(64).expect("a ladder");
++        assert!(t.is_learned());
++        assert_eq!(t.candidates(), vec![2, 4, 8, 16, 32, 64]);
++        assert_eq!(t.probe(), Some(2));
++        assert!(VerifyCost::learned(1).is_none());
++    }
++
++    #[test]
+     fn a_step_no_width_inside_could_win_is_never_probed() {
+         // The 4-bit shape: flat to 8 rows, then a 50% step -- and past 8 rows the tree's tokens
+         // barely grow, so no width in 8..16 can pay for more time than 8 rows take.
+@@ -1329,8 +1417,19 @@
+     }
+ 
+     #[test]
+-    fn a_step_is_priced_by_its_top_only() {
+-        let mut t = table(64);
++    fn a_declared_table_never_splits() {
++        let mut t = table(32);
++        for w in t.candidates() {
++            feed(&mut t, w, 10 + w as u64, PROBES as usize);
++        }
++        tick(&mut t, 9.0, PROBES as usize);
++        assert!(!t.is_learned());
++        assert_eq!(hold(&mut t, 16, 4 * REFINE_HOLD, &linear), None);
++    }
++
++    #[test]
++    fn a_learned_step_is_priced_by_its_top_only() {
++        let mut t = VerifyCost::learned(64).expect("a ladder");
+         // 10 rows is inside the 9..16 step; its time says nothing certain about 16 rows.
+         feed(&mut t, 10, 20, PROBES as usize);
+         assert!(t.steps().iter().all(|s| s.seen == 0));
+@@ -1340,7 +1439,7 @@
+ 
+     #[test]
+     fn the_widest_step_learns_how_wide_a_tree_can_be() {
+-        let mut t = table(64);
++        let mut t = VerifyCost::learned(64).expect("a ladder");
+         for w in [2, 4, 8, 16, 32] {
+             feed(&mut t, w, 10 + w as u64, PROBES as usize);
+         }
+@@ -1358,7 +1457,7 @@
+ 
+     #[test]
+     fn a_middle_top_no_tree_reaches_stops_being_probed() {
+-        let mut t = table(64);
++        let mut t = VerifyCost::learned(64).expect("a ladder");
+         for w in [2, 4, 8] {
+             feed(&mut t, w, 10 + w as u64, PROBES as usize);
+         }
+@@ -1375,7 +1474,7 @@
+     /// the seed left a 58..64 step no tree reaches, probed every round. The stored reach is kept.
+     #[test]
+     fn a_restarted_table_keeps_the_reach_it_learned() {
+-        let mut t = table(64);
++        let mut t = VerifyCost::learned(64).expect("a ladder");
+         for w in [2, 4, 8, 16, 32] {
+             feed(&mut t, w, 10 + w as u64, PROBES as usize);
+         }
+@@ -1384,35 +1483,40 @@
+         feed(&mut t, 57, 70, PROBES as usize);
+         assert_eq!(t.probe(), None);
+         let rows = t.rows();
+-        let mut restarted = table(64);
++        let mut restarted = VerifyCost::learned(64).expect("a ladder");
+         assert!(restarted.seed(&rows));
+         assert_eq!(restarted.candidates(), vec![2, 4, 8, 16, 32, 57]);
+         assert_eq!(restarted.probe(), None);
+         // A table stored mid-probe, its widest stored top a ladder width, keeps the rest to probe.
+-        let mut early = table(64);
++        let mut early = VerifyCost::learned(64).expect("a ladder");
+         feed(&mut early, 2, 12, PROBES as usize);
+-        let mut again = table(64);
++        let mut again = VerifyCost::learned(64).expect("a ladder");
+         assert!(again.seed(&early.rows()));
+         assert_eq!(again.candidates(), vec![2, 4, 8, 16, 32, 64]);
+     }
+ 
+     #[test]
+-    fn a_stored_table_restores_its_splits() {
++    fn a_stored_learned_table_restores_its_splits() {
+         let mut t = learned_full(|w| if w <= 8 { 26 } else { 40 });
+         assert_eq!(hold(&mut t, 8, REFINE_HOLD + 1, &linear), Some(9));
+         feed(&mut t, 9, 40, PROBES as usize);
+         let rows = t.rows();
+-        let mut restarted = table(64);
++        let mut restarted = VerifyCost::learned(64).expect("a ladder");
+         assert!(restarted.seed(&rows));
+         assert_eq!(restarted.candidates(), vec![2, 4, 8, 9, 16, 32, 64]);
+         // A row the ladder cannot hold is refused, and the refusal changes nothing.
+-        let mut other = table(64);
++        let mut other = VerifyCost::learned(64).expect("a ladder");
+         assert!(!other.seed(&[(5, 70, 1000.0, 3)]));
+         assert_eq!(other.candidates(), vec![2, 4, 8, 16, 32, 64]);
+-        // So is a file from a build whose widest verify was wider: its widest step does not fit.
+-        let mut narrower = table(48);
+-        assert!(!narrower.seed(&rows));
+-        assert_eq!(narrower.candidates(), vec![2, 4, 8, 16, 32, 48]);
++    }
++
++    #[test]
++    fn a_row_count_off_the_class_tops_still_prices_its_class() {
++        let mut t = table(32);
++        // A pinned tree of 20 rows reports into the 17..24 class, whose top is 24.
++        feed(&mut t, 20, 45, PROBES as usize);
++        near(t.cost_us(24), 45_000.0);
++        assert_eq!(t.probe(), Some(8));
+     }
+ }
+ 

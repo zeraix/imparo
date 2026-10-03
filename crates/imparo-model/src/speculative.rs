@@ -109,10 +109,39 @@ impl DraftTally {
     }
 }
 
+/// How this verification actually submitted its target work, not whether a
+/// graph was eligible. Unknown keeps uninstrumented adapters out of cost classes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TreeSubmission {
+    #[default]
+    Unknown,
+    Ordinary,
+    Capture,
+    Replayed,
+}
+
+/// One successful speculative transaction, including its accepted history commit.
+/// Target KV/recurrent commit is already inside `verify`; `commit` measures only
+/// the additional drafter/history work. Tail rounds are censored for rate learning.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeRoundTiming {
+    pub context: usize,
+    pub rows: usize,
+    /// Accepted input rows including the anchor, unlike `DraftTally`.
+    pub accepted: usize,
+    pub fixed: std::time::Duration,
+    pub verify: std::time::Duration,
+    pub commit: std::time::Duration,
+    pub total: std::time::Duration,
+    pub submission: TreeSubmission,
+    pub continuing: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct TreeVerification {
     pub path: Vec<i32>,
     pub next_token: u32,
+    pub submission: TreeSubmission,
 }
 
 /// A node the tree builder may place: its token, the candidate it hangs from (-1 for the anchor)
@@ -192,6 +221,10 @@ pub struct Choice<'a> {
     pub gain: f64,
     /// The same scale for the marginal the n-gram's and agreed nodes carry.
     pub gain_n: f64,
+    /// The two scales for a width BELOW `base_rows`, `(g_d, g_n)`: what the rows it gives up are
+    /// worth. Fitted on every round's revealed prefixes, not on the wide rounds `gain` comes
+    /// from (`VerifyCost::gain_below`).
+    pub gain_below: (f64, f64),
     /// The width this provider is currently sitting on, or 0 before the first round. The
     /// budget keeps it unless an alternative clears it by `switch_margin`.
     pub hold: usize,
@@ -385,11 +418,13 @@ fn probe_choice(s: &[f64], s_n: &[f64], order_len: usize, choice: &Choice<'_>, k
         })
         .collect();
     eprintln!(
-        "dspark choose kept={keep} hold={} fixed_us={:.1} gain={:.4} gain_n={:.4} rho={} order={order_len} widths={}",
+        "dspark choose kept={keep} hold={} fixed_us={:.1} gain={:.4} gain_n={:.4} gain_below={:.4} gain_n_below={:.4} rho={} order={order_len} widths={}",
         choice.hold,
         choice.fixed_us,
         choice.gain,
         choice.gain_n,
+        choice.gain_below.0,
+        choice.gain_below.1,
         choice
             .rho
             .map_or_else(|| "-".to_string(), |r| format!("{:.3}", r * 1e6)),
@@ -892,8 +927,10 @@ pub(crate) struct Valuer<'a> {
     order_len: usize,
     base_s: f64,
     base_n: f64,
+    base_keep: usize,
     gain: f64,
     gain_n: f64,
+    gain_below: (f64, f64),
     fixed_us: f64,
     rho: Option<f64>,
 }
@@ -921,20 +958,28 @@ impl<'a> Valuer<'a> {
             order_len,
             base_s: s.get(base_keep).copied().unwrap_or(0.0),
             base_n: s_n.get(base_keep).copied().unwrap_or(0.0),
+            base_keep,
             gain: choice.gain,
             gain_n: choice.gain_n,
+            gain_below: choice.gain_below,
             fixed_us: choice.fixed_us,
             rho,
         }
     }
 
     /// Expected tokens a round commits when it keeps `keep` nodes: each source's marginal by its
-    /// own gain, design 6.6's `g_d dS_d(n) + g_n dS_n(n)`.
+    /// own gain, design 6.6's `g_d dS_d(n) + g_n dS_n(n)`. Below the reference the marginal is
+    /// negative -- the rows the width gives up -- and is scaled by the gains fitted on those rows.
     pub(crate) fn tokens(&self, keep: usize) -> f64 {
         let raw = self.s.get(keep).copied().unwrap_or(0.0);
         let raw_n = self.s_n.get(keep).copied().unwrap_or(0.0);
         let (d_n, d_all) = (raw_n - self.base_n, raw - self.base_s);
-        1.0 + self.base_s + self.gain * (d_all - d_n) + self.gain_n * d_n
+        let (g_d, g_n) = if keep < self.base_keep {
+            self.gain_below
+        } else {
+            (self.gain, self.gain_n)
+        };
+        1.0 + self.base_s + g_d * (d_all - d_n) + g_n * d_n
     }
 
     pub(crate) fn value(&self, keep: usize, us: f64) -> f64 {
@@ -1083,6 +1128,16 @@ pub trait DraftProvider {
     /// again every time, so a narrower tree does not save all of what it looks like it saves.
     fn observe_round_fixed(&mut self, _elapsed: std::time::Duration) {}
 
+    /// A complete successful tree round, reported once after its history commit
+    /// or tail keep. Failed verification/commit, abstention and chain fallback do
+    /// not report a sample. Existing verify/fixed observers retain their ordering.
+    fn observe_tree_round(&mut self, _tree: &DraftTree, _timing: &TreeRoundTiming) {}
+
+    /// Opt-in observation of the existing chain, without changing its proposal,
+    /// verification or commit. Unknown submission modes cannot teach a price.
+    fn observes_chain_round(&self) -> bool { false }
+    fn observe_chain_round(&mut self, _timing: &TreeRoundTiming) {}
+
     /// Target inputs per block, including its unconsumed anchor.
     fn block_size(&self) -> usize;
     /// Smallest remaining output budget worth a full physical verification.
@@ -1142,6 +1197,53 @@ pub trait DraftProvider {
         Ok(())
     }
 }
+
+/// Called only after the target has successfully verified and committed a tree.
+/// Keeping the observation beside the fallible history commit prevents rejected
+/// or partially committed rounds from becoming cost samples.
+fn commit_observed_tree<D: DraftProvider + ?Sized>(
+    provider: &mut D,
+    tree: &DraftTree,
+    path: &[i32],
+    inputs: &[u32],
+    next: u32,
+    started: std::time::Instant,
+    mut timing: TreeRoundTiming,
+) -> Result<(), String> {
+    if !timing.continuing && !provider.keeps_rows(timing.context, inputs.len()) {
+        return Ok(());
+    }
+    let commit_at = std::time::Instant::now();
+    if timing.continuing {
+        provider.commit_tree(timing.context, inputs, path, next)?;
+    } else {
+        provider.keep_tree(timing.context, inputs, path)?;
+    }
+    timing.commit = commit_at.elapsed();
+    timing.total = started.elapsed();
+    provider.observe_tree_round(tree, &timing);
+    Ok(())
+}
+
+/// Keep the chain's existing commit/tail behavior; observe only after success.
+/// The same full-round clock as tree includes drafting and target state commit.
+fn commit_observed_chain<D: DraftProvider + ?Sized>(
+    provider: &mut D,
+    inputs: &[u32],
+    started: std::time::Instant,
+    mut timing: TreeRoundTiming,
+) -> Result<(), String> {
+    if !timing.continuing && !provider.keeps_rows(timing.context, inputs.len()) {
+        return Ok(());
+    }
+    let commit_at = std::time::Instant::now();
+    provider.commit(timing.context, inputs)?;
+    timing.commit = commit_at.elapsed();
+    timing.total = started.elapsed();
+    provider.observe_chain_round(&timing);
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
     Limit,
@@ -1339,13 +1441,12 @@ impl GreedyCursor {
         // weight once for all of them. Left to the prefill route, a 9-row drafter block read
         // LFM2.5-8B-A1B's Q6_K lm head once per row and a 10-row verify decoded a padded tile:
         // drafter 21.5 -> 11.0 ms, verify 44.3 -> 26.9 ms a round.
-        let be = crate::backend::active();
-        if let Some(be) = be {
-            be.set_decode_rows(Some(imparo_backend::RowRoute::Fast));
-        }
+        // Keep this projection hint separate from independent-slot co-batching:
+        // CUDA's co-batch owner excludes verification graphs and tree contexts.
+        let be = crate::backend::active().filter(|be| be.set_speculative_rows(true));
         let round = self.refill_round(target, provider);
         if let Some(be) = be {
-            be.set_decode_rows(None);
+            be.set_speculative_rows(false);
         }
         round
     }
@@ -1458,6 +1559,8 @@ impl GreedyCursor {
             let mut selected_path = None;
             let probe_rows = tree.as_ref().map_or(input.len(), |t| t.tokens.len());
             let probe_verify_at = round_probe().then(std::time::Instant::now);
+            let mut selected_tree = None;
+            let mut chain_timing = None;
             let (v, accepted_inputs) = if let Some(tree) = tree {
                 // The clock spans the whole verify because that is what the provider's
                 // choice buys or spends: the rows go in, the accepted path comes back, and
@@ -1465,7 +1568,8 @@ impl GreedyCursor {
                 let at = std::time::Instant::now();
                 let result =
                     target.verify_greedy_tree(&tree, old, commit_limit, &self.stops)?;
-                provider.observe_verify(tree.tokens.len(), at.elapsed());
+                let verify_elapsed = at.elapsed();
+                provider.observe_verify(tree.tokens.len(), verify_elapsed);
                 self.drafted.tree(&tree, &result.path);
                 if score_probe() {
                     // The stop set once, so an offline pass can count stop-token nodes.
@@ -1497,9 +1601,14 @@ impl GreedyCursor {
                     consumed: inputs.len(),
                     next_token: result.next_token,
                 };
+                selected_tree = Some((tree, result.submission, verify_elapsed));
                 selected_path = Some(result.path);
                 (v, inputs)
             } else {
+                let at = provider.observes_chain_round().then(|| {
+                    target.state_mut().tree_submission = TreeSubmission::Unknown;
+                    std::time::Instant::now()
+                });
                 // A CHAIN IS THE TREE WITH ONE CHILD PER NODE, and the tree verify runs the row
                 // layout's attention (packed heads, key split) where the block verify runs the
                 // causal batch's. Measured before this route (Qwen3-4B, 8,444 keys): an 8-row
@@ -1519,12 +1628,14 @@ impl GreedyCursor {
                     Some(t) if target.prepare_greedy_tree(&t, old)? => Some(t),
                     _ => None,
                 };
+                let mut tree_submission = None;
                 let v = if let Some(t) = chain_tree {
                     let result = target.verify_greedy_tree(&t, old, commit_limit, &self.stops)?;
                     // The accepted path of a chain is its first rows in order.
                     if result.path.iter().enumerate().any(|(i, &r)| usize::try_from(r) != Ok(i)) {
                         return Err("chain verified as a tree returned a non-prefix path".into());
                     }
+                    tree_submission = Some(result.submission);
                     crate::GreedyVerification {
                         consumed: result.path.len(),
                         next_token: result.next_token,
@@ -1534,6 +1645,9 @@ impl GreedyCursor {
                 } else {
                     target.verify_greedy_block(&input, old)?
                 };
+                chain_timing = at.map(|at| {
+                    (at.elapsed(), tree_submission.unwrap_or(target.state().tree_submission))
+                });
                 let inputs = input
                     .get(..v.consumed)
                     .ok_or("invalid accepted range")?
@@ -1587,18 +1701,38 @@ impl GreedyCursor {
             // goes into the history unlearned when the provider keeps it, so the history ends
             // where the stream ends and the next turn can resume at the stream's grid point.
             let probe_commit_at = round_probe().then(std::time::Instant::now);
-            if self.drafts_again(provider, pos) {
-                if let Some(path) = selected_path {
-                    provider.commit_tree(old, &accepted_inputs, &path, v.next_token)?;
-                } else {
-                    provider.commit(old, &accepted_inputs)?;
-                }
-            } else if provider.keeps_rows(old, v.consumed) {
-                if let Some(path) = selected_path {
-                    provider.keep_tree(old, &accepted_inputs, &path)?;
-                } else {
-                    provider.commit(old, &accepted_inputs)?;
-                }
+            let continuing = self.drafts_again(provider, pos);
+            if let (Some((tree, submission, verify_elapsed)), Some(path)) =
+                (selected_tree, selected_path)
+            {
+                commit_observed_tree(
+                    provider,
+                    &tree,
+                    &path,
+                    &accepted_inputs,
+                    v.next_token,
+                    fixed_at,
+                    TreeRoundTiming {
+                        context: old,
+                        rows: tree.tokens.len(),
+                        accepted: v.consumed,
+                        fixed: round_fixed,
+                        verify: verify_elapsed,
+                        commit: std::time::Duration::ZERO,
+                        total: std::time::Duration::ZERO,
+                        submission,
+                        continuing,
+                    },
+                )?;
+            } else if let Some((verify, submission)) = chain_timing {
+                commit_observed_chain(provider, &accepted_inputs, fixed_at, TreeRoundTiming {
+                    context: old, rows: input.len(), accepted: v.consumed,
+                    fixed: round_fixed, verify, submission, continuing,
+                    commit: std::time::Duration::ZERO,
+                    total: std::time::Duration::ZERO,
+                })?;
+            } else if continuing || provider.keeps_rows(old, v.consumed) {
+                provider.commit(old, &accepted_inputs)?;
             }
             if let (Some(verify), Some(commit_at)) = (probe_verify, probe_commit_at) {
                 eprintln!(
@@ -1912,6 +2046,167 @@ impl DraftSpec {
 mod tests {
     use super::{TreeCandidate, acceptance_labels, best_first_tree, budgeted_tree};
 
+    #[derive(Default)]
+    struct RoundObserver {
+        keep_tail: bool,
+        fail: bool,
+        events: Vec<&'static str>,
+        timings: Vec<super::TreeRoundTiming>,
+    }
+
+    impl super::DraftProvider for RoundObserver {
+        fn block_size(&self) -> usize {
+            3
+        }
+        fn draft(
+            &mut self,
+            _target: &mut dyn crate::Model,
+            _start: usize,
+            _anchor: u32,
+        ) -> Result<Vec<u32>, String> {
+            unreachable!("the fixture starts after successful target verification")
+        }
+        fn keeps_rows(&self, _start: usize, _n: usize) -> bool {
+            self.keep_tail
+        }
+        fn commit(&mut self, start: usize, inputs: &[u32]) -> Result<(), String> {
+            assert_eq!((start, inputs), (512, &[10, 11][..]));
+            self.events.push("chain-commit");
+            if self.fail { Err("history commit failed".into()) } else { Ok(()) }
+        }
+        fn observe_chain_round(&mut self, timing: &super::TreeRoundTiming) {
+            self.events.push("chain-observe");
+            self.timings.push(*timing);
+        }
+        fn commit_tree(
+            &mut self,
+            start: usize,
+            inputs: &[u32],
+            path: &[i32],
+            next: u32,
+        ) -> Result<(), String> {
+            assert_eq!((start, inputs, path, next), (512, &[10, 11][..], &[0, 1][..], 99));
+            self.events.push("commit");
+            if self.fail { Err("history commit failed".into()) } else { Ok(()) }
+        }
+        fn keep_tree(
+            &mut self,
+            start: usize,
+            inputs: &[u32],
+            path: &[i32],
+        ) -> Result<(), String> {
+            assert_eq!((start, inputs, path), (512, &[10, 11][..], &[0, 1][..]));
+            self.events.push("keep");
+            if self.fail { Err("history keep failed".into()) } else { Ok(()) }
+        }
+        fn observe_tree_round(
+            &mut self,
+            tree: &super::DraftTree,
+            timing: &super::TreeRoundTiming,
+        ) {
+            assert_eq!(tree.tokens, [10, 11, 12]);
+            self.events.push("observe");
+            self.timings.push(*timing);
+        }
+    }
+
+    fn observe_round(
+        provider: &mut RoundObserver,
+        continuing: bool,
+    ) -> Result<(), String> {
+        use std::time::{Duration, Instant};
+        super::commit_observed_tree(
+            provider,
+            &super::DraftTree::plain(vec![10, 11, 12], vec![-1, 0, 1]),
+            &[0, 1],
+            &[10, 11],
+            99,
+            Instant::now() - Duration::from_millis(3),
+            super::TreeRoundTiming {
+                context: 512,
+                rows: 3,
+                accepted: 2,
+                fixed: Duration::from_millis(1),
+                verify: Duration::from_millis(2),
+                commit: Duration::ZERO,
+                total: Duration::ZERO,
+                submission: super::TreeSubmission::Replayed,
+                continuing,
+            },
+        )
+    }
+
+    #[test]
+    fn tree_round_is_observed_once_after_successful_history_commit() {
+        let mut provider = RoundObserver::default();
+        observe_round(&mut provider, true).unwrap();
+        assert_eq!(provider.events, ["commit", "observe"]);
+        assert_eq!(provider.timings.len(), 1);
+        let timing = provider.timings[0];
+        assert_eq!((timing.context, timing.rows, timing.accepted), (512, 3, 2));
+        assert_eq!(timing.submission, super::TreeSubmission::Replayed);
+        assert!(timing.continuing);
+        assert!(timing.total >= timing.fixed + timing.verify + timing.commit);
+    }
+
+    #[test]
+    fn tree_round_kept_tail_is_censored_and_unkept_tail_has_no_sample() {
+        let mut provider = RoundObserver { keep_tail: true, ..RoundObserver::default() };
+        observe_round(&mut provider, false).unwrap();
+        assert_eq!(provider.events, ["keep", "observe"]);
+        assert_eq!(provider.timings.len(), 1);
+        assert!(!provider.timings[0].continuing);
+
+        let mut provider = RoundObserver::default();
+        observe_round(&mut provider, false).unwrap();
+        assert!(provider.events.is_empty());
+        assert!(provider.timings.is_empty());
+    }
+
+    #[test]
+    fn tree_round_failed_history_commit_or_keep_has_no_sample() {
+        for continuing in [true, false] {
+            let mut provider = RoundObserver {
+                keep_tail: true,
+                fail: true,
+                ..RoundObserver::default()
+            };
+            assert!(observe_round(&mut provider, continuing).is_err());
+            assert_eq!(provider.events, [if continuing { "commit" } else { "keep" }]);
+            assert!(provider.timings.is_empty());
+        }
+    }
+
+    #[test]
+    fn chain_cost_observation_preserves_commit_and_censors_tail_or_failure() {
+        use std::time::{Duration, Instant};
+        for (continuing, keep_tail, fail, commits, observes) in [
+            (true, false, false, true, true),
+            (false, true, false, true, true),
+            (false, false, false, false, false),
+            (true, false, true, true, false),
+            (false, true, true, true, false),
+        ] {
+            let mut provider = RoundObserver { keep_tail, fail, ..RoundObserver::default() };
+            let result = super::commit_observed_chain(&mut provider, &[10, 11],
+                Instant::now() - Duration::from_millis(3), super::TreeRoundTiming {
+                    context: 512, rows: 3, accepted: 2, continuing,
+                    fixed: Duration::from_millis(1), verify: Duration::from_millis(2),
+                    commit: Duration::ZERO, total: Duration::ZERO,
+                    submission: super::TreeSubmission::Replayed,
+                });
+            assert_eq!(result.is_err(), fail && commits);
+            assert_eq!(provider.events.contains(&"chain-commit"), commits);
+            assert_eq!(provider.events.contains(&"chain-observe"), observes);
+            assert_eq!(provider.timings.len(), usize::from(observes));
+            for timing in provider.timings {
+                assert_eq!(timing.continuing, continuing);
+                assert_eq!((timing.rows, timing.accepted), (3, 2));
+                assert!(timing.total >= timing.fixed + timing.verify + timing.commit);
+            }
+        }
+    }
+
     /// `budgeted_tree` at anchor 5 with no stop tokens, no offset and an untrained gain; the
     /// per-round ratio unless `rho` is given.
     fn budget(
@@ -1926,6 +2221,7 @@ mod tests {
             fixed_us,
             gain: 1.0,
             gain_n: 1.0,
+            gain_below: (1.0, 1.0),
             hold,
             offset: 0.0,
             rho,
@@ -2031,6 +2327,37 @@ mod tests {
             }
         );
         assert_eq!(by_hand.total(), by_hand.drafter);
+    }
+
+    /// A width below the reference prices the rows it gives up with the gains fitted on those rows.
+    #[test]
+    fn a_width_below_the_reference_is_priced_by_the_gain_fitted_below_it() {
+        // S over the best-first order, keep k -> s[k]; the reference is 8 rows (keep 7).
+        let s = [0.0, 0.9, 1.6, 2.2, 2.7, 3.1, 3.4, 3.6, 3.75, 3.85];
+        let none = [0.0; 10];
+        let widths = [(4, 100.0), (8, 100.0), (10, 100.0)];
+        let choice = |below: f64| super::Choice {
+            widths: &widths,
+            fixed_us: 0.0,
+            gain: 0.25,
+            gain_n: 1.0,
+            gain_below: (below, 1.0),
+            hold: 8,
+            offset: 0.0,
+            rho: None,
+            base_rows: 8,
+        };
+        let (c, low) = (choice(1.0), choice(0.25));
+        let v = super::Valuer::new(&s, &none, s.len() - 1, &c, None);
+        // 4 rows give up s[7] - s[3] = 1.4 nodes, at the scale fitted below the reference ...
+        assert!((v.tokens(3) - (1.0 + 3.6 - 1.4)).abs() < 1e-9);
+        // ... and 10 rows add s[9] - s[7] = 0.25 at the scale fitted above it.
+        assert!((v.tokens(9) - (1.0 + 3.6 + 0.25 * 0.25)).abs() < 1e-9);
+        // The single scale this replaces discounted what 4 rows give up as well, so a narrow
+        // width looked almost as productive as the reference.
+        let w = super::Valuer::new(&s, &none, s.len() - 1, &low, None);
+        assert!((w.tokens(3) - (1.0 + 3.6 - 0.25 * 1.4)).abs() < 1e-9);
+        assert!(w.tokens(3) > v.tokens(3));
     }
 
     /// THE EXPLORATION ROW: the last row of the width goes to the frontier's n-gram node in the

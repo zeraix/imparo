@@ -28,6 +28,59 @@ int main() {
     assert(physical_row(512, 511, pair_swap) == 0);
     assert(physical_row(520, 511, pair_swap) == 8);
 
+    // Prefix bounds use all identity-filled entries, including those beyond an
+    // installed prefix (a freshly built identity table has installed_len == 0).
+    PageTableLayer prefix;
+    prefix.capacity = 208;
+    prefix.max_entry = 207;
+    prefix.host_shadow.resize(prefix.capacity);
+    for (uint32_t i = 0; i < prefix.capacity; ++i) prefix.host_shadow[i] = i;
+    uint64_t extent = 999;
+    assert(prefix.installed_len == 0);
+    assert(mapped_prefix_rows(prefix, 6145, &extent) && extent == 6145);
+    assert(mapped_prefix_rows(prefix, 13312, &extent) && extent == 13312);
+    for (uint32_t i = 0; i < 97; ++i) prefix.host_shadow[i] = 98 + i;
+    assert(mapped_prefix_rows(prefix, 6145, &extent) && extent == 98 * 64 + 6145);
+    assert(mapped_prefix_rows(prefix, 6144, &extent) && extent == 98 * 64 + 6144);
+    // Only one row of the highest mapped last page is live.
+    prefix.host_shadow[96] = 207;
+    assert(mapped_prefix_rows(prefix, 6145, &extent) && extent == 207 * 64 + 1);
+    // A higher earlier page contributes all 64 rows; the last page alone cannot
+    // determine the extent of a non-monotonic mapping.
+    prefix.host_shadow[0] = 206;
+    prefix.host_shadow[96] = 194;
+    assert(mapped_prefix_rows(prefix, 6145, &extent) && extent == 207 * 64);
+    // Unused tail entries are not part of this live prefix.
+    prefix.host_shadow[97] = UINT32_MAX;
+    assert(mapped_prefix_rows(prefix, 6145, &extent) && extent == 207 * 64);
+
+    PageTableLayer empty;
+    assert(mapped_prefix_rows(empty, 0, &extent) && extent == 0);
+    assert(mapped_prefix_rows(prefix, 0, &extent) && extent == 0);
+    extent = 999;
+    assert(!mapped_prefix_rows(empty, 1, &extent) && extent == 999);
+    assert(!mapped_prefix_rows(prefix, 13313, &extent) && extent == 999);
+    assert(!mapped_prefix_rows(prefix, 1, nullptr));
+    auto malformed = prefix;
+    malformed.host_shadow.pop_back();
+    assert(!mapped_prefix_rows(malformed, 1, &extent) && extent == 999);
+    malformed = prefix;
+    malformed.host_shadow.push_back(0);
+    assert(!mapped_prefix_rows(malformed, 0, &extent) && extent == 999);
+    malformed = prefix;
+    malformed.host_shadow[0] = prefix.max_entry + 1;
+    assert(!mapped_prefix_rows(malformed, 1, &extent) && extent == 999);
+
+    PageTableLayer edge;
+    edge.capacity = 1;
+    edge.max_entry = UINT32_MAX;
+    edge.host_shadow = {UINT32_MAX / kPageCells};
+    assert(mapped_prefix_rows(edge, 64, &extent) && extent == uint64_t(UINT32_MAX) + 1);
+    assert(physical_row(63, 0, edge.host_shadow.data()) == UINT32_MAX);
+    edge.host_shadow[0] += 1;
+    extent = 999;
+    assert(!mapped_prefix_rows(edge, 1, &extent) && extent == 999);
+
     constexpr uint32_t MaxLayers = 4;
     const uint64_t bytes[] = {0, 127 * 16};
     const PagingLayout layout[] = {

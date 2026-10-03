@@ -476,6 +476,13 @@ pub fn batch(
     if !pipe.is_some_and(|p| p.token_on_device) {
         be().write_u32(BufId::Tokens, 0, tokens);
     }
+    // The native tree verifier reads this only after a successful forward.
+    // Ordinary is the path actually entered below; graph eligibility alone never
+    // labels a replay. General row-layout verification leaves its result Unknown.
+    #[cfg(feature = "cuda-speculative")]
+    if row_argmax && row_layout == 0 && b > 1 {
+        wf.state.tree_submission = crate::speculative::TreeSubmission::Ordinary;
+    }
     #[cfg(feature = "cuda-speculative")]
     let (tree_graph_capture, tree_graph_flush) = if tree_graph_eligible(wf, b, argmax) {
         // Preserve bounded-flush bookkeeping on both ordinary and replay paths.
@@ -484,9 +491,11 @@ pub fn batch(
         match unsafe { imparo_cuda::tree::graph_prepare()? } {
             imparo_cuda::tree::TreeGraphSubmission::Ordinary => (None, Some(flush)),
             imparo_cuda::tree::TreeGraphSubmission::Capture(capture) => {
+                wf.state.tree_submission = crate::speculative::TreeSubmission::Capture;
                 (Some(capture), Some(flush))
             }
             imparo_cuda::tree::TreeGraphSubmission::Replayed => {
+                wf.state.tree_submission = crate::speculative::TreeSubmission::Replayed;
                 be().end()
                     .map_err(|rc| format!("lfm2 tree graph replay failed rc={rc}"))?;
                 crate::gpu_support::prefill_region_ended();
@@ -1634,16 +1643,20 @@ pub fn batch(
 /// every row with its position and slot.
 ///
 /// # Errors
-/// For a quantized cache, a backend without decode rows or a per-row operation, or a device
-/// failure.
+/// For unsupported KV codecs, a backend without decode rows or a per-row operation, or a
+/// device failure.
 pub fn rows(
     wf: &mut Lfm2,
     rows: &[crate::DecodeRow],
     logits: Option<&mut Vec<f32>>,
     picks: &mut Vec<u32>,
 ) -> Result<(), String> {
-    if KvType::k() != KvType::F16 || KvType::v() != KvType::F16 {
-        return Err("co-batched decode reads an f16 cache only".into());
+    let codecs = (KvType::k().ggml_id(), KvType::v().ggml_id());
+    if !<crate::lfm2::Lfm2Arch as crate::Architecture>::DEVICE_ROWS_KV_CODECS
+        .contains(&codecs)
+        || !be().supports_decode_rows_kv(codecs.0, codecs.1)
+    {
+        return Err("co-batched LFM2 decode does not support these KV codecs".into());
     }
     if !be().supports_argmax_rows() {
         return Err("co-batched decode needs a per-row argmax".into());
@@ -1662,12 +1675,9 @@ pub fn rows(
     let fit = wf.gpu_fit_batch(rows.len());
     wf.state.output_demand = crate::OutputDemand::LastToken;
     fit?;
-    if !be().set_decode_rows(Some(wf.state.row_route)) {
-        return Err("the backend has no decode rows".into());
-    }
-    let encoded = encode_rows(wf, rows, b);
-    be().set_decode_rows(None);
-    encoded?;
+    crate::gpu_support::submit_decode_rows(be(), wf.state.row_route, || {
+        encode_rows(wf, rows, b)
+    })?;
     let mut got = vec![0.0_f32; rows.len()];
     be().read(BufId::Tmp, 0, &mut got);
     picks.clear();
@@ -1682,6 +1692,13 @@ pub fn rows(
 /// The graph of [`rows`], ending with the per-row argmax in `BufId::Tmp`.
 fn encode_rows(wf: &Lfm2, rows: &[crate::DecodeRow], b: u32) -> Result<(), String> {
     let c = &wf.plan.config;
+    let kv_quant_route = effective_workflow_kv_route(
+        &wf.plan,
+        KvType::k(),
+        KvType::v(),
+        be().kv_quantization_route(),
+        be().kv_quantization_route_override(),
+    )?;
     let n_embd = c.n_embd;
     let n_head = c.n_heads;
     let n_kv = c.n_kv_heads;
@@ -1770,6 +1787,16 @@ fn encode_rows(wf: &Lfm2, rows: &[crate::DecodeRow], b: u32) -> Result<(), Strin
             ) => {
                 let qw = n_head * hd;
                 let kw = n_kv * hd;
+                let hk = if KvType::k() == KvType::F16 {
+                    0
+                } else {
+                    had_nrot("IMPARO_HAD_K", kv_quant_route.key, hd)?
+                };
+                let hv = if KvType::v() == KvType::F16 {
+                    0
+                } else {
+                    had_nrot("IMPARO_HAD_V", kv_quant_route.value, hd)?
+                };
                 be().matmat(
                     wkind(wq),
                     wq.offset as u64,
@@ -1800,7 +1827,7 @@ fn encode_rows(wf: &Lfm2, rows: &[crate::DecodeRow], b: u32) -> Result<(), Strin
                 let ring = ring_mask(layer.attention, wf.state.kv_ring_batch);
                 let max_scores: Vec<u32> =
                     pos.iter().map(|&p| scores_needed(p, 1, 0)).collect();
-                let served = be().head_norm_rope_at(
+                let heads_served = be().head_norm_rope_hadamard_at(
                     BufId::Q,
                     q_norm.offset,
                     hd,
@@ -1810,7 +1837,8 @@ fn encode_rows(wf: &Lfm2, rows: &[crate::DecodeRow], b: u32) -> Result<(), Strin
                     rope_dim,
                     rope_base,
                     None,
-                ) && be().head_norm_rope_at(
+                    hk,
+                ) && be().head_norm_rope_hadamard_at(
                     BufId::K,
                     k_norm.offset,
                     hd,
@@ -1820,7 +1848,16 @@ fn encode_rows(wf: &Lfm2, rows: &[crate::DecodeRow], b: u32) -> Result<(), Strin
                     rope_dim,
                     rope_base,
                     None,
-                ) && be().kv_store_slot_rows(
+                    hk,
+                );
+                if !heads_served {
+                    return Err(format!("co-batched LFM2 head transform not served at layer {li}"));
+                }
+                // LFM2 rotates V without the V RMS normalization used by Gemma4.
+                if hv != 0 {
+                    be().hadamard(BufId::V, b * kw, hv);
+                }
+                let served = be().kv_store_slot_rows(
                     BufId::K,
                     li as u32,
                     kw,
@@ -1850,6 +1887,10 @@ fn encode_rows(wf: &Lfm2, rows: &[crate::DecodeRow], b: u32) -> Result<(), Strin
                     return Err(format!(
                         "co-batched attention not served at layer {li}"
                     ));
+                }
+                // Return the weighted values to the ordinary output basis.
+                if hv != 0 {
+                    be().hadamard(BufId::Attn, b * qw, hv);
                 }
                 be().matmat(
                     wkind(wo),
@@ -2039,35 +2080,8 @@ fn encode_rows(wf: &Lfm2, rows: &[crate::DecodeRow], b: u32) -> Result<(), Strin
     if let Some(cap) = wf.plan.output.logit_softcap {
         be().softcap(BufId::Logits, cap, b * c.vocab_size);
     }
-    // A row whose step ends on a checkpoint boundary keeps its state there: its slot's
-    // snapshot twin takes a copy of the plane the step wrote, as a one-row decode's
-    // external snapshot does (`finish_decode_snapshot`).
-    if rows.iter().any(|r| r.snap) {
-        for r in rows.iter().filter(|r| r.snap) {
-            if !be().select_slot(r.slot) {
-                return Err(format!(
-                    "co-batched snapshot: slot {} not selected",
-                    r.slot
-                ));
-            }
-            be().copy_range(
-                BufId::RecurSnap,
-                0,
-                BufId::Recur,
-                r.plane_out * recur_elems,
-                recur_elems,
-            );
-        }
-        if !be().select_slot(wf.state.slot) {
-            return Err(format!(
-                "co-batched snapshot: slot {} not selected",
-                wf.state.slot
-            ));
-        }
-    }
     be().argmax_rows(BufId::Logits, BufId::Tmp, c.vocab_size, b);
-    be().end()
-        .map_err(|rc| format!("lfm2 co-batched step failed rc={rc}"))
+    Ok(())
 }
 
 /// Preserve the boundary state only after all recurrent layers have advanced.

@@ -13,7 +13,8 @@ import math, os, re, sys
 ROUND = re.compile(r'dspark round start=(\d+) rows=(\d+) consumed=(\d+) draft_us=(\d+) '
                    r'tree_us=(\d+) verify_us=(\d+)')
 CHOOSE = re.compile(r'dspark choose kept=(\d+) hold=(\d+) fixed_us=([\d.]+) gain=([\d.-]+) '
-                    r'gain_n=([\d.-]+) rho=(\S+) order=(\d+) widths=(\S+)')
+                    r'gain_n=([\d.-]+) (?:gain_below=[\d.-]+ gain_n_below=[\d.-]+ )?rho=(\S+) order=(\d+) '
+                    r'widths=(\S+)')
 PATH = re.compile(r'dspark path fixed_us=[\d.]+ rows=(\d+) path=([\d,-]+) next=\d+')
 CONV = re.compile(r'\[imparo\] conv=(\S+) prompt=(\d+)')
 

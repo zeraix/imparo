@@ -7,7 +7,9 @@ A fragment whose inputs are missing is left as it is, and the script says so.
 
   FIG verify_cost   T(n) against rows on each target        {m}_survey/survey.tsv
   TAB context_law   per-class context slope                 {m}_survey/survey.tsv
-  TAB widths        fixed widths, chain and chosen width     {m}_widths/table4.tsv
+  TAB widths        AdaSpark against its pinned widths       {m}_learned(_narrow), and each _rep
+  TAB classes       learned widths against kernel classes    {m}_classes, {m}_classes_rep results
+  FIG marginal      what rows 9-16 cost and buy              {m}_widths/table4.tsv
   TAB e2e           four targets, speedups per engine        {m}_full/results.jsonl
   FIG e2e           the same as bars                          {m}_full/results.jsonl
   TAB ladder        ablation per source, both LFM2.5 targets  {m}_full/results.jsonl
@@ -30,7 +32,6 @@ import figs  # noqa: E402
 import tables  # noqa: E402
 
 # The learned-against-declared A/B, a sibling of the campaign's run directory.
-AB_DIR = "ab_classes7"
 
 MODELS = [("lfm26", "LFM2.5-2.6B"), ("moekm", "LFM2.5-8B-A1B"), ("q4b", "Qwen3-4B"),
           ("q8b", "Qwen3-8B")]
@@ -175,40 +176,83 @@ def widths(path):
     return {c: {a: sum(v) / len(v) for a, v in d.items()} for c, d in acc.items()}
 
 
-def tab_widths(data):
-    arms = ["chain", "8", "12", "16", "budget"]
+BAND_EDGE = 2048
+
+
+def pinned_width(arm):
+    """`complete-wN` -> N, the pinned width of an arm, or None for any other arm."""
+    m = re.fullmatch(r"complete-w(\d+)", arm)
+    return int(m.group(1)) if m else None
+
+
+def tab_widths_agentic(stages):
+    """THE WIDTH TABLE ON REAL USE: AdaSpark against the same scheduler with its width pinned, on the
+    evaluation subset -- every model, the n-gram fill and the store learning from empty as in
+    AdaSpark, only the width fixed. `stages` maps a target to its stages, each `(rows, repeat)`: one
+    agentic run of AdaSpark and some pinned arms, then AdaSpark again after them. A pinned arm is
+    compared with the AdaSpark runs of ITS stage, whose speed per reply is the mean of the two runs,
+    so a drift across the stage cancels. Each cell is a pinned arm over AdaSpark, geometric mean of
+    per-reply decode ratios (above 1 is faster than AdaSpark), for all replies and by the context
+    the reply was decoded at; the last columns give AdaSpark over the best pinned width with its 95%
+    interval, and AdaSpark's second run over its first in the first stage."""
+    widths = sorted({pinned_width(r["arm"]) for st in stages.values() for rs, _ in st for r in rs}
+                    - {None})
     rows = []
     for m, name in MODELS:
-        d = data.get(m)
-        if not d:
+        st = [(rs, rep) for rs, rep in stages.get(m, []) if any(r["arm"] == "complete" for r in rs)]
+        if not st:
             continue
-        for k, c in enumerate(sorted(d)):
-            fixed = {a: d[c][a] for a in ("8", "12", "16") if a in d[c]}
-            best_a = min(fixed, key=fixed.get)
-            best = fixed[best_a]
+        ctx = {(r["set"], r["conv"], r["turn"], r["type"]): r["prompt_tokens"] + (r["completion_tokens"] or 0) / 2
+               for r in st[0][0] if r["arm"] == "complete"}
+        bands = [("all replies", None), (f"under {BAND_EDGE:,}", lambda u: ctx.get(u, 0) < BAND_EDGE),
+                 (f"{BAND_EDGE:,} and over", lambda u: ctx.get(u, 0) >= BAND_EDGE)]
+        # Each stage's rows with AdaSpark's two runs together, averaged per reply by `ratios`.
+        merged = [rs + [r for r in rep if r["arm"] == "complete"] for rs, rep in st]
+        first_rs, first_rep = st[0]
+        both = first_rs + [dict(r, arm="complete@2") for r in first_rep if r["arm"] == "complete"]
+        for k, (label, keep) in enumerate(bands):
+            fixed, home = {}, {}
+            for rs in merged:
+                for w in sorted({pinned_width(r["arm"]) for r in rs} - {None}):
+                    g = ratios(rs, f"complete-w{w}", "complete", keep=keep)
+                    if g:
+                        fixed[w], home[w] = g, rs
+            if not fixed:
+                continue
+            best_w = max(fixed, key=lambda w: fixed[w]["x"])
             cells = []
-            for a in arms:
-                if a not in d[c]:
+            for w in widths:
+                g = fixed.get(w)
+                if not g:
                     cells.append("<td>&ndash;</td>")
                     continue
-                rel = (d[c][a] / best - 1) * 100
-                s = "best" if a == best_a else signed(rel)
-                cells.append(f"<td><b>{s}</b></td>" if a == best_a else f"<td>{s}</td>")
-            rows.append(f"<tr><td>{name if k == 0 else ''}</td><td>{c:,}</td><td>{best:.2f}</td>"
-                        + "".join(cells) + "</tr>")
+                v = f"{g['x']:.3f}"
+                cells.append(f"<td><b>{v}</b></td>" if w == best_w else f"<td>{v}</td>")
+            best = ratios(home[best_w], "complete", f"complete-w{best_w}", keep=keep)
+            again = ratios(both, "complete@2", "complete", keep=keep)
+            again_s = f"{again['x']:.3f}" if again else "&ndash;"
+            n = ratios(merged[0], "complete-w8", "complete", keep=keep) or fixed[best_w]
+            rows.append(f"<tr><td>{name if k == 0 else ''}</td><td class=\"txt\">{label}</td>"
+                        f"<td>{n['n']}</td>" + "".join(cells) +
+                        f"<td>{ci(best, 3)}</td><td>{again_s}</td></tr>")
     if not rows:
         return None
-    return ('<figure class="tb">\n  <figcaption><span class="lbl" id="tab-widths">Table 0:</span> Tree width '
-            'policies at fixed context, 256 generated tokens, three prompts, two passes. The '
-            'third column is the best fixed width\'s milliseconds per token; the other cells are '
-            'relative to it (lower is faster), with the best fixed tree width (8, 12 or 16 rows) in bold. <i>chosen</i> is '
-            'AdaSpark\'s width (cost and acceptance models; n-gram fill off in this table, so the '
-            'comparison is between widths only), from a store learned once per target over all nine (context, prompt) cells; '
-            'the fixed widths\' stores come from one unmeasured run per prompt.</figcaption>\n  <div class="scroll"><table class="compact">\n'
-            '    <thead><tr><th>target</th><th>context</th><th>best fixed<br>ms/token</th>'
-            '<th>chain</th><th>8</th><th>12</th><th>16</th><th>chosen</th></tr></thead>\n'
-            '    <tbody>\n      ' + "\n      ".join(rows) + '\n    </tbody>\n  </table></div>\n'
-            '</figure>')
+    head = "".join(f"<th>{w}</th>" for w in widths)
+    return ('<figure class="tb">\n  <figcaption><span class="lbl" id="tab-widths">Table 0:</span> The width on '
+            'the evaluation subset: AdaSpark against the same scheduler with its width pinned, every other part unchanged '
+            '(both online models, the n-gram fill, a store learning from empty). The width columns are each pinned arm\'s '
+            'decode speed over AdaSpark\'s, geometric mean of per-reply ratios (above 1 is faster than AdaSpark), with the '
+            'best pinned width in bold, for all replies and by the context a reply was decoded at (prompt plus half the '
+            'reply). AdaSpark runs before the pinned arms and again after them, and its speed on a reply is the mean of the '
+            'two runs. The routed target is also pinned at 4, 5 and 6 rows, in a second stage run the same way and compared '
+            'with its own two AdaSpark runs; a dash marks a width not run (&sect;3.4). '
+            '<i>AdaSpark / best</i> is AdaSpark over the best pinned width with its 95% bootstrap interval over '
+            'conversations; <i>again</i> is AdaSpark\'s second run over its first. Looped and single-delta replies are left '
+            'out as in <a class="xref" href="#tab-e2e">Table&nbsp;7</a>.</figcaption>\n'
+            '  <div class="scroll"><table class="compact">\n'
+            '    <thead><tr><th>target</th><th>replies</th><th>n</th>' + head +
+            '<th>AdaSpark / best</th><th>again</th></tr></thead>\n'
+            '    <tbody>\n      ' + "\n      ".join(rows) + '\n    </tbody>\n  </table></div>\n</figure>')
 
 
 def widths_rows(path):
@@ -284,7 +328,8 @@ def fig_marginal(paths):
     body.append(txt(16, (y0 + y1) / 2, "extra accepted tokens per round", 12.5, "middle", "var(--ink-2)",
                     f' transform="rotate(-90 16 {(y0 + y1) / 2})"'))
     cap = ('<span class="lbl" id="fig-marginal">Figure 0:</span> What the second eight rows of a tree cost and what they buy. '
-           'Each point is one target at one context and prompt of <a class="xref" href="#tab-widths">Table 0</a>: the extra time per round of a '
+           'Each point is one target at one context (443, 1,596 or 8,444 tokens) and one of three prompts, from runs of 256 '
+           'tokens at a fixed width of 8 and of 16 rows (acceptance model on, n-gram candidates off; setup notes): the extra time per round of a '
            '16-row tree over an 8-row tree (the drafter included), against the extra tokens it accepts per '
            'round, both relative to the 8-row tree. Above the diagonal the wider tree decodes faster. The '
            'diagonal is the break-even line for every target.')
@@ -312,7 +357,7 @@ def speed(r):
     return v if isinstance(v, (int, float)) and math.isfinite(v) and v > 0 else None
 
 
-def ratios(rows, a, ref, sets=None, finished_only=True):
+def ratios(rows, a, ref, sets=None, finished_only=True, keep=None):
     """Geometric mean over replies of decode_a / decode_ref, with a 95% percentile bootstrap
     interval that resamples whole CONVERSATIONS: replies of one conversation share their history
     and the arm's learned state, so they are not independent. A reply that reached the token cap
@@ -326,6 +371,8 @@ def ratios(rows, a, ref, sets=None, finished_only=True):
     by_conv = collections.defaultdict(list)
     for u in sorted(units):
         if sets and u[0] not in sets:
+            continue
+        if keep and not keep(u):
             continue
         x, y = cell.get((a, u)), cell.get((ref, u))
         if not (x and y) or not all(speed(r) for r in x + y):
@@ -382,12 +429,13 @@ def signed(x):
     return "0.0%" if abs(x) < 0.05 else f"{x:+.1f}%".replace("-", "&minus;")
 
 
-def ci(g):
+def ci(g, digits=2):
     if not g:
         return "&ndash;"
     if g["lo"] is None:
-        return f"{g['x']:.2f}&times;"
-    return f"{g['x']:.2f}&times;<br><span class=\"ci\">[{g['lo']:.2f}, {g['hi']:.2f}]</span>"
+        return f"{g['x']:.{digits}f}&times;"
+    return (f"{g['x']:.{digits}f}&times;<br><span class=\"ci\">"
+            f"[{g['lo']:.{digits}f}, {g['hi']:.{digits}f}]</span>")
 
 
 E2E_ARMS = {"llama-dspark", "chain3", "complete"}
@@ -419,12 +467,12 @@ def tab_e2e(runs, smoke):
     if not rows:
         return None
     return ('<figure class="tb">\n  <figcaption><span class="lbl" id="tab-e2e">Table 0:</span> End to end. '
-            'Left: decode tok/s on the evaluation subset (&sect;4.2; generated tokens over decode time, '
+            'Left: decode tok/s on the evaluation subset (Appendix&nbsp;A; generated tokens over decode time, '
             'summed over replies) and AdaSpark over llama.cpp DSpark (geometric mean of per-reply '
             'ratios, 95% bootstrap interval over conversations). Replies that reached the 8,192-token cap in any arm are repetition '
             'loops under greedy decoding; they are left out of every column and counted. A reply streamed as a single delta (a bare tool call) has no client-clock decode interval and is left out as well (' + ', '.join(single) + '). Right: each '
             'engine\'s speculation speedup over its own autoregressive (AR) decode: its tok/s on the evaluation subset over '
-            'its AR tok/s, which is measured on the short subset (&sect;4.4) only (llama.cpp and imparo: ' + '; '.join(ar) +
+            'its AR tok/s, which is measured on the short subset (setup notes) only (llama.cpp and imparo: ' + '; '.join(ar) +
             ' tok/s). AR speed barely depends on the text; the short subset\'s contexts are shorter, where AR decode is '
             'faster, so these speedups are if anything understated.</figcaption>\n  <div class="scroll"><table class="compact">\n    <thead>'
             '<tr><th rowspan="2">target</th><th colspan="5">evaluation subset: tok/s and ratio</th>'
@@ -974,7 +1022,7 @@ def fig_from_figs(kind, logs):
         body, note = figs.fig_widths(targets)
         h = 20 + 34 * len(targets) + 10
         cap = ('<span class="lbl" id="fig-widths">Figure 0:</span> Share of rounds at each verified width, per '
-               'target, from AdaSpark\'s rounds on the instrumented run over the short subset (&sect;4.4), cold-start rounds excluded. ' + note + '.')
+               'target, from AdaSpark\'s rounds on the instrumented run over the short subset (setup notes), cold-start rounds excluded. ' + note + '.')
         return figure(svg(620, h, body, "Share of rounds at each width per target"), cap)
     if kind == "learning":
         (m, name), p = logs[0]
@@ -1020,65 +1068,62 @@ def number(paper):
 
 
 # ---------------------------------------------------------------- learned width classes
-def tab_classes(ab):
-    """Learned against declared width classes (harness/ab_classes.sh, last at f55a73de): the budget arm's ms/token per target
-    and context, learned over declared, from two interleaved repeats (D L D L) of three prompts, each
-    arm's store learned once per model over all nine cells first; and the widths each learned table
-    offered at the end, and its probe rounds in the measured runs."""
-    import glob, statistics
+def store_widths(home):
+    """The widths a stored verify-cost table offers: the top row count of each `step` line."""
+    import glob
+    for f in glob.glob(os.path.join(home, ".imparo", "verify-*.txt")):
+        tops = [int(l.split("=")[1].split(",")[1]) for l in open(f) if l.startswith("step=")]
+        tops = sorted(set(t for t in tops if t > 0))  # the step at 0 rows is the round's fixed cost
+        if tops:
+            return tops
+    return []
+
+
+def spans(ws):
+    """[2, 3, 4, 8, 9, 16] -> '2&ndash;4, 8, 9, 16': runs of three or more as a range."""
+    out, i = [], 0
+    while i < len(ws):
+        j = i
+        while j + 1 < len(ws) and ws[j + 1] == ws[j] + 1:
+            j += 1
+        out += [f"{ws[i]}&ndash;{ws[j]}"] if j - i >= 2 else [str(w) for w in ws[i:j + 1]]
+        i = j + 1
+    return ", ".join(out)
+
+
+def tab_classes_agentic(stages, run):
+    """Learned widths against the 8-bit matrix kernel's row classes (harness/run_classes.sh), on the
+    evaluation subset: per target and context band, AdaSpark on the kernel classes over AdaSpark
+    with learned widths, the learned arm's speed per reply the mean of its two runs (before and
+    after the classes arm); and the widths each arm's table offered at the end of its run."""
     rows = []
     for m, name in MODELS:
-        cells = {}
-        for v in ("declared", "learned"):
-            for f in glob.glob(os.path.join(ab, f"{m}_{v}_r*", "table4.tsv")):
-                for line in open(f):
-                    x = re.search(r"ctx=(\d+) prompt=(\w) arm=budget rc=0 ms_per_token=([\d.]+)", line)
-                    if x:
-                        cells.setdefault((int(x.group(1)), x.group(2)), {}).setdefault(v, []).append(
-                            float(x.group(3)))
-        full = {k: d for k, d in cells.items() if len(d.get("declared", [])) >= 2
-                and len(d.get("learned", [])) >= 2}
-        if not full:
+        if m not in stages:
             continue
-        logr = lambda d: math.log(statistics.mean(d["learned"]) / statistics.mean(d["declared"]))
-        by = {}
-        for (c, _), d in full.items():
-            by.setdefault(c, []).append(logr(d))
-        pct = lambda xs: signed((math.exp(sum(xs) / len(xs)) - 1) * 100)
-        allx = [logr(d) for d in full.values()]
-        # the widths the last learned run's table offered when it last split, and probe rounds per
-        # measured run of the learned arm
-        tops, probes, runs = "", 0, 0
-        for f in sorted(glob.glob(os.path.join(ab, f"{m}_learned_r*", "p1_*.err"))):
-            runs += 1
-            for line in open(f, errors="replace"):
-                if re.search(r"dspark cost probe=\d", line):
-                    probes += 1
-                x = re.search(r"dspark cost split=\d+ held=\d+ steps=(\S+( \S+)*) scale=", line)
-                if x:
-                    tops = ", ".join(t.split("=")[0].split("..")[1] for t in x.group(1).split())
-        if not tops:
-            for f in sorted(glob.glob(os.path.join(ab, f"{m}_learned_r*", "warm_*.err"))):
-                for line in open(f, errors="replace"):
-                    x = re.search(r"dspark cost split=\d+ held=\d+ steps=(\S+( \S+)*) scale=", line)
-                    if x:
-                        tops = ", ".join(t.split("=")[0].split("..")[1] for t in x.group(1).split())
-        rows.append(f"<tr><td>{name}</td>" + "".join(f"<td>{pct(by[c])}</td>" for c in sorted(by)) +
-                    f"<td>{pct(allx)}</td><td class=\"txt\">{tops}</td>"
-                    f"<td>{probes / max(1, runs):.1f}</td></tr>")
+        rs, rep = stages[m]
+        ctx = {(r["set"], r["conv"], r["turn"], r["type"]): r["prompt_tokens"] + (r["completion_tokens"] or 0) / 2
+               for r in rs if r["arm"] == "complete"}
+        merged = rs + [r for r in rep if r["arm"] == "complete"]
+        cells = []
+        for keep in (None, lambda u: ctx.get(u, 0) < BAND_EDGE, lambda u: ctx.get(u, 0) >= BAND_EDGE):
+            cells.append(ci(ratios(merged, "complete", "complete-classes", keep=keep), 3))
+        learned = store_widths(os.path.join(run, f"{m}_classes", "home_complete_r1"))
+        kernel = store_widths(os.path.join(run, f"{m}_classes", "home_complete-classes_r1"))
+        rows.append(f"<tr><td>{name}</td>" + "".join(f"<td>{c}</td>" for c in cells) +
+                    f"<td class=\"txt\">{spans(learned)}</td>"
+                    f"<td class=\"txt\">{spans(kernel)}</td></tr>")
     if not rows:
         return None
     return ('<figure class="tb">\n  <figcaption><span class="lbl" id="tab-classes">Table 0:</span> Learned against '
-            'kernel width classes: the change in milliseconds per token of the cost-model width (acceptance '
-            'model on, n-gram off) when the widths are learned (&sect;3.2) instead of taken from the 8-bit '
-            'matrix kernel\'s row classes, at each context, geometric mean over three prompts of two interleaved '
-            'repeats (kernel classes, learned, kernel classes, learned) of 256 tokens; negative is faster. Each arm\'s store '
-            'is learned once per target over all nine (context, prompt) cells before the measured runs start '
-            'from it. The last two columns give the widths the learned table offered at its last split and the '
-            'rounds per measured run spent measuring a new width. The two arms ran alternately on the same engine '
-            '(Appendix&nbsp;B).</figcaption>\n'
-            '  <div class="scroll"><table class="compact">\n    <thead><tr><th>target</th><th>443</th><th>1,596</th>'
-            '<th>8,444</th><th>all</th><th>learned widths</th><th>measurement rounds per run</th></tr></thead>\n'
+            'kernel width classes on the evaluation subset: AdaSpark\'s decode speed with learned widths (&sect;3.2) over '
+            'its speed with the widths taken from the 8-bit matrix kernel\'s row classes, geometric mean of per-reply '
+            'ratios with its 95% bootstrap interval over conversations, for all replies and by the context a reply was '
+            'decoded at; above 1 the learned widths are faster. Both arms start from an empty store and ran on one build; '
+            'the learned arm runs before the kernel-class arm and again after it, and its speed on a reply is the mean of '
+            'the two runs. The last columns give the widths each arm\'s table offered at the end of its run (setup notes).'
+            '</figcaption>\n  <div class="scroll"><table class="compact">\n    <thead><tr><th>target</th>'
+            f'<th>all replies</th><th>under {BAND_EDGE:,}</th><th>{BAND_EDGE:,} and over</th>'
+            '<th>learned widths</th><th>kernel-class widths</th></tr></thead>\n'
             '    <tbody>\n      ' + "\n      ".join(rows) + '\n    </tbody>\n  </table></div>\n</figure>')
 
 
@@ -1132,16 +1177,6 @@ def main():
           if os.path.exists(p(f"{m}_survey", "survey.tsv"))}
     wd = {m: widths(p(f"{m}_widths", "table4.tsv")) for m, _ in MODELS
           if os.path.exists(p(f"{m}_widths", "table4.tsv"))}
-    for m in wd:  # the chain column re-measured on the chain-as-tree build
-        if os.path.exists(p(f"{m}_widths_chain", "table4.tsv")):
-            for c, arms in widths(p(f"{m}_widths_chain", "table4.tsv")).items():
-                if c in wd[m] and "chain" in arms:
-                    wd[m][c]["chain"] = arms["chain"]
-        # the chosen column re-measured on the build whose cost model learns its widths
-        if os.path.exists(p(f"{m}_widths_learned", "table4.tsv")):
-            for c, arms in widths(p(f"{m}_widths_learned", "table4.tsv")).items():
-                if c in wd[m] and "budget" in arms:
-                    wd[m][c]["budget"] = arms["budget"]
     import json
     runs = {m: [json.loads(l) for l in open(p(f"{m}_full", "results.jsonl"))] for m, _ in MODELS
             if os.path.exists(p(f"{m}_full", "results.jsonl"))}
@@ -1156,13 +1191,47 @@ def main():
         # its widths, replaces the same arm measured before
         if os.path.exists(p(f"{m}_learned", "results.jsonl")):
             new = [json.loads(l) for l in open(p(f"{m}_learned", "results.jsonl"))]
+            new = [r for r in new if pinned_width(r["arm"]) is None]  # the pinned arms are Table 3's
+            # AdaSpark ran twice on this subset, before the pinned arms and after them: its speed on
+            # a reply is the mean of the two runs, one row per reply as for every other arm.
+            if os.path.exists(p(f"{m}_learned_rep", "results.jsonl")):
+                unit = lambda r: (r["set"], r["conv"], r["turn"], r["type"])
+                again = {unit(r): r for r in map(json.loads, open(p(f"{m}_learned_rep", "results.jsonl")))
+                         if r["arm"] == "complete"}
+                for i, r in enumerate(new):
+                    o = again.get(unit(r))
+                    if r["arm"] == "complete" and o and r["finished"] and o["finished"] and speed(r) and speed(o):
+                        new[i] = dict(r, decode_tok_s=(speed(r) + speed(o)) / 2, runs=2)
             arms = {r["arm"] for r in new}
             runs[m] = [r for r in runs[m] if r["arm"] not in arms] + new
+    # THE WIDTH TABLE reads each stage that ran AdaSpark beside pinned widths, with AdaSpark's repeat
+    # after them: the main stage on every target, and the narrow widths on the routed one.
+    load = lambda st: [json.loads(l) for l in open(p(st, "results.jsonl"))] if os.path.exists(p(st, "results.jsonl")) else []
+    # TABLE 10 reads the measurement build's learned and kernel-class arms (run_classes.sh).
+    cstages = {m: (load(f"{m}_classes"), load(f"{m}_classes_rep")) for m, _ in MODELS
+               if any(r["arm"] == "complete-classes" for r in load(f"{m}_classes"))}
+    wstages = {}
+    for m, _ in MODELS:
+        for tag in (f"{m}_learned", f"{m}_learned_narrow"):
+            rs = load(tag)
+            if any(pinned_width(r["arm"]) for r in rs):
+                wstages.setdefault(m, []).append((rs, load(f"{tag}_rep")))
     # run_toolace.sh: ToolACE with JSON Schema parameter types. Its rows replace every arm's rows
     # of the conversations whose schemas the rename changed; ta-1 and ta-3 keep the rows of the run
     # they belong to and are the control for the learned state (`toolace_control`).
     toolace = {m: [json.loads(l) for l in open(p(f"{m}_toolace", "results.jsonl"))] for m, _ in MODELS
                if os.path.exists(p(f"{m}_toolace", "results.jsonl"))}
+
+    def relearned(rows, stage):
+        """A run_learned.sh stage's arms replace the same arms of an earlier run: the scheduler
+        changed, the llama.cpp and plain arms did not."""
+        if not os.path.exists(p(stage, "results.jsonl")):
+            return rows
+        new = [json.loads(l) for l in open(p(stage, "results.jsonl"))]
+        arms = {r["arm"] for r in new}
+        return [r for r in rows if r["arm"] not in arms] + new
+
+    toolace = {m: relearned(v, f"{m}_toolace_learned") for m, v in toolace.items()}
 
     def fixed(rows, m, convs):
         if m not in toolace:
@@ -1173,7 +1242,8 @@ def main():
 
     for m in list(runs):
         runs[m] = fixed(runs[m], m, TOOLACE_RENAMED_CORE)
-    heldout = {m: fixed([json.loads(l) for l in open(p(f"{m}_heldout", "results.jsonl"))], m,
+    heldout = {m: fixed(relearned([json.loads(l) for l in open(p(f"{m}_heldout", "results.jsonl"))],
+                                  f"{m}_heldout_learned"), m,
                         TOOLACE_RENAMED_REST) for m, _ in MODELS
                if os.path.exists(p(f"{m}_heldout", "results.jsonl"))}
     toolace_control(runs, toolace)
@@ -1197,9 +1267,8 @@ def main():
     for kind, name, make in [
         ("FIG", "verify_cost", lambda: fig_verify_cost(sv) if sv else None),
         ("TAB", "context_law", lambda: tab_context_law(sv) if sv else None),
-        ("TAB", "widths", lambda: tab_widths(wd) if wd else None),
-        ("TAB", "classes", lambda: tab_classes(os.path.join(os.path.dirname(os.path.abspath(run)),
-                                                            AB_DIR))),
+        ("TAB", "widths", lambda: tab_widths_agentic(wstages) if wstages else None),
+        ("TAB", "classes", lambda: tab_classes_agentic(cstages, run) if cstages else None),
         ("FIG", "marginal", lambda: fig_marginal({m: p(f"{m}_widths", "table4.tsv") for m, _ in MODELS
                                                   if os.path.exists(p(f"{m}_widths", "table4.tsv"))})
          if wd else None),

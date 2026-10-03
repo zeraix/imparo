@@ -1281,7 +1281,11 @@ fn verify_workflow_tree_rows<A: Architecture>(
     w.state
         .window_history
         .commit(ticket, start, committed, slack);
-    Ok(crate::speculative::TreeVerification { path, next_token })
+    Ok(crate::speculative::TreeVerification {
+        path,
+        next_token,
+        submission: crate::speculative::TreeSubmission::Unknown,
+    })
 }
 
 /// Candidates per committed position in the target dump.
@@ -1409,11 +1413,11 @@ pub(crate) fn verify_greedy_tree<A: Architecture>(
 /// recurrent rollback slot. CUDA owns packed-row state until path publication.
 #[cfg(feature = "cuda-speculative")]
 fn validate_tree_parents(parents: &[i32]) -> Result<(), String> {
-    if parents.len() != 16 {
+    if !(2..=16).contains(&parents.len()) {
         return Err("tree parent shape".into());
     }
     let mut depths = [0usize; 16];
-    for i in 0..16 {
+    for i in 0..parents.len() {
         if (i == 0 && parents[i] != -1)
             || (i > 0 && (parents[i] < 0 || parents[i] as usize >= i))
         {
@@ -1428,30 +1432,234 @@ fn validate_tree_parents(parents: &[i32]) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The first E4B tree reuses the retained short Q4 execution and its existing KV
+/// owners. This capability is deliberately separate from the Metal F16 row route.
+#[cfg(feature = "cuda-speculative")]
+fn e4b_tree_geometry<A: Architecture>(
+    w: &Workflow<A>,
+) -> Result<(Vec<imparo_cuda::tree::E4bTreeGeometry>, usize), String> {
+    let c = &w.plan.config;
+    if c.architecture != "gemma4"
+        || c.n_embd != 2560
+        || c.vocab_size != 262_144
+        || c.n_heads != 8
+        || c.n_kv_heads != 2
+        || w.state.host_forward
+        || !A::DEVICE_ALL_LOGITS
+        || w.plan.recurrent_elems() != 0
+        || KvType::k() != KvType::Q4_0
+        || KvType::v() != KvType::Q4_0
+        || !crate::e4b_retained_decode_policy_enabled()
+    {
+        return Err("E4B tree requires retained Q4 D256-window/D512-full target".into());
+    }
+    for layer in &w.plan.layers {
+        if !matches!(layer.attention,
+            crate::Attention::Window { head_dim: 256, window: 512, .. }
+                | crate::Attention::Full { head_dim: 512, .. })
+        {
+            return Err("E4B tree attention geometry".into());
+        }
+        if let crate::KvSource::SharedWith(source) = layer.kv_source {
+            let owner = w.plan.layers.get(source as usize)
+                .ok_or("E4B tree shared KV owner outside model")?;
+            if source >= layer.index
+                || owner.kv_source != crate::KvSource::Own
+                || owner.attention.head_dim() != layer.attention.head_dim()
+            {
+                return Err("E4B tree shared KV owner geometry".into());
+            }
+        }
+    }
+    let state = crate::kv::state_geometry(&w.plan, ring_batch(w));
+    let slack = imparo_kv::state::window_slack(&state);
+    let mut geometry = Vec::with_capacity(state.len());
+    let mut has_window = false;
+    let mut has_full = false;
+    for g in state {
+        let (head_dim, window, ring_slots) = match g.kind {
+            imparo_kv::StateKind::Window { window: 512, ring: 1024 } => {
+                has_window = true;
+                (256, 512, 1024)
+            }
+            imparo_kv::StateKind::Full => {
+                has_full = true;
+                (512, 0, 0)
+            }
+            _ => return Err("E4B tree requires the admitted 1024-slot window ring".into()),
+        };
+        geometry.push(imparo_cuda::tree::E4bTreeGeometry {
+            layer: g.layer,
+            head_dim,
+            window,
+            ring_slots,
+            k_stride: g.k_stride as u64,
+            v_stride: g.v_stride as u64,
+        });
+    }
+    if !has_window || !has_full {
+        return Err("E4B tree missing window/full KV owners".into());
+    }
+    Ok((geometry, slack))
+}
+
+#[cfg(feature = "cuda-speculative")]
+fn prepare_e4b_tree<A: Architecture>(
+    w: &mut Workflow<A>,
+    tree: &crate::speculative::DraftTree,
+    start: usize,
+) -> Result<bool, String> {
+    if !crate::gemma4_mtp::tree4_enabled()
+        || !crate::gemma4_mtp::tree4_fits(
+            start, w.state.kv_rt.capacity, crate::prefill_batch().max(1),
+        )
+    {
+        return Ok(false);
+    }
+    if tree.tokens.len() != 4 || tree.parents.as_slice() != crate::gemma4_mtp::tree4_parents() {
+        return Err("E4B tree requires the admitted four-node topology".into());
+    }
+    validate(w, &tree.tokens, start)?;
+    let (geometry, slack) = e4b_tree_geometry(w)?;
+    let end = start + tree.tokens.len();
+    if end > w.state.kv_rt.slots
+        || w.state.window_history.for_verification(start, end, slack).is_none()
+    {
+        return Ok(false);
+    }
+    let words = tree_row_layout(start, &tree.parents)?;
+    w.ensure_gpu_ready()?;
+    unsafe { imparo_cuda::tree::prepare_e4b(start as u32, &tree.parents, &words, &geometry) }
+}
+
+#[cfg(feature = "cuda-speculative")]
+fn verify_e4b_tree<A: Architecture>(
+    w: &mut Workflow<A>,
+    tree: &crate::speculative::DraftTree,
+    start: usize,
+    limit: usize,
+    stops: &[u32],
+) -> Result<crate::speculative::TreeVerification, String> {
+    if !crate::gemma4_mtp::tree4_enabled()
+        || !crate::gemma4_mtp::tree4_fits(
+            start, w.state.kv_rt.capacity, crate::prefill_batch().max(1),
+        )
+        || tree.tokens.len() != 4
+        || tree.parents.as_slice() != crate::gemma4_mtp::tree4_parents()
+        || limit == 0
+    {
+        return Err("E4B tree verification outside admitted shape/boundary".into());
+    }
+    validate(w, &tree.tokens, start)?;
+    let (geometry, slack) = e4b_tree_geometry(w)?;
+    let end = start + tree.tokens.len();
+    // All four physical rows can overwrite ring history, even when only [0,3]
+    // is accepted. Keep this narrowed history on every error and on success.
+    let history = w.state.window_history.for_verification(start, end, slack)
+        .ok_or("E4B tree prefix coverage")?;
+    let ticket = history.clone().begin(start)?;
+    let (note_at, note) = recurrent_note(w);
+    let words = tree_row_layout(start, &tree.parents)?;
+    w.ensure_gpu_ready()?;
+    w.kv_fit(end)?;
+    unsafe { imparo_cuda::tree::begin_e4b(start as u32, &tree.parents, &words, &geometry)?; }
+    w.state.window_history = history.clone();
+    w.state.row_layout = 4;
+    w.state.tree_submission = crate::speculative::TreeSubmission::Ordinary;
+    let be = crate::gpu_support::be();
+    let mut rows = Vec::new();
+    let result = w.forward_with_output_demand(
+        &tree.tokens, start, &mut rows, None, OutputDemand::RowArgmax, None,
+    ).and_then(|()| {
+        be.end().map_err(|rc| format!("E4B tree output completion rc={rc}"))?;
+        if rows.len() != 4 {
+            return Err("E4B tree row argmax packet length".into());
+        }
+        let picks: Vec<u32> = rows.iter().map(|v| v.to_bits()).collect();
+        if picks.iter().any(|&v| v >= w.plan.config.vocab_size) {
+            return Err("E4B tree argmax outside vocabulary".into());
+        }
+        // Bounded Graph admission probe, outside capture and before accepted-
+        // path commit. Compare all physical rows, not just the chosen token.
+        if let Some(directory) = std::env::var_os("IMPARO_LAB_E4B_TREE_GRAPH_PROBE_DIR") {
+            use std::io::Write;
+            let directory = std::path::PathBuf::from(directory);
+            for (name, buffer, width) in [
+                ("hidden", imparo_backend::BufId::X, w.plan.config.n_embd),
+                ("logits", imparo_backend::BufId::Logits, w.plan.config.vocab_size),
+            ] {
+                let mut values = vec![0.0_f32; 4 * width as usize];
+                be.read(buffer, 0, &mut values);
+                if values.iter().any(|x| !x.is_finite()) {
+                    return Err(format!("E4B tree Graph probe nonfinite {name}"));
+                }
+                let bytes: Vec<u8> = values.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+                let path = directory.join(format!("{start}-{name}.bin"));
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+                    .and_then(|mut f| f.write_all(&bytes))
+                    .map_err(|e| format!("E4B tree Graph probe {}: {e}", path.display()))?;
+            }
+            eprintln!("[e4b-tree-graph-probe] start={start} submission={:?} picks={picks:?}",
+                w.state.tree_submission);
+        }
+        let (path, next_token) = tree_accepted_path(
+            &picks, &tree.tokens, &tree.parents, limit, stops,
+        );
+        unsafe { imparo_cuda::tree::commit_e4b(&path)?; }
+        Ok(crate::speculative::TreeVerification {
+            path, next_token, submission: w.state.tree_submission,
+        })
+    });
+    let accepted = match result {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            let drain = be.end().err();
+            let cleanup = unsafe { imparo_cuda::tree::end() }.err();
+            settle_tree_state(w, start, history, note, note_at);
+            return Err(format!("{error}; E4B tree rollback drain={drain:?}, end={cleanup:?}"));
+        }
+    };
+    let committed = start + accepted.path.len();
+    settle_tree_state(w, committed, history, note, note_at);
+    w.state.window_history.commit(ticket, start, committed, slack);
+    static TREE4_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !TREE4_SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("IMPARO_LAB_DRAFT_ACCEPTANCE_TRACE").as_deref() == Ok("1")
+    {
+        eprintln!("[e4b-tree-verify] start={start} rows=4 accepted={} path={:?}",
+            accepted.path.len(), accepted.path);
+    }
+    Ok(accepted)
+}
+
 #[cfg(feature = "cuda-speculative")]
 pub(crate) fn prepare_workflow_tree<A: Architecture>(
     w: &mut Workflow<A>,
     tree: &crate::speculative::DraftTree,
     start: usize,
 ) -> Result<bool, String> {
+    if w.plan.config.architecture == "gemma4" {
+        return prepare_e4b_tree(w, tree, start);
+    }
     if w.plan.config.architecture != "lfm2"
         || w.state.host_forward
         || !A::DEVICE_ALL_LOGITS
         || w.plan.config.n_heads != 32
         || w.plan.config.n_kv_heads != 8
-        || tree.tokens.len() != 16
-        || tree.parents.len() != 16
+        || !(2..=16).contains(&tree.tokens.len())
+        || tree.parents.len() != tree.tokens.len()
     {
         return Err("tree admission capability/shape".into());
     }
     validate_tree_parents(&tree.parents)?;
     validate(w, &tree.tokens, start)?;
     let end = start
-        .checked_add(16)
+        .checked_add(tree.tokens.len())
         .ok_or("tree admission position overflow")?;
     let cell = crate::prefill_batch().max(1);
-    if end > u32::MAX as usize || 16 > cell - start % cell {
-        return Err("tree admission forward cell".into());
+    if end > u32::MAX as usize || tree.tokens.len() > cell - start % cell {
+        return Ok(false);
     }
     if w.plan.layers.iter().any(|l| {
         l.attention.is_attention()
@@ -1481,13 +1689,17 @@ pub(crate) fn verify_workflow_tree<A: Architecture>(
     limit: usize,
     stops: &[u32],
 ) -> Result<crate::speculative::TreeVerification, String> {
+    if w.plan.config.architecture == "gemma4" {
+        return verify_e4b_tree(w, tree, start, limit, stops);
+    }
+    w.state.tree_submission = crate::speculative::TreeSubmission::Unknown;
     let tokens = &tree.tokens;
     let parents = &tree.parents;
     let b = tokens.len();
     if w.plan.config.architecture != "lfm2"
         || w.state.host_forward
         || !A::DEVICE_ALL_LOGITS
-        || b != 16
+        || !(2..=16).contains(&b)
         || parents.len() != b
         || limit == 0
     {
@@ -1578,6 +1790,7 @@ pub(crate) fn verify_workflow_tree<A: Architecture>(
             Ok(crate::speculative::TreeVerification {
                 path,
                 next_token: next,
+                submission: w.state.tree_submission,
             })
         });
     w.state.output_demand = OutputDemand::LastToken;
@@ -1601,9 +1814,9 @@ pub(crate) fn verify_workflow_tree<A: Architecture>(
     w.state.recur_ckpt_on_device = false;
     if std::env::var("IMPARO_LAB_DRAFT_ACCEPTANCE_TRACE").as_deref() == Ok("1") {
         eprintln!(
-            "[tree-verify] start={start} rows=16 accepted={} alternate={} path={:?}",
+            "[tree-verify] start={start} rows={b} accepted={} alternate={} path={:?}",
             accepted.path.len(),
-            accepted.path.iter().any(|&i| i >= 9),
+            accepted.path.iter().enumerate().any(|(depth, &row)| row as usize != depth),
             accepted.path
         );
     }
@@ -1613,6 +1826,38 @@ pub(crate) fn verify_workflow_tree<A: Architecture>(
 #[cfg(test)]
 mod tests {
     use super::{WindowSource, tree_accepted_path, tree_row_layout, window_sources};
+
+    #[test]
+    fn four_row_tree_keeps_the_original_chain_and_commits_the_alternate_path() {
+        let tokens = [10, 11, 12, 20];
+        let parents = [-1, 0, 1, 0];
+        assert_eq!(tree_accepted_path(&[11, 12, 99, 99], &tokens, &parents, 4, &[]),
+            (vec![0, 1, 2], 99));
+        assert_eq!(tree_accepted_path(&[20, 99, 99, 21], &tokens, &parents, 4, &[]),
+            (vec![0, 3], 21));
+        let words = tree_row_layout(765, &parents).unwrap();
+        assert_eq!(words.len(), 48);
+        assert_eq!((words[24], words[36]), (767, 766));
+        assert_eq!(words[38], 0b1001); // The sibling cannot read the original chain.
+    }
+
+    #[test]
+    fn delayed_four_row_tree_uses_the_second_parent_and_actual_last_node() {
+        let tokens = [10, 11, 12, 20];
+        let parents = [-1, 0, 1, 1];
+        assert_eq!(tree_accepted_path(&[11, 12, 99, 99], &tokens, &parents, 4, &[]),
+            (vec![0, 1, 2], 99));
+        assert_eq!(tree_accepted_path(&[11, 20, 99, 21], &tokens, &parents, 4, &[]),
+            (vec![0, 1, 3], 21));
+        assert_eq!(tree_accepted_path(&[11, 20, 99, 21], &tokens, &parents, 2, &[]),
+            (vec![0, 1], 20));
+        assert_eq!(tree_accepted_path(&[11, 20, 99, 21], &tokens, &parents, 4, &[20]),
+            (vec![0, 1], 20));
+        let words = tree_row_layout(765, &parents).unwrap();
+        assert_eq!((words[24], words[36]), (767, 767));
+        assert_eq!(words[38], 0b1011);
+        assert_eq!(&words[40..43], &[1, 0, 0]);
+    }
 
     #[test]
     fn a_rebuilt_window_takes_path_inputs_then_old_slots() {
@@ -1704,6 +1949,16 @@ mod tests {
         let mut invalid = parents;
         invalid[9] = 8;
         assert!(super::validate_tree_parents(&invalid).is_err());
+    }
+
+    #[cfg(feature = "cuda-speculative")]
+    #[test]
+    fn native_small_tree_topology_bounds() {
+        super::validate_tree_parents(&PARENTS).unwrap();
+        super::validate_tree_parents(&[-1, 0]).unwrap();
+        for parents in [vec![], vec![-1], vec![-1;17], vec![-2,0], vec![-1,1], (-1..9).collect()] {
+            assert!(super::validate_tree_parents(&parents).is_err(), "{parents:?}");
+        }
     }
 
     #[test]

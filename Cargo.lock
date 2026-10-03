@@ -280,6 +280,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "imparo-backend",
+ "imparo-cpu",
  "imparo-host",
  "imparo-program-pack",
  "serde_json",

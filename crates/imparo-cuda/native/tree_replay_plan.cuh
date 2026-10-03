@@ -208,8 +208,8 @@ public:
      n.kind=Kind::Store;if(!n.bind({P,P,U,U,U,U,P,P}))return tree_replay_reject(__LINE__);
      if(n.get<uint32_t>(2)!=512||n.get<uint32_t>(3)!=g.start||n.get<uint32_t>(4)!=16
       ||n.get<uint32_t>(5)||n.get<void*>(6)||!page_identity(n.get<void*>(1),n.get<void*>(7)))return tree_replay_reject(__LINE__);++stores;
-    }else if(is((void*)imparo_sm80_kv::dequant_parallel<8>)||is((void*)k_kv_dequant)){
-     n.kind=Kind::Dequant;const bool fallback=is((void*)k_kv_dequant);
+    }else if(is((void*)imparo_sm80_kv::dequant_parallel<8>)||is((void*)k_kv_dequant<>)){
+     n.kind=Kind::Dequant;const bool fallback=is((void*)k_kv_dequant<>);
      if(!n.bind(fallback?std::vector<size_t>{P,P,U,U,U,U,P}:std::vector<size_t>{P,P,U,U,U,P}))return tree_replay_reject(__LINE__);
      if(n.get<uint32_t>(2)!=512||n.get<uint32_t>(3)!=g.start+16||n.p.gridDim.y!=g.start+16
       ||n.get<uint32_t>(fallback?5:4)||!page_identity(n.get<void*>(0),n.get<void*>(fallback?6:5))||(fallback&&n.get<uint32_t>(4)!=8))return tree_replay_reject(__LINE__);++dequants;

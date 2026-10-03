@@ -90,8 +90,8 @@ pub struct LayerW {
 
 pub struct ModelW {
     pub(crate) token_embd: Tensor,
-    /// Its own tensor: `output.weight` is present, so the head is NOT tied to the
-    /// embedding table the way LFM2's is.
+    /// Independent output tensor, or the same mapped span as the embedding table
+    /// when the model plan declares tied embeddings. No duplicated weight payload.
     pub(crate) output: Tensor,
     pub(crate) output_norm: NormW,
     pub(crate) layers: Vec<LayerW>,
@@ -206,7 +206,11 @@ pub fn prepare(weights: &Weights, plan: &ModelPlan) -> Result<ModelW, String> {
     }
     Ok(ModelW {
         token_embd: f.matmul("token_embd.weight")?,
-        output: f.matmul("output.weight")?,
+        output: f.matmul(if plan.output.tied_embeddings {
+            "token_embd.weight"
+        } else {
+            "output.weight"
+        })?,
         output_norm: f.norm("output_norm.weight")?,
         layers,
     })

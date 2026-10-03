@@ -495,6 +495,77 @@ pub struct KvCommit {
     pub pool_capacity: usize,
 }
 
+/// Inputs to eager pool growth, after backend admission and geometry resolution.
+/// The logical capacity is read only; only the physical pool can grow here.
+#[derive(Clone, Copy)]
+struct EagerPoolBudget {
+    logical_capacity: usize,
+    page_cells: usize,
+    current_blocks: usize,
+    slots: usize,
+    available_bytes: u64,
+    slot_state_bytes: u64,
+    block_bytes: u64,
+    dequant_block_bytes: u64,
+    dequant_reserved_blocks: usize,
+    max_view_blocks: Option<usize>,
+    page_limit: Option<usize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EagerPoolGrowth {
+    blocks: usize,
+    rows: usize,
+}
+
+fn eager_pool_growth(
+    budget: EagerPoolBudget,
+    layer_bytes: &[u64],
+) -> Result<Option<EagerPoolGrowth>, String> {
+    if budget.slots <= 1 || budget.block_bytes == 0 {
+        return Ok(None);
+    }
+    // The old arena remains live until its replacement commits. Also retain room
+    // for private slot state and arena/page-table alignment before buying blocks.
+    let replacement_base = layer_bytes.iter()
+        .fold(0_u64, |sum, x| sum.saturating_add(x.saturating_mul(2)))
+        .saturating_add(1 << 20);
+    let private = budget.slot_state_bytes.saturating_mul((budget.slots - 1) as u64);
+    let growth_budget = budget.available_bytes
+        .saturating_sub(private).saturating_sub(replacement_base);
+    // Quantized KV expands into physical-indexed half scratch. Its logical
+    // capacity (at least KV_FIRST_SLOTS) is already allocated; charge only pages
+    // beyond that reservation, once across all layers, for each required side.
+    let covered_blocks = budget.dequant_reserved_blocks.saturating_sub(budget.current_blocks);
+    let covered_extra = usize::try_from(growth_budget / budget.block_bytes)
+        .unwrap_or(usize::MAX).min(covered_blocks);
+    let remaining = growth_budget - covered_extra as u64 * budget.block_bytes;
+    let grown_block_bytes = budget.block_bytes.checked_add(budget.dequant_block_bytes)
+        .ok_or("physical KV pool growth cost overflow")?;
+    let extra = covered_extra.saturating_add(
+        usize::try_from(remaining / grown_block_bytes).unwrap_or(usize::MAX),
+    );
+    let requested = (budget.logical_capacity / budget.page_cells).saturating_mul(budget.slots);
+    let mut blocks = requested.min(budget.current_blocks.saturating_add(extra));
+    if let Some(limit) = budget.max_view_blocks {
+        blocks = blocks.min(limit);
+    }
+    if let Some(limit) = budget.page_limit {
+        blocks = blocks.min(limit);
+    }
+    if blocks <= budget.current_blocks {
+        return Ok(None);
+    }
+    let rows = blocks.checked_mul(budget.page_cells)
+        .ok_or("physical KV pool rows overflow")?;
+    Ok(Some(EagerPoolGrowth { blocks, rows }))
+}
+
+fn eager_pool_layer_bytes(rows: usize, stride: usize) -> Result<u64, String> {
+    (rows as u64).checked_mul(stride as u64)
+        .ok_or_else(|| "physical KV pool bytes overflow".into())
+}
+
 /// Blocks the pool's device tier holds: the KV tier (what the fast tier has left once the
 /// weights are placed) less the state that is not pooled, over the bytes one block takes
 /// across the pooled layers -- and never fewer than one conversation at `capacity`, which
@@ -1104,6 +1175,99 @@ pub trait KvPoolMember {
         c.pool_prefetched = 0;
         Ok(())
     }
+    /// Prepare a bounded physical pool for concurrent requests on an eager backend.
+    /// Logical context and model/tuner admission remain per request. Incremental
+    /// backends retain their existing budgeted address-space reservation.
+    fn kv_prepare_pool_for_slots(
+        &mut self,
+        slots: usize,
+        slot_state_bytes: u64,
+    ) -> Result<(), String> {
+        self.kv_prepare_pool()?;
+        let be = backend();
+        let slots = slots.min(be.decode_rows_max(imparo_backend::RowRoute::Fast));
+        if slots <= 1 || be.supports_kv_incremental_commit() {
+            return Ok(());
+        }
+        // Startup only: pool block ownership must not change underneath requests.
+        if self.kv_runtime().filled != 0 || !self.state().slots.is_empty() {
+            return Err("physical KV pool sizing must precede active slots".into());
+        }
+        let Some(available) = be.slot_state_budget_bytes() else { return Ok(()); };
+        let capacity = self.kv_runtime().capacity;
+        let page = imparo_kv::page_cells();
+        let current = self.kv_capacity_blocks() as usize;
+        let geometry = self.kv_state_geometry();
+        let full: Vec<_> = geometry.iter()
+            .filter(|g| matches!(g.kind, StateKind::Full)).collect();
+        let block_bytes: u64 = full.iter()
+            .map(|g| 2 * g.k_stride.max(g.v_stride) as u64 * page as u64).sum();
+        if block_bytes == 0 { return Ok(()); }
+        let mut bytes = kv_bytes_for(self.plan(), capacity, capacity, self.kv_ring_batch());
+        let mut layouts = kv_layout_for(self.plan(), capacity, capacity, self.kv_ring_batch());
+        let diagnostic = crate::gpu_support::kvq_mask_on();
+        let dequant_rows = capacity.max(KV_FIRST_SLOTS);
+        let dequant = crate::gpu_support::kv_dequant_scratch_requirements(
+            self.plan(), capacity,
+            KvType::k() != KvType::F16 || diagnostic,
+            KvType::v() != KvType::F16 || diagnostic,
+        );
+        // Reuse the allocator's n_kv * max_head * sizeof(u16) requirement for
+        // each required side. The existing logical scratch is already paid for.
+        let dequant_row_bytes = dequant.iter().try_fold(0_u64, |sum, req| {
+            sum.checked_add(req.bytes / dequant_rows as u64)
+        }).ok_or("physical KV pool dequant row cost overflow")?;
+        let dequant_block_bytes = dequant_row_bytes.checked_mul(page as u64)
+            .ok_or("physical KV pool dequant block cost overflow")?;
+        let max_view_blocks = be.kv_max_view_bytes().and_then(|max_view| {
+            full.iter().filter_map(|g| {
+                let stride = g.k_stride.max(g.v_stride) as u64 * page as u64;
+                (stride != 0).then(|| usize::try_from(max_view / stride).unwrap_or(usize::MAX))
+            }).min()
+        });
+        let page_limit = std::env::var("IMPARO_KV_POOL_PAGES").ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let Some(EagerPoolGrowth { blocks, rows }) = eager_pool_growth(EagerPoolBudget {
+            logical_capacity: capacity,
+            page_cells: page,
+            current_blocks: current,
+            slots,
+            available_bytes: available,
+            slot_state_bytes,
+            block_bytes,
+            dequant_block_bytes,
+            dequant_reserved_blocks: dequant_rows / page,
+            max_view_blocks,
+            page_limit,
+        }, &bytes)? else { return Ok(()); };
+        for g in full {
+            let layer = g.layer as usize;
+            bytes[layer] = eager_pool_layer_bytes(rows, g.k_stride.max(g.v_stride))?;
+            layouts[layer].logical_slots = rows as u64;
+        }
+        be.grow_kv_layout(&bytes, &layouts)
+            .map_err(|rc| format!("physical KV pool growth failed rc={rc}"))?;
+        // Reserve physical-addressed mirrors before admitting slots, even if the
+        // next forward keeps the initial batch width and skips activation resize.
+        for req in dequant {
+            let scratch_bytes = (req.bytes / dequant_rows as u64)
+                .checked_mul(rows.max(dequant_rows) as u64)
+                .ok_or("physical KV scratch bytes overflow")?;
+            if let Err(rc) = be.alloc(req.id, scratch_bytes) {
+                // A backend may release the old scratch before failing its
+                // replacement. Force single-resident fallback to rebuild it,
+                // even if the first request uses the initial batch width.
+                self.state_mut().gpu_batch = 0;
+                return Err(format!("physical KV scratch allocation failed rc={rc}"));
+            }
+        }
+        // Eager storage is now fully committed. Keep pooled=false: partial commits
+        // and releases belong only to backends that implement those operations.
+        self.state_mut().kv_commit.pool_capacity = blocks;
+        eprintln!("[imparo] eager KV pool: {current} -> {blocks} pages, {slots} requested slots, logical context {capacity} unchanged");
+        Ok(())
+    }
+
     /// Make the pooled layers' storage reach `blocks` blocks before anything writes them,
     /// and get the next chunk's worth ready off the step's path.
     ///
@@ -1530,7 +1694,8 @@ fn backend() -> &'static dyn Backend {
 #[cfg(test)]
 mod tests {
     use super::{
-        KvType, byte_layout_profile_with_overrides, execution_kv_route,
+        EagerPoolBudget, EagerPoolGrowth, KvType, byte_layout_profile_with_overrides,
+        eager_pool_growth, eager_pool_layer_bytes, execution_kv_route,
         kv_basis_route_with_overrides, parse_hadamard_override,
         resolve_hadamard_override, resume_point,
     };
@@ -1538,6 +1703,195 @@ mod tests {
         HadamardWidth, KvByteCodec, KvByteCodecRoute, KvQuantizationRoute,
     };
     use imparo_kv::{ConfigRoot, KvQuantizationBasis};
+
+    fn eager_budget(available_bytes: u64) -> EagerPoolBudget {
+        EagerPoolBudget {
+            logical_capacity: 256,
+            page_cells: 64,
+            current_blocks: 4,
+            slots: 2,
+            available_bytes,
+            slot_state_bytes: 1024,
+            block_bytes: 2048,
+            dequant_block_bytes: 0,
+            dequant_reserved_blocks: 4,
+            max_view_blocks: None,
+            page_limit: None,
+        }
+    }
+
+    #[test]
+    fn eager_pool_growth_retains_replacement_and_private_slot_headroom() {
+        // Per-side sizes: one full layer plus one private ring. K and V both
+        // survive while the replacement is made, followed by one new slot.
+        let layer_bytes = [4096, 2048];
+        let reserved = (1 << 20) + 2 * (4096 + 2048) + 1024;
+        for available in [0, reserved - 1, reserved, reserved + 2047] {
+            assert_eq!(eager_pool_growth(eager_budget(available), &layer_bytes), Ok(None));
+        }
+        assert_eq!(
+            eager_pool_growth(eager_budget(reserved + 2048), &layer_bytes),
+            Ok(Some(EagerPoolGrowth { blocks: 5, rows: 320 })),
+        );
+        assert_eq!(
+            eager_pool_growth(eager_budget(reserved + 2 * 2048 + 2047), &layer_bytes),
+            Ok(Some(EagerPoolGrowth { blocks: 6, rows: 384 })),
+        );
+    }
+
+    #[test]
+    fn eager_pool_growth_charges_only_added_quantized_side_scratch() {
+        let layer_bytes = [8192, 2048];
+        let reserved = (1 << 20) + 2 * (8192 + 2048) + 1024;
+        // The same remaining 6144 bytes buys three KV pages for F16, two when
+        // one side needs half scratch, or one when both sides need it.
+        for (dequant_block_bytes, blocks) in [(0, 11), (1024, 10), (2048, 9)] {
+            let budget = EagerPoolBudget {
+                logical_capacity: 512,
+                current_blocks: 8,
+                dequant_reserved_blocks: 8,
+                dequant_block_bytes,
+                ..eager_budget(reserved + 6144)
+            };
+            assert_eq!(
+                eager_pool_growth(budget, &layer_bytes),
+                Ok(Some(EagerPoolGrowth { blocks, rows: blocks * 64 })),
+            );
+        }
+        let budget = EagerPoolBudget {
+            logical_capacity: 512,
+            current_blocks: 8,
+            dequant_reserved_blocks: 8,
+            dequant_block_bytes: 2048,
+            ..eager_budget(reserved + 4095)
+        };
+        assert_eq!(eager_pool_growth(budget, &layer_bytes), Ok(None));
+        assert_eq!(
+            eager_pool_growth(EagerPoolBudget { available_bytes: reserved + 4096, ..budget }, &layer_bytes),
+            Ok(Some(EagerPoolGrowth { blocks: 9, rows: 576 })),
+        );
+    }
+
+    #[test]
+    fn eager_pool_growth_credits_existing_dequant_minimum_capacity() {
+        let layer_bytes = [4096, 2048];
+        let reserved = (1 << 20) + 2 * (4096 + 2048) + 3 * 1024;
+        let budget = EagerPoolBudget {
+            slots: 4,
+            dequant_reserved_blocks: super::KV_FIRST_SLOTS / 64,
+            dequant_block_bytes: 4096,
+            // Four extra KV pages are covered by existing 512-row scratch.
+            ..eager_budget(reserved + 4 * 2048)
+        };
+        assert_eq!(
+            eager_pool_growth(budget, &layer_bytes),
+            Ok(Some(EagerPoolGrowth { blocks: 8, rows: 512 })),
+        );
+        // The next physical page needs both a KV page and a scratch page.
+        for (extra, blocks) in [(6143, 8), (6144, 9)] {
+            assert_eq!(
+                eager_pool_growth(EagerPoolBudget {
+                    available_bytes: budget.available_bytes + extra,
+                    ..budget
+                }, &layer_bytes),
+                Ok(Some(EagerPoolGrowth { blocks, rows: blocks * 64 })),
+            );
+        }
+        assert_eq!(budget.logical_capacity, 256);
+    }
+
+    #[test]
+    fn eager_pool_growth_checks_combined_kv_and_dequant_page_cost() {
+        let budget = EagerPoolBudget {
+            dequant_block_bytes: u64::MAX,
+            ..eager_budget(u64::MAX)
+        };
+        assert_eq!(
+            eager_pool_growth(budget, &[4096, 2048]),
+            Err("physical KV pool growth cost overflow".into()),
+        );
+    }
+
+    #[test]
+    fn eager_pool_growth_bounds_requested_slots_and_preserves_logical_context() {
+        let budget = EagerPoolBudget {
+            logical_capacity: 6656,
+            current_blocks: 104,
+            ..eager_budget(u64::MAX)
+        };
+        let growth = eager_pool_growth(budget, &[6656 * 16, 2048]).unwrap().unwrap();
+        assert_eq!(growth, EagerPoolGrowth { blocks: 208, rows: 13312 });
+        assert_eq!(budget.logical_capacity, 6656);
+        assert_eq!(eager_pool_layer_bytes(growth.rows, 16), Ok(212_992));
+        // Backend admission supplies this already-capped slot count; abundant
+        // memory must not enlarge the physical pool past that request.
+        assert_eq!(
+            eager_pool_growth(EagerPoolBudget { slots: 4, ..budget }, &[6656 * 16, 2048]),
+            Ok(Some(EagerPoolGrowth { blocks: 416, rows: 26624 })),
+        );
+    }
+
+    #[test]
+    fn eager_pool_growth_honors_view_and_explicit_page_caps_without_shrinking() {
+        for (max_view_blocks, page_limit, expected) in [
+            (Some(6), None, Some(EagerPoolGrowth { blocks: 6, rows: 384 })),
+            (None, Some(5), Some(EagerPoolGrowth { blocks: 5, rows: 320 })),
+            (Some(6), Some(5), Some(EagerPoolGrowth { blocks: 5, rows: 320 })),
+            (Some(5), Some(6), Some(EagerPoolGrowth { blocks: 5, rows: 320 })),
+            (Some(4), None, None),
+            (Some(3), None, None),
+            (None, Some(0), None),
+        ] {
+            let budget = EagerPoolBudget { max_view_blocks, page_limit, ..eager_budget(u64::MAX) };
+            assert_eq!(eager_pool_growth(budget, &[4096, 2048]), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn eager_pool_growth_skips_single_slot_or_no_full_attention_storage() {
+        for slots in [0, 1] {
+            let budget = EagerPoolBudget { slots, ..eager_budget(u64::MAX) };
+            assert_eq!(eager_pool_growth(budget, &[4096, 2048]), Ok(None));
+        }
+        let budget = EagerPoolBudget { block_bytes: 0, ..eager_budget(u64::MAX) };
+        assert_eq!(eager_pool_growth(budget, &[2048]), Ok(None));
+    }
+
+    #[test]
+    fn eager_pool_growth_saturating_reserves_never_create_headroom() {
+        let budget = EagerPoolBudget {
+            slots: 3,
+            slot_state_bytes: u64::MAX,
+            ..eager_budget(u64::MAX)
+        };
+        assert_eq!(eager_pool_growth(budget, &[4096, 2048]), Ok(None));
+        for layer_bytes in [&[u64::MAX][..], &[u64::MAX / 2, u64::MAX / 2][..]] {
+            assert_eq!(eager_pool_growth(eager_budget(u64::MAX), layer_bytes), Ok(None));
+        }
+    }
+
+    #[test]
+    fn eager_pool_growth_checks_physical_row_overflow() {
+        let budget = EagerPoolBudget {
+            logical_capacity: usize::MAX,
+            current_blocks: usize::MAX / 64 + 1,
+            ..eager_budget(u64::MAX)
+        };
+        assert_eq!(
+            eager_pool_growth(budget, &[4096, 2048]),
+            Err("physical KV pool rows overflow".into()),
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn eager_pool_growth_checks_layer_byte_overflow() {
+        assert_eq!(eager_pool_layer_bytes(2, usize::MAX / 2), Ok(u64::MAX - 1));
+        assert_eq!(
+            eager_pool_layer_bytes(2, usize::MAX / 2 + 1),
+            Err("physical KV pool bytes overflow".into()),
+        );
+    }
 
     /// The rule the engine gate measures, in one place: land on the 64 grid, and leave
     /// the resumed pass at least two tokens (one is a decode shape and still differs).

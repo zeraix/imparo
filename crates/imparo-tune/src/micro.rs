@@ -1545,7 +1545,11 @@ pub fn measure(
             BufId::X,
             n_tok,
         );
-        let canonical_sidecar_selected = reg.iter().any(|decl| {
+        // The canonical prefill sidecar selector is inert for Decode and TM weights.
+        // A stored canonical seat must not make those different transactions assert.
+        let canonical_sidecar_selected = n_tok > 8
+            && gate_kind == 2 && up_kind == 2 && down_kind == 2
+            && reg.iter().any(|decl| {
             decl.name == "mmq_q8_canonical_gate_up_pair"
                 && matches!((decl.current)(), 2..=4)
         });

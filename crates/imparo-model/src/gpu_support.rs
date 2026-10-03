@@ -20,6 +20,60 @@ pub(crate) fn be() -> &'static dyn Backend {
     crate::backend::active().expect("gpu workflow entered with no active backend")
 }
 
+/// Close and reset a row submission even when an encoder rejects a later layer.
+/// The encoder opens the forward but does not call `end`; queued work and pending
+/// device errors are drained before the scheduler may select another conversation.
+pub(crate) fn submit_decode_rows(
+    backend: &dyn Backend,
+    route: imparo_backend::RowRoute,
+    encode: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if !backend.set_decode_rows(Some(route)) {
+        return Err("the backend has no decode rows".into());
+    }
+    let encoded = encode();
+    let ended = backend.end().map_err(|rc| format!("co-batched step failed rc={rc}"));
+    let reset = backend.set_decode_rows(None);
+    encoded?;
+    ended?;
+    if !reset {
+        return Err("the backend could not close decode rows".into());
+    }
+    Ok(())
+}
+
+/// Checkpoints switch conversation bindings only after the row forward is closed.
+/// Reuse the backend's ordinary post-forward copy so CUDA never changes slots inside
+/// a live forward/graph. Always restore the host workflow's selected slot on error.
+pub(crate) fn snapshot_decode_rows(
+    backend: &dyn Backend,
+    rows: &[crate::DecodeRow],
+    selected: u32,
+    recurrent_elems: u32,
+) -> Result<(), String> {
+    if !rows.iter().any(|r| r.snap) {
+        return Ok(());
+    }
+    let copied = (|| {
+        for row in rows.iter().filter(|r| r.snap) {
+            let offset = row.plane_out.checked_mul(recurrent_elems)
+                .ok_or("co-batched snapshot plane overflow")?;
+            if !backend.select_slot(row.slot) {
+                return Err(format!("co-batched snapshot: slot {} not selected", row.slot));
+            }
+            backend.copy_range_after_forward(
+                BufId::RecurSnap, 0, BufId::Recur, offset, recurrent_elems,
+            ).map_err(|rc| format!("co-batched snapshot: slot {} copy failed rc={rc}", row.slot))?;
+        }
+        Ok(())
+    })();
+    let restored = backend.select_slot(selected);
+    if !restored {
+        return Err(format!("co-batched snapshot: could not restore slot {selected}; copy result: {copied:?}"));
+    }
+    copied
+}
+
 /// Hard cap on attention scores held in threadgroup memory (32 KiB). The
 /// attention dispatch slices any longer span (scores-aware slices), so this is
 /// a tile size, not a context limit. IMPARO_MAX_SCORES shrinks it (test
@@ -293,6 +347,30 @@ pub fn kv_dequant_scratch_requirements(
         });
     }
     requirements
+}
+
+/// Quantized-KV mirrors retain physical page addressing, just like their cache.
+/// A multi-conversation pool can exceed one logical context; resizing activations
+/// must retain that physical extent without changing model/tuner geometry.
+fn fit_paged_kv_scratch(
+    requirements: &mut [BufferRequirement],
+    logical_capacity: usize,
+    physical_rows: usize,
+) -> Result<(), String> {
+    let logical_rows = logical_capacity.max(crate::kv::KV_FIRST_SLOTS) as u64;
+    let rows = (physical_rows as u64).max(logical_rows);
+    for req in requirements {
+        if !matches!(req.id, BufId::Kdq | BufId::Vdq) {
+            continue;
+        }
+        // These requirements originate from kv_dequant_scratch_requirements.
+        if req.bytes % logical_rows != 0 {
+            return Err("KV scratch does not have a whole-row layout".into());
+        }
+        req.bytes = (req.bytes / logical_rows).checked_mul(rows)
+            .ok_or("physical KV scratch bytes overflow")?;
+    }
+    Ok(())
 }
 
 /// Backend-owned half-precision mirrors of the activation.
@@ -1083,13 +1161,17 @@ impl<A: Architecture> Workflow<A> {
     pub fn gpu_alloc_activations(&mut self, b_req: usize) -> Result<u64, String> {
         let (layout_rows, layout_demand) = self.activation_layout_request(b_req);
         let b = batch_floor(layout_rows);
-        let reqs = A::buffer_requirements_for_output(
+        let mut reqs = A::buffer_requirements_for_output(
             &self.plan,
             b,
             self.state.kv_rt.capacity,
             layout_demand,
             layout_rows,
         )?;
+        let physical_rows = self.state.kv_commit.pool_capacity
+            .checked_mul(imparo_kv::page_cells())
+            .ok_or("physical KV scratch rows overflow")?;
+        fit_paged_kv_scratch(&mut reqs, self.state.kv_rt.capacity, physical_rows)?;
         let layout = place_buffers(&reqs)?;
         self.state.gpu_batch = layout_rows;
         self.state.gpu_all_logits = layout_demand.requires_all_positions();
@@ -1548,6 +1630,38 @@ mod plan_tests {
         }
     }
 
+    #[test]
+    fn paged_kv_scratch_preserves_pool_extent_across_batch_resizes() {
+        for batch in [512_u64, 2, 1] {
+            let mut reqs = vec![
+                req(BufId::Q, batch * 4096 * 4, Placement::Dedicated),
+                req(BufId::Kdq, 6656 * 1024 * 2, Placement::Dedicated),
+                req(BufId::Vdq, 6656 * 1024 * 2, Placement::Dedicated),
+            ];
+            fit_paged_kv_scratch(&mut reqs, 6656, 13312).unwrap();
+            assert_eq!(reqs[0].bytes, batch * 4096 * 4);
+            assert_eq!(reqs[1].bytes, 13312 * 1024 * 2);
+            assert_eq!(reqs[2].bytes, 13312 * 1024 * 2);
+        }
+    }
+
+    #[test]
+    fn paged_kv_scratch_retains_floor_and_absent_mirrors() {
+        let floor = crate::kv::KV_FIRST_SLOTS;
+        let mut reqs = vec![req(BufId::Kdq, floor as u64 * 2048, Placement::Dedicated)];
+        fit_paged_kv_scratch(&mut reqs, 64, 128).unwrap();
+        assert_eq!(reqs[0].bytes, floor as u64 * 2048);
+        fit_paged_kv_scratch(&mut [], 6656, 13312).unwrap();
+    }
+
+    #[test]
+    fn paged_kv_scratch_rejects_invalid_row_layout_and_overflow() {
+        let mut bad = [req(BufId::Kdq, 6657, Placement::Dedicated)];
+        assert!(fit_paged_kv_scratch(&mut bad, 6656, 13312).is_err());
+        let mut large = [req(BufId::Vdq, 6656 * 2048, Placement::Dedicated)];
+        assert!(fit_paged_kv_scratch(&mut large, 6656, usize::MAX).is_err());
+    }
+
     /// The #194 defect: an alias another group reaches into is promoted to its own
     /// allocation by the allocator, and the reserve has to count it. The mixer group (1) is
     /// larger than the host's group (0), so the alias at offset 0 of the host sits inside
@@ -1693,5 +1807,65 @@ mod plan_tests {
             plan.steps.iter().find(|s| s.id == BufId::Q).unwrap().action,
             Action::AliasPlace { .. }
         ));
+    }
+}
+
+
+#[cfg(all(test, any(feature = "cuda", feature = "cuda-dynamic")))]
+mod row_submission_gpu_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires an idle CUDA device and owns process-global state"]
+    fn gpu_decode_rows_encoder_error_closes() {
+        let backend=imparo_cuda::CudaBackend;
+        let weights=Box::leak(vec![1.0_f32;1024].into_boxed_slice());
+        unsafe { backend.init_weights(weights.as_ptr().cast(),4096) }.unwrap();
+        for id in [BufId::Q,BufId::Attn,BufId::Recur,BufId::RecurSnap] {backend.alloc(id,1024).unwrap();}
+        assert!(backend.supports_argmax_rows());
+        backend.alloc(BufId::Logits,32).unwrap();backend.alloc(BufId::Tmp,8).unwrap();
+        backend.write(BufId::Logits,0,&[0.0,3.0,1.0,2.0,8.0,4.0,2.0,0.0]);
+        backend.argmax_rows(BufId::Logits,BufId::Tmp,4,2);backend.end().unwrap();
+        let mut picks=[0.0_f32;2];backend.read(BufId::Tmp,0,&mut picks);
+        assert_eq!(picks.map(f32::to_bits),[1,0]);
+        backend.end().unwrap();assert!(backend.set_slots(2,&[]));
+        let route=imparo_backend::RowRoute::Fast;
+        let failed=submit_decode_rows(&backend,route,|| {
+            backend.begin_forward(false);
+            Err("injected encoder rejection".into())
+        });
+        assert!(failed.unwrap_err().contains("injected encoder rejection"));
+        assert!(backend.select_slot(1),"encoder rejection left the forward open");
+        assert!(!backend.head_norm_rope_at(BufId::Q,0,32,1e-6,1,&[0],32,10000.0,None),"row mode leaked");
+        let failed=submit_decode_rows(&backend,route,|| {
+            backend.begin_forward(false);
+            // Invalid shape is rejected before any kernel launch; exercise pending-error drain.
+            backend.causal_conv(imparo_backend::ConvForm::PlainSilu,BufId::Q,0,BufId::Recur,0,0,BufId::Attn,32,1,1);
+            Ok(())
+        });
+        assert!(failed.unwrap_err().contains("co-batched step failed"));
+        assert!(backend.select_slot(0),"native rejection left the forward open");
+        submit_decode_rows(&backend,route,|| {backend.begin_forward(false);Ok(())}).unwrap();
+        assert!(backend.select_slot(1),"next submission did not recover");
+        // A two-row checkpoint crosses a real slot boundary after end(), and copies
+        // the committed plane rather than the old plane into each slot's snapshot.
+        for slot in [0,1] {
+            assert!(backend.select_slot(slot));
+            let values:Vec<f32>=(0..8).map(|i| (slot*100+i) as f32).collect();
+            backend.write(BufId::Recur,0,&values);backend.end().unwrap();
+        }
+        assert!(backend.select_slot(0));
+        submit_decode_rows(&backend,route,|| {backend.begin_forward(false);Ok(())}).unwrap();
+        let rows:Vec<_>=[0,1].into_iter().map(|slot| crate::DecodeRow {
+            slot,token:0,pos:63,plane_in:0,plane_out:1,snap:true,
+        }).collect();
+        snapshot_decode_rows(&backend,&rows,0,4).unwrap();
+        let mut live=[0.0;4];backend.read(BufId::Recur,0,&mut live);
+        assert_eq!(live,[0.0,1.0,2.0,3.0],"selected slot was not restored");
+        for slot in [0,1] {
+            assert!(backend.select_slot(slot));
+            let mut got=[0.0;4];backend.read(BufId::RecurSnap,0,&mut got);
+            assert_eq!(got,std::array::from_fn(|i| (slot*100+i as u32+4) as f32));
+        }
+
     }
 }

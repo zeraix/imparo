@@ -32,7 +32,7 @@ use crate::gpu_support::{
     BufferRequirement, Placement, be, fuse_epilogue_enabled, gprobe,
     gpu_probe_last_row, gpu_probe_layer, half_activation_mirror_requirements,
     kv_dequant_scratch_requirements, kvq_mask_on, layer_skip_log, scores_needed,
-    should_fuse_epilogue, tail_align, tail_split, trace_rows,
+    should_fuse_epilogue, tail_align, tail_split, tail_split_min_rows, trace_rows,
 };
 use crate::kv::{KvType, effective_workflow_kv_route, had_nrot, ring_mask};
 use crate::qwen35::Qwen35;
@@ -91,7 +91,7 @@ pub fn prepare_device(wf: &mut Qwen35) -> Result<(), String> {
         }
     }
     if cache.include_head {
-        // NOT tied: `output.weight` is its own tensor here, unlike LFM2's head.
+        // The resolved output span also covers tied embeddings, as in LFM2.
         push(&wf.w.output, n_out, wf.plan.config.vocab_size);
     }
     be().prepare_quantized_weight_cache(&spans)
@@ -382,7 +382,14 @@ pub fn batch(
     // docs/prefill-ends-at-the-last-state-writing-layer.md. Not taken under 128 rows,
     // so the move never overlaps itself.
     let tail = if wf.state.logits_wanted && b >= 128 {
-        tail_split(b, tail_align())
+        // Reuse the shared row-local policy already used by Gemma/LFM. Keep
+        // the aligned multi-row family and narrow only after the last state write.
+        let rows = be().row_local_prefill_tail_rows(b);
+        if gpu_probe_layer() == usize::MAX && matches!(rows, 16 | 32) {
+            tail_split_min_rows(b, tail_align(), rows)
+        } else {
+            tail_split(b, tail_align())
+        }
     } else {
         None
     };
@@ -1125,12 +1132,9 @@ pub fn rows(
     let fit = wf.gpu_fit_batch(rows.len());
     wf.state.output_demand = crate::OutputDemand::LastToken;
     fit?;
-    if !be().set_decode_rows(Some(wf.state.row_route)) {
-        return Err("the backend has no decode rows".into());
-    }
-    let encoded = encode_rows(wf, rows, b);
-    be().set_decode_rows(None);
-    encoded?;
+    crate::gpu_support::submit_decode_rows(be(), wf.state.row_route, || {
+        encode_rows(wf, rows, b)
+    })?;
     let mut got = vec![0.0_f32; rows.len()];
     be().read(BufId::Tmp, 0, &mut got);
     picks.clear();
@@ -1559,35 +1563,8 @@ fn encode_rows(wf: &Qwen35, rows: &[crate::DecodeRow], b: u32) -> Result<(), Str
     if let Some(cap) = wf.plan.output.logit_softcap {
         be().softcap(BufId::Logits, cap, b * c.vocab_size);
     }
-    // A row whose step ends on a checkpoint boundary keeps its state there: its slot's
-    // snapshot twin takes a copy of the plane the step wrote, as the one-row decode's
-    // boundary snapshot writes it aside.
-    if rows.iter().any(|r| r.snap) {
-        for r in rows.iter().filter(|r| r.snap) {
-            if !be().select_slot(r.slot) {
-                return Err(format!(
-                    "co-batched snapshot: slot {} not selected",
-                    r.slot
-                ));
-            }
-            be().copy_range(
-                BufId::RecurSnap,
-                0,
-                BufId::Recur,
-                r.plane_out * recur_elems,
-                recur_elems,
-            );
-        }
-        if !be().select_slot(wf.state.slot) {
-            return Err(format!(
-                "co-batched snapshot: slot {} not selected",
-                wf.state.slot
-            ));
-        }
-    }
     be().argmax_rows(BufId::Logits, BufId::Tmp, c.vocab_size, b);
-    be().end()
-        .map_err(|rc| format!("qwen35 co-batched step failed rc={rc}"))
+    Ok(())
 }
 
 /// IMPARO_SKIP_AB=1 drops the alpha and beta projections. A skip lever for the

@@ -4,7 +4,7 @@ constexpr unsigned K=256,V=128000,M=9,B=4;
 struct Node{uint32_t token;int parent,depth;float score;};
 struct Top{uint32_t token;float logp;};
 struct Part{uint32_t ids[4];float values[4],sum;};
-struct State{Part parts[256];Node nodes[33],out[16];Top top[16];int front[4];};
+struct State{Part parts[256];Node nodes[33],out[16];Top top[16];int front[4];Top groups[29][4];};
 static_assert(sizeof(Node)==16,"node ABI");
 template<unsigned C>__global__ void shortk_batch(const uint8_t*w,const BlockQ8_1*x,float*y){
  const unsigned lane=threadIdx.x,row=blockIdx.x*4+threadIdx.y,block=lane/4,iqs=2*(lane&3);float p[C]={};
@@ -40,7 +40,10 @@ __global__ void merge_top(State*s){
 }
 
 __global__ void initialize(State*s,uint32_t*tok,unsigned anchor){if(threadIdx.x==0){s->nodes[0]={anchor,-1,0,0.f};s->front[0]=0;tok[0]=anchor;}}
-__global__ void choose_frontier(State*s,uint32_t*tok,unsigned depth,unsigned rows){if(threadIdx.x)return;int old[4];for(unsigned i=0;i<rows;++i)old[i]=s->front[i];bool used[16]={};
+__global__ void choose_frontier(State*s,uint32_t*tok,unsigned depth,unsigned rows,bool save_groups){if(threadIdx.x)return;int old[4];for(unsigned i=0;i<rows;++i)old[i]=s->front[i];bool used[16]={};
+ // Preserve all four local choices before the existing global beam pruning.
+ // Parent nodes 0..28 are expanded exactly once; depth-eight nodes are leaves.
+ if(save_groups)for(unsigned i=0;i<rows;++i)for(unsigned j=0;j<4;++j)s->groups[old[i]][j]=s->top[i*4+j];
  for(unsigned k=0;k<4;++k){int best=-1;float score=-INFINITY;for(unsigned j=0;j<rows*4;++j)if(!used[j]){float z=s->nodes[old[j/4]].score+s->top[j].logp;if(best<0||z>score||(z==score&&j<unsigned(best))){best=j;score=z;}}used[best]=true;int at=1+depth*4+k;auto top=s->top[best];s->nodes[at]={top.token,old[best/4],int(depth)+1,score};s->front[k]=at;tok[k]=top.token;}}
 __global__ void choose_budget(State*s){if(threadIdx.x)return;int map[33];for(int i=0;i<33;++i)map[i]=-1;map[0]=0;s->out[0]=s->nodes[0];
  for(int k=1;k<16;++k){int best=-1;for(int j=1;j<33;++j)if(map[j]<0&&(best<0||s->nodes[j].score>s->nodes[best].score))best=j;map[best]=k;Node n=s->nodes[best];n.parent=map[n.parent];s->out[k]=n;}}

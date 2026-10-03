@@ -63,7 +63,18 @@ unsafe extern "C" {
         src: u32,
     ) -> i32;
     fn imparo_cuda_gemma4_mtp_append(start: u32, consumed: u32) -> i32;
+    fn imparo_cuda_gemma4_mtp_append_tree(
+        start: u32,
+        path: *const i32,
+        count: u32,
+    ) -> i32;
     fn imparo_cuda_gemma4_mtp_generate(start: u32, anchor: u32, ids: *mut u32) -> i32;
+    fn imparo_cuda_gemma4_mtp_generate_selected(start: u32, anchor: u32, ids: *mut u32) -> i32;
+    fn imparo_cuda_gemma4_mtp_generate_tree4(
+        start: u32,
+        anchor: u32,
+        ids: *mut u32,
+    ) -> i32;
     fn imparo_cuda_gemma4_mtp_generate_gated(
         start: u32,
         anchor: u32,
@@ -132,6 +143,30 @@ pub unsafe fn capture_layer(
 pub unsafe fn append(start: u32, consumed: u32) -> Result<(), String> {
     unsafe { checked(imparo_cuda_gemma4_mtp_append(start, consumed)) }
 }
+fn tree_commit_count(start: u32, path: &[i32]) -> Result<u32, String> {
+    let count = u32::try_from(path.len()).map_err(|_| "MTP tree path overflow")?;
+    if path.first() != Some(&0)
+        || path.windows(2).any(|pair| pair[0] >= pair[1])
+        || start.checked_add(count).is_none()
+        || path
+            .last()
+            .and_then(|&node| u32::try_from(node).ok())
+            .and_then(|node| start.checked_add(node))
+            .is_none()
+    {
+        return Err("MTP tree commit path invalid".into());
+    }
+    Ok(count)
+}
+/// # Safety
+/// Target has verified and committed this root-first accepted path. Every index names a
+/// normalized row in the current capture at `start`, and parent/child edges were checked
+/// by the target verifier. Native selects FEATURE[path.last()] while advancing hidden
+/// history by path.len(); missing/stale captured rows are errors, never an empty hidden.
+pub unsafe fn append_tree(start: u32, path: &[i32]) -> Result<(), String> {
+    let count = tree_commit_count(start, path)?;
+    unsafe { checked(imparo_cuda_gemma4_mtp_append_tree(start, path.as_ptr(), count)) }
+}
 /// # Safety
 /// Target state and committed post-output-norm hidden both end at start. The two predictions
 /// use the same target position, with h_p paired with target embedding x_(p+1).
@@ -142,6 +177,31 @@ pub unsafe fn generate(
 ) -> Result<(), String> {
     unsafe {
         checked(imparo_cuda_gemma4_mtp_generate(
+            start,
+            anchor,
+            ids.as_mut_ptr(),
+        ))
+    }
+}
+/// # Safety
+/// Same boundary as generate, in the default-off short E4B selector domain.
+/// Returns [selected first, conditional second, original first, alternate first].
+/// The ordinary target verifier must validate both proposals before any commit.
+pub unsafe fn generate_selected(start: u32, anchor: u32, ids: &mut [u32; 4]) -> Result<(), String> {
+    unsafe { checked(imparo_cuda_gemma4_mtp_generate_selected(start, anchor, ids.as_mut_ptr())) }
+}
+/// # Safety
+/// Same committed target/hidden boundary as generate, in the admitted short E4B tree4
+/// geometry. Returns the original two-step chain and a second candidate from the
+/// selected first/second step (the explicit delayed-tree lab flag). Both reuse
+/// that step's dense/cluster logits, without another assistant forward.
+pub unsafe fn generate_tree4(
+    start: u32,
+    anchor: u32,
+    ids: &mut [u32; 3],
+) -> Result<(), String> {
+    unsafe {
+        checked(imparo_cuda_gemma4_mtp_generate_tree4(
             start,
             anchor,
             ids.as_mut_ptr(),
@@ -183,4 +243,26 @@ pub unsafe fn generate_gated(
 /// must invalidate any graph destinations before releasing its assistant buffers.
 pub unsafe fn detach() -> Result<(), String> {
     unsafe { checked(imparo_cuda_gemma4_mtp_detach()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tree_commit_count;
+
+    #[test]
+    fn accepted_tree_path_counts_tokens_instead_of_storage_rows() {
+        assert_eq!(tree_commit_count(1022, &[0, 3]).unwrap(), 2);
+        assert_eq!(tree_commit_count(1022, &[0]).unwrap(), 1);
+        assert_eq!(tree_commit_count(1022, &[0, 1, 2]).unwrap(), 3);
+    }
+
+    #[test]
+    fn malformed_or_overflowing_tree_paths_are_rejected_before_native() {
+        for path in [&[][..], &[1], &[-1], &[0, -1], &[0, 0], &[0, 3, 1]] {
+            assert!(tree_commit_count(512, path).is_err(), "{path:?}");
+        }
+        assert!(tree_commit_count(u32::MAX, &[0]).is_err());
+        assert!(tree_commit_count(u32::MAX - 2, &[0, 3]).is_err());
+        assert_eq!(tree_commit_count(u32::MAX - 2, &[0, 1]).unwrap(), 2);
+    }
 }

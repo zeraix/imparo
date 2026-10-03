@@ -7,6 +7,8 @@
 mod w4a16_ffn_check;
 
 mod continuation_score;
+#[cfg(feature = "cuda-speculative")]
+mod cuda_tree_check;
 
 use std::path::PathBuf;
 
@@ -14,6 +16,40 @@ use imparo_model::build_plan;
 // No `use` for Model or KvPoolMember: the tool holds a Box<dyn Model>, and a trait
 // object dispatches its own methods -- including the supertrait's -- without them.
 use imparo_model::weights::Weights;
+
+#[derive(Debug, Eq, PartialEq)]
+struct CorrectnessTemplateOptions {
+    kv: String,
+    draft_pairing: Option<PathBuf>,
+}
+
+fn correctness_template_options(
+    mut args: impl Iterator<Item = String>,
+) -> Result<CorrectnessTemplateOptions, String> {
+    let mut kv = None;
+    let mut draft_pairing = None;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--kv" if kv.is_none() => {
+                let value = args.next().ok_or("--correctness-template --kv needs a value")?;
+                if !matches!(value.as_str(), "q4_0" | "q8_0" | "f16") {
+                    return Err("--correctness-template --kv supports q4_0, q8_0 or qualified f16".into());
+                }
+                kv = Some(value);
+            }
+            "--draft-pairing" if draft_pairing.is_none() => {
+                let value = args.next().filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or("--correctness-template --draft-pairing needs a manifest path")?;
+                draft_pairing = Some(PathBuf::from(value));
+            }
+            _ => return Err(format!("--correctness-template unknown or repeated option: {flag}")),
+        }
+    }
+    Ok(CorrectnessTemplateOptions {
+        kv: kv.unwrap_or_else(|| "q4_0".into()),
+        draft_pairing,
+    })
+}
 
 fn top10_string(logits: &[f32], out: &mut String) {
     use std::fmt::Write as _;
@@ -898,46 +934,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.next()
                 .ok_or("--correctness-template needs CONFIG and MODEL")?,
         );
-        let kv = if let Some(flag) = args.next() {
-            if flag != "--kv" {
-                return Err("--correctness-template optional argument is --kv".into());
-            }
-            let value = args
-                .next()
-                .ok_or("--correctness-template --kv needs a value")?;
-            if args.next().is_some() {
-                return Err(
-                    "--correctness-template accepts only CONFIG MODEL [--kv TYPE]"
-                        .into(),
-                );
-            }
-            value
-        } else {
-            "q4_0".to_string()
-        };
-        if kv != "q4_0" && kv != "q8_0" && kv != "f16" {
-            return Err(
-                "--correctness-template --kv supports q4_0, q8_0 or qualified f16"
-                    .into(),
-            );
-        }
+        #[cfg_attr(not(any(feature = "cuda", feature = "cuda-dynamic")), allow(unused_variables))]
+        let options = correctness_template_options(args)?;
         #[cfg(any(feature = "cuda", feature = "cuda-dynamic"))]
         {
             unsafe { std::env::set_var("IMPARO_HOST_CONFIG", &config) };
             let document = imparo_gguf::read(&model_path)?;
             let plan = build_plan(&document, &model_path)?;
-            let weights = Weights::open_with(&document, &model_path)?;
+            let (weights, plan, model_bytes) = if let Some(manifest) = options.draft_pairing.as_deref() {
+                #[cfg(feature = "cuda-speculative")]
+                {
+                    let declared: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
+                    let (draft, spec) = if plan.config.architecture == "gemma4" {
+                        if declared.get("draft_kind").is_some_and(|kind| kind.as_str() != Some("gemma4-mtp")) {
+                            return Err("Gemma4 correctness pairing requires gemma4-mtp".into());
+                        }
+                        let (draft, pairing) = imparo_model::gemma4_mtp::Pairing::load(manifest, &model_path)?;
+                        (draft, imparo_model::speculative::DraftSpec::GemmaMtp(pairing))
+                    } else {
+                        if !matches!(plan.config.architecture.as_str(), "lfm2" | "lfm2moe" | "qwen3") {
+                            return Err("target has no supported correctness pairing".into());
+                        }
+                        if declared.get("draft_kind").is_some_and(|kind| kind.as_str() != Some("dspark")) {
+                            return Err("DSpark correctness pairing requires dspark".into());
+                        }
+                        // Preserve identity checks for existing template manifests,
+                        // then open the drafter through the service's current API.
+                        let (draft, pairing) = load_draft_pairing(manifest, &model_path)?;
+                        let vocab = document.tensor("token_embd.weight")
+                            .and_then(|t| t.dimensions.get(1)).copied()
+                            .ok_or("target embedding vocabulary missing")?;
+                        if u64::from(pairing.mask_token()) >= vocab {
+                            return Err("DSpark mask token is outside target vocabulary".into());
+                        }
+                        (draft, imparo_model::speculative::DraftSpec::Dspark(pairing))
+                    };
+                    let weights = Weights::open_with_appended(&document, &model_path, &draft)?;
+                    spec.appended_spans(&weights, plan.config.n_layers)?;
+                    let plan = imparo_model::ModelPlan {
+                        drafter: spec.drafter_plan(&weights, plan.config.n_layers)?,
+                        ..plan
+                    };
+                    // Match the service: the tune key covers target tensors, while
+                    // correctness hashes the complete mapped target/padding/drafter.
+                    let model_bytes = weights.model_bytes();
+                    (weights, plan, model_bytes)
+                }
+                #[cfg(not(feature = "cuda-speculative"))]
+                {
+                    let _ = manifest;
+                    return Err("--correctness-template --draft-pairing requires cuda-speculative".into());
+                }
+            } else {
+                // Preserve the legacy single-file/composite template contract.
+                let weights = Weights::open_with(&document, &model_path)?;
+                let model_bytes = weights.byte_len();
+                (weights, plan, model_bytes)
+            };
+            let kv = &options.kv;
             let kv_layout_sha256 =
-                imparo_model::kv::effective_kv_byte_layout_profile(&plan, &kv, &kv)?
+                imparo_model::kv::effective_kv_byte_layout_profile(&plan, kv, kv)?
                     .sha256_identity();
             let receipt = imparo_cuda::correctness_receipt_template(
                 &config,
-                weights.byte_len(),
+                model_bytes,
                 weights.full_file_sha256(),
                 *plan.sha256_identity().as_bytes(),
                 kv_layout_sha256,
-                &kv,
-                &kv,
+                kv,
+                kv,
             )?;
             println!("{}", serde_json::to_string(&receipt)?);
             return Ok(());
@@ -1212,6 +1277,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         first = args
             .next()
             .ok_or("--decode-vs-verify R MODEL.gguf TOKEN...")?;
+    }
+    let verify_cuda_tree_small = first == "--verify-cuda-tree-small";
+    if verify_cuda_tree_small {
+        if !cfg!(feature = "cuda-speculative") || repeat != 1 || decode_n > 0
+            || graph_decode_n > 0 || dbatch != 1 || split.is_some()
+            || !split_series.is_empty() || verify_chain.is_some() || dspark_draft.is_some() {
+            return Err("--verify-cuda-tree-small runs alone on a CUDA speculative build".into());
+        }
+        first = args.next().ok_or("--verify-cuda-tree-small MODEL.gguf TOKEN...")?;
     }
     let mut verify_tree = false;
     if first == "--verify-tree" {
@@ -1490,6 +1564,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "load  ms={load_ms:.1} tensors={tensor_count} layers={layer_count} vocab={vocab_size}"
     );
+    #[cfg(feature = "cuda-speculative")]
+    if verify_cuda_tree_small {
+        return cuda_tree_check::run(model.as_mut(), &tokens).map_err(Into::into);
+    }
     if let Some(prefix) = score_prefix {
         use sha2::{Digest, Sha256};
         use std::fmt::Write as _;
@@ -3169,6 +3247,14 @@ impl imparo_model::speculative::DraftProvider for RoundLog<'_> {
         self.inner.observe_round_fixed(elapsed);
     }
 
+    fn observe_tree_round(
+        &mut self,
+        tree: &imparo_model::speculative::DraftTree,
+        timing: &imparo_model::speculative::TreeRoundTiming,
+    ) {
+        self.inner.observe_tree_round(tree, timing);
+    }
+
     fn block_size(&self) -> usize {
         self.inner.block_size()
     }
@@ -3253,6 +3339,38 @@ fn load_drafter(
 ) -> Result<(PathBuf, imparo_model::dspark::Pairing), Box<dyn std::error::Error>> {
     let (draft, pairing) = imparo_model::dspark::Pairing::open(draft, None)?;
     eprintln!("[imparo] drafter admitted: {}", draft.display());
+    Ok((draft, pairing))
+}
+
+/// Compatibility for existing correctness-template manifests only. The ordinary
+/// service and forward paths use v2's direct drafter-file admission.
+#[cfg(feature = "cuda-speculative")]
+fn load_draft_pairing(
+    manifest: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(PathBuf, imparo_model::dspark::Pairing), Box<dyn std::error::Error>> {
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
+    let text = |key: &str| {
+        doc[key].as_str().ok_or_else(|| format!("pairing manifest has no {key}"))
+    };
+    let number = |key: &str| {
+        doc[key].as_u64().ok_or_else(|| format!("pairing manifest has no {key}"))
+    };
+    if std::path::Path::new(text("target_path")?).canonicalize()? != target.canonicalize()? {
+        return Err("correctness pairing names another target".into());
+    }
+    let draft = PathBuf::from(text("draft_path")?);
+    for (key, path) in [("target", target), ("draft", draft.as_path())] {
+        imparo_gguf::pairing::verify(
+            path,
+            number(&format!("{key}_bytes"))?,
+            text(&format!("{key}_sha256"))?,
+            doc[format!("{key}_stamp")].as_str(),
+        )?;
+    }
+    let mask = u32::try_from(number("mask_token")?)?;
+    let (draft, pairing) = imparo_model::dspark::Pairing::open(&draft, Some(mask))?;
+    eprintln!("[imparo] correctness drafter admitted: {}", draft.display());
     Ok((draft, pairing))
 }
 
@@ -3351,6 +3469,54 @@ mod full_history_control_tests {
                 )
                 .is_err()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod correctness_template_option_tests {
+    use super::{CorrectnessTemplateOptions, correctness_template_options};
+    use std::path::PathBuf;
+
+    fn parse(values: &[&str]) -> Result<CorrectnessTemplateOptions, String> {
+        correctness_template_options(values.iter().map(|value| (*value).to_owned()))
+    }
+
+    #[test]
+    fn legacy_template_keeps_default_and_explicit_kv_without_pairing() {
+        assert_eq!(parse(&[]).unwrap(), CorrectnessTemplateOptions {
+            kv: "q4_0".into(), draft_pairing: None,
+        });
+        for kv in ["q4_0", "q8_0", "f16"] {
+            assert_eq!(parse(&["--kv", kv]).unwrap(), CorrectnessTemplateOptions {
+                kv: kv.into(), draft_pairing: None,
+            });
+        }
+    }
+
+    #[test]
+    fn paired_template_accepts_explicit_manifest_in_either_option_order() {
+        for values in [
+            vec!["--draft-pairing", "pairing.json"],
+            vec!["--draft-pairing", "pairing.json", "--kv", "q4_0"],
+            vec!["--kv", "q4_0", "--draft-pairing", "pairing.json"],
+        ] {
+            assert_eq!(parse(&values).unwrap(), CorrectnessTemplateOptions {
+                kv: "q4_0".into(), draft_pairing: Some(PathBuf::from("pairing.json")),
+            });
+        }
+    }
+
+    #[test]
+    fn template_rejects_incomplete_duplicate_and_unknown_options() {
+        for values in [
+            vec!["--kv"], vec!["--kv", "q4_1"], vec!["--draft-pairing"],
+            vec!["--draft-pairing", ""], vec!["--draft-pairing", "--kv", "q4_0"],
+            vec!["--kv", "q4_0", "--kv", "q4_0"],
+            vec!["--draft-pairing", "a.json", "--draft-pairing", "b.json"],
+            vec!["--unknown"], vec!["unexpected"],
+        ] {
+            assert!(parse(&values).is_err(), "accepted {values:?}");
         }
     }
 }

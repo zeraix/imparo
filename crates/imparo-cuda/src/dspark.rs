@@ -43,6 +43,17 @@ pub struct Layer {
 }
 const _: () =
     assert!(std::mem::size_of::<Config>() == 120 && std::mem::size_of::<Layer>() == 88);
+/// One expanded parent's complete local top-4 before beam pruning.
+/// `logp` is normalized over the vocabulary, not the four returned choices.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct FrontierGroup {
+    pub parent: u32,
+    pub tokens: [u32; 4],
+    pub logp: [f32; 4],
+    pub confidence: f32,
+}
+const _: () = assert!(std::mem::size_of::<FrontierGroup>() == 40);
 unsafe extern "C" {
     fn imparo_cuda_dspark_attach(
         c: *const Config,
@@ -77,6 +88,17 @@ unsafe extern "C" {
         conf: *mut f32,
     ) -> i32;
     fn imparo_cuda_dspark_detach() -> i32;
+    fn imparo_cuda_dspark_generate_with_accept_features(
+        start: u32,
+        anchor: u32,
+        ids: *mut u32,
+        conf: *mut f32,
+    ) -> i32;
+    fn imparo_cuda_dspark_frontier_groups(
+        start: u32,
+        anchor: u32,
+        groups: *mut FrontierGroup,
+    ) -> i32;
 }
 fn checked(rc: i32) -> Result<(), String> {
     if rc == 0 {
@@ -229,7 +251,7 @@ pub unsafe fn tree_leaves(start: u32, anchor: u32) -> Result<Vec<u32>, String> {
     Ok(ids)
 }
 /// # Safety
-/// Path was verified by target; most recent feature capture has the 16 tree rows.
+/// Path was verified by target; most recent feature capture has its 2–16 tree rows.
 pub unsafe fn compact_features(path: &[i32]) -> Result<(), String> {
     unsafe {
         checked(imparo_cuda_dspark_compact_features(
@@ -264,4 +286,93 @@ pub unsafe fn frontier_tree(
         ))?;
     }
     Ok((ids, parents))
+}
+
+unsafe extern "C" {
+    fn imparo_cuda_dspark_frontier_scores(start: u32, anchor: u32, scores: *mut f32) -> i32;
+}
+/// Cumulative log probabilities already cached by native frontier generation.
+/// # Safety
+/// Same exclusive owner and round as `frontier_tree`; no intervening draft.
+pub unsafe fn frontier_scores(start: u32, anchor: u32) -> Result<Vec<f32>, String> {
+    let mut scores = vec![0.0; 16];
+    unsafe { checked(imparo_cuda_dspark_frontier_scores(start, anchor, scores.as_mut_ptr()))?; }
+    Ok(scores)
+}
+
+unsafe extern "C" {
+    fn imparo_cuda_dspark_frontier_candidates(
+        start: u32,
+        anchor: u32,
+        ids: *mut u32,
+        parents: *mut i32,
+        scores: *mut f32,
+    ) -> i32;
+}
+/// The 33 already-read beam nodes before the default 16-row selection.
+/// Includes the anchor at row 0 with parent -1 and score 0. Every other parent
+/// precedes its child, depth is at most 8, and scores are cumulative log
+/// probabilities, not confidence-head values or target acceptance estimates.
+/// No additional GPU work or synchronization is submitted by this accessor.
+/// # Safety
+/// Same exclusive live owner and round as `frontier_tree`, immediately after
+/// successful frontier generation. No intervening generate, reset, append,
+/// suspend, resume, or target-state change; each destination has 33 elements.
+pub unsafe fn frontier_candidates(
+    start: u32,
+    anchor: u32,
+) -> Result<(Vec<u32>, Vec<i32>, Vec<f32>), String> {
+    let mut ids = vec![0; 33];
+    let mut parents = vec![0; 33];
+    let mut scores = vec![0.0; 33];
+    unsafe {
+        checked(imparo_cuda_dspark_frontier_candidates(
+            start,
+            anchor,
+            ids.as_mut_ptr(),
+            parents.as_mut_ptr(),
+            scores.as_mut_ptr(),
+        ))?;
+    }
+    Ok((ids, parents, scores))
+}
+
+/// Generate with the same kernels while retaining complete frontier groups and
+/// computing their real confidence heads on the host. Additional feature copies
+/// occur only when this call actually takes the native frontier route.
+/// # Safety
+/// Same owner, weight lifetime, and destination capacities as `generate`.
+pub unsafe fn generate_with_accept_features(
+    start: u32,
+    anchor: u32,
+    ids: &mut [u32],
+    confidence: &mut [f32],
+    block_size: usize,
+) -> Result<(), String> {
+    if ids.len() != block_size || confidence.len() != block_size {
+        return Err("draft output capacity mismatch".into());
+    }
+    unsafe {
+        checked(imparo_cuda_dspark_generate_with_accept_features(
+            start, anchor, ids.as_mut_ptr(), confidence.as_mut_ptr(),
+        ))
+    }
+}
+
+/// The 29 expanded parents, indexed by parent node 0..28 in `frontier_candidates`.
+/// Each group retains all four original local choices, even if beam pruning
+/// omitted a child. Confidence is computed from this parent's token and depth.
+/// # Safety
+/// Same exclusive live owner and round as `frontier_candidates`, immediately
+/// after a successful frontier `generate_with_accept_features`. No intervening
+/// generation, reset, append, suspend, resume, or target-state change.
+pub unsafe fn frontier_groups(
+    start: u32,
+    anchor: u32,
+) -> Result<Vec<FrontierGroup>, String> {
+    let mut groups = vec![FrontierGroup::default(); 29];
+    unsafe {
+        checked(imparo_cuda_dspark_frontier_groups(start, anchor, groups.as_mut_ptr()))?;
+    }
+    Ok(groups)
 }

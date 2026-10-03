@@ -61,6 +61,8 @@ constexpr uint32_t LOGITS=12, TOK=13, FEATURE=20, COMMITTED=21, NEXT=22, CONCAT=
 // Slots below 28 include the shared BufId::Pick appended by v2.
 // These three slots belong only to the isolated assistant execution owner.
 constexpr uint32_t CLUSTER_DATA=28, CLUSTER_SCORES=29, CLUSTER_IDS=30;
+// Private assistant scores; never alias its predicted/committed hidden or target KV.
+constexpr uint32_t SELECT_FIRST=31, SELECT_SECOND=32;
 struct Session {
     Config cfg;
     std::vector<Layer> layers;
@@ -94,6 +96,9 @@ struct Session {
             cudaKernelNodeParams p={};ck(cudaGraphKernelNodeGetParams(node,&p));req(p.kernelParams,"missing kernel arguments");
             auto is=[&](void*f){return graph_kernel_is(p.func,f);};
             auto u=[&](uint32_t i){return *static_cast<const uint32_t*>(p.kernelParams[i]);};
+            const bool paged_scores=is((void*)imparo_sm80_d512_small::scores_paged<512,2,2>);
+            const bool paged_values=is((void*)imparo_sm80_d512_small::values_combine_paged<512,2,1,2>)
+                ||is((void*)imparo_sm80_d512_small::values_combine_paged<512,2,2,2>);
             unsigned argc=0,si=UINT32_MAX,vi=UINT32_MAX,span=UINT32_MAX;uint32_t ring=0;bool dq=false;
             if(is((void*)k_head_norm_rope_hadamard<256,true>)||is((void*)k_head_norm_rope_hadamard<256,false>)){
                 argc=13;si=6;++heads;req(u(si)==start,"assistant rope start");
@@ -109,8 +114,8 @@ struct Session {
                 req(needed<=execution().attention_scratch_bytes,"assistant fused workspace");
                 step_max=std::min(step_max,u(11)*32);
                 ++scores;++softmax;++values;
-            }else if(is((void*)imparo_sm80_d512_small::scores<256,1,2,false>)||is((void*)imparo_sm80_d512_small::scores<512,2,2,false>)){
-                argc=16;si=7;vi=12;span=13;ring=u(11);++scores;
+            }else if(is((void*)imparo_sm80_d512_small::scores<256,1,2,false>)||is((void*)imparo_sm80_d512_small::scores<512,2,2,false>)||paged_scores){
+                argc=paged_scores?17:16;si=7;vi=12;span=13;ring=u(11);++scores;
                 req(u(7)==start-1&&u(10)==1&&p.gridDim.z==1,"assistant score geometry");
                 req(u(vi)==(ring?std::min(start,ring+1):start),"assistant valid span");
                 attention_ring=ring;attention_span=u(span);
@@ -124,8 +129,8 @@ struct Session {
             }else if(is((void*)imparo_sm80_d512_small::values_combine<256,1,1,2,false>)
                     ||is((void*)imparo_sm80_d512_small::values_combine<512,2,1,2,false>)
                     ||is((void*)imparo_sm80_d512_small::values_combine<512,2,1,2,false,true>)
-                    ||is((void*)imparo_sm80_d512_small::values_combine<512,2,2,2,false,true>)){
-                argc=13;vi=9;span=10;ring=u(8);++values;
+                    ||is((void*)imparo_sm80_d512_small::values_combine<512,2,2,2,false,true>)||paged_values){
+                argc=paged_values?14:13;vi=9;span=10;ring=u(8);++values;
                 req(scores==values&&ring==attention_ring&&u(span)==attention_span,"assistant values dependency");
             }else if(is((void*)imparo_sm80_kv::dequant_parallel<2>)){
                 argc=6;vi=3;ring=u(4);dq=true;req(u(vi)==(ring?std::min(start,ring+1):start),"assistant dequant extent");
@@ -138,7 +143,10 @@ struct Session {
             if(dq)d.native_update=NativeGraphUpdate::ValidGridY;
             step_graph.nodes.push_back(std::move(d));
         }
-        req(heads==layers.size()&&scores==layers.size()&&values==layers.size()&&softmax==layers.size(),"assistant graph dynamic coverage");
+        if(heads!=layers.size()||scores!=layers.size()||values!=layers.size()||softmax!=layers.size())
+            throw std::runtime_error("assistant graph dynamic coverage heads="+std::to_string(heads)
+                +" scores="+std::to_string(scores)+" values="+std::to_string(values)
+                +" softmax="+std::to_string(softmax));
         req(step_max>=step_min,"assistant graph range");
     }
     template<class Body>void submit_step(uint32_t start,bool eager,Body body){
@@ -147,6 +155,23 @@ struct Session {
             ck(step_graph.replay(start,g.stream));++step_updates;
         }else{
             clear_step_graphs();
+            // Ring replay grows within a complete 32-key bucket. The eager
+            // start may reserve only its exact prefix, which is too small at
+            // the bucket end. Reserve the replay envelope before capturing any
+            // pointer; the kernels keep their original numerical geometry.
+            uint64_t replay_bytes=0;
+            for(const auto &l:layers) {
+                const uint32_t valid=l.ring?std::min(start,l.ring+1):start;
+                const uint32_t span=l.ring
+                    ?uint32_t(std::min((uint64_t(valid)+31)/32*32,uint64_t(l.ring)+1))
+                    :attention_schedule_span(valid,0,imparo_sm80_prefill::kScheduleKeys);
+                const uint32_t groups=(span+31)/32;
+                const uint32_t parts=std::max(1u,std::min(groups,
+                    2u*uint32_t(std::max(1,g.sm_count))/cfg.kv_heads));
+                replay_bytes=std::max(replay_bytes,
+                    imparo_sm80_d512_small::block_stride(span,parts)*sizeof(float)*cfg.kv_heads);
+            }
+            req(ensure_attention_scratch(replay_bytes),"assistant replay workspace allocation");
             // Eager warmup reserves ordinary owner scratch before stream capture.
             // NEXT is a loop-carried input; save/restore it around that warmup.
             imparo_cuda_copy_range(STEP_SAVED,0,NEXT,0,cfg.target_hidden);
@@ -184,6 +209,26 @@ struct Session {
     void boundary() {
         identity();
         req(active_execution_owner_id==target_owner && execution_boundary_closed(),"target boundary is not closed");
+    }
+    void append_selected(uint32_t start,uint32_t consumed,uint64_t feature_position,bool require_feature) {
+        boundary();
+        req(capture_enabled&&start==S&&consumed&&uint64_t(start)+consumed<=UINT32_MAX,"commit boundary");
+        const uint32_t wanted=start+consumed-1;
+        const bool present=feature_generation==generation&&feature_rows
+            &&feature_position>=feature_start&&feature_position<uint64_t(feature_start)+feature_rows;
+        req(!require_feature||(feature_start==start&&present),"tree commit lacks captured path hidden");
+        if(present){
+            const uint64_t row=feature_position-feature_start;
+            ck(cudaMemcpyAsync(draft()->bufs[COMMITTED],
+                static_cast<const float*>(draft()->bufs[FEATURE])+row*cfg.target_hidden,
+                uint64_t(cfg.target_hidden)*4,cudaMemcpyDeviceToDevice,g.stream));
+            ck(cudaStreamSynchronize(g.stream));hidden_position=wanted;hidden_valid=true;
+        }else{
+            // State-only prefill chunks can omit the final layer. Advancing the
+            // cursor is valid; manufacturing an assistant hidden state is not.
+            hidden_valid=false;
+        }
+        S=start+consumed;feature_rows=0;feature_generation=0;
     }
     void span(uint64_t off,uint64_t bytes) {
         req(off<=weights_len && bytes<=weights_len-off,"weight span outside composite mapping");
@@ -265,8 +310,16 @@ struct Session {
         std::vector<unsigned char>seen(cfg.vocab,0);for(uint32_t id:order){req(id<cfg.vocab&&!seen[id],"cluster ordering is not permutation");seen[id]=1;}
         rc(imparo_cuda_alloc(CLUSTER_DATA,(centers.size()+order.size())*4));
         rc(imparo_cuda_alloc(CLUSTER_SCORES,(2048+32)*4));rc(imparo_cuda_alloc(CLUSTER_IDS,4096*4));
-        ck(cudaMemcpy(execution().bufs[CLUSTER_DATA],centers.data(),centers.size()*4,cudaMemcpyHostToDevice));
-        ck(cudaMemcpy(static_cast<float*>(execution().bufs[CLUSTER_DATA])+centers.size(),order.data(),order.size()*4,cudaMemcpyHostToDevice));
+        // alloc() clears on the nonblocking execution stream. Upload on that same
+        // stream so the clear cannot race these copies; keep both host vectors
+        // alive until DMA completes, including when an upload reports an error.
+        const cudaError_t centers_copy=cudaMemcpyAsync(execution().bufs[CLUSTER_DATA],
+            centers.data(),centers.size()*4,cudaMemcpyHostToDevice,g.stream);
+        const cudaError_t order_copy=cudaMemcpyAsync(
+            static_cast<float*>(execution().bufs[CLUSTER_DATA])+centers.size(),
+            order.data(),order.size()*4,cudaMemcpyHostToDevice,g.stream);
+        const cudaError_t upload_done=cudaStreamSynchronize(g.stream);
+        ck(centers_copy);ck(order_copy);ck(upload_done);
         cluster_head_enabled=true;
         std::fprintf(stderr,"[mtp-cluster-head] clusters=32 candidates=4096 source=65892304 owner=private target_verify=unchanged\n");
     }
@@ -296,10 +349,17 @@ struct Session {
         for(uint32_t b:{X,CUR,O})rc(imparo_cuda_alloc(b,uint64_t(cfg.hidden)*4));
         for(uint32_t b:{Q,ATTN})rc(imparo_cuda_alloc(b,uint64_t(qwidth)*4));
         for(uint32_t b:{GATE,UP})rc(imparo_cuda_alloc(b,uint64_t(cfg.ffn)*4));
-        rc(imparo_cuda_alloc(LOGITS,uint64_t(cfg.vocab)*4));rc(imparo_cuda_alloc(TOK,8));
+        const char* trace=std::getenv("IMPARO_LAB_E4B_TREE_CONFIDENCE_TRACE");
+        const bool trace_values=trace&&std::strcmp(trace,"1")==0;
+        rc(imparo_cuda_alloc(LOGITS,uint64_t(cfg.vocab)*4));rc(imparo_cuda_alloc(TOK,trace_values?24:16));
         rc(imparo_cuda_alloc(FEATURE,uint64_t(cfg.batch_capacity)*cfg.target_hidden*4));
         for(uint32_t b:{COMMITTED,NEXT,STEP_SAVED})rc(imparo_cuda_alloc(b,uint64_t(cfg.target_hidden)*4));
         rc(imparo_cuda_alloc(CONCAT,uint64_t(cfg.target_hidden)*8));
+        const char* selector=std::getenv("IMPARO_LAB_E4B_CHAIN_SELECTOR");
+        if(selector&&std::strcmp(selector,"1")==0){
+            rc(imparo_cuda_alloc(SELECT_FIRST,sizeof(float)));
+            rc(imparo_cuda_alloc(SELECT_SECOND,sizeof(float)));
+        }
         load_cluster_head();
     }
     void dequant_capacity(uint32_t start) {
@@ -311,7 +371,12 @@ struct Session {
         }
         rc(imparo_cuda_alloc(KDQ,bytes));rc(imparo_cuda_alloc(VDQ,bytes));
     }
-    uint32_t step(uint32_t start,uint32_t token,float *probability=nullptr,bool eager=false) {
+    uint32_t step(uint32_t start,uint32_t token,float *probability=nullptr,bool eager=false,uint32_t *alternate=nullptr,float *top2_scores=nullptr) {
+        if(top2_scores){
+            const char* trace=std::getenv("IMPARO_LAB_E4B_TREE_CONFIDENCE_TRACE");
+            req(alternate&&trace&&std::strcmp(trace,"1")==0&&execution().sizes[TOK]>=24,
+                "Top2 values require trace and an alternate in the prepared owner");
+        }
         imparo_cuda_begin();
         // This owner has no target-token stores and no existing decode Graph body.
         // RoPE uses start; attention alone uses start-1 to stop before anchor KV.
@@ -356,17 +421,67 @@ struct Session {
             imparo_cuda_argmax(LOGITS,TOK,cfg.vocab);
         }
         });
+        if(alternate){
+            // Reuse the ordinary Top2 reduction on the head just computed. Sparse
+            // columns name vocabulary IDs through CLUSTER_IDS, including tie breaks.
+            // Keep TOK[0], the original head's choice, untouched.
+            auto*out=static_cast<uint32_t*>(execution().bufs[TOK]);
+            if(top2_scores){
+                k_argmax_two<1024,true><<<1,1024,0,g.stream>>>(
+                    static_cast<const float*>(execution().bufs[LOGITS]),out+2,out+3,
+                    cluster_head_enabled?4096:cfg.vocab,1,
+                    cluster_head_enabled?static_cast<const uint32_t*>(execution().bufs[CLUSTER_IDS]):nullptr,
+                    reinterpret_cast<float*>(out+4));
+            }else{
+                k_argmax_two<1024><<<1,1024,0,g.stream>>>(
+                    static_cast<const float*>(execution().bufs[LOGITS]),out+2,out+3,
+                    cluster_head_enabled?4096:cfg.vocab,1,
+                    cluster_head_enabled?static_cast<const uint32_t*>(execution().bufs[CLUSTER_IDS]):nullptr);
+            }
+            mark_buf_written(TOK);
+        }
         if(probability&&!cluster_head_enabled)first_probability<<<1,1024,0,g.stream>>>(
             static_cast<const float*>(execution().bufs[LOGITS]),
             static_cast<const uint32_t*>(execution().bufs[TOK]),
             static_cast<float*>(execution().bufs[TOK])+1,cfg.vocab);
         rc(imparo_cuda_end());
-        uint32_t returned[2]={0,0};
-        imparo_cuda_read(TOK,0,reinterpret_cast<float*>(returned),probability?2:1);rc(imparo_cuda_end());
+        uint32_t returned[6]={0,0,0,0,0,0};
+        imparo_cuda_read(TOK,0,reinterpret_cast<float*>(returned),top2_scores?6:(alternate?4:(probability?2:1)));rc(imparo_cuda_end());
         req(returned[0]<cfg.vocab,"assistant argmax outside vocabulary");
+        if(top2_scores){
+            req(returned[2]==returned[0],"Top2 trace primary differs from assistant argmax");
+            std::memcpy(top2_scores,returned+4,2*sizeof(float));
+            req(std::isfinite(top2_scores[0])&&std::isfinite(top2_scores[1])
+                &&top2_scores[0]>=top2_scores[1],"Top2 trace values invalid");
+        }
+        if(alternate){
+            *alternate=returned[2]==returned[0]?returned[3]:returned[2];
+            req(*alternate<cfg.vocab&&*alternate!=returned[0],"assistant second candidate invalid");
+        }
         if(probability){std::memcpy(probability,&returned[1],sizeof(float));
             req(std::isfinite(*probability)&&*probability>0&&*probability<=1.0f,"assistant probability invalid");}
         return returned[0];
+    }
+    uint32_t select_predicted_head(uint32_t first,uint32_t alternate) {
+        req(cfg.target_embedding_kind==1&&cfg.target_hidden==2560
+            &&first<cfg.vocab&&alternate<cfg.vocab&&first!=alternate,"selector head geometry");
+        // NEXT already predicts the target's post-final-norm feature. Applying
+        // target RMSNorm again would change its domain. Score only these two
+        // Q4_0 tied-head rows with existing Q4 x Q8_1 matvec. This is a draft
+        // ranking proxy (including activation quantization), not target logits.
+        const uint64_t stride=uint64_t(cfg.target_hidden/32)*18;
+        imparo_cuda_begin();
+        imparo_cuda_matmat(1,cfg.target_embedding+uint64_t(first)*stride,
+            cfg.target_hidden,1,NEXT,SELECT_FIRST,1,0);
+        imparo_cuda_matmat(1,cfg.target_embedding+uint64_t(alternate)*stride,
+            cfg.target_hidden,1,NEXT,SELECT_SECOND,1,0);
+        rc(imparo_cuda_end());
+        float a=NAN,b=NAN;
+        ck(cudaMemcpyAsync(&a,execution().bufs[SELECT_FIRST],sizeof(float),cudaMemcpyDeviceToHost,g.stream));
+        ck(cudaMemcpyAsync(&b,execution().bufs[SELECT_SECOND],sizeof(float),cudaMemcpyDeviceToHost,g.stream));
+        ck(cudaStreamSynchronize(g.stream));
+        req(std::isfinite(a)&&std::isfinite(b),"selector score is not finite");
+        return b>a?alternate:first; // Ties preserve the existing MTP choice.
     }
     void proof_step(uint32_t start,uint32_t anchor) {
         const char *path=std::getenv("IMPARO_LAB_MTP_STEP_GRAPH_PROOF");
@@ -512,23 +627,17 @@ extern "C" int imparo_cuda_gemma4_mtp_capture_layer(uint32_t layer,uint32_t star
 }
 extern "C" int imparo_cuda_gemma4_mtp_append(uint32_t start,uint32_t consumed) {
     using namespace imparo_gemma4_mtp;
-    return invoke([&](Session&s){s.boundary();
-        s.req(s.capture_enabled&&start==s.S&&consumed&&uint64_t(start)+consumed<=UINT32_MAX,"commit boundary");
-        const uint32_t wanted=start+consumed-1;
-        const bool present=s.feature_generation==s.generation&&s.feature_rows
-            &&wanted>=s.feature_start&&uint64_t(wanted)<uint64_t(s.feature_start)+s.feature_rows;
-        if(present){
-            const uint64_t row=wanted-s.feature_start;
-            s.ck(cudaMemcpyAsync(s.draft()->bufs[COMMITTED],
-                static_cast<const float*>(s.draft()->bufs[FEATURE])+row*s.cfg.target_hidden,
-                uint64_t(s.cfg.target_hidden)*4,cudaMemcpyDeviceToDevice,g.stream));
-            s.ck(cudaStreamSynchronize(g.stream));s.hidden_position=wanted;s.hidden_valid=true;
-        }else{
-            // State-only prefill chunks can omit the final layer. Advancing the
-            // cursor is valid; manufacturing an assistant hidden state is not.
-            s.hidden_valid=false;
-        }
-        s.S=start+consumed;s.feature_rows=0;s.feature_generation=0;
+    return invoke([&](Session&s){s.append_selected(start,consumed,uint64_t(start)+consumed-1,false);});
+}
+extern "C" int imparo_cuda_gemma4_mtp_append_tree(uint32_t start,const int32_t*path,uint32_t count) {
+    using namespace imparo_gemma4_mtp;
+    return invoke([&](Session&s){
+        s.req(path&&count&&count<=s.cfg.batch_capacity&&path[0]==0,"tree commit path");
+        for(uint32_t i=0;i<count;++i)
+            s.req(path[i]>=0&&uint32_t(path[i])<s.feature_rows&&(!i||path[i]>path[i-1]),"tree commit node");
+        // FEATURE stays in tree row order. Its selected row can differ from the
+        // committed logical position: path [0,3] selects row 3 but ends at start+1.
+        s.append_selected(start,count,uint64_t(start)+uint32_t(path[count-1]),true);
     });
 }
 extern "C" int imparo_cuda_gemma4_mtp_generate(uint32_t start,uint32_t anchor,uint32_t*ids) {
@@ -542,6 +651,61 @@ extern "C" int imparo_cuda_gemma4_mtp_generate(uint32_t start,uint32_t anchor,ui
         imparo_cuda_copy_range(NEXT,0,COMMITTED,0,s.cfg.target_hidden);
         const uint32_t first=s.step(start,anchor);const uint32_t second=s.step(start,first);
         s.clear_borrow();s.rc(execution_owner_select(s.target_owner));ids[0]=first;ids[1]=second;
+    });
+}
+extern "C" int imparo_cuda_gemma4_mtp_generate_tree4(uint32_t start,uint32_t anchor,uint32_t*ids) {
+    using namespace imparo_gemma4_mtp;
+    return invoke([&](Session&s){s.boundary();
+        const char*mode=std::getenv("IMPARO_DSPARK_TREE");
+        s.req(mode&&std::strcmp(mode,"4")==0&&start>=512&&start<=765
+            &&g.sm_version==86&&g.kv_type_k==2&&g.kv_type_v==2
+            &&imparo_cuda_e4b_retained_decode_policy()==1
+            &&imparo_cuda_e4b_retained_decode_domain()==1,"tree4 proposal capability");
+        s.req(ids&&s.capture_enabled&&start==s.S&&anchor<s.cfg.vocab
+            &&s.hidden_valid&&s.hidden_position==start-1,"proposal lacks committed target hidden");
+        s.borrow_kv(start);s.rc(execution_owner_select(s.draft_owner));s.dequant_capacity(start);
+        imparo_cuda_copy_range(NEXT,0,COMMITTED,0,s.cfg.target_hidden);
+        uint32_t alternate=0;
+        const char*branch=std::getenv("IMPARO_LAB_E4B_TREE_DELAYED");
+        const bool delayed=branch&&std::strcmp(branch,"1")==0;
+        const char*trace=std::getenv("IMPARO_LAB_E4B_TREE_CONFIDENCE_TRACE");
+        const bool trace_confidence=trace&&std::strcmp(trace,"1")==0;
+        // Reuse the clustered probability and Top2 reduction. The same return
+        // copy adds two observed logits, without another kernel or synchronization.
+        // This is masked draft confidence, not target acceptance.
+        s.req(!trace_confidence||s.cluster_head_enabled,"tree confidence requires clustered head");
+        float confidence=0,top2_scores[2]={0,0};
+        // Keep both ordinary MTP forwards and their position/hidden recurrence.
+        // Only move the existing Top2 reduction to the parent where it is used.
+        const uint32_t first=s.step(start,anchor,trace_confidence&&!delayed?&confidence:nullptr,false,delayed?nullptr:&alternate,trace_confidence&&!delayed?top2_scores:nullptr);
+        const uint32_t second=s.step(start,first,trace_confidence&&delayed?&confidence:nullptr,false,delayed?&alternate:nullptr,trace_confidence&&delayed?top2_scores:nullptr);
+        s.clear_borrow();s.rc(execution_owner_select(s.target_owner));
+        ids[0]=first;ids[1]=second;ids[2]=alternate;
+        if(trace_confidence)std::fprintf(stderr,
+            "[mtp-tree-confidence] start=%u delayed=%u parent=%u primary=%u alternate=%u probability=%.9g top1_logit=%.9g alternate_logit=%.9g\n",
+            start,unsigned(delayed),unsigned(delayed),delayed?second:first,alternate,double(confidence),double(top2_scores[0]),double(top2_scores[1]));
+    });
+}
+extern "C" int imparo_cuda_gemma4_mtp_generate_selected(uint32_t start,uint32_t anchor,uint32_t*ids) {
+    using namespace imparo_gemma4_mtp;
+    return invoke([&](Session&s){s.boundary();
+        const char*mode=std::getenv("IMPARO_LAB_E4B_CHAIN_SELECTOR");
+        s.req(mode&&std::strcmp(mode,"1")==0&&start>=512&&start<=765
+            &&g.sm_version==86&&g.kv_type_k==2&&g.kv_type_v==2
+            &&imparo_cuda_e4b_retained_decode_policy()==1
+            &&imparo_cuda_e4b_retained_decode_domain()==1,"chain selector capability");
+        s.req(ids&&s.capture_enabled&&start==s.S&&anchor<s.cfg.vocab
+            &&s.hidden_valid&&s.hidden_position==start-1,"proposal lacks committed target hidden");
+        s.borrow_kv(start);s.rc(execution_owner_select(s.draft_owner));s.dequant_capacity(start);
+        imparo_cuda_copy_range(NEXT,0,COMMITTED,0,s.cfg.target_hidden);
+        uint32_t alternate=0;
+        const uint32_t original=s.step(start,anchor,nullptr,false,&alternate);
+        const uint32_t selected=s.select_predicted_head(original,alternate);
+        // Regenerate the conditional second proposal from the selected first.
+        // COMMITTED and target KV remain untouched until ordinary Chain3 commit.
+        const uint32_t second=s.step(start,selected);
+        s.clear_borrow();s.rc(execution_owner_select(s.target_owner));
+        ids[0]=selected;ids[1]=second;ids[2]=original;ids[3]=alternate;
     });
 }
 // A zero count is a temporary abstention, not a failed or empty proposal.
