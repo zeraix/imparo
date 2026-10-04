@@ -2024,7 +2024,7 @@ impl<S: DsparkSession> DraftProvider for DsparkProvider<S> {
         // THE SLOW TIMESCALE RUNS HERE. The round's learner is one pass at 399 ns and its
         // weights reach the very next round; this refits each law over its retained window
         // and keeps the result only if it beats the incumbent on held-out samples. A
-        // request boundary is where it belongs: ~0.18 ms a law is a whole decode round, and
+        // request boundary is where it belongs: ~0.04 ms a law (measured, show_what_a_refit_costs), and
         // nothing is waiting once a request ends. It runs BEFORE the store so the refitted
         // law is what persists and what the next request seeds from.
         if let Some(cost) = self.cost.as_mut() {

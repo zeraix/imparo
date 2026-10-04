@@ -469,7 +469,7 @@ dspark-paper/harness/check.py
 dspark-paper/harness/figs.py
 dspark-paper/harness/kernel_classes.patch
 dspark-paper/harness/paper_figs.py
-dspark-paper/harness/print_pdf.sh
+dspark-paper/harness/print_pdf.py
 dspark-paper/harness/run.sh
 dspark-paper/harness/run_chain.sh
 dspark-paper/harness/run_classes.sh

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-token decode cost by width policy and context (paper Tables 2 and 4).
+"""Per-token decode cost by width policy and context (the microbenchmark behind the paper's Figure 5).
 
 Arms: chain (the drafter's block verified as a chain), fixed widths, and the budget (width
 chosen each round from the online cost model). Every other setting is the same in every arm --

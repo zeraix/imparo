@@ -42,6 +42,10 @@ SOURCES = [("specbench", "Spec-Bench"), ("speedbench", "SPEED-Bench"), ("wildcha
 FONT = 'font-family="Newsreader, serif"'
 
 
+# One colour per target in every figure (paper.html defines --c1..--c6, an Okabe-Ito palette).
+TARGET_COLOUR = {"lfm26": "var(--c1)", "moekm": "var(--c2)", "q4b": "var(--c3)", "q8b": "var(--c4)"}
+
+
 def svg(w, h, body, label):
     return (f'<svg viewBox="0 0 {w} {h}" role="img" aria-label="{label}">\n' + "\n".join(body) +
             "\n</svg>")
@@ -102,14 +106,14 @@ def fig_verify_cost(data):
             body.append(txt(ox - 5, fy(v) + 4, v, 10.5, "end"))
         for n in range(8, nmax + 1, 8 if nmax <= 48 else 16):
             body.append(txt(fx(n), oy + ph + 14, n, 10.5, "middle"))
-        for c, style in ((far, 'stroke="var(--ink-3)" stroke-width="1.2" stroke-dasharray="4 3"'),
-                         (mid, 'stroke="var(--ink)" stroke-width="1.7"')):
+        for c, style in ((far, 'stroke="var(--c5)" stroke-width="1.3" stroke-dasharray="4 3"'),
+                         (mid, 'stroke="var(--c1)" stroke-width="1.7"')):
             pts = [(fx(n), fy(d[c][n])) for n in ns if n in d[c]]
             body.append('<path d="M ' + " L ".join(f"{a:.1f} {b:.1f}" for a, b in pts) +
                         f'" fill="none" {style}/>')
             if c == mid:
                 for a, b in pts:
-                    body.append(f'<circle cx="{a:.1f}" cy="{b:.1f}" r="2.3" fill="var(--ink)"/>')
+                    body.append(f'<circle cx="{a:.1f}" cy="{b:.1f}" r="2.3" fill="var(--c1)"/>')
         t2, t16 = d[mid].get(2), d[mid].get(16)
         if t2 and t16:
             notes.append(f"{name} {t16 / t2:.2f}")
@@ -118,11 +122,11 @@ def fig_verify_cost(data):
     body.append(txt(16, H / 2, "verify (ms)", 12.5, "middle", "var(--ink-2)",
                     f' transform="rotate(-90 16 {H / 2})"'))
     ctxs = sorted(next(iter(data.values())))
-    body.append(f'<line x1="440" y1="{H - 30}" x2="466" y2="{H - 30}" stroke="var(--ink)" '
+    body.append(f'<line x1="440" y1="{H - 30}" x2="466" y2="{H - 30}" stroke="var(--c1)" '
                 f'stroke-width="1.7"/>')
     body.append(txt(472, H - 26, f"c = {ctxs[len(ctxs) // 2]:,}", 11, fill="var(--ink-2)"))
-    body.append(f'<line x1="540" y1="{H - 30}" x2="566" y2="{H - 30}" stroke="var(--ink-3)" '
-                f'stroke-width="1.2" stroke-dasharray="4 3"/>')
+    body.append(f'<line x1="540" y1="{H - 30}" x2="566" y2="{H - 30}" stroke="var(--c5)" '
+                f'stroke-width="1.3" stroke-dasharray="4 3"/>')
     body.append(txt(572, H - 26, f"c = {ctxs[-1]:,}", 11, fill="var(--ink-2)"))
     cap = ('<span class="lbl" id="fig-verify_cost">Figure 0:</span> Verify time against the number of rows verified, '
            'on each target, at two context lengths (median over two passes of the per-run median '
@@ -272,8 +276,8 @@ def fig_marginal(paths):
     """What the second eight rows cost against what they buy: per target and (context, prompt),
     extra time per round of a 16-row tree over an 8-row one (x) against extra accepted tokens per
     round (y), both relative to the 8-row tree. Above the diagonal the wider tree is faster."""
-    marks = {"lfm26": ("circle", "var(--ink)"), "moekm": ("square", "var(--ink)"),
-             "q4b": ("circle", "none"), "q8b": ("square", "none")}
+    marks = {m: (shape, TARGET_COLOUR[m]) for m, shape in
+             (("lfm26", "circle"), ("moekm", "square"), ("q4b", "circle"), ("q8b", "square"))}
     pts = {}
     for m, name in MODELS:
         if m not in paths:
@@ -312,9 +316,9 @@ def fig_marginal(paths):
         shape, fill = marks[m]
         for x, y in v:
             if shape == "circle":
-                body.append(f'<circle cx="{fx(x):.1f}" cy="{fy(y):.1f}" r="3.6" fill="{fill}" stroke="var(--ink)" stroke-width="1"/>')
+                body.append(f'<circle cx="{fx(x):.1f}" cy="{fy(y):.1f}" r="3.6" fill="{fill}" stroke="var(--paper)" stroke-width="0.8"/>')
             else:
-                body.append(f'<rect x="{fx(x) - 3.4:.1f}" y="{fy(y) - 3.4:.1f}" width="6.8" height="6.8" fill="{fill}" stroke="var(--ink)" stroke-width="1"/>')
+                body.append(f'<rect x="{fx(x) - 3.4:.1f}" y="{fy(y) - 3.4:.1f}" width="6.8" height="6.8" fill="{fill}" stroke="var(--paper)" stroke-width="0.8"/>')
     lx = x0 + 12
     for k, (m, name) in enumerate([(m, n) for m, n in MODELS if m in pts]):
         shape, fill = marks[m]
@@ -469,8 +473,10 @@ def tab_e2e(runs, smoke):
     return ('<figure class="tb">\n  <figcaption><span class="lbl" id="tab-e2e">Table 0:</span> End to end. '
             'Left: decode tok/s on the evaluation subset (Appendix&nbsp;A; generated tokens over decode time, '
             'summed over replies) and AdaSpark over llama.cpp DSpark (geometric mean of per-reply '
-            'ratios, 95% bootstrap interval over conversations). Replies that reached the 8,192-token cap in any arm are repetition '
-            'loops under greedy decoding; they are left out of every column and counted. A reply streamed as a single delta (a bare tool call) has no client-clock decode interval and is left out as well (' + ', '.join(single) + '). Right: each '
+            'ratios, 95% bootstrap interval over conversations). A reply that reached the 8,192-token cap is a repetition '
+            'loop under greedy decoding: each tok/s column leaves out its own arm\'s looped replies and each ratio the replies that '
+            'looped in either of its two arms; <i>looped</i> counts the replies that looped in any arm. AdaSpark\'s speed on a reply '
+            'is the mean of its two runs (&sect;3.4). A reply streamed as a single delta (a bare tool call) has no client-clock decode interval and is left out as well (' + ', '.join(single) + '). Right: each '
             'engine\'s speculation speedup over its own autoregressive (AR) decode: its tok/s on the evaluation subset over '
             'its AR tok/s, which is measured on the short subset (setup notes) only (llama.cpp and imparo: ' + '; '.join(ar) +
             ' tok/s). AR speed barely depends on the text; the short subset\'s contexts are shorter, where AR decode is '
@@ -489,9 +495,9 @@ def fig_e2e(runs):
     names = [(m, n) for m, n in MODELS if runs.get(m) and E2E_ARMS <= {r["arm"] for r in runs[m]}]
     if not names:
         return None
-    bars = [("imparo DSpark / llama.cpp DSpark", "chain3", "llama-dspark", "var(--band)"),
-            ("AdaSpark / imparo DSpark", "complete", "chain3", "var(--ink-3)"),
-            ("AdaSpark / llama.cpp DSpark", "complete", "llama-dspark", "var(--ink)")]
+    bars = [("imparo DSpark / llama.cpp DSpark", "chain3", "llama-dspark", "var(--c6)"),
+            ("AdaSpark / imparo DSpark", "complete", "chain3", "var(--c2)"),
+            ("AdaSpark / llama.cpp DSpark", "complete", "llama-dspark", "var(--c1)")]
     W, bar, gap = 640, 12, 26
     H = 44 + len(names) * (len(bars) * bar + gap) + 40
     x0, x1 = 150, 600
@@ -542,7 +548,7 @@ def fig_e2e(runs):
     cap = ('<span class="lbl" id="fig-e2e">Figure 0:</span> Where the gain over llama.cpp comes from. The engine '
            'factor is imparo DSpark over llama.cpp DSpark, the two engines running the same algorithm (a chain of at most three '
            'draft tokens); the scheduler factor is AdaSpark over imparo DSpark, on the same '
-           'engine; the total is AdaSpark over llama.cpp DSpark, the product of the two, over the replies both engines served. Whiskers are 95% bootstrap '
+           'engine; the total is AdaSpark over llama.cpp DSpark, over the replies both engines served; it is close to the product of the two, whose reply sets differ only by replies that looped in one arm. Whiskers are 95% bootstrap '
            'intervals over conversations.')
     return figure(svg(W, H, body, "Engine and scheduler factors per target"), cap)
 
@@ -610,8 +616,8 @@ def tab_agree(full):
         rows.append(f"<tr><td>{name}</td><td>{s}/{n}</td><td>{s1}/{n1}</td></tr>")
     if not rows:
         return None
-    return ('<figure class="tb">\n  <figcaption><span class="lbl" id="tab-agree">Table 0:</span> Replies of the '
-            'evaluation subset whose text, reasoning included, is byte-identical between AdaSpark and imparo\'s '
+    return ('<figure class="tb col">\n  <figcaption><span class="lbl" id="tab-agree">Table 0:</span> Replies of the '
+            'evaluation subset whose text, reasoning included, is byte-identical between AdaSpark\'s first run and imparo\'s '
             'three-pick DSpark. Later turns carry each arm\'s own earlier replies, so one early difference makes every '
             'later turn of that conversation differ; first turns share their history and isolate the verify.</figcaption>\n'
             '  <div class="scroll"><table class="compact">\n    <thead><tr><th>target</th><th>all replies</th>'
@@ -684,7 +690,7 @@ def tab_sources(runs):
         if not g:
             return "<td>&ndash;</td>"
         t = 0.0 if hi <= lo else (g["x"] - lo) / (hi - lo)
-        shade = f"color-mix(in srgb, var(--ink) {int(8 + 30 * t)}%, var(--paper))"
+        shade = f"color-mix(in srgb, var(--c1) {int(6 + 34 * t)}%, var(--paper))"
         return f'<td style="background:{shade}">{g["x"]:.2f}</td>'
     head = "<tr><th>source</th>" + "".join(f"<th>{n}</th>" for _, n in have) + "</tr>"
     body = []
@@ -692,7 +698,7 @@ def tab_sources(runs):
         body.append(f"<tr><td>{sn}</td>" + "".join(cell(vals[(m, s)]) for m, _ in have) + "</tr>")
     body.append('<tr class="em"><td>all replies</td>' +
                 "".join(f"<td>{ratios(runs[m], 'complete', 'chain3')['x']:.2f}</td>" for m, _ in have) + "</tr>")
-    return ('<figure class="tb">\n  <figcaption><span class="lbl" id="tab-sources">Table 0:</span> The scheduler\'s '
+    return ('<figure class="tb col">\n  <figcaption><span class="lbl" id="tab-sources">Table 0:</span> The scheduler\'s '
             'gain by workload: AdaSpark over imparo DSpark (same engine, a chain of at most three draft '
             'tokens), geometric mean of per-reply decode ratios per source, looped replies excluded. '
             'Darker cells are larger gains.</figcaption>\n  <div class="scroll"><table class="compact">\n    <thead>' +
@@ -801,7 +807,7 @@ def fig_accept_curve(logs, fullruns):
         for i, r in enumerate(red):
             y0, y1 = sorted((fy(0), fy(r)))
             body.append(f'<rect x="{fx(i) - bw / 2:.1f}" y="{y0:.1f}" width="{bw:.1f}" height="{max(0.5, y1 - y0):.1f}" '
-                        f'fill="{"var(--ink)" if r >= 0 else "var(--ink-3)"}"/>')
+                        f'fill="{"var(--c1)" if r >= 0 else "var(--c5)"}"/>')
         wins = sum(1 for row in v[1:] if row[0] < row[1])
         notes.append(f"{wins} of {len(v) - 1}")
         # A change of source: where the first request of the new source ranks among that source's
@@ -819,7 +825,7 @@ def fig_accept_curve(logs, fullruns):
     cap = ('<span class="lbl" id="fig-accept_curve">Figure 0:</span> The acceptance model while serving the evaluation '
            'subset from an empty store (looped replies left out): for each request, how much lower the fitted model\'s log loss per labelled node '
            'is than that of the head-based estimate it competes with (1 &minus; fitted / head-based), both scored before '
-           'either learns from the request\'s labels. A bar above the dashed zero line is a request the fitted model predicted better. '
+           'either learns from the request\'s labels. A bar above the dashed zero line (blue) is a request the fitted model predicted better. '
            'Shaded bands mark the six sources in serving order (SB Spec-Bench, SP SPEED-Bench, WC WildChat, '
            'CF ConvFinQA, TA ToolACE, LB LongBench). The fitted model is lower on ' + ", ".join(notes) + " requests after the first, in the order of the panels." +
            (f' At the {len(switch_ranks)} changes of source (five on each target), the first request of the new source ranks '
@@ -835,18 +841,24 @@ def cold_start(log):
     first request ends at the first acceptance verdict line."""
     lines = open(log, errors="replace").read().splitlines()
     end = next((i for i, l in enumerate(lines) if "dspark accept model_ll=" in l), len(lines))
-    probe_next, probes, widths, t_probe, t_first = False, 0, [], 0.0, 0.0
+    probe_next, probe_width, probes, widths, t_probe, t_first = False, 0, 0, [], 0.0, 0.0
     for i, l in enumerate(lines):
         m = re.match(r"dspark cost probe=(\d+|-)", l)
         if m:
             probe_next = m.group(1) != "-"
-            if probe_next:
-                probes += 1
-                widths.append(int(m.group(1)))
+            probe_width = int(m.group(1)) if probe_next else 0
+            continue
+        # A `choose` line after a probe means the probe's tree came out narrower than the width
+        # it would measure: the chooser set that round, which measured nothing.
+        if l.startswith("dspark choose "):
+            probe_next = False
             continue
         r = ROUND_FULL.search(l)
         if r:
             us = sum(int(r.group(k)) for k in (4, 5, 6, 7))
+            if probe_next:
+                probes += 1
+                widths.append(probe_width)
             if i < end:
                 t_first += us
                 if probe_next:
@@ -971,8 +983,8 @@ def fig_round(logs, ar_ms):
     H = 40 + len(data) * (bar + gap) + 36
     top = max(d["draft"] + d["tree"] + d["verify"] + d["commit"] for _, d, _ in data) * 1.05
     fx = lambda v: x0 + (x1 - x0) * v / top
-    parts = [("draft", "var(--ink-3)"), ("tree", "var(--grid)"), ("verify", "var(--ink)"),
-             ("commit", "var(--band)")]
+    parts = [("draft", "var(--c2)"), ("tree", "var(--c6)"), ("verify", "var(--c1)"),
+             ("commit", "var(--c3)")]
     body = []
     for k, (lab, fill) in enumerate(parts):
         lx = x0 + k * 80
@@ -1009,7 +1021,7 @@ def fig_round(logs, ar_ms):
            'target, at the width its rounds most often ran: the drafter\'s forward, the tree build, '
            'the verify and the commit (medians), and the tokens committed per round at that width. The '
            'text beside each bar also gives the tokens per round and milliseconds per token over all rounds, '
-           'wider ones included, beside the same engine\'s autoregressive (AR) milliseconds per token on the short subset. ' +
+           'other widths included, beside the same engine\'s autoregressive (AR) milliseconds per token on the short subset. ' +
            "; ".join(notes) + ".")
     return figure(svg(W, H, body, "Anatomy of a round per target"), cap)
 

@@ -694,8 +694,8 @@ impl VerifyCost {
     /// THE SLOW TIMESCALE. Every law refits over its retained window and is kept only if it
     /// beats the incumbent on samples it never saw. Returns how many were adopted.
     ///
-    /// CALLED AT A REQUEST BOUNDARY, not inside a round: it is ~0.18 ms per law, which is a
-    /// whole decode round, and nothing is waiting when a request ends. The fast path stays
+    /// CALLED AT A REQUEST BOUNDARY, not inside a round: it is ~0.04 ms per law, about 1 ms for
+    /// 24 laws, and nothing is waiting when a request ends. The fast path stays
     /// 399 ns and its weights are read by the very next round; this is the other half.
     pub fn refit(&mut self) -> usize {
         self.steps

@@ -46,7 +46,7 @@ those files, so its label table carries both spellings.
                              every model and the n-gram fill as in complete, only the width fixed
   complete-table             complete plus the stored table
   complete-classes           the complete form with the 8-bit matrix kernel's row classes in place of
-                             learned widths (IMPARO_DSPARK_CLASSES=declared: Table 10, read only by
+                             learned widths (IMPARO_DSPARK_CLASSES=declared: Table 9, read only by
                              the measurement build that still carries the declared classes)
   llama-dspark               llama-server upstream, --spec-type draft-dspark, the same drafter file,
                              upstream's default --spec-draft-n-max (3)

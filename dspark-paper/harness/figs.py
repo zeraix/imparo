@@ -89,19 +89,19 @@ def fig_learning(recs, first=160):
     s = axis(x0, y0, x1, y1, list(range(0, len(r), 40)), list(range(0, int(ymax) + 1, step)),
              'round (one conversation after another, from an empty store)', 'verify (ms)', fx, fy)
     for i, x in enumerate(r):
-        fill = 'none' if x['probe'] else 'var(--ink-3)'
+        fill = 'none' if x['probe'] else 'var(--c6)'
         s.append(f'<circle cx="{fx(i):.1f}" cy="{fy(x["verify_ms"]):.1f}" r="2.4" fill="{fill}" '
-                 f'stroke="var(--ink-3)" stroke-width="0.8"/>')
+                 f'stroke="var(--c1)" stroke-width="0.7"/>')
     pts = [(fx(i), fy(x['est_ms'])) for i, x in enumerate(r) if x['est_ms'] is not None]
     if pts:  # the estimate on top of the measurements, which it tracks closely
         s.append('<path d="M ' + ' L '.join(f'{a:.1f} {b:.1f}' for a, b in pts) +
-                 '" stroke="var(--ink)" stroke-width="1.4" fill="none"/>')
+                 '" stroke="var(--c5)" stroke-width="1.5" fill="none"/>')
     lx, ly = x1 - 230, y0 + 8
-    s.append(f'<circle cx="{lx}" cy="{ly}" r="2.4" fill="var(--ink-3)" stroke="var(--ink-3)"/>')
+    s.append(f'<circle cx="{lx}" cy="{ly}" r="2.4" fill="var(--c6)" stroke="var(--c1)" stroke-width="0.7"/>')
     s.append(f'<text x="{lx + 8}" y="{ly + 4}" font-family="Newsreader, serif" font-size="11" fill="var(--ink-2)">measured</text>')
-    s.append(f'<circle cx="{lx + 70}" cy="{ly}" r="2.4" fill="none" stroke="var(--ink-3)"/>')
+    s.append(f'<circle cx="{lx + 70}" cy="{ly}" r="2.4" fill="none" stroke="var(--c1)" stroke-width="0.7"/>')
     s.append(f'<text x="{lx + 78}" y="{ly + 4}" font-family="Newsreader, serif" font-size="11" fill="var(--ink-2)">cold start</text>')
-    s.append(f'<line x1="{lx + 142}" y1="{ly}" x2="{lx + 164}" y2="{ly}" stroke="var(--ink)" stroke-width="1.4"/>')
+    s.append(f'<line x1="{lx + 142}" y1="{ly}" x2="{lx + 164}" y2="{ly}" stroke="var(--c5)" stroke-width="1.5"/>')
     s.append(f'<text x="{lx + 169}" y="{ly + 4}" font-family="Newsreader, serif" font-size="11" fill="var(--ink-2)">estimate</text>')
     errs = [abs(x['verify_ms'] - x['est_ms']) / x['verify_ms'] for x in recs
             if x['est_ms'] is not None]
@@ -130,11 +130,11 @@ def fig_widths(targets):
             if not c:
                 continue
             wd = (x1 - x0) * c / n
-            shade = 'var(--ink)' if c / n > 0.4 else ('var(--ink-3)' if c / n > 0.1 else 'var(--grid)')
+            shade = 'var(--c1)' if c / n > 0.4 else ('var(--c6)' if c / n > 0.1 else 'var(--tint-1)')
             s.append(f'<rect x="{at:.1f}" y="{y}" width="{wd:.1f}" height="20" fill="{shade}" '
                      f'stroke="var(--paper)" stroke-width="1"/>')
             if wd > 26:
-                txt = 'var(--paper)' if c / n > 0.1 else 'var(--ink)'
+                txt = 'var(--paper)' if c / n > 0.4 else 'var(--ink)'
                 s.append(f'<text x="{at + wd/2:.1f}" y="{y+14}" text-anchor="middle" '
                          f'font-family="IBM Plex Mono, monospace" font-size="10.5" fill="{txt}">'
                          f'{w}</text>')
@@ -167,10 +167,10 @@ def fig_calibration(series):
     s.append(f'<line x1="{fx(0)}" y1="{fy(0)}" x2="{fx(top)}" y2="{fy(top)}" '
              f'stroke="var(--rule-2)" stroke-width="1" stroke-dasharray="3 3"/>')
     notes = []
-    styles = [('', 'var(--ink)', 'circle', 'var(--ink)'),
-              (' stroke-dasharray="6 3"', 'var(--ink-2)', 'square', 'var(--ink-2)'),
-              (' stroke-dasharray="2 2"', 'var(--ink-2)', 'triangle', 'var(--ink-2)'),
-              (' stroke-dasharray="6 2 2 2"', 'var(--ink-3)', 'circle', 'none'),
+    styles = [('', 'var(--c1)', 'circle', 'var(--c1)'),
+              (' stroke-dasharray="6 3"', 'var(--c2)', 'square', 'var(--c2)'),
+              (' stroke-dasharray="2 2"', 'var(--c3)', 'triangle', 'var(--c3)'),
+              (' stroke-dasharray="6 2 2 2"', 'var(--c4)', 'circle', 'none'),
               (' stroke-dasharray="1 3"', 'var(--ink-3)', 'square', 'none')]
     def mark(kind, x, y, colour, fill):
         f = colour if fill != 'none' else 'var(--paper)'

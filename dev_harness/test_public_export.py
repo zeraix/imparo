@@ -23,7 +23,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST = ROOT / "dev_harness" / "public-export.allowlist"
-EXPECTED_ALLOWLIST_SHA256 = "1d901c653e5e94a8676ce68a12a3b5ba467ebf7ed167d762ad0d50db961a8d89"
+EXPECTED_ALLOWLIST_SHA256 = "1f6efcf092042f777e15ffb230ec2d04e07250605fe6fd60128bb281241cbb40"
 REQUIRED_COMMUNITY_FILES = {
     ".github/ISSUE_TEMPLATE/bug_report.yml",
     ".github/ISSUE_TEMPLATE/config.yml",

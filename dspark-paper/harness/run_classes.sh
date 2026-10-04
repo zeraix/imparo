@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Table 10: learned widths against the 8-bit matrix kernel's row classes, on the evaluation subset.
+# Table 9: learned widths against the 8-bit matrix kernel's row classes, on the evaluation subset.
 # The kernel classes are not part of the released engine, so this runs a MEASUREMENT BUILD: the
 # engine with harness/kernel_classes.patch applied (it restores the declared classes), built into
 # its own target directory:
