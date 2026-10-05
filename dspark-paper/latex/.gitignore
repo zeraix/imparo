@@ -1,0 +1,9 @@
+# build products of harness/build_latex.py
+*.aux
+*.log
+*.out
+*.blg
+*.bbl
+AdaSpark.pdf
+gen
+arxiv-source.tar.gz

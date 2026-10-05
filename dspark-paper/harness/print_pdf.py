@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""paper.html -> AdaSpark.pdf for arXiv's PDF route (https://info.arxiv.org/help/submit_pdf.html),
+"""paper.html -> AdaSpark-html.pdf (the web page printed) for arXiv's PDF route (https://info.arxiv.org/help/submit_pdf.html),
 then a check of that PDF against arXiv's rules.
 
 arXiv takes one PDF whose fonts are all embedded outline fonts (TrueType or Type 1, never Type 3),
@@ -127,7 +127,7 @@ def check(pdf, title):
 
 
 def main():
-    out = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "AdaSpark.pdf"))
+    out = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "AdaSpark-html.pdf"))
     with tempfile.TemporaryDirectory() as work:
         page, title, n = print_copy(PAPER, work)
         print(f"print copy: {n} static font files inline, title {title!r}")

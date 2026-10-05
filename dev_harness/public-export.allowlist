@@ -465,9 +465,12 @@ dspark-paper/README.md
 dspark-paper/SETUP.md
 dspark-paper/harness/agentic.py
 dspark-paper/harness/agentic_report.py
+dspark-paper/harness/build_latex.py
 dspark-paper/harness/check.py
 dspark-paper/harness/figs.py
+dspark-paper/harness/html2tex.py
 dspark-paper/harness/kernel_classes.patch
+dspark-paper/harness/latex_assets.py
 dspark-paper/harness/paper_figs.py
 dspark-paper/harness/print_pdf.py
 dspark-paper/harness/run.sh
@@ -481,6 +484,9 @@ dspark-paper/harness/table4.py
 dspark-paper/harness/tables.py
 dspark-paper/harness/verify_route.py
 dspark-paper/harness/verify_route.sh
+dspark-paper/latex/.gitignore
+dspark-paper/latex/AdaSpark.tex
+dspark-paper/latex/refs.bib
 dspark-paper/manifest.md
 dspark-paper/paper.html
 dspark-paper/testset/.gitignore
