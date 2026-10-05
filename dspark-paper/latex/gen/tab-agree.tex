@@ -1,0 +1,16 @@
+\begin{table}[t]
+\centering\small
+\caption{Replies of the evaluation subset whose text, reasoning included, is byte-identical between AdaSpark's first run and imparo's three-pick DSpark. Later turns carry each arm's own earlier replies, so one early difference makes every later turn of that conversation differ; first turns share their history and isolate the verify.}
+\label{tab:agree}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrr}
+\toprule
+\rowcolor{head}\textbf{target} & \textbf{all replies} & \textbf{first turns} \\
+\midrule
+LFM2.5-2.6B & 81/95 & 39/42 \\
+LFM2.5-8B-A1B & 73/95 & 34/42 \\
+Qwen3-4B & 78/95 & 37/42 \\
+Qwen3-8B & 85/95 & 38/42 \\
+\bottomrule
+\end{tabular}
+\end{table}

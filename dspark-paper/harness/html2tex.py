@@ -1,5 +1,5 @@
-"""HTML fragments of paper.html -> LaTeX. Shared by latex_assets.py (tables, captions, figures)
-and the one-time prose conversion.
+"""HTML fragments -> LaTeX: the tables and figure captions paper_figs.py builds (via
+latex_assets.py), and the inline text rules they need.
 
 Inline rules: a variable is <i>x</i> (one letter, maybe a digit) or a Greek entity; <sub>/<sup>
 attach to it; operators and brackets between two math pieces join them into one $...$. Citations
@@ -73,14 +73,11 @@ class Tree(HTMLParser):
 
 
 class Refs:
-    """Number -> label maps built from paper.html, and the citation keys."""
+    """Number -> label maps for plain "Table N"/"Figure N" text ({"3": "tab:widths"}), and the
+    citation keys by reference number."""
 
-    def __init__(self, page, cite_keys):
-        figs = re.findall(r'<figure class="fg">.*?id="(fig-[\w-]+)"', page, re.S)
-        tabs = re.findall(r'<figure class="tb[^"]*">.*?id="(tab-[\w-]+)"', page, re.S)
-        self.fig = {str(i): lab(x) for i, x in enumerate(figs, 1)}
-        self.tab = {str(i): lab(x) for i, x in enumerate(tabs, 1)}
-        self.cite = cite_keys
+    def __init__(self, fig, tab, cite_keys):
+        self.fig, self.tab, self.cite = fig, tab, cite_keys
 
 
 def lab(html_id):
@@ -378,7 +375,9 @@ def rows(part, refs, header):
             st = re.search(r'style="([^"]*)"', attrs); cc = re.search(r'class="([^"]*)"', attrs)
             cells.append({"colspan": cs.group(1) if cs else "1", "rowspan": rs.group(1) if rs else "1",
                           "style": st.group(1) if st else "", "cls": cc.group(1) if cc else "",
-                          "body": body, "tex": inline(body, refs, br=r"\\")})
+                          # a line break inside a cell is "\\ " (with a space): the public export's
+                          # share-path scan reads "\\{\\scriptsize" as \\server\\share
+                          "body": body, "tex": inline(body, refs, br="\\\\ ")})
         out.append(cells)
         out[-1] = {"cls": cls.group(1) if cls else "", "cells": cells}
     return [r for r in out] if not header else [r["cells"] for r in out]

@@ -1,0 +1,24 @@
+\begin{table*}[t]
+\centering\small
+\caption{Verify time (ms) at three contexts for three row counts on each target, and the fit $T(c) = \alpha + \beta\cdot c$ of Eq.~\eqref{eq:3}.}
+\label{tab:context-law}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrrr}
+\toprule
+\rowcolor{head}\textbf{target} & \textbf{rows} & \textbf{$T$(443)} & \textbf{$T$(1,596)} & \textbf{$T$(8,444)} & \textbf{$\alpha$ (ms)} & \textbf{$\beta$ (ms per 1k tokens)} & \textbf{max residual} \\
+\midrule
+LFM2.5-2.6B & 8 & 24.0 & 24.1 & 25.0 & 23.9 & 0.13 & 0.1\% \\
+LFM2.5-2.6B & 16 & 26.0 & 25.9 & 27.5 & 25.8 & 0.20 & 0.7\% \\
+LFM2.5-2.6B & 32 & 43.9 & 44.4 & 47.3 & 43.7 & 0.43 & 0.0\% \\
+LFM2.5-8B-A1B & 8 & 24.2 & 23.0 & 23.7 & 23.6 & $-$0.01 & 2.7\% \\
+LFM2.5-8B-A1B & 16 & 32.3 & 30.3 & 32.4 & 31.3 & 0.11 & 3.9\% \\
+LFM2.5-8B-A1B & 32 & 54.8 & 54.4 & 57.3 & 54.3 & 0.35 & 0.8\% \\
+Qwen3-4B & 8 & 25.2 & 26.8 & 35.5 & 24.7 & 1.28 & 0.2\% \\
+Qwen3-4B & 16 & 37.6 & 40.6 & 56.4 & 36.7 & 2.35 & 0.4\% \\
+Qwen3-4B & 32 & 102.5 & 106.6 & 134.5 & 100.5 & 4.03 & 0.3\% \\
+Qwen3-8B & 8 & 41.8 & 43.2 & 51.4 & 41.3 & 1.20 & 0.1\% \\
+Qwen3-8B & 16 & 63.4 & 66.2 & 81.7 & 62.5 & 2.27 & 0.2\% \\
+Qwen3-8B & 32 & 177.3 & 182.2 & 210.3 & 175.6 & 4.12 & 0.1\% \\
+\bottomrule
+\end{tabular}
+\end{table*}

@@ -1,0 +1,6 @@
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{gen/fig-e2e-img.pdf}
+\caption{Where the gain over llama.cpp comes from. The engine factor is imparo DSpark over llama.cpp DSpark, the two engines running the same algorithm (a chain of at most three draft tokens); the scheduler factor is AdaSpark over imparo DSpark, on the same engine; the total is AdaSpark over llama.cpp DSpark, over the replies both engines served; it is close to the product of the two, whose reply sets differ only by replies that looped in one arm. Whiskers are 95\% bootstrap intervals over conversations.}
+\label{fig:e2e}
+\end{figure*}

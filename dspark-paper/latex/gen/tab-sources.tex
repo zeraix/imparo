@@ -1,0 +1,19 @@
+\begin{table}[t]
+\centering\small
+\caption{The scheduler's gain by workload: AdaSpark over imparo DSpark (same engine, a chain of at most three draft tokens), geometric mean of per-reply decode ratios per source, looped replies excluded. Darker cells are larger gains.}
+\label{tab:sources}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrr}
+\toprule
+\rowcolor{head}\textbf{source} & \makecell[r]{\bfseries LFM2.5-\\2.6B} & \makecell[r]{\bfseries LFM2.5-\\8B-A1B} & \textbf{Qwen3-4B} & \textbf{Qwen3-8B} \\
+\midrule
+Spec-Bench & \cellcolor{c1!27}1.51 & \cellcolor{c1!7}1.14 & \cellcolor{c1!14}1.28 & \cellcolor{c1!17}1.33 \\
+SPEED-Bench & \cellcolor{c1!27}1.51 & \cellcolor{c1!9}1.19 & \cellcolor{c1!12}1.24 & \cellcolor{c1!16}1.31 \\
+WildChat & \cellcolor{c1!23}1.43 & \cellcolor{c1!6}1.12 & \cellcolor{c1!12}1.24 & \cellcolor{c1!17}1.32 \\
+ConvFinQA & \cellcolor{c1!38}1.71 & \cellcolor{c1!12}1.24 & \cellcolor{c1!19}1.36 & \cellcolor{c1!21}1.41 \\
+ToolACE & \cellcolor{c1!22}1.41 & \cellcolor{c1!9}1.19 & \cellcolor{c1!12}1.23 & \cellcolor{c1!12}1.24 \\
+LongBench & \cellcolor{c1!40}1.73 & \cellcolor{c1!6}1.13 & \cellcolor{c1!13}1.26 & \cellcolor{c1!15}1.28 \\
+\rowcolor{tint1}\textbf{all replies} & \textbf{1.52} & \textbf{1.17} & \textbf{1.27} & \textbf{1.31} \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -91,6 +91,68 @@ BINARY_ALLOWLIST = {
         4348832,
         "9521406b46b918c23450e6199ed973149c88fcb2e33e5a7d8348212f7694cf37",
     ),
+    # AdaSpark paper figures, printed by dspark-paper/harness/latex_assets.py (Chrome, embedded
+    # TrueType). Re-pin after paper_figs.py RUNDIR or a figures/*.svg edit re-renders them.
+    "dspark-paper/latex/figures/fig-overview.pdf": (
+        b'%PDF-1.4',
+        b'3\n%%EOF\n',
+        23091,
+        "fa69c2b81a2ce22f8d76a1aeea0658c15ba8b4a5f261402950d7ceed4752721f",
+    ),
+    "dspark-paper/latex/figures/fig-shape.pdf": (
+        b'%PDF-1.4',
+        b'2\n%%EOF\n',
+        19430,
+        "9f518bf147e839223d79466ecfb5fcbffae67edf921c2cdfa50b66fea999a2d5",
+    ),
+    "dspark-paper/latex/gen/fig-accept-curve-img.pdf": (
+        b'%PDF-1.4',
+        b'2\n%%EOF\n',
+        19860,
+        "28cb3cb7dbc2824db1e7473eb24a3006654a7072d414ac7c7a9b8ccb45257179",
+    ),
+    "dspark-paper/latex/gen/fig-calibration-img.pdf": (
+        b'%PDF-1.4',
+        b'0\n%%EOF\n',
+        33458,
+        "1bf506505924cb6fc9b5e48488b3d75666bf3d764283a1ff3dcc72fb23c18a60",
+    ),
+    "dspark-paper/latex/gen/fig-e2e-img.pdf": (
+        b'%PDF-1.4',
+        b'0\n%%EOF\n',
+        10157,
+        "b5292354e7cf79a558f5aa5197b606796b4288efa8845c0dd63d365770fb8baf",
+    ),
+    "dspark-paper/latex/gen/fig-learning-img.pdf": (
+        b'%PDF-1.4',
+        b'2\n%%EOF\n',
+        53810,
+        "918bac98daf19bf5f532259ba85c9c6018ecb9e4efd9984a497dae3489e959cd",
+    ),
+    "dspark-paper/latex/gen/fig-marginal-img.pdf": (
+        b'%PDF-1.4',
+        b'9\n%%EOF\n',
+        22637,
+        "6ccb6ba8f7d6c1ef5600aac6a7f19223cdf0e996f5f3cec22a8bf165fb905b61",
+    ),
+    "dspark-paper/latex/gen/fig-round-img.pdf": (
+        b'%PDF-1.4',
+        b'7\n%%EOF\n',
+        9694,
+        "d491bdd73c41ea8c937864d3862ec7f8a6c263ea6e0567330b7ce8cca35ac97e",
+    ),
+    "dspark-paper/latex/gen/fig-verify-cost-img.pdf": (
+        b'%PDF-1.4',
+        b'2\n%%EOF\n',
+        38400,
+        "2f9d495f9608cb26574faa56f4e36d7527da792ca52c22e6cacaf4d4b501cbdf",
+    ),
+    "dspark-paper/latex/gen/fig-widths-img.pdf": (
+        b'%PDF-1.4',
+        b'8\n%%EOF\n',
+        9815,
+        "60b546b8e69aa28d0e4c7981e685e31a9af84cf912bb0df72acf7eb02296fa8d",
+    ),
 }
 SECRET_PATTERNS = (
     (

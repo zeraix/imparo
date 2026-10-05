@@ -1,0 +1,20 @@
+\begin{table*}[t]
+\centering\small
+\caption{What n-gram fill contributes, from the instrumented AdaSpark run on the short subset. Rows are the verified nodes past each round's anchor; accepted tokens are the draft tokens committed. A round is widened when its n-gram candidates move the chooser to a wider class than it takes with them priced at zero.}
+\label{tab:ngram}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrr}
+\toprule
+\rowcolor{head}\textbf{} & \textbf{LFM2.5-2.6B} & \textbf{LFM2.5-8B-A1B} & \textbf{Qwen3-4B} & \textbf{Qwen3-8B} \\
+\midrule
+verified rows held by n-gram-only nodes & 15.2\% & 9.4\% & 7.2\% & 8.1\% \\
+accepted draft tokens from n-gram-only nodes & 15.8\% & 7.8\% & 5.1\% & 7.8\% \\
+accepted draft tokens from nodes both sources proposed & 18.1\% & 18.5\% & 22.1\% & 22.4\% \\
+acceptance rate, drafter-only nodes & 24\% & 46\% & 33\% & 34\% \\
+acceptance rate, nodes both proposed & 70\% & 72\% & 64\% & 70\% \\
+acceptance rate, n-gram-only nodes & 30\% & 40\% & 26\% & 37\% \\
+rounds with n-gram candidates & 906 & 2,012 & 2,253 & 2,650 \\
+of those, rounds the n-gram widened the verify & 10.9\% & 7.5\% & 2.9\% & 4.2\% \\
+\bottomrule
+\end{tabular}
+\end{table*}

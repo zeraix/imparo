@@ -1,0 +1,50 @@
+<!-- drawn by hand; colours are the paper's CSS variables (latex_assets.TOKENS), rendered by latex_assets.py -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 330" role="img" aria-label="Components of one AdaSpark round: drafter and n-gram index feed a candidate order, the width chooser reads the cost and acceptance models, one verify commits the accepted path and updates both models">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--mark)"/>
+          </marker>
+        </defs>
+        <g font-family="Newsreader, serif" font-size="12.5" fill="var(--ink)">
+          <rect x="16" y="16" width="132" height="44" fill="none" stroke="var(--ink)" stroke-width="1"/>
+          <text x="82" y="34" text-anchor="middle">target model</text>
+          <text x="82" y="50" text-anchor="middle" font-size="11" fill="var(--ink-3)">hidden states</text>
+          <rect x="182" y="16" width="132" height="44" fill="none" stroke="var(--ink)" stroke-width="1"/>
+          <text x="248" y="34" text-anchor="middle">DSpark drafter</text>
+          <text x="248" y="50" text-anchor="middle" font-size="11" fill="var(--ink-3)">block, top-K per position</text>
+          <rect x="348" y="16" width="132" height="44" fill="none" stroke="var(--ink)" stroke-width="1"/>
+          <text x="414" y="34" text-anchor="middle">candidate order</text>
+          <text x="414" y="50" text-anchor="middle" font-size="11" fill="var(--ink-3)">best-first on path Q</text>
+          <rect x="496" y="16" width="128" height="44" fill="var(--tint-2)" stroke="var(--ink)" stroke-width="1"/>
+          <text x="560" y="34" text-anchor="middle">n-gram index</text>
+          <text x="560" y="50" text-anchor="middle" font-size="11" fill="var(--ink-3)">request text (&sect;3.3)</text>
+          <rect x="182" y="110" width="298" height="46" fill="none" stroke="var(--c1)" stroke-width="1.8"/>
+          <text x="331" y="130" text-anchor="middle" font-weight="600">width chooser (Eq. 7)</text>
+          <text x="331" y="147" text-anchor="middle" font-size="11" fill="var(--ink-3)">expected tokens against expected time, with hysteresis</text>
+          <rect x="16" y="98" width="132" height="32" fill="var(--tint-1)" stroke="var(--ink)" stroke-width="1"/>
+          <text x="82" y="118" text-anchor="middle">cost model <tspan font-style="italic">T</tspan> (&sect;3.2)</text>
+          <rect x="16" y="140" width="132" height="32" fill="var(--tint-3)" stroke="var(--ink)" stroke-width="1"/>
+          <text x="82" y="160" text-anchor="middle">acceptance <tspan font-style="italic">S</tspan> (&sect;3.3)</text>
+          <rect x="182" y="200" width="298" height="46" fill="none" stroke="var(--c1)" stroke-width="1.8"/>
+          <text x="331" y="220" text-anchor="middle" font-weight="600">tree verify: one forward over n* rows</text>
+          <text x="331" y="237" text-anchor="middle" font-size="11" fill="var(--ink-3)">a tree row equals its chain row, bit for bit (&sect;3.5)</text>
+          <rect x="232" y="286" width="198" height="34" fill="none" stroke="var(--ink)" stroke-width="1"/>
+          <text x="331" y="308" text-anchor="middle">commit accepted path</text>
+        </g>
+        <g stroke="var(--ink)" stroke-width="1" fill="none" marker-end="url(#ar)">
+          <line x1="148" y1="38" x2="180" y2="38"/>
+          <line x1="314" y1="38" x2="346" y2="38"/>
+          <line x1="496" y1="46" x2="482" y2="46"/>
+          <line x1="414" y1="60" x2="414" y2="108"/>
+          <line x1="148" y1="114" x2="180" y2="122"/>
+          <line x1="148" y1="156" x2="180" y2="146"/>
+          <line x1="331" y1="156" x2="331" y2="198"/>
+          <line x1="331" y1="246" x2="331" y2="284"/>
+        </g>
+        <g stroke="var(--ink-3)" stroke-width="1" fill="none" stroke-dasharray="4 3" marker-end="url(#ar)">
+          <path d="M 232 303 H 92 V 176"/>
+          <path d="M 430 303 H 604 V 224 H 488"/>
+        </g>
+        <text x="100" y="196" font-family="Newsreader, serif" font-size="11" font-style="italic" fill="var(--ink-3)">verify time, accept labels</text>
+        <text x="596" y="296" font-family="Newsreader, serif" font-size="11" font-style="italic" fill="var(--ink-3)" text-anchor="end">committed text <tspan font-family="IBM Plex Mono, monospace" font-style="normal">&rarr;</tspan> index</text>
+      </svg>

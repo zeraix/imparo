@@ -1,0 +1,18 @@
+\begin{table*}[t]
+\centering\small
+\caption{AdaSpark over llama.cpp DSpark on the evaluation subset, on the held-out conversations (the 31 conversations, 61 turns, of the test set outside the subset, which no arm had run when the subset was measured) and on the whole test set (73 conversations, 148 turns): geometric mean of per-reply decode ratios with the 95\% bootstrap interval over conversations, and the replies it rests on. Looped and single-delta replies are left out as in Table~\ref{tab:e2e}; the last column counts the held-out replies that reached the cap.}
+\label{tab:heldout}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrrr}
+\toprule
+\rowcolor{head} & \multicolumn{2}{c}{\textbf{evaluation subset}} & \multicolumn{2}{c}{\textbf{held out}} & \multicolumn{2}{c}{\textbf{whole test set}} &  \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7}
+\rowcolor{head}\multirow{-2}{*}{\textbf{target}} & \textbf{ratio} & \textbf{replies} & \textbf{ratio} & \textbf{replies} & \textbf{ratio} & \textbf{replies} & \multirow{-2}{*}{\makecell[r]{\bfseries looped,\\ held out}} \\
+\midrule
+LFM2.5-2.6B & \makecell[r]{1.87$\times$\\ {\scriptsize [1.80, 1.95]}} & 92 & \makecell[r]{1.80$\times$\\ {\scriptsize [1.73, 1.89]}} & 64 & \makecell[r]{1.84$\times$\\ {\scriptsize [1.79, 1.90]}} & 156 & 3 \\
+LFM2.5-8B-A1B & \makecell[r]{1.54$\times$\\ {\scriptsize [1.52, 1.57]}} & 93 & \makecell[r]{1.50$\times$\\ {\scriptsize [1.46, 1.54]}} & 65 & \makecell[r]{1.52$\times$\\ {\scriptsize [1.50, 1.55]}} & 158 & 1 \\
+Qwen3-4B & \makecell[r]{2.83$\times$\\ {\scriptsize [2.73, 2.92]}} & 88 & \makecell[r]{2.88$\times$\\ {\scriptsize [2.83, 2.94]}} & 65 & \makecell[r]{2.85$\times$\\ {\scriptsize [2.79, 2.91]}} & 153 & 2 \\
+Qwen3-8B & \makecell[r]{3.11$\times$\\ {\scriptsize [3.05, 3.18]}} & 94 & \makecell[r]{3.07$\times$\\ {\scriptsize [3.00, 3.14]}} & 67 & \makecell[r]{3.10$\times$\\ {\scriptsize [3.05, 3.14]}} & 161 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table*}

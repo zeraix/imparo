@@ -1,0 +1,24 @@
+\begin{table*}[t]
+\centering\small
+\caption{The width on the evaluation subset: AdaSpark against the same scheduler with its width pinned, every other part unchanged (both online models, the n-gram fill, a store learning from empty). The width columns are each pinned arm's decode speed over AdaSpark's, geometric mean of per-reply ratios (above 1 is faster than AdaSpark), with the best pinned width in bold, for all replies and by the context a reply was decoded at (prompt plus half the reply). AdaSpark runs before the pinned arms and again after them, and its speed on a reply is the mean of the two runs. The routed target is also pinned at 4, 5 and 6 rows, in a second stage run the same way and compared with its own two AdaSpark runs; a dash marks a width not run (\S\ref{sec:3.4}). \emph{AdaSpark / best} is AdaSpark over the best pinned width with its 95\% bootstrap interval over conversations; \emph{again} is AdaSpark's second run over its first. Looped and single-delta replies are left out as in Table~\ref{tab:e2e}.}
+\label{tab:widths}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llrrrrrrrrr}
+\toprule
+\rowcolor{head}\textbf{target} & \textbf{replies} & \textbf{n} & \textbf{4} & \textbf{5} & \textbf{6} & \textbf{8} & \textbf{12} & \textbf{16} & \textbf{AdaSpark / best} & \textbf{again} \\
+\midrule
+LFM2.5-2.6B & all replies & 92 & -- & -- & -- & 0.907 & 0.968 & \textbf{0.998} & \makecell[r]{1.002$\times$\\ {\scriptsize [0.996, 1.008]}} & 0.995 \\
+ & under 2,048 & 75 & -- & -- & -- & 0.909 & 0.970 & \textbf{1.000} & \makecell[r]{1.000$\times$\\ {\scriptsize [0.995, 1.007]}} & 0.995 \\
+ & 2,048 and over & 17 & -- & -- & -- & 0.899 & 0.962 & \textbf{0.990} & \makecell[r]{1.010$\times$\\ {\scriptsize [0.991, 1.025]}} & 0.995 \\
+LFM2.5-8B-A1B & all replies & 91 & 0.857 & 0.920 & 0.953 & \textbf{0.997} & 0.926 & 0.900 & \makecell[r]{1.003$\times$\\ {\scriptsize [0.989, 1.019]}} & 0.995 \\
+ & under 2,048 & 74 & 0.847 & 0.910 & 0.947 & \textbf{0.996} & 0.930 & 0.902 & \makecell[r]{1.004$\times$\\ {\scriptsize [0.990, 1.020]}} & 1.002 \\
+ & 2,048 and over & 17 & 0.899 & 0.969 & 0.980 & \textbf{0.998} & 0.911 & 0.891 & \makecell[r]{1.002$\times$\\ {\scriptsize [0.950, 1.042]}} & 0.964 \\
+Qwen3-4B & all replies & 88 & -- & -- & -- & \textbf{1.001} & 0.801 & 0.818 & \makecell[r]{0.999$\times$\\ {\scriptsize [0.992, 1.007]}} & 1.014 \\
+ & under 2,048 & 66 & -- & -- & -- & \textbf{1.003} & 0.796 & 0.811 & \makecell[r]{0.997$\times$\\ {\scriptsize [0.990, 1.005]}} & 1.017 \\
+ & 2,048 and over & 22 & -- & -- & -- & \textbf{0.994} & 0.818 & 0.839 & \makecell[r]{1.006$\times$\\ {\scriptsize [0.991, 1.018]}} & 1.006 \\
+Qwen3-8B & all replies & 94 & -- & -- & -- & \textbf{0.995} & 0.771 & 0.792 & \makecell[r]{1.005$\times$\\ {\scriptsize [1.000, 1.011]}} & 1.001 \\
+ & under 2,048 & 74 & -- & -- & -- & \textbf{0.997} & 0.772 & 0.792 & \makecell[r]{1.003$\times$\\ {\scriptsize [0.999, 1.009]}} & 1.001 \\
+ & 2,048 and over & 20 & -- & -- & -- & \textbf{0.989} & 0.768 & 0.793 & \makecell[r]{1.011$\times$\\ {\scriptsize [0.995, 1.028]}} & 0.999 \\
+\bottomrule
+\end{tabular}
+\end{table*}

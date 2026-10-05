@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Every generated table and figure in paper.html, from one run directory of run.sh.
+"""Every generated table and figure of the paper, from one run directory of run.sh.
 
-Each fragment is written between its markers in the paper, <!--FIG:name--> ... <!--/FIG:name-->
-or <!--TAB:name--> ... <!--/TAB:name-->, so the paper can be regenerated from the data alone.
-A fragment whose inputs are missing is left as it is, and the script says so.
+Each one is built as an HTML fragment (a <figure> with its caption) and written to latex/gen/ by
+latex_assets.py: a table as gen/tab-<name>.tex, a figure as gen/fig-<name>-img.pdf and
+gen/fig-<name>.tex. The paper can be regenerated from the data alone. A fragment whose inputs
+are missing is left as it is, and the script says so.
 
   FIG verify_cost   T(n) against rows on each target        {m}_survey/survey.tsv
   TAB context_law   per-class context slope                 {m}_survey/survey.tsv
@@ -22,7 +23,7 @@ A fragment whose inputs are missing is left as it is, and the script says so.
   FIG learning      cost model estimate against measured      {m}_figs/server_complete_r1.log
   FIG calibration   realised against expected accepted nodes  {m}_figs/server_*_r1.log
 
-usage: paper_figs.py RUNDIR [PAPER]      (PAPER defaults to ../paper.html)
+usage: paper_figs.py RUNDIR      (needs Chrome and network for the figures' fonts)
 """
 import math, os, re, statistics, sys
 
@@ -42,7 +43,7 @@ SOURCES = [("specbench", "Spec-Bench"), ("speedbench", "SPEED-Bench"), ("wildcha
 FONT = 'font-family="Newsreader, serif"'
 
 
-# One colour per target in every figure (paper.html defines --c1..--c6, an Okabe-Ito palette).
+# One colour per target in every figure (latex_assets.TOKENS defines --c1..--c6, an Okabe-Ito palette).
 TARGET_COLOUR = {"lfm26": "var(--c1)", "moekm": "var(--c2)", "q4b": "var(--c3)", "q8b": "var(--c4)"}
 
 
@@ -1053,32 +1054,6 @@ def fig_from_figs(kind, logs):
         return figure(svg(620, 260, body, "Acceptance calibration"), cap)
 
 
-def number(paper):
-    """Figures and tables numbered by order of appearance; every `xref` link takes its target's
-    number. A caption is `<span class="lbl" id="fig-NAME">Figure N:</span>` (or tab-); a reference
-    is `<a class="xref" href="#fig-NAME">Figure N</a>`."""
-    nums, count = {}, {"fig": 0, "tab": 0}
-    def lbl(m):
-        kind = m.group(1)
-        count[kind] += 1
-        nums[f"{kind}-{m.group(2)}"] = count[kind]
-        word = "Figure" if kind == "fig" else "Table"
-        return f'<span class="lbl" id="{kind}-{m.group(2)}">{word} {count[kind]}:</span>'
-    paper = re.sub(r'<span class="lbl" id="(fig|tab)-([\w-]+)">(?:Figure|Table) \d+:</span>', lbl, paper)
-    missing = set()
-    def xref(m):
-        key = m.group(1)
-        if key not in nums:
-            missing.add(key)
-            return m.group(0)
-        word = "Figure" if key.startswith("fig") else "Table"
-        return f'<a class="xref" href="#{key}">{word}&nbsp;{nums[key]}</a>'
-    paper = re.sub(r'<a class="xref" href="#((?:fig|tab)-[\w-]+)">[^<]*</a>', xref, paper)
-    if missing:
-        print("  references to missing labels: " + ", ".join(sorted(missing)))
-    return paper
-
-
 # ---------------------------------------------------------------- learned width classes
 def store_widths(home):
     """The widths a stored verify-cost table offers: the top row count of each `step` line."""
@@ -1170,20 +1145,10 @@ def unlooped(log):
     return path
 
 
-def put(paper, kind, name, frag):
-    a, b = f"<!--{kind}:{name}-->", f"<!--/{kind}:{name}-->"
-    i, j = paper.find(a), paper.find(b)
-    if i < 0 or j < 0:
-        print(f"  {kind}:{name}: markers missing in the paper")
-        return paper
-    return paper[: i + len(a)] + "\n" + frag + "\n" + paper[j:]
-
-
 def main():
     run = sys.argv[1]
-    paper_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(HERE),
-                                                                    "paper.html")
-    paper = open(paper_path).read()
+    import latex_assets
+    writer = latex_assets.Writer()
     p = lambda *xs: os.path.join(run, *xs)
     sv = {m: survey(p(f"{m}_survey", "survey.tsv")) for m, _ in MODELS
           if os.path.exists(p(f"{m}_survey", "survey.tsv"))}
@@ -1308,13 +1273,10 @@ def main():
     ]:
         frag = make()
         if frag:
-            paper = put(paper, kind, name, frag)
-            done.append(f"{kind}:{name}")
+            done.append(writer.write(frag))
         else:
             print(f"  {kind}:{name}: no data yet, left as it is")
-    paper = number(paper)
-    open(paper_path, "w").write(paper)
-    print("written: " + ", ".join(done))
+    print("written to latex/gen: " + ", ".join(done))
 
 
 if __name__ == "__main__":

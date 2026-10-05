@@ -32,7 +32,7 @@
 \renewcommand{\algorithmicensure}{\textbf{output:}}
 
 \title{AdaSpark: Adaptive DSpark with Online Learning\\for Tree Verification and N-gram Fill}
-\author{Liquan Liu \and Yifan Zhang\\[4pt]
+\author{Liquan Liu \qquad Yifan Zhang\\[4pt]
   {\normalsize\itshape Zeraix}\\
   {\small\texttt{liquan@zeraix.com}, \texttt{fergus@zeraix.com}}}
 \date{5 October 2026}
@@ -89,7 +89,12 @@ A verify round takes a tree of candidate tokens rooted at the anchor and runs th
 
 At each position we keep the drafter's top $K = 8$ candidates: the top one is the drafter's \emph{pick}, the other $K - 1$ its \emph{siblings}. The candidates of one block form a tree of fixed shape (Figure~\ref{fig:shape}). The picks form a spine: the pick at position $i$ hangs from the pick at position $i -$~1, and the first from the anchor. The siblings at position $i$ hang from the same parent as the pick and are leaves: our engine runs the Markov head along the picks only, so it scores nothing below a sibling, and an accepted sibling ends the drafter's part of the round. PCTree \cite{li2026chains} and TreeSpark \cite{zhou2026treespark} give siblings children of their own by running the head once more for each expanded parent; we did not implement this. N-gram candidates (\S\ref{sec:3.3}) form chains that branch from the anchor and from each pick, and can run past the end of the drafter's block.
 
-\input{gen/fig-shape}
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{figures/fig-shape.pdf}
+\caption{Shape of the candidate tree, drawn for a block of $B = 4$ positions and $K = 3$ candidates per position. Dark blue nodes are the drafter's picks, light blue nodes its siblings, orange squares an n-gram chain. The targets here use $B = 7$ or 9 and $K = 8$; a verify takes the best-first prefix of these nodes (\S\ref{sec:3.1}).}
+\label{fig:shape}
+\end{figure*}
 
 \section{AdaSpark}\label{sec:3}
 
@@ -97,7 +102,12 @@ At each position we keep the drafter's top $K = 8$ candidates: the top one is th
 
 Figure~\ref{fig:overview} shows one round and Algorithm~\ref{alg:round} states it. The drafter emits a block with its top-$K$ candidates per position, and n-gram chains from the request's own text are added to them. Each candidate gets $q$, the probability that it is accepted if its parent is. The candidates are ordered best-first by $Q$, the product of $q$ along the path from the anchor, so that every prefix of the order is itself a tree. The width chooser takes the prefix length that maximises Eq.~\eqref{eq:7}, the target verifies that prefix in one forward, and the round's measured time and accept outcomes update the two online models.
 
-\input{gen/fig-overview}
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{figures/fig-overview.pdf}
+\caption{One AdaSpark round. Solid arrows are the forward path; dashed arrows are the feedback that trains the two online models and extends the n-gram index. Both models persist across requests. The acceptance model's per-request intercept, and the per-request offset of the head-based estimate it competes with, restart with each request.}
+\label{fig:overview}
+\end{figure*}
 
 \paragraph{One order serves every width.} A node can be accepted only if its parent is, and at most one child of an accepted node is accepted. The probability that candidate $j$ lies on the accepted path is therefore $Q_{j}$, and the expected number of accepted candidates of a tree is the sum of $Q$ over its nodes,
 
@@ -381,13 +391,53 @@ On the evaluation subset, 81 of AdaSpark's 95 replies on LFM2.5-2.6B are byte-id
 
 Table~\ref{tab:sizing} summarises how schedulers for speculative decoding size a verify: whether the size is chosen anew for each verify, and where the two quantities the choice needs come from.
 
-\input{gen/tab-sizing}
+\begin{table*}[t]
+\centering\small
+\caption{How schedulers size a verify. ``Per round'' means the size is chosen anew for each verify from the listed estimates. Entries are taken from each paper or, for the engines, from their source code (\S\ref{sec:6}).}
+\label{tab:sizing}
+\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\rowcolor{head}\textbf{method} & \textbf{size chosen per round} & \textbf{verify cost from} & \textbf{acceptance from} \\
+\midrule
+\textbf{AdaSpark} & yes: tree width, from widths it learns, 2--64 rows & fitted online from served rounds, per learned width, as a function of context & fitted online per node, with terms for n-gram candidates \\
+CAST \cite{hong2026inference} & yes: per step, by a cost-benefit test with thresholds set by hand per model & latency table over batch size, context and tokens fed, profiled per device before serving & drafter probabilities \\
+EVICT \cite{pan2026making} & yes: tree prefix, 1--32 tokens & table profiled at startup per verify length, no context term & drafter probabilities \\
+Bastion \cite{oh2026bastion} & yes: grows the tree until the estimated speedup falls & roofline model in width and context, calibrated offline, optional online scale factor & drafter probabilities \\
+TreeSpark \cite{zhou2026treespark} & yes: stops at a price per verified token & latency ladder measured once per deployment & two-parameter map fitted offline to target outcomes \\
+DSpark \cite{cheng2026dspark}, vLLM \cite{kwon2023efficient}, SGLang \cite{zheng2024sglang} & yes: a chain length per request under a batch budget & table profiled at engine start \cite{cheng2026dspark}; at startup at 8,192 tokens \cite{kwon2023efficient}; offline, at contexts under about 600 tokens \cite{zheng2024sglang} & confidence head, calibrated offline \cite{cheng2026dspark} \\
+TurboSpec \cite{liu2024turbospec} & yes: chain length & linear model fitted offline & running acceptance rate, online \\
+Cascade \cite{saxena2025utility} & yes: chain length, re-tested periodically & measured online in short trial phases, no model & measured together with the cost \\
+EAGLE-2 \cite{li2024eagleb}, OPT-Tree \cite{wang2025opt}, TALON \cite{liu2026talon} & tree shape adapts; node budget fixed & not modelled & drafter probabilities or confidence \\
+PCTree \cite{li2026chains}, Trees from Marginals \cite{oda2026trees} & no: size fixed, found by a sweep & not modelled & drafter probabilities \\
+Graft \cite{shen2026draft} & no: 60 nodes; the split between drafted and retrieved nodes changes by confidence stage & not modelled & drafter probabilities; retrieved nodes not priced \\
+llama.cpp DSpark \cite{gerganovndllama} & no: a chain of up to 3 tokens by default & not modelled & optional cut-off on the confidence head, off by default \\
+\bottomrule
+\end{tabularx}
+\end{table*}
 
 \paragraph{Tree size from a cost.} CAST \cite{hong2026inference} sizes a speculative tree from a latency table over batch size, context and tokens fed, measured per device before serving, with thresholds set by hand per model. Sequoia \cite{chen2024sequoia} also profiles the hardware to size trees, and CaDDTree \cite{zhang2026cost} sizes diffusion draft trees from a cost curve fitted offline once per model and device; DDTree \cite{ringel2026accelerating} builds draft trees from a block-diffusion drafter. Three recent schedulers choose the tree size each round from a cost and the prefix property of Proposition~\ref{prop:1}, two by the ratio of expected accepted tokens to cost and one by a price per verified token. EVICT \cite{pan2026making} does this for EAGLE-3 trees on mixture-of-experts targets, with acceptance from the draft probabilities and a step-latency table profiled at initialisation per verify length, with no context term. Bastion \cite{oh2026bastion} does it for block-diffusion drafters with a roofline model in width and context, calibrated offline per GPU and target and correctable online by one multiplicative factor; its stopping rule assumes a cost convex in the width. TreeSpark \cite{zhou2026treespark} builds DSpark trees from parent-conditioned candidates and stops at a price read from a latency ladder measured once per deployment. TurboSpec \cite{liu2024turbospec} and ASPIRE \cite{ziashahabi2026aspire} fit linear cost models offline, and D-cut \cite{liu2026d} prunes verify depth from a cost table profiled at startup. Cascade \cite{saxena2025utility} measures the utility of a few draft lengths online in short test phases, without a cost model, and AdaptiveSD \cite{saremi2026adaptivesd}, BanditSpec \cite{hou2025banditspec} and Sun et~al. \cite{sun2026delay} learn a chain's length online from measured outcomes. Other tree methods fix the budget: PCTree \cite{li2026chains} and Trees from Marginals \cite{oda2026trees} at a size found by a sweep, TALON \cite{liu2026talon} with a hand-set threshold, and ECHO \cite{hu2026echo} and Graft \cite{shen2026draft} with thresholds set in a warm-up run. EAGLE-2 \cite{li2024eagleb} and OPT-Tree \cite{wang2025opt} select a dynamic tree's nodes by the product of draft probabilities along the path, the rule of Proposition~\ref{prop:1}, under a fixed node budget. AdaSpark differs from all of these in fitting the verify cost while serving, for widths it learns and as a function of context, with no profile or calibration before serving, and in pricing time at the long-run rate over a cost with steps.
 
 \paragraph{DSpark in serving engines.} vLLM \cite{kwon2023efficient} and SGLang \cite{zheng2024sglang} each ship a DSpark scheduler (Table~\ref{tab:vllm}). Both size a batch-wide verify budget by the ratio of expected accepted tokens to the cost of a step, and both take expected acceptance from the drafter's confidence head. vLLM's adaptive verification (\texttt{enable\_adaptive\_verification}, off by default) profiles its table at startup at one context length, 8,192 tokens by default, and makes it monotone by a running maximum; the table is a step function because CUDA-graph capture pads a batch to the next captured size. SGLang reads a table written by a separate offline profiler, which by default decodes 16-token prompts for about 570 steps, so its contexts stay below about 600 tokens; without that file it verifies every drafted token. Neither refits its table while serving.
 
-\input{gen/tab-vllm}
+\begin{table*}[t]
+\centering\small
+\caption{DSpark schedulers in vLLM (read from vLLM commit 41c4a3ed4e) and SGLang (read from SGLang commit 8b2ca8ecc2), and AdaSpark.}
+\label{tab:vllm}
+\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\textwidth}{XXXX}
+\toprule
+\rowcolor{head}\textbf{} & \textbf{vLLM adaptive verification} & \textbf{SGLang DSpark scheduler} & \textbf{AdaSpark} \\
+\midrule
+objective & expected tokens / cost & expected tokens $\times$ steps per second & expected tokens $-$ $\rho$ $\cdot$ time (Eq.~7) \\
+source of cost & profiled at startup & offline profiler, loaded from a file & fitted from served rounds (\S\ref{sec:3.2}) \\
+context & one length, 8,192 tokens by default & 16-token prompts decoded for about 570 steps (contexts up to about 600 tokens) & per-class law in context, refitted while serving \\
+where the table is not monotone & running maximum over narrower widths: a cheaper wide width is priced up and never used & lookup at the nearest profiled size below & minimum over wider classes: a cheaper wide class is used for the narrower widths \\
+source of acceptance & drafter confidence head & drafter confidence head, optional offline calibration & fitted multinomial (\S\ref{sec:3.3}) \\
+candidate sources per verify & one & one & two, priced separately (\S\ref{sec:3.3}) \\
+\bottomrule
+\end{tabularx}
+\end{table*}
 
 \paragraph{Predicting acceptance.} SpecDec++ \cite{huang2025specdec} trains an acceptance-prediction head onto the draft model and stops drafting when the predicted rejection probability crosses a threshold. DSpark \cite{cheng2026dspark} trains its confidence head on the per-position acceptance rate, calibrates it offline by temperature scaling, and passes the calibrated values to its scheduler. TreeSpark \cite{zhou2026treespark} reports that this head ranks tree edges poorly and replaces it with a two-parameter map from the drafter's probability, fitted once to the target's outcomes; TAPS \cite{wang2026taps} trains a scorer over each parent's children offline from recorded verifications; C2T \cite{huo2025c2t} trains a classifier on accepted and rejected tree nodes; and LiLiCorr \cite{rusanovsky2026lilicorr} trains a head on the drafter's confidence features. TurboSpec \cite{liu2024turbospec} and ASPIRE \cite{ziashahabi2026aspire} track an acceptance rate online as a running average, and BanditSpec \cite{hou2025banditspec} learns the draft length online as a bandit problem. D-PACE \cite{wu2026d} trains a parallel drafter with per-position loss weights derived from a surrogate of the expected accepted length. Our measurements (\S\ref{sec:3.3}, Table~\ref{tab:accept}) agree with TreeSpark's that a model fitted to the target's outcomes predicts acceptance better than the head; AdaSpark fits such a per-node model online, from an empty store, with separate terms for n-gram candidates and for agreement between the sources.
 
@@ -412,7 +462,25 @@ AdaSpark fits both quantities from the rounds it serves: the widths worth offeri
 
 Every prompt in the end-to-end evaluation comes from a published dataset; we wrote no prompt text. The protocol is ours: multi-turn conversations over each engine's HTTP API, with each engine's own replies carried as history. A method that learns from its workload is easy to favour with a workload chosen for it, so the text is fixed by the rule below and can be rebuilt by anyone.
 
-\input{gen/tab-testset}
+\begin{table*}[t]
+\centering\small
+\caption{The test set: six public sources, 73 conversations, 148 turns, and the evaluation subset drawn from it. Licences as each source states them. The last column lists every change made to source text.}
+\label{tab:testset}
+\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\textwidth}{XrrrrrX}
+\toprule
+\rowcolor{head}\textbf{source and content} & \textbf{licence} & \textbf{categories} & \textbf{conv.} & \textbf{turns} & \textbf{subset turns} & \textbf{change to the text} \\
+\midrule
+Spec-Bench \cite{xia2024unlocking}\newline MT-Bench two-turn items, translation, summarisation, QA, math reasoning, RAG & Apache-2.0 & 13 & 18 & 26 & 21 & none \\
+SPEED-Bench \cite{abramovich2026speed}\newline qualitative split & source's own & 11 & 19 & 23 & 15 & none \\
+WildChat \cite{zhao2024wildchat}\newline real user conversations; user turns only & ODC-BY & 1 & 8 & 32 & 16 & cut to the first four user turns \\
+ConvFinQA \cite{chen2022convfinqa,xie2023pixiu}\newline several questions about one earnings report & not stated & 1 & 8 & 29 & 16 & later turns reduced to their own question \\
+ToolACE \cite{liu2025toolace}\newline tool use with the source's schemas and recorded tool results & Apache-2.0 & 1 & 8 & 26 & 13 & Python-style parameter types (\texttt{dict}, \texttt{float}, \texttt{int}) renamed to the JSON Schema types they name \\
+LongBench \cite{bai2024longbench}\newline long documents with the benchmark's own task prompt & MIT & 6 & 12 & 12 & 6 & a document over the cap cut from the middle \\
+\bottomrule
+\end{tabularx}
+\par\smallskip\parbox{\linewidth}{\footnotesize The FLARE release of ConvFinQA repeats the report and the dialogue history in every turn; the harness carries the history itself, so later turns keep only their own question. LongBench's middle cut is the benchmark's own rule for inputs longer than a model's window.}
+\end{table*}
 
 \paragraph{Selection.} Items are taken in each dataset's own order: the first that pass one length cap (4,000 characters of prompt; 12,000 for ConvFinQA, ToolACE and LongBench, whose items carry a report, tool schemas or a document). A LongBench document over its cap is cut from the middle rather than skipped. The benchmark sets take a category's items until the category holds at least two turns, so a multi-turn item can take it to three. The single-category sets take their first eight conversations that pass the dataset's own filters (for WildChat: English, not flagged toxic, not redacted, at least four user turns). There is no sampling, and no item was examined for how any engine performs on it. SPEED-Bench's qualitative split reuses some Spec-Bench questions and repeats some of its own first turns; the rule keeps every copy it selects, and two conversations of the evaluation subset (humanities and QA) open with the same question as a Spec-Bench conversation. AdaSpark's n-gram index holds only the current request's text, so a repeated question gains nothing from an earlier copy. The conversations' text was fixed and committed before the first end-to-end run; a conversation's hash covers its turns, and ToolACE's tool schemas are converted by the rule in Table~\ref{tab:testset}. Each conversation records its source row identifier and a hash of its text, and each file records the source revision it was built from; rebuilding the set six days after the first build reproduced all 73 hashes.
 
@@ -424,12 +492,68 @@ Every prompt in the end-to-end evaluation comes from a published dataset; we wro
 
 Table~\ref{tab:constants} lists every constant the scheduler uses, with its value and how it was set. ``Hand'' means chosen once from what the quantity means, not by a search; ``dev'' means chosen by comparing a few values on the development corpus (setup notes). All were set while developing on LFM2.5-2.6B and are used unchanged on the four targets.
 
-\input{gen/tab-constants}
+\begin{table*}[t]
+\centering\small
+\caption{The scheduler's constants.}
+\label{tab:constants}
+\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\rowcolor{head}\textbf{part} & \textbf{constant} & \textbf{value} & \textbf{set by} \\
+\midrule
+cost model (\S\ref{sec:3.2}) & quantile level $\tau$ & 0.15 & hand (Proposition~\ref{prop:3}) \\
+ & context basis unit & 8,192 tokens & hand \\
+ & L1 and L2 weights $\lambda_{1}$, $\lambda_{2}$ (on time normalised by the class's scale) & 0.002, 0.01 & hand \\
+ & FTRL rate and stabiliser & 0.05, 1 & hand \\
+ & squared-gradient cap (rate floor) & 400 & hand \\
+ & sample bank per context band; samples a refit is judged on & 16 samples; the newest quarter of a band, all of a band with fewer than four & hand \\
+ & law clamp, relative to the class's lowest time & [0.5, 3] & hand \\
+ & level window; level clamp & 8 verifies; [0.5, 2] & hand \\
+ & measurements before a width is priced; samples before its law is fitted & 3; 3 & hand \\
+ & starting ladder & 2, 4, 8, 16, 32, 64 rows & hand \\
+ & rounds the chooser holds a width before a split; steep interval & 8; a rise above 25\% & hand \\
+ & most widths learned & 24 & hand \\
+width choice (\S\ref{sec:3.4}) & long-run rate half-life; rounds before a band's rate is used & 64 rounds; 8 & hand \\
+ & gain clamp; shrinkage toward 1 & [0.25, 4]; ridge weight 0.02 times each regressor's sum of squares & hand \\
+ & gain reference width $n_{0}$ & 8 rows & hand \\
+ & ratio margin before the band's rate is known & 4\% & hand \\
+ & hysteresis margin & 0.04 of the incumbent's expected tokens & dev \\
+acceptance model (\S\ref{sec:3.3}) & drafter and depth/context terms: FTRL rate, stabiliser, L2 & 0.05, 1, 0.01 & hand \\
+ & n-gram bucket FTRL rate & 0.5 & hand \\
+ & gate on leaving the prior & $3\sqrt{m}$ after $m$ updates & hand \\
+ & squared-gradient cap & 400 & hand \\
+ & request intercept: AdaGrad rate, band, squared-gradient cap & 0.15, $\pm$2, 16 & hand \\
+ & guard half-life & 256 labelled parents & hand \\
+ & head-based estimate's per-request offset: AdaGrad rate, band & 0.15, $\pm$2 & hand \\
+n-gram fill (\S\ref{sec:3.3}) & follower context when no earlier passage continues & last 3 tokens & hand \\
+ & chain depth limit & 32 tokens below the anchor & hand \\
+ & exploration period & every 16th tree round with n-gram candidates & dev \\
+drafter (\S\ref{sec:2.2}) & candidates kept per position $K$ & 8 & hand \\
+\bottomrule
+\end{tabularx}
+\end{table*}
 
 \section{Alternatives we measured and rejected}\label{app:C}
 
 Table~\ref{tab:rejected} lists the design alternatives we built and measured before settling on the form of \S\ref{sec:3}, what went wrong with each, and the measurement that showed it.
 
-\input{gen/tab-rejected}
+\begin{table*}[t]
+\centering\small
+\caption{Design alternatives that were built and measured before the form of \S\ref{sec:3}, all measured on LFM2.5-2.6B during development. Changes are in milliseconds per token; positive is slower.}
+\label{tab:rejected}
+\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\textwidth}{XXX}
+\toprule
+\rowcolor{head}\textbf{alternative} & \textbf{what went wrong} & \textbf{measured} \\
+\midrule
+Per-round ratio without the fixed cost $D$ & narrow rounds looked cheap & +2.2\% against a fixed width of 16 (1,596-token context); $-$0.8\% with $D$ \\
+Argmax of the value with no margin & the choice flipped on noise near the boundary & +1.70\% / $-$0.95\% against the best fixed width at two contexts; $-$0.40\% / $-$0.42\% with the margin \\
+One acceptance curve per width, learned from rounds at that width & a round at $n$ rows says nothing about wider trees, so the learner never left its start & stayed at its initial width in 56 of 56 rounds from 8 rows and 47 of 47 from 16 \\
+Drafter candidates priced without the contradicted term & picks next to a strong n-gram proposal were over-priced; the drafter's gain fell to 0.5 and trees stayed at 8 rows & contradicted picks: 0.598 predicted, 0.539 accepted; their siblings 0.041 and 0.012. With the term, picks contradicted by a copy of $ \geq 16$ tokens: 0.129 predicted, 0.147 accepted \\
+Agreed candidates starting from the drafter's own estimate & agreement was not counted & agreed picks: 0.865 predicted, 0.970 accepted \\
+Monotone cost table (running maximum over narrower widths) & a cheaper wide class can never be chosen & by construction; 48 rows are 4\% cheaper than 40 (\S\ref{sec:3.2}) \\
+\bottomrule
+\end{tabularx}
+\end{table*}
 
 \end{document}

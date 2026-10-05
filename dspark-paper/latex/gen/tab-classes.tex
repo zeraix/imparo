@@ -1,0 +1,16 @@
+\begin{table*}[t]
+\centering\small
+\caption{Learned against kernel width classes on the evaluation subset: AdaSpark's decode speed with learned widths (\S\ref{sec:3.2}) over its speed with the widths taken from the 8-bit matrix kernel's row classes, geometric mean of per-reply ratios with its 95\% bootstrap interval over conversations, for all replies and by the context a reply was decoded at; above 1 the learned widths are faster. Both arms start from an empty store and ran on one build; the learned arm runs before the kernel-class arm and again after it, and its speed on a reply is the mean of the two runs. The last columns give the widths each arm's table offered at the end of its run (setup notes).}
+\label{tab:classes}
+\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\textwidth}{lrrrXX}
+\toprule
+\rowcolor{head}\textbf{target} & \textbf{all replies} & \textbf{under 2,048} & \textbf{2,048 and over} & \textbf{learned widths} & \textbf{kernel-class widths} \\
+\midrule
+LFM2.5-2.6B & \makecell[r]{0.997$\times$\\ {\scriptsize [0.992, 1.001]}} & \makecell[r]{0.995$\times$\\ {\scriptsize [0.990, 1.001]}} & \makecell[r]{1.005$\times$\\ {\scriptsize [0.995, 1.012]}} & 2--4, 6, 8--10, 12--17, 20, 22, 24, 26, 28, 32, 34, 36, 40, 48, 64 & 8, 16, 24, 32, 40, 47, 48, 56, 64 \\
+LFM2.5-8B-A1B & \makecell[r]{0.996$\times$\\ {\scriptsize [0.990, 1.003]}} & \makecell[r]{0.994$\times$\\ {\scriptsize [0.987, 1.002]}} & \makecell[r]{1.005$\times$\\ {\scriptsize [0.992, 1.019]}} & 2--17, 20, 24, 28, 32, 64 & 8, 16, 24, 32, 40, 48, 56, 64 \\
+Qwen3-4B & \makecell[r]{0.998$\times$\\ {\scriptsize [0.986, 1.008]}} & \makecell[r]{1.003$\times$\\ {\scriptsize [0.997, 1.010]}} & \makecell[r]{0.985$\times$\\ {\scriptsize [0.947, 1.012]}} & 2--18, 20, 24, 28, 30, 32, 44, 57 & 8, 16, 24, 32, 40, 48, 56, 64 \\
+Qwen3-8B & \makecell[r]{1.002$\times$\\ {\scriptsize [0.999, 1.006]}} & \makecell[r]{1.003$\times$\\ {\scriptsize [1.001, 1.006]}} & \makecell[r]{0.999$\times$\\ {\scriptsize [0.989, 1.010]}} & 2--17, 20, 22, 24, 26, 28, 30, 32, 57 & 8, 16, 24, 32, 40, 48, 56, 64 \\
+\bottomrule
+\end{tabularx}
+\end{table*}

@@ -1,0 +1,18 @@
+\begin{table*}[t]
+\centering\small
+\caption{End to end. Left: decode tok/s on the evaluation subset (Appendix~\ref{app:A}; generated tokens over decode time, summed over replies) and AdaSpark over llama.cpp DSpark (geometric mean of per-reply ratios, 95\% bootstrap interval over conversations). A reply that reached the 8,192-token cap is a repetition loop under greedy decoding: each tok/s column leaves out its own arm's looped replies and each ratio the replies that looped in either of its two arms; \emph{looped} counts the replies that looped in any arm. AdaSpark's speed on a reply is the mean of its two runs (\S\ref{sec:3.4}). A reply streamed as a single delta (a bare tool call) has no client-clock decode interval and is left out as well (none on LFM2.5-2.6B, 2 on LFM2.5-8B-A1B, none on Qwen3-4B, none on Qwen3-8B). Right: each engine's speculation speedup over its own autoregressive (AR) decode: its tok/s on the evaluation subset over its AR tok/s, which is measured on the short subset (setup notes) only (llama.cpp and imparo: LFM2.5-2.6B 43.2 and 46.1; LFM2.5-8B-A1B 99.0 and 105.0; Qwen3-4B 42.9 and 43.2; Qwen3-8B 25.6 and 25.8 tok/s). AR speed barely depends on the text; the short subset's contexts are shorter, where AR decode is faster, so these speedups are if anything understated.}
+\label{tab:e2e}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrrr}
+\toprule
+\rowcolor{head} & \multicolumn{5}{c}{\textbf{evaluation subset: tok/s and ratio}} & \multicolumn{2}{c}{\textbf{over own AR}} \\
+\cmidrule(lr){2-6} \cmidrule(lr){7-8}
+\rowcolor{head}\multirow{-2}{*}{\textbf{target}} & \makecell[r]{\bfseries llama.cpp\\ DSpark} & \makecell[r]{\bfseries imparo\\ DSpark} & \textbf{AdaSpark} & \makecell[r]{\bfseries AdaSpark /\\ llama.cpp} & \textbf{looped} & \makecell[r]{\bfseries llama.cpp\\ DSpark} & \textbf{AdaSpark} \\
+\midrule
+LFM2.5-2.6B & 66.9 & 83.8 & 126.3 & \makecell[r]{1.87$\times$\\ {\scriptsize [1.80, 1.95]}} & 3 & 1.55$\times$ & 2.74$\times$ \\
+LFM2.5-8B-A1B & 79.1 & 105.5 & 122.1 & \makecell[r]{1.54$\times$\\ {\scriptsize [1.52, 1.57]}} & 2 & 0.80$\times$ & 1.16$\times$ \\
+Qwen3-4B & 35.7 & 79.1 & 100.4 & \makecell[r]{2.83$\times$\\ {\scriptsize [2.73, 2.92]}} & 7 & 0.83$\times$ & 2.33$\times$ \\
+Qwen3-8B & 21.7 & 50.9 & 68.2 & \makecell[r]{3.11$\times$\\ {\scriptsize [3.05, 3.18]}} & 1 & 0.85$\times$ & 2.64$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table*}

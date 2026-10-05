@@ -1,9 +1,12 @@
 # Adaptive DSpark: the paper, its test set, and its harness
 
-Everything a number in `paper.html` depends on, apart from the engine itself.
+Everything a number in the paper depends on, apart from the engine itself.
 
 ```
-paper.html            the paper
+latex/
+  AdaSpark.tex        the paper (pdfLaTeX); refs.bib its references
+  gen/                its generated tables and figures, written by harness/paper_figs.py
+  figures/            the two hand-drawn figures (SVG, rendered to PDF)
 manifest.md           planning notes behind the paper (claims, open questions)
 testset/
   build.py            builds sets/ from six public datasets; rules in its docstring and paper §6.1
@@ -18,6 +21,8 @@ harness/
   table4.py           width policies at fixed contexts (chain / fixed widths / budget)
   survey.py           verify cost by pinned width and context (Table 1)
   figs.py             the mechanism figures, from a probe run's server logs
+  paper_figs.py       every generated table and figure, from one run directory, into latex/gen/
+  build_latex.py      AdaSpark.pdf and the arXiv source bundle
 runs/                 run outputs (not committed)
 ```
 

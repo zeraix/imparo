@@ -1,173 +1,187 @@
-"""paper.html's figures and tables -> the LaTeX paper's generated parts (latex/gen/).
+"""The LaTeX paper's tables and figures, written from HTML fragments.
 
-Every table and figure of the paper, its caption and its numbers, is produced once, by
-paper_figs.py (generated blocks) or by hand (Tables 11-15, Figures 1-2), in paper.html. This
-script carries them into the LaTeX version so the two cannot disagree:
-  gen/tab-<name>.tex   the table environment (booktabs), caption and label
-  gen/fig-<name>.pdf   the figure, printed from its SVG by Chrome with TrueType fonts
-  gen/fig-<name>.tex   the figure environment, caption and label
-  --bib                (re)writes latex/refs.bib from the reference list; overwrites hand edits
+paper_figs.py builds every generated table and figure from the run data as an HTML fragment (a
+<figure> with its caption and, for a figure, an SVG); this module turns each one into
+latex/gen/: a table into gen/tab-<name>.tex (booktabs), a figure into gen/fig-<name>-img.pdf
+(the SVG printed by Chrome with embedded TrueType fonts) and gen/fig-<name>.tex (the figure
+environment). The image has its own name because arXiv deletes a PDF that shares its name
+with a .tex file. The two hand-drawn figures live in latex/figures/*.svg; running this file
+renders each to the PDF beside it when the SVG is newer.
 
-usage: latex_assets.py [--bib]      (needs network for the fonts, like print_pdf.py)
+usage: latex_assets.py [--force]      (needs Chrome and network for the fonts)
 """
-import html
+import glob
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import html2tex as h2t  # noqa: E402
-import print_pdf  # noqa: E402
 
-PAPER = os.path.join(HERE, "..", "paper.html")
-LATEX = os.path.join(HERE, "..", "latex")
+LATEX = os.path.normpath(os.path.join(HERE, "..", "latex"))
 GEN = os.path.join(LATEX, "gen")
+FIGURES = os.path.join(LATEX, "figures")
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 FIG_WIDTH = r"0.8\textwidth"  # one scale for every figure: SVG text keeps one size (~6.6 pt)
+# Static TrueType files: Google Fonts serves these to a plain client (a browser gets variable
+# WOFF2, which Chrome would embed as Type 3).
+FONTS = ("https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;"
+         "0,6..72,600;0,6..72,700;1,6..72,400;1,6..72,600&family=IBM+Plex+Mono:wght@400;500;700&display=swap")
+# The figures' colours: the SVGs name them as CSS variables. --c1..--c6 are an Okabe-Ito palette.
+TOKENS = """:root{
+  --paper:#FFFFFF; --ink:#111111; --ink-2:#333333; --ink-3:#5C5C5C;
+  --rule:#111111; --rule-2:#BBBBBB; --grid:#D8D8D8; --band:#F0F0F0; --band-2:#F7F7F7;
+  --link:#1A4E8A; --mark:#000000;
+  --c1:#0072B2; --c2:#E69F00; --c3:#009E73; --c4:#CC79A7; --c5:#D55E00; --c6:#56B4E9;
+  --tint-1:#E3EEF7; --tint-2:#FBEBCC; --tint-3:#DDF1EA; --head:#EAF1F7;}"""
 
 
-# ------------------------------------------------------------------ references
+# ------------------------------------------------------------------ rendering
 
-def references(page):
-    items = re.findall(r"<li>(.*?)</li>", re.search(r'<ol class="refs">(.*?)</ol>', page, re.S).group(1), re.S)
-    out, used = [], set()
-    for it in items:
-        m = re.match(r"\s*(.*?)\s*<i>(.*?)</i>\s*(.*)$", it, re.S)
-        authors, title, rest = m.group(1).rstrip("."), m.group(2).strip(), m.group(3).strip()
-        alias = re.match(r"\((\w[\w.-]*)\)\.?\s*", rest)
-        if alias:
-            title = title.rstrip(".") + f" ({alias.group(1)})"; rest = rest[alias.end():]
-        title = title.rstrip(".")
-        rest = rest.lstrip(". ").strip()
-        plain = html.unescape(re.sub(r"<[^>]+>", "", authors))
-        first = re.split(r",| et al| \(", plain)[0].strip()
-        last = re.sub(r"[^a-z]", "", (first.split()[-1] if " " in first and "." in first else first).lower())
-        year = (re.findall(r"\b(19\d\d|20\d\d)\b", rest) or ["nd"])[-1]
-        word = next((w for w in re.findall(r"[A-Za-z0-9]+", html.unescape(re.sub(r"<[^>]+>", "", title))).__iter__()
-                     if w.lower() not in {"a", "an", "the", "on", "to", "from", "via", "with", "for", "of"}), "x").lower()
-        key = f"{last}{year}{word}"
-        while key in used:
-            key += "b"
-        used.add(key)
-        out.append({"key": key, "authors": plain, "title": title, "rest": rest})
+def fetch(url):
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "latex_assets"})) as r:
+        return r.read()
+
+
+def font_css(work):
+    """@font-face rules pointing at downloaded TrueType files."""
+    css = fetch(FONTS).decode()
+    urls = re.findall(r"url\((https://fonts\.gstatic\.com/[^)]+)\)", css)
+    if not urls or any(not u.endswith(".ttf") for u in urls):
+        sys.exit("latex_assets: Google Fonts did not serve TrueType files; the PDFs would carry Type 3")
+    for i, u in enumerate(urls):
+        path = os.path.join(work, f"font{i}.ttf")
+        with open(path, "wb") as f:
+            f.write(fetch(u))
+        css = css.replace(u, "file://" + path)
+    return css
+
+
+def render_svg(svg, pdf, work, css):
+    """One SVG -> a one-page PDF of the SVG's own size."""
+    w, h = (float(x) for x in re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', svg).groups())
+    page = ("<!doctype html><html><head><meta charset='utf-8'><style>" + css + TOKENS +
+            f"@page{{size:{w}px {h}px;margin:0}} html,body{{margin:0;padding:0;background:#fff;overflow:hidden}}"
+            f"svg{{display:block;width:{w}px;height:{h}px}}</style></head><body>" + svg + "</body></html>")
+    src = os.path.join(work, os.path.basename(pdf) + ".html")
+    open(src, "w", encoding="utf-8").write(page)
+    subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
+                    "--virtual-time-budget=10000", f"--print-to-pdf={pdf}", "file://" + src],
+                   check=True, capture_output=True)
+    check_pdf(pdf)
+
+
+def fonts_of(resources, seen):
+    """(name, subtype, embedded) for every font a page draws, through form XObjects too."""
+    out = []
+    if resources is None:
+        return out
+    resources = resources.get_object()
+    for _, ref in (resources.get("/Font") or {}).items():
+        font = ref.get_object()
+        if id(font) in seen:
+            continue
+        seen.add(id(font))
+        sub = font.get("/Subtype")
+        desc = font["/DescendantFonts"][0].get_object() if sub == "/Type0" else font
+        fd = desc.get("/FontDescriptor")
+        fd = fd.get_object() if fd is not None else {}
+        out.append((str(font.get("/BaseFont", "(none)")), str(sub),
+                    any(k in fd for k in ("/FontFile", "/FontFile2", "/FontFile3"))))
+    for _, ref in (resources.get("/XObject") or {}).items():
+        x = ref.get_object()
+        if x.get("/Subtype") == "/Form":
+            out += fonts_of(x.get("/Resources"), seen)
     return out
 
 
-def bib_authors(a):
-    if "(" in a or not re.search(r"[A-Z]\.", a):   # an organisation or a named team: print as written
-        return "{" + a + "}"
-    parts = [p.strip() for p in re.split(r",\s*", a.replace(" et al.", ", others").replace(" et al", ", others"))]
-    return " and ".join(p for p in parts if p)
-
-
-def write_bib(page, refs_tex):
-    lines = []
-    for r in references(page):
-        title = h2t.inline(r["title"], refs_tex)
-        rest = h2t.inline(r["rest"], refs_tex)
-        rest = re.sub(r"\b(github\.com/\S+?)([;.,]?)(?=\s|$)", lambda m: r"\url{" + m.group(1) + "}" + m.group(2), rest)
-        lines.append(f"@misc{{{r['key']},\n  author = {{{bib_authors(r['authors'])}}},\n"
-                     f"  title = {{{{{title}}}}},\n  howpublished = {{{rest.rstrip('.')}}}\n}}\n")
-    open(os.path.join(LATEX, "refs.bib"), "w").write("\n".join(lines))
-    print(f"wrote refs.bib: {len(lines)} entries")
-
-
-# ------------------------------------------------------------------ tables and figures
-
-def figures_of(page, cls):
-    return re.findall(rf'<figure class="{cls}[^"]*">.*?</figure>', page, re.S)
-
-
-def write_tables(page, refs):
-    names = []
-    for f in figures_of(page, "tb"):
-        tid = re.search(r'id="(tab-[\w-]+)"', f).group(1)
-        col = 'class="tb col"' in f
-        body = re.search(r"<tbody>(.*?)</tbody>", f, re.S).group(1)
-        # a column of long text cells becomes a paragraph column (X); short text stays left-aligned
-        widths = {}
-        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.S):
-            j = 0
-            for attrs, cell in re.findall(r"<td([^>]*)>(.*?)</td>", tr, re.S):
-                span = int((re.search(r'colspan="(\d+)"', attrs) or [None, "1"])[1])
-                if 'class="txt"' in attrs:
-                    widths[j] = max(widths.get(j, 0), len(re.sub(r"<[^>]+>|&\w+;", "x", cell)))
-                j += span
-        ncol = max(sum(int((re.search(r'colspan="(\d+)"', a) or [None, "1"])[1]) for a in re.findall(r"<td([^>]*)>", tr))
-                   for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.S))
-        spec = ""
-        for j in range(ncol):
-            if widths.get(j, 0) > 30:
-                spec += "X"
-            elif j == 0 or j in widths:
-                spec += "l"
-            else:
-                spec += "r"
-        if tid == "tab-constants":    # long names and long values: both wrap
-            spec = "lXXl"
-        # one column only for tables of short cells; a paragraph column needs the full width
-        tex = h2t.table(f, refs, colspec=spec, wide=not col or "X" in spec)
-        name = h2t.lab(tid).replace(":", "-")
-        open(os.path.join(GEN, name + ".tex"), "w").write(tex)
-        names.append(name)
-    print(f"wrote {len(names)} tables: " + " ".join(names))
-
-
-def write_figures(page, refs, work):
-    printed, title, _ = print_pdf.print_copy(PAPER, work)
-    head = open(printed, encoding="utf-8").read()
-    head = head[:head.index('<div class="page">')]
-    names = []
-    for f in figures_of(page, "fg"):
-        fid = re.search(r'id="(fig-[\w-]+)"', f).group(1)
-        name = h2t.lab(fid).replace(":", "-")
-        svg = re.search(r"<svg.*?</svg>", f, re.S).group(0)
-        w, h = (float(x) for x in re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', svg).groups())
-        doc = (head + f"<style>@page{{size:{w}px {h}px;margin:0}} html,body{{margin:0;padding:0;"
-               f"background:#fff;overflow:hidden}} svg{{display:block;width:{w}px;height:{h}px;max-width:none}}</style>"
-               + svg + "</body></html>")
-        src = os.path.join(work, name + ".html")
-        open(src, "w", encoding="utf-8").write(doc)
-        pdf = os.path.join(GEN, name + ".pdf")
-        subprocess.run([print_pdf.CHROME, "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
-                        "--virtual-time-budget=10000", f"--print-to-pdf={pdf}", "file://" + src],
-                       check=True, capture_output=True)
-        cap = h2t.inline(re.search(r"<figcaption>(.*?)</figcaption>", f, re.S).group(1), refs)
-        env = [r"\begin{figure*}[t]", r"\centering",                 # one line per item: the export's
-               r"\includegraphics[width=" + FIG_WIDTH + "]{gen/" + name + ".pdf}",  # path scan reads a
-               r"\caption{" + cap + "}", r"\label{" + h2t.lab(fid) + "}",          # backslash pair before
-               r"\end{figure*}"]                                                    # text as a share path
-        open(os.path.join(GEN, name + ".tex"), "w").write("\n".join(env) + "\n")
-        names.append(name)
-    print(f"wrote {len(names)} figures: " + " ".join(names))
-    return names
-
-
-def check_figures(names):
-    """Every figure PDF: one page, fonts embedded, none of them Type 3."""
+def check_pdf(pdf):
+    """A figure PDF: one page, every font embedded, none of them Type 3."""
     from pypdf import PdfReader
-    for n in names:
-        r = PdfReader(os.path.join(GEN, n + ".pdf"))
-        fonts = print_pdf.fonts_of(r.pages[0].get("/Resources"), set())
-        bad = [f for f in fonts if f[1] == "/Type3" or not f[2]]
-        if len(r.pages) != 1 or bad:
-            sys.exit(f"latex_assets: {n}.pdf has {len(r.pages)} pages, bad fonts {bad}")
-    print(f"checked {len(names)} figure PDFs: one page each, fonts embedded, no Type 3")
+    r = PdfReader(pdf)
+    bad = [f for f in fonts_of(r.pages[0].get("/Resources"), set()) if f[1] == "/Type3" or not f[2]]
+    if len(r.pages) != 1 or bad:
+        sys.exit(f"latex_assets: {pdf} has {len(r.pages)} pages, bad fonts {bad}")
+
+
+# ------------------------------------------------------------------ fragments -> LaTeX
+
+def refs():
+    """Citation keys in refs.bib order (a caption's [n] is the n-th entry). Fragments name other
+    tables and figures by link (class xref), so no number maps are needed."""
+    keys = re.findall(r"@\w+\{([^,\s]+),", open(os.path.join(LATEX, "refs.bib")).read())
+    return h2t.Refs({}, {}, {i: k for i, k in enumerate(keys, 1)})
+
+
+def table_tex(frag, r):
+    """<figure class="tb"> -> (name, LaTeX table). A column of long text cells becomes a
+    paragraph column (X); a table with one stays full width."""
+    tid = re.search(r'id="(tab-[\w-]+)"', frag).group(1)
+    body = re.search(r"<tbody>(.*?)</tbody>", frag, re.S).group(1)
+    trs = re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.S)
+    widths = {}
+    for tr in trs:
+        j = 0
+        for attrs, cell in re.findall(r"<td([^>]*)>(.*?)</td>", tr, re.S):
+            span = int((re.search(r'colspan="(\d+)"', attrs) or [None, "1"])[1])
+            if 'class="txt"' in attrs:
+                widths[j] = max(widths.get(j, 0), len(re.sub(r"<[^>]+>|&\w+;", "x", cell)))
+            j += span
+    ncol = max(sum(int((re.search(r'colspan="(\d+)"', a) or [None, "1"])[1]) for a in re.findall(r"<td([^>]*)>", tr))
+               for tr in trs)
+    spec = "".join("X" if widths.get(j, 0) > 30 else ("l" if j == 0 or j in widths else "r") for j in range(ncol))
+    col = 'class="tb col"' in frag
+    return h2t.lab(tid).replace(":", "-"), h2t.table(frag, r, colspec=spec, wide=not col or "X" in spec)
+
+
+def figure_tex(frag, r, work, css):
+    """<figure class="fg"> -> (name, figure environment), its image rendered to gen/<name>-img.pdf."""
+    fid = re.search(r'id="(fig-[\w-]+)"', frag).group(1)
+    name = h2t.lab(fid).replace(":", "-")
+    render_svg(re.search(r"<svg.*?</svg>", frag, re.S).group(0), os.path.join(GEN, name + "-img.pdf"), work, css)
+    cap = h2t.inline(re.search(r"<figcaption>(.*?)</figcaption>", frag, re.S).group(1), r)
+    env = [r"\begin{figure*}[t]", r"\centering",                 # one line per item: the export's
+           r"\includegraphics[width=" + FIG_WIDTH + "]{gen/" + name + "-img.pdf}",  # path scan reads a
+           r"\caption{" + cap + "}", r"\label{" + h2t.lab(fid) + "}",          # backslash pair before
+           r"\end{figure*}"]                                                    # text as a share path
+    return name, "\n".join(env) + "\n"
+
+
+class Writer:
+    """Writes fragments into latex/gen/ (fonts fetched once)."""
+
+    def __init__(self):
+        os.makedirs(GEN, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.css = font_css(self.tmp.name)
+        self.refs = refs()
+
+    def write(self, frag):
+        if '<figure class="fg"' in frag:
+            name, tex = figure_tex(frag, self.refs, self.tmp.name, self.css)
+        else:
+            name, tex = table_tex(frag, self.refs)
+        open(os.path.join(GEN, name + ".tex"), "w").write(tex)
+        return name
 
 
 def main():
-    args = sys.argv[1:]
-    page = open(PAPER, encoding="utf-8").read()
-    refs = h2t.Refs(page, {i: r["key"] for i, r in enumerate(references(page), 1)})
-    os.makedirs(GEN, exist_ok=True)
-    if "--bib" in args:
-        write_bib(page, refs)
-    write_tables(page, refs)
+    """Render each hand-drawn figure (latex/figures/*.svg) to the PDF beside it when stale."""
+    force = "--force" in sys.argv[1:]
+    todo = [s for s in sorted(glob.glob(os.path.join(FIGURES, "*.svg")))
+            if force or not os.path.exists(s[:-4] + ".pdf") or os.path.getmtime(s[:-4] + ".pdf") < os.path.getmtime(s)]
+    if not todo:
+        print("latex_assets: hand-drawn figures up to date")
+        return
     with tempfile.TemporaryDirectory() as work:
-        names = write_figures(page, refs, work)
-    check_figures(names)
+        css = font_css(work)
+        for s in todo:
+            render_svg(open(s, encoding="utf-8").read(), s[:-4] + ".pdf", work, css)
+    print("latex_assets: rendered " + ", ".join(os.path.basename(s) for s in todo))
 
 
 if __name__ == "__main__":

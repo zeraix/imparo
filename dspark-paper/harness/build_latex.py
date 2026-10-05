@@ -1,12 +1,13 @@
 """latex/AdaSpark.tex -> AdaSpark.pdf and the arXiv source bundle.
 
-Steps: (optionally) regenerate latex/gen/ from paper.html; pdflatex, bibtex, pdflatex twice; fail on
+Steps: render the hand-drawn figures if their SVGs changed (latex_assets.py); pdflatex, bibtex,
+pdflatex twice; fail on
 any undefined reference or citation, overfull line or BibTeX warning; check every PDF font is
-embedded and none is Type 3; copy the PDF to dspark-paper/AdaSpark.pdf; pack latex/arxiv-source.tar.gz
-(AdaSpark.tex, AdaSpark.bbl, gen/) and compile that bundle alone in an empty directory, as arXiv does.
+embedded and none is Type 3; move the PDF to dspark-paper/AdaSpark.pdf; pack latex/arxiv-source.tar.gz
+(AdaSpark.tex, AdaSpark.bbl, gen/, figures/*.pdf) and compile that bundle alone in an empty directory,
+as arXiv does. latex/gen/ is tracked: paper_figs.py RUNDIR rewrites it from the run data.
 
-usage: build_latex.py [--assets]       TeX from $TEXBIN, else ~/Library/TinyTeX/bin/*, else PATH
-latex/gen/ is not tracked: it is regenerated when missing, or always with --assets.
+usage: build_latex.py       TeX from $TEXBIN, else ~/Library/TinyTeX/bin/*, else PATH
 """
 import glob
 import os
@@ -60,12 +61,12 @@ def compile_in(tb, cwd, bibtex=True):
 
 def check_fonts(pdf):
     sys.path.insert(0, HERE)
-    import print_pdf
+    import latex_assets
     from pypdf import PdfReader
     r = PdfReader(pdf)
     fonts, seen = [], set()
     for p in r.pages:
-        fonts += print_pdf.fonts_of(p.get("/Resources"), seen)
+        fonts += latex_assets.fonts_of(p.get("/Resources"), seen)
     type3 = [f for f in fonts if f[1] == "/Type3"]
     bare = [f for f in fonts if f[1] != "/Type3" and not f[2]]
     if type3 or bare:
@@ -74,15 +75,24 @@ def check_fonts(pdf):
 
 
 def main():
-    if "--assets" in sys.argv[1:] or not glob.glob(os.path.join(LATEX, "gen", "*.tex")):
-        subprocess.run([sys.executable, os.path.join(HERE, "latex_assets.py")], check=True)
+    if not glob.glob(os.path.join(LATEX, "gen", "*.tex")):
+        sys.exit("build_latex: latex/gen/ is empty; it is tracked (git checkout) or rewritten by paper_figs.py RUNDIR")
+    subprocess.run([sys.executable, os.path.join(HERE, "latex_assets.py")], check=True)
     tb = texbin()
     pdf = compile_in(tb, LATEX)
     pages, kinds = check_fonts(pdf)
-    shutil.copy(pdf, OUT)
+    shutil.move(pdf, OUT)   # one copy of the paper, outside the build folder
+    # arXiv removes x.pdf when x.tex exists ("name conflict"): it takes the PDF for that file's output
+    stems = {}
+    for p in glob.glob(os.path.join(LATEX, "gen", "*")) + glob.glob(os.path.join(LATEX, "figures", "*")):
+        stems.setdefault(os.path.splitext(p)[0], set()).add(os.path.splitext(p)[1])
+    clash = sorted(os.path.basename(s) for s, ext in stems.items() if {".tex", ".pdf"} <= ext)
+    if clash:
+        sys.exit("build_latex: arXiv would delete these PDFs, which share a name with a .tex: " + ", ".join(clash))
     with tarfile.open(BUNDLE, "w:gz") as t:
         for name in ["AdaSpark.tex", "AdaSpark.bbl"] + sorted(
-                os.path.relpath(p, LATEX) for p in glob.glob(os.path.join(LATEX, "gen", "*"))):
+                os.path.relpath(p, LATEX) for p in glob.glob(os.path.join(LATEX, "gen", "*"))
+                + glob.glob(os.path.join(LATEX, "figures", "*.pdf"))):
             t.add(os.path.join(LATEX, name), arcname=name)
     with tempfile.TemporaryDirectory() as d:          # the bundle alone, the way arXiv builds it
         with tarfile.open(BUNDLE) as t:

@@ -1,0 +1,16 @@
+\begin{table*}[t]
+\centering\small
+\caption{Acceptance prediction on the evaluation subset: log loss per labelled node of the head-based estimate (the drafter's confidence head with its per-request offset) and of the fitted model, both scored on each round's labels before either learned from them, over every request after the first that did not reach the token cap. \emph{priced} is the share of rounds whose tree the fitted model priced; the last column gives rounds priced over tree rounds for the first request, which starts from an empty store.}
+\label{tab:accept}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+\rowcolor{head}\textbf{target} & \textbf{requests} & \textbf{nodes} & \textbf{head-based} & \textbf{fitted} & \textbf{change} & \textbf{requests won} & \textbf{priced} & \textbf{first request} \\
+\midrule
+LFM2.5-2.6B & 91 & 580,495 & 0.1410 & 0.1238 & $-$12.2\% & 91/91 & 100\% & 157/436 \\
+LFM2.5-8B-A1B & 94 & 592,660 & 0.1520 & 0.1360 & $-$10.5\% & 94/94 & 100\% & 322/644 \\
+Qwen3-4B & 87 & 567,698 & 0.1644 & 0.1400 & $-$14.8\% & 87/87 & 100\% & 779/838 \\
+Qwen3-8B & 93 & 634,175 & 0.1572 & 0.1336 & $-$15.0\% & 93/93 & 100\% & 749/864 \\
+\bottomrule
+\end{tabular}
+\end{table*}

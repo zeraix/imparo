@@ -1,0 +1,35 @@
+<!-- drawn by hand; colours are the paper's CSS variables (latex_assets.TOKENS), rendered by latex_assets.py -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 214" role="img" aria-label="Shape of the candidate tree: a spine of drafter picks, sibling leaves under each, and an n-gram chain branching from a pick and running past the block">
+        <g stroke="var(--ink)" stroke-width="1" fill="none">
+          <line x1="58" y1="50" x2="152" y2="50"/><line x1="168" y1="50" x2="262" y2="50"/>
+          <line x1="278" y1="50" x2="372" y2="50"/><line x1="388" y1="50" x2="482" y2="50"/>
+          <line x1="56" y1="56" x2="154" y2="96"/><line x1="54" y1="58" x2="155" y2="130"/>
+          <line x1="166" y1="56" x2="264" y2="96"/><line x1="164" y1="58" x2="265" y2="130"/>
+          <line x1="276" y1="56" x2="374" y2="96"/><line x1="274" y1="58" x2="375" y2="130"/>
+          <line x1="386" y1="56" x2="484" y2="96"/><line x1="384" y1="58" x2="485" y2="130"/>
+        </g>
+        <g stroke="var(--c2)" stroke-width="1.2" fill="none" stroke-dasharray="4 3">
+          <line x1="165" y1="57" x2="265" y2="170"/><line x1="276" y1="176" x2="372" y2="176"/>
+          <line x1="388" y1="176" x2="482" y2="176"/><line x1="498" y1="176" x2="592" y2="176"/>
+        </g>
+        <g stroke="var(--ink)" stroke-width="1">
+          <circle cx="50" cy="50" r="8" fill="var(--paper)" stroke-width="1.6"/>
+          <circle cx="160" cy="50" r="8" fill="var(--c1)" stroke="var(--c1)"/><circle cx="270" cy="50" r="8" fill="var(--c1)" stroke="var(--c1)"/>
+          <circle cx="380" cy="50" r="8" fill="var(--c1)" stroke="var(--c1)"/><circle cx="490" cy="50" r="8" fill="var(--c1)" stroke="var(--c1)"/>
+          <circle cx="160" cy="100" r="6" fill="var(--c6)" stroke="var(--c1)"/><circle cx="160" cy="134" r="6" fill="var(--c6)" stroke="var(--c1)"/>
+          <circle cx="270" cy="100" r="6" fill="var(--c6)" stroke="var(--c1)"/><circle cx="270" cy="134" r="6" fill="var(--c6)" stroke="var(--c1)"/>
+          <circle cx="380" cy="100" r="6" fill="var(--c6)" stroke="var(--c1)"/><circle cx="380" cy="134" r="6" fill="var(--c6)" stroke="var(--c1)"/>
+          <circle cx="490" cy="100" r="6" fill="var(--c6)" stroke="var(--c1)"/><circle cx="490" cy="134" r="6" fill="var(--c6)" stroke="var(--c1)"/>
+          <rect x="263" y="169" width="14" height="14" fill="var(--c2)" stroke="var(--c2)"/><rect x="373" y="169" width="14" height="14" fill="var(--c2)" stroke="var(--c2)"/>
+          <rect x="483" y="169" width="14" height="14" fill="var(--c2)" stroke="var(--c2)"/><rect x="593" y="169" width="14" height="14" fill="var(--c2)" stroke="var(--c2)"/>
+        </g>
+        <g font-family="Newsreader, serif" font-size="11.5" fill="var(--ink-2)">
+          <text x="50" y="30" text-anchor="middle">anchor</text>
+          <text x="160" y="30" text-anchor="middle">position 1</text><text x="270" y="30" text-anchor="middle">position 2</text>
+          <text x="380" y="30" text-anchor="middle">position 3</text><text x="490" y="30" text-anchor="middle">position 4</text>
+          <text x="600" y="160" text-anchor="middle" font-style="italic" fill="var(--ink-3)">past the block</text>
+          <text x="538" y="54" fill="var(--ink-3)">picks</text>
+          <text x="512" y="120" fill="var(--ink-3)">siblings (leaves)</text>
+          <text x="20" y="202" fill="var(--ink-3)">n-gram chain from the pick at position 1: its nodes may agree with a drafter candidate or run past the block</text>
+        </g>
+      </svg>
