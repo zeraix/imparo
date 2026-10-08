@@ -32,10 +32,10 @@
 \renewcommand{\algorithmicensure}{\textbf{output:}}
 
 \title{AdaSpark: Adaptive DSpark with Online Learning\\for Tree Verification and N-gram Fill}
-\author{Liquan Liu \qquad Yifan Zhang\\[4pt]
-  {\normalsize\itshape Zeraix}\\
-  {\small\texttt{liquan@zeraix.com}, \texttt{fergus@zeraix.com}}}
-\date{5 October 2026}
+\author{Liquan Liu\\ {\small\texttt{liquan@zeraix.com}} \and
+  Yifan Zhang\\ {\small\texttt{fergus@zeraix.com}} \and
+  Bowei Xu\\ {\small\texttt{xbw112233@gmail.com}}}
+\date{\textit{Zeraix}\enspace$\cdot$\enspace 5 October 2026}
 
 \begin{document}
 \twocolumn[
@@ -46,7 +46,7 @@ Block drafters such as DSpark propose ranked candidates for several positions in
 
 AdaSpark learns both quantities while it serves, with no profile, calibration or sweep in advance. It learns which verify widths are worth offering and fits each one's verify time as a function of context. It fits each candidate's acceptance probability to the target's verify outcomes, with the drafter's confidence head as one input, and orders and sizes the tree by that fit instead of by the head. The same model prices n-gram continuations of the request's own text, so drafted and text-derived candidates compete for rows in one best-first order. The width is chosen by pricing time at the long-run decode rate.
 
-On single- and multi-turn conversations from six public datasets, on three dense targets and one mixture-of-experts target, AdaSpark decodes 1.5--3.1$\times$ faster than llama.cpp's DSpark with the same drafters; on three of the targets llama.cpp's DSpark is slower than llama.cpp's own autoregressive decode. On one engine, AdaSpark is 1.17--1.52$\times$ faster than the three-token chain llama.cpp uses by default. Without a width sweep, it is never more than 0.3\% slower than the best pinned tree width on any dense target or context band. On the mixture-of-experts target it ties the best pinned width, and the other pinned widths from 4 to 16 rows are 5--14\% slower.
+On single- and multi-turn conversations from six public datasets, on three dense targets and one mixture-of-experts target, AdaSpark decodes 1.5--3.1$\times$ faster than llama.cpp's DSpark with the same drafters. Our imparo engine with AdaSpark is 1.17--1.52$\times$ faster than imparo running with a three-token chain (the default llama.cpp setting); this gain comes from the scheduler alone. Without a width sweep, AdaSpark is never more than 0.3\% slower than the best pinned tree width on any dense target or context band. On the mixture-of-experts target it ties the best pinned width, and the other pinned widths from 4 to 16 rows are 5--14\% slower.
 
 \smallskip
 \noindent\textit{Keywords:} speculative decoding; tree verification; DSpark; online learning; verify cost; mixture of experts\\

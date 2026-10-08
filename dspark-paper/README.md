@@ -1,5 +1,8 @@
 # Adaptive DSpark: the paper, its test set, and its harness
 
+AdaSpark: Adaptive DSpark with Online Learning for Tree Verification and N-gram Fill.
+Liquan Liu, Yifan Zhang, Bowei Xu. arXiv:2610.05774 (cs.LG), https://arxiv.org/abs/2610.05774
+
 Everything a number in the paper depends on, apart from the engine itself.
 
 ```
